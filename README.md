@@ -66,3 +66,85 @@ def is_product_active(url):
         driver.quit()
 
     return is_active
+
+
+
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.proxy import Proxy, ProxyType
+
+def setup_selenium_with_proxy():
+    # Настройка опций Chrome
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")  # Режим без интерфейса
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--window-size=1920x1080")
+
+    # Настройка прокси
+    proxy = Proxy()
+    proxy.proxy_type = ProxyType.MANUAL
+    proxy.http_proxy = "mi.makhmudov:mR3%5Bypulczaf@proxy-perovo.roscap.com:3128"
+    proxy.ssl_proxy = "mi.makhmudov:mR3%5Bypulczaf@proxy-perovo.roscap.com:3128"
+
+    capabilities = webdriver.DesiredCapabilities.CHROME
+    proxy.add_to_capabilities(capabilities)
+
+    # Создаем драйвер Chrome с прокси и капабилити
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=chrome_options, desired_capabilities=capabilities)
+    return driver
+
+
+def is_product_active_with_proxy(url):
+    """
+    Checks if a product URL is active on the website by detecting redirection patterns,
+    using a proxy for Selenium requests.
+    """
+    driver = setup_selenium_with_proxy()  # Используем настройку с прокси
+
+    is_active = True
+    try:
+        print(f"Checking product URL: {url}")
+        driver.get(url)
+        current_url = driver.current_url
+        print(f"Initial URL loaded: {current_url}")
+
+        # Ожидание и обработка редиректов
+        max_wait_time = 10
+        WebDriverWait(driver, max_wait_time).until(EC.url_changes(current_url))
+
+        max_redirects = 10
+        redirect_count = 0
+        while redirect_count < max_redirects:
+            time.sleep(2)
+            new_url = driver.current_url
+
+            if "ProductIsNotActive" in new_url or "ProductsNotActive" in driver.page_source:
+                print("Detected inactive product message.")
+                is_active = False
+                break
+
+            if new_url == current_url:
+                break
+
+            current_url = new_url
+            redirect_count += 1
+            print(f"Redirect {redirect_count}: {current_url}")
+
+        print(f"Final URL after redirects: {current_url}")
+
+    except Exception as e:
+        print(f"An error occurred during checking: {e}")
+        is_active = False
+    finally:
+        driver.quit()
+
+    return is_active
+
+# Пример использования
+test_url = "https://lk.finuslugi.ru/add-product?aggregatorId=moex-mp-new-sc&productId=12309&optionId=37316072195609816"
+print("Is the product active?", is_product_active_with_proxy(test_url))
