@@ -6,57 +6,46 @@ AS
 /*
   Это представление агрегирует данные по депозитам, начиная с 2024 года.
   
-  Для открытых депозитов (определяемых по DT_OPEN):
-    • Отбираются депозиты, открытые в месяце, которые прожили ≥ 10 дней.
-    • MATUR = DATEDIFF(DAY, DT_OPEN, DT_CLOSE_PLAN); ставка в ежемесячной конвенции 
-      вычисляется через функцию:
+  Для открытых депозитов (по DT_OPEN):
+    - Отбираются депозиты, открытые в месяце, которые прожили ≥ 10 дней.
+    - MATUR = DATEDIFF(DAY, DT_OPEN, DT_CLOSE_PLAN); ConvertedRate рассчитывается через функцию
           LIQUIDITY.liq.fnc_IntRate(RATE, NEW_CONVENTION_NAME, 'monthly', MATUR, 1)
-    • Присоединяется информация из LIQUIDITY.[liq].man_CONVENTION (по CONVENTION),
-      чтобы получить NEW_CONVENTION_NAME.
-    • По DaysLived (DATEDIFF(DAY, DT_OPEN, DT_CLOSE)) определяется бакет срочности (TermBucket)
+    - Информация из LIQUIDITY.[liq].man_CONVENTION используется для получения NEW_CONVENTION_NAME.
+    - По DaysLived (DATEDIFF(DAY, DT_OPEN, DT_CLOSE)) определяется бакет срочности (TermBucket)
       через таблицу [man_TermGroup] (поле TERM_GROUP).
-    • Через LEFT JOIN с [conrel_prolongations] определяется число пролонгаций (ProlongCount).
-      Если запись отсутствует – ProlongCount = 0; иначе – 1, 2 или 3+.
-    • Если пролонгация существует (ProlongCount > 0), для первого звена (old1)
-      рассчитывается PrevConvertedRate и берётся его баланс (PrevBalance).
-    • Агрегируются показатели по открытым депозитам с сегментацией (MonthEnd, SegmentGrouping,
-      CurrencyGrouping, TermBucketGrouping). В CTE OpenAggregated вычисляются:
-         - OpenedDeals, Summ_BalanceRub;
-         - По пролонгациям:
-             Count_Prolong (количество депозитов с ProlongCount > 0),
-             Count_NewNoProlong (с ProlongCount = 0),
-             Count_1yProlong, Count_2yProlong, Count_3plusProlong;
-             суммы: Sum_ProlongRub (сумма по депозитам с ProlongCount > 0),
-             Sum_NewNoProlong (с ProlongCount = 0),
-             Sum_1yProlong_Rub, Sum_2yProlong_Rub, Sum_3plusProlong_Rub;
-         - Взвешенные суммы:
-             Sum_RateWeighted = SUM(BALANCE_RUB * ConvertedRate) – для всех депозитов,
-             Sum_RateWeighted_NewNoProlong = сумма для депозитов без пролонгации,
-             а новый агрегат:
-             Sum_RateWeighted_Prolong = SUM(CASE WHEN ProlongCount > 0 THEN BALANCE_RUB * ConvertedRate ELSE 0 END)
-         - Также агрегируются показатели для предыдущих депозитов (для пролонгированных):
-             Sum_PreviousBalance и Sum_PreviousRateWeighted.
-         - Затем в итоговом SELECT для открытых депозитов вычисляются средневзвешенные ставки:
-              WeightedRate_All = Sum_RateWeighted / Summ_BalanceRub,
-              WeightedRate_NewNoProlong = Sum_RateWeighted_NewNoProlong / Sum_NewNoProlong,
-              WeightedRate_AllProlong = Sum_RateWeighted_Prolong / Sum_ProlongRub,
-              WeightedRate_1y = SUM(BALANCE_RUB * ConvertedRate) / SUM(BALANCE_RUB) для депозитов с ProlongCount = 1,
-              WeightedRate_2y, WeightedRate_3plus аналогично,
-              WeightedRate_Previous = Sum_PreviousRateWeighted / Sum_PreviousBalance.
+    - Через LEFT JOIN с [conrel_prolongations] определяется число пролонгаций (ProlongCount).
+      Если пролонгация есть (ProlongCount > 0), для первого звена (old1) рассчитывается PrevConvertedRate и берётся PrevBalance.
+    - Агрегируются показатели по открытым депозитам (CTE OpenAggregated), где вычисляются:
+         • OpenedDeals, Summ_BalanceRub;
+         • По пролонгациям: Count_Prolong, Count_NewNoProlong, Count_1yProlong, Count_2yProlong, Count_3plusProlong;
+           суммы: Sum_ProlongRub, Sum_NewNoProlong, Sum_1yProlong_Rub, Sum_2yProlong_Rub, Sum_3plusProlong_Rub;
+         • Взвешенные суммы: Sum_RateWeighted = SUM(BALANCE_RUB * ConvertedRate) для всех,
+           Sum_RateWeighted_NewNoProlong для депозитов без пролонгации,
+           Sum_RateWeighted_1y, Sum_RateWeighted_2y, Sum_RateWeighted_3plus для соответствующих групп,
+           а также Sum_RateWeighted_Prolong = SUM(CASE WHEN ProlongCount > 0 THEN BALANCE_RUB * ConvertedRate ELSE 0 END).
+         • Для предыдущих депозитов – Sum_PreviousBalance и Sum_PreviousRateWeighted.
+    - Из этих агрегатов можно вычислить средневзвешенные ставки:
+         WeightedRate_All = Sum_RateWeighted / Summ_BalanceRub,
+         WeightedRate_NewNoProlong = Sum_RateWeighted_NewNoProlong / Sum_NewNoProlong,
+         WeightedRate_1y = Sum_RateWeighted_1y / Sum_1yProlong_Rub,
+         WeightedRate_2y = Sum_RateWeighted_2y / Sum_2yProlong_Rub,
+         WeightedRate_3plus = Sum_RateWeighted_3plus / Sum_3plusProlong_Rub,
+         WeightedRate_AllProlong = Sum_RateWeighted_Prolong / Sum_ProlongRub,
+         WeightedRate_Previous = Sum_PreviousRateWeighted / Sum_PreviousBalance.
   
-  Для закрытых депозитов (определяемых по DT_CLOSE_FACT):
-    • Аналогичным образом отбираются депозиты, рассчитывается MATUR и ConvertedRate,
-      определяется бакет срочности и агрегируются показатели: ClosedDeals, Summ_ClosedBalanceRub,
-      а также WeightedRate_Closed = Sum_RateWeighted_Closed / Summ_ClosedBalanceRub.
+  Для закрытых депозитов (по DT_CLOSE):
+    - Аналогично отбираются депозиты, рассчитывается MATUR и ConvertedRate, определяется бакет срочности,
+      агрегируются ClosedDeals, Summ_ClosedBalanceRub и Sum_RateWeighted_Closed, а затем
+      WeightedRate_Closed = Sum_RateWeighted_Closed / Summ_ClosedBalanceRub.
       
-  Итог – агрегаты по открытым и закрытым депозитам объединяются через FULL OUTER JOIN по ключу 
+  Итог – агрегаты по открытым и закрытым депозитам объединяются через FULL OUTER JOIN по ключу:
          (MonthEnd, SegmentGrouping, CurrencyGrouping, TermBucketGrouping).
-  Сегментация осуществляется по: MonthEnd, SegmentGrouping (с перекодировкой), CurrencyGrouping и TermBucketGrouping.
-  Итоговые значения заменяются через ISNULL/COALESCE, а группировка выполняется с помощью CUBE.
+  Сегментация осуществляется по MonthEnd, SegmentGrouping (с перекодировкой), CurrencyGrouping и TermBucketGrouping.
+  Итоговые значения заменяются через ISNULL/COALESCE.
 */
 WITH
 -----------------------------
--- 0) Генерация месяцев (MonthEnd) от 2024-01-31 до 2025-02-28
+-- 0) Генерация месяцев (MonthEnd)
 -----------------------------
 cteMonths AS (
     SELECT CONVERT(date, '2024-01-31') AS MonthEnd
@@ -356,9 +345,9 @@ SELECT
     ISNULL(o.Sum_3plusProlong_Rub, 0) AS Sum_3plusProlong_Rub,
     CASE WHEN ISNULL(o.Summ_BalanceRub, 0) > 0 THEN 1.0 * o.Sum_ProlongRub / o.Summ_BalanceRub ELSE 0 END AS [Доля_пролонгаций_Rub],
     CASE WHEN ISNULL(o.OpenedDeals, 0) > 0 THEN 1.0 * o.Count_Prolong / o.OpenedDeals ELSE 0 END AS [Доля_пролонгаций_шт],
-    CASE WHEN ISNULL(o.OpenedDeals, 0) > 0 THEN 1.0 * o.Count_1yProlong / o.OpenedDeals ELSE 0 END AS [Доля_1йПролонгаций_шт],
-    CASE WHEN ISNULL(o.OpenedDeals, 0) > 0 THEN 1.0 * o.Count_2yProlong / o.OpenedDeals ELSE 0 END AS [Доля_2йПролонгаций_шт],
-    CASE WHEN ISNULL(o.OpenedDeals, 0) > 0 THEN 1.0 * o.Count_3plusProlong / o.OpenedDeals ELSE 0 END AS [Доля_3plusПролонгаций_шт],
+    CASE WHEN ISNULL(o.Summ_BalanceRub, 0) > 0 THEN 1.0 * o.Sum_1yProlong_Rub / o.Summ_BalanceRub ELSE 0 END AS [Доля_1йПролонгаций_Rub],
+    CASE WHEN ISNULL(o.Summ_BalanceRub, 0) > 0 THEN 1.0 * o.Sum_2yProlong_Rub / o.Summ_BalanceRub ELSE 0 END AS [Доля_2йПролонгаций_Rub],
+    CASE WHEN ISNULL(o.Summ_BalanceRub, 0) > 0 THEN 1.0 * o.Sum_3plusProlong_Rub / o.Summ_BalanceRub ELSE 0 END AS [Доля_3plusПролонгаций_Rub],
     CASE WHEN ISNULL(o.Summ_BalanceRub, 0) > 0 THEN 1.0 * o.Sum_RateWeighted / o.Summ_BalanceRub ELSE 0 END AS [WeightedRate_All],
     CASE WHEN ISNULL(o.Sum_NewNoProlong, 0) > 0 THEN 1.0 * o.Sum_RateWeighted_NewNoProlong / o.Sum_NewNoProlong ELSE 0 END AS [WeightedRate_NewNoProlong],
     CASE WHEN o.Sum_1yProlong_Rub > 0 THEN o.Sum_RateWeighted_1y / o.Sum_1yProlong_Rub ELSE 0 END AS [WeightedRate_1y],
@@ -387,9 +376,6 @@ FULL OUTER JOIN ClosedWeightedRates cw
    AND c.SegmentGrouping = cw.SegmentGrouping
    AND c.CurrencyGrouping = cw.CurrencyGrouping
    AND c.TermBucketGrouping = cw.TermBucketGrouping
-GROUP BY COALESCE(o.MonthEnd, ow.MonthEnd, c.MonthEnd, cw.MonthEnd),
-         ISNULL(COALESCE(o.SegmentGrouping, ow.SegmentGrouping, c.SegmentGrouping, cw.SegmentGrouping), N'Все сегменты'),
-         ISNULL(COALESCE(o.CurrencyGrouping, ow.CurrencyGrouping, c.CurrencyGrouping, cw.CurrencyGrouping), N'Все валюты'),
-         ISNULL(COALESCE(o.TermBucketGrouping, ow.TermBucketGrouping, c.TermBucketGrouping, cw.TermBucketGrouping), N'Все бакеты')
-ORDER BY COALESCE(o.MonthEnd, ow.MonthEnd, c.MonthEnd, cw.MonthEnd);
+ORDER BY
+    COALESCE(o.MonthEnd, ow.MonthEnd, c.MonthEnd, cw.MonthEnd);
 GO
