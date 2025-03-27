@@ -154,3 +154,129 @@ ORDER BY WEEK_START, WEEK, OUTGOING_BANK_NAME;
 Так вы получите нужную визуализацию без динамического SQL.
 
 
+
+Для решения задачи **без жесткого указания названий банков** и с динамическим формированием столбцов на основе топ-5 банков за каждую неделю, можно использовать следующий подход. Однако в стандартном SQL это требует многоэтапной логики. Вот запросы для входящих и исходящих переводов:
+
+---
+
+### **Шаг 1: Определяем все банки, которые когда-либо входили в топ-5**
+#### Для входящих переводов:
+```sql
+WITH
+-- Ранжируем банки по входящим переводам за каждую неделю
+weekly_rank_in AS (
+  SELECT
+    WEEK_START,
+    WEEK,
+    INCOMING_BANK_NAME,
+    SUM(INCOMING_SUM_TRANS) AS total_incoming,
+    ROW_NUMBER() OVER (
+      PARTITION BY WEEK_START 
+      ORDER BY SUM(INCOMING_SUM_TRANS) DESC
+    ) AS rank
+  FROM sbp_statistic
+  GROUP BY WEEK_START, WEEK, INCOMING_BANK_NAME
+),
+-- Собираем все банки, которые хотя бы раз были в топ-5
+top_banks_in AS (
+  SELECT DISTINCT INCOMING_BANK_NAME 
+  FROM weekly_rank_in 
+  WHERE rank <= 5
+),
+-- Формируем данные для каждого банка из топ-5
+bank_data_in AS (
+  SELECT
+    wr.WEEK_START,
+    wr.WEEK,
+    tb.INCOMING_BANK_NAME,
+    CASE 
+      WHEN wr.rank <= 5 THEN wr.total_incoming 
+      ELSE NULL 
+    END AS incoming_sum
+  FROM weekly_rank_in wr
+  RIGHT JOIN top_banks_in tb 
+    ON wr.INCOMING_BANK_NAME = tb.INCOMING_BANK_NAME
+)
+-- Агрегируем данные по неделям и банкам
+SELECT
+  WEEK_START,
+  WEEK,
+  -- Для каждого банка из top_banks_in создаем столбец
+  MAX(CASE WHEN INCOMING_BANK_NAME = 'Банк 1' THEN incoming_sum END) AS "Банк 1",
+  MAX(CASE WHEN INCOMING_BANK_NAME = 'Банк 2' THEN incoming_sum END) AS "Банк 2",
+  -- ... добавить все банки из top_banks_in
+  SUM(CASE WHEN incoming_sum IS NULL THEN total_incoming ELSE 0 END) AS "ОСТАЛЬНЫЕ_БАНКИ"
+FROM bank_data_in
+GROUP BY WEEK_START, WEEK
+ORDER BY WEEK_START;
+```
+
+---
+
+### **Шаг 2: Автоматизация через динамический SQL**
+Если названия банков заранее неизвестны, потребуется **динамический SQL** (например, через PL/pgSQL). Пример логики:
+
+```sql
+DO $$
+DECLARE 
+  bank_list TEXT;
+  sql_query TEXT;
+BEGIN
+  -- Собираем список банков из топ-5
+  SELECT STRING_AGG(DISTINCT 'MAX(CASE WHEN INCOMING_BANK_NAME = ''' || INCOMING_BANK_NAME || ''' THEN incoming_sum END) AS "' || INCOMING_BANK_NAME || '"', ', ')
+  INTO bank_list
+  FROM top_banks_in;
+
+  -- Формируем динамический запрос
+  sql_query := '
+    WITH 
+    weekly_rank_in AS (...),
+    top_banks_in AS (...),
+    bank_data_in AS (...)
+    SELECT
+      WEEK_START,
+      WEEK,
+      ' || bank_list || ',
+      SUM(ОСТАЛЬНЫЕ_БАНКИ) AS "ОСТАЛЬНЫЕ_БАНКИ"
+    FROM bank_data_in
+    GROUP BY WEEK_START, WEEK
+    ORDER BY WEEK_START;
+  ';
+
+  -- Выполняем запрос
+  EXECUTE sql_query;
+END $$;
+```
+
+---
+
+### **Пояснение:**
+1. **CTE `weekly_rank_in`**:
+   - Ранжирует банки по сумме входящих переводов за каждую неделю.
+
+2. **CTE `top_banks_in`**:
+   - Собирает уникальные названия банков, которые хотя бы раз были в топ-5.
+
+3. **CTE `bank_data_in`**:
+   - Для каждой недели и каждого банка из `top_banks_in` проверяет, входит ли он в топ-5. Если да — возвращает сумму, иначе `NULL`.
+
+4. **Финальный запрос**:
+   - Преобразует строки в столбцы с помощью `CASE`.
+   - Значение `NULL` означает, что банк не входил в топ-5 на этой неделе.
+
+---
+
+### **Для исходящих переводов** (аналогично):
+Замените:
+- `INCOMING_BANK_NAME` → `OUTGOING_BANK_NAME`,
+- `INCOMING_SUM_TRANS` → `OUTGOING_SUM_TRANS`.
+
+---
+
+### **Важно:**
+- Если банков в топ-5 много, запрос станет громоздким. Решение через динамический SQL предпочтительнее.
+- Для Excel можно экспортировать данные в формате:
+  ```
+  | WEEK_START | WEEK | Банк 1 | Банк 2 | ... | ОСТАЛЬНЫЕ_БАНКИ |
+  ``` 
+  и настроить сводную таблицу.
