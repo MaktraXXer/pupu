@@ -1,44 +1,46 @@
 import pandas as pd
 
-# 1. Читаем и подготавливаем данные
-df = pd.read_excel("your_file.xlsx")  # замените на нужное имя
+# Читаем данные
+df = pd.read_excel("your_file.xlsx")
 df['Date'] = pd.to_datetime(df['Date'])
-df = df.sort_values(['Bank', 'Term', 'Date'])
 
-# 2. Смещаем каждую дату вниз, чтобы получить дату окончания интервала
-df['NextDate'] = df.groupby(['Bank', 'Term'])['Date'].shift(-1)
+# Сортировка для корректной работы
+df = df.sort_values(['Bank', 'Term', 'Currency', 'Date'])
 
-# Удаляем последние строки без NextDate
-df = df[df['NextDate'].notna()]
+# Получаем следующую дату в группе
+df['NextDate'] = df.groupby(['Bank', 'Term', 'Currency'])['Date'].shift(-1)
 
-# 3. Создаём таблицу с размножением по всем датам между Date и NextDate
-all_rows = []
+# Для последней даты в группе — прибавляем 7 дней (заполнение до недели вперёд)
+mask_last = df['NextDate'].isna()
+df.loc[mask_last, 'NextDate'] = df.loc[mask_last, 'Date'] + pd.Timedelta(days=7)
+
+# Теперь создаём записи на каждый день между Date и NextDate - 1
+expanded_rows = []
+
 for _, row in df.iterrows():
     date_range = pd.date_range(start=row['Date'], end=row['NextDate'] - pd.Timedelta(days=1))
-    temp = pd.DataFrame({
+    temp_df = pd.DataFrame({
         'Date': date_range,
         'Bank': row['Bank'],
         'Term': row['Term'],
+        'Currency': row['Currency'],
         'Rate': row['Rate']
     })
-    all_rows.append(temp)
+    expanded_rows.append(temp_df)
 
 # Объединяем всё в один датафрейм
-df_expanded = pd.concat(all_rows, ignore_index=True)
+df_daily = pd.concat(expanded_rows, ignore_index=True)
 
-# 4. Вычисляем начало "четверговой недели"
-df_expanded['WeekStart'] = df_expanded['Date'] - pd.to_timedelta((df_expanded['Date'].dt.weekday - 3) % 7, unit='D')
+# Вычисляем дату начала недели (четверг)
+df_daily['WeekStart'] = df_daily['Date'] - pd.to_timedelta((df_daily['Date'].dt.weekday - 3) % 7, unit='d')
 
-# 5. Считаем количество дней каждого наблюдения — нужно для взвешивания
-df_expanded['Weight'] = 1
-
-# 6. Средневзвешенная ставка по неделе, банку и сроку
-weekly_rates = (
-    df_expanded
-    .groupby(['WeekStart', 'Bank', 'Term'])
-    .apply(lambda g: (g['Rate'] * g['Weight']).sum() / g['Weight'].sum())
-    .reset_index(name='WeightedRate')
+# Группируем и усредняем по неделе, банку, сроку, валюте
+weekly_avg = (
+    df_daily
+    .groupby(['WeekStart', 'Bank', 'Term', 'Currency'])['Rate']
+    .mean()
+    .reset_index(name='WeeklyAvgRate')
 )
 
-# Результат
-print(weekly_rates.head())
+# Результат:
+print(weekly_avg.head())
