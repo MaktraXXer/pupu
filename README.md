@@ -1,46 +1,48 @@
-import pandas as pd
-
-# Читаем данные
-df = pd.read_excel("your_file.xlsx")
-df['Date'] = pd.to_datetime(df['Date'])
-
-# Сортировка для корректной работы
-df = df.sort_values(['Bank', 'Term', 'Currency', 'Date'])
-
-# Получаем следующую дату в группе
-df['NextDate'] = df.groupby(['Bank', 'Term', 'Currency'])['Date'].shift(-1)
-
-# Для последней даты в группе — прибавляем 7 дней (заполнение до недели вперёд)
-mask_last = df['NextDate'].isna()
-df.loc[mask_last, 'NextDate'] = df.loc[mask_last, 'Date'] + pd.Timedelta(days=7)
-
-# Теперь создаём записи на каждый день между Date и NextDate - 1
-expanded_rows = []
-
-for _, row in df.iterrows():
-    date_range = pd.date_range(start=row['Date'], end=row['NextDate'] - pd.Timedelta(days=1))
-    temp_df = pd.DataFrame({
-        'Date': date_range,
-        'Bank': row['Bank'],
-        'Term': row['Term'],
-        'Currency': row['Currency'],
-        'Rate': row['Rate']
-    })
-    expanded_rows.append(temp_df)
-
-# Объединяем всё в один датафрейм
-df_daily = pd.concat(expanded_rows, ignore_index=True)
-
-# Вычисляем дату начала недели (четверг)
-df_daily['WeekStart'] = df_daily['Date'] - pd.to_timedelta((df_daily['Date'].dt.weekday - 3) % 7, unit='d')
-
-# Группируем и усредняем по неделе, банку, сроку, валюте
-weekly_avg = (
-    df_daily
-    .groupby(['WeekStart', 'Bank', 'Term', 'Currency'])['Rate']
-    .mean()
-    .reset_index(name='WeeklyAvgRate')
+-------------------------------------------------------------------------------
+-- Ввод дат
+--ACCEPT p_start_date CHAR PROMT 'Enter start date (dd.mm.yyyy): '; 
+--ACCEPT p_end_date   CHAR PROMT 'Enter end date (dd.mm.yyyy): ';
+--DEFINE p_start_date;
+--DEFINE p_end_date;
+-------------------------------------------------------------------------------
+WITH base_data AS (
+  SELECT /*+ parallel(4) */
+         -- Определяем начало недели по дате создания документа
+         TRUNC(d.created) - MOD(TRUNC(d.created) - TO_DATE(&p_start_date, 'DD.MM.YYYY'), 7) AS week_start,
+         d.transfer_amount_value,
+         d.client_id
+  FROM ods_011.documents d
+  WHERE d.transfer_type = 'PHONE'
+    AND d.digest LIKE 'Перевод по номеру телефона INTERNAL%'
+    AND d.active_flag = 'Y'
+    AND d.status = 'Processed'
+    AND d.created >= TO_DATE(&p_start_date, 'DD.MM.YYYY')
+    AND d.created < TO_DATE(&p_end_date, 'DD.MM.YYYY')
+),
+weekly_agg AS (
+  SELECT
+    week_start,
+    -- Формируем текстовое поле с диапазоном дат недели (например, 01 Янв - 07 Янв)
+    TO_CHAR(week_start, 'FMDD Mon', 'NLS_DATE_LANGUAGE=RUSSIAN')
+         || ' - ' ||
+    TO_CHAR(week_start + 6, 'FMDD Mon', 'NLS_DATE_LANGUAGE=RUSSIAN') AS week,
+    -- Сумма переводов, где единоразовый перевод < 100 тыс. руб.
+    SUM(CASE WHEN transfer_amount_value < 100000 THEN transfer_amount_value ELSE 0 END) AS sum_trans_lt100k,
+    -- Количество уникальных клиентов (по client_id) для переводов < 100 тыс. руб.
+    COUNT(DISTINCT CASE WHEN transfer_amount_value < 100000 THEN client_id END) AS unique_clients_lt100k,
+    -- Сумма переводов, где единоразовый перевод >= 100 тыс. руб.
+    SUM(CASE WHEN transfer_amount_value >= 100000 THEN transfer_amount_value ELSE 0 END) AS sum_trans_ge100k,
+    -- Количество уникальных клиентов (по client_id) для переводов >= 100 тыс. руб.
+    COUNT(DISTINCT CASE WHEN transfer_amount_value >= 100000 THEN client_id END) AS unique_clients_ge100k
+  FROM base_data
+  GROUP BY week_start
 )
-
-# Результат:
-print(weekly_avg.head())
+SELECT
+  week_start,
+  week,
+  sum_trans_lt100k,
+  unique_clients_lt100k,
+  sum_trans_ge100k,
+  unique_clients_ge100k
+FROM weekly_agg
+ORDER BY week_start;
