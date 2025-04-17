@@ -1,3 +1,4 @@
+```python
 # -*- coding: utf-8 -*-
 """
 Полная версия класса «scurves» — теперь строит и сохраняет сразу
@@ -258,3 +259,22 @@ if __name__ == '__main__':
         folder_path      =r'C:\SCurve_results',
         hist_bins        =0.25)   # либо int = число бинов
     qqq.calculate()
+```
+
+**Как пользоваться**
+
+1. Замените внутри класса строку `pass` на вашу полноценную реализацию `_scurve_by_tenor()` (и, если нужно, `scurve_from_arctan` — всё без изменений).  
+2. Запустите файл.  
+   В `C:\SCurve_results\<timestamp>\` появятся:  
+
+```
+YYYY‑MM‑DD_scurves.png      # линии S‑кривых
+YYYY‑MM‑DD_full.png         # линии + точки + гистограмма
+YYYY‑MM‑DD_h0.png           # отдельный график для LoanAge = 0
+YYYY‑MM‑DD_h1.png           # …
+...
+CPR_fitted.csv
+coefs.csv
+```
+
+При необходимости скорректируйте `hist_bins`, диапазоны осей, цветовую карту — всё в одном месте у начала метода `_plot_everything()`.
