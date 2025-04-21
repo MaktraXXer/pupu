@@ -1,92 +1,92 @@
-# ---------------------------------------------------------------------------
-# 0.  PREP |  берём данные как есть
-# ---------------------------------------------------------------------------
-import pandas as pd, numpy as np, matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter
+##############################################################################
+# 0.  PREP  ─ строго по вашему фрейму                                        #
+##############################################################################
+df = (agg_daily[['dt_rep',
+                 'INCOMING_SUM_TRANS_total',
+                 'OUTGOING_SUM_TRANS_total']]
+      .set_index('dt_rep')
+      .asfreq('D', fill_value=0))
+
+df['incoming'] = df['INCOMING_SUM_TRANS_total']
+df['outgoing'] = -df['OUTGOING_SUM_TRANS_total'].abs()   # всегда «−»
+df['saldo']    = df['incoming'] + df['outgoing']
+cols = ['incoming', 'outgoing', 'saldo']
+
+##############################################################################
+# 1.  DETECTORS                                                              #
+##############################################################################
 from scipy import stats
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
 
-# удостоверимся, что дата — индекс
-saldo_df = saldo_df.set_index('dt_rep')
-
-if 'incoming' not in saldo_df.columns:
-    saldo_df['incoming'] = saldo_df['INCOMING_SUM_TRANS_total'].fillna(0)
-if 'outgoing' not in saldo_df.columns:
-    saldo_df['outgoing'] = -saldo_df['OUTGOING_SUM_TRANS_total'].fillna(0).abs()
-if 'saldo' not in saldo_df.columns:
-    saldo_df['saldo'] = saldo_df['incoming'] + saldo_df['outgoing']
-
-# ---------------------------------------------------------------------------
-# 1.  DETECTOR‑ФУНКЦИИ
-# ---------------------------------------------------------------------------
 def robust_z(series, thresh=3.5):
-    med = series.median()
-    mad = np.median(np.abs(series - med))
+    med = series.median(); mad = np.median(np.abs(series-med))
     z   = 0.6745*(series-med)/mad if mad else np.zeros_like(series)
     mask = np.abs(z) > thresh
-    return mask, med                                   # замена = глобальная медиана
+    return mask, med                                          # глобальная замена
 
 def hampel(series, window=15, n_sig=3):
-    L = 1.4826
+    L=1.4826
     med = series.rolling(window, center=True).median()
-    diff = np.abs(series - med)
-    mad  = L*diff.rolling(window, center=True).median()
+    diff= np.abs(series-med)
+    mad = L*diff.rolling(window, center=True).median()
     mask = (diff > n_sig*mad).fillna(False)
-    return mask, med                                   # замена = локальная медиана
+    return mask, med                                          # локальная замена
 
-def grubbs_mask(series, alpha=.05):
+def grubbs(series, alpha=.05):
     x = series.dropna().values.copy(); N=len(x)
     out = np.zeros(N, dtype=bool); idx = np.arange(N)
-    while N > 2:
-        z = np.abs(x - x.mean())/x.std(ddof=1)
-        i = z.argmax(); G = z[i]
-        t = stats.t.ppf(1-alpha/(2*N), N-2)
-        Gcrit = ((N-1)/np.sqrt(N))*np.sqrt(t**2/(N-2+t**2))
-        if G > Gcrit:
+    while N>2:
+        z   = np.abs(x-x.mean())/x.std(ddof=1)
+        i,G = z.argmax(), z.max()
+        t   = stats.t.ppf(1-alpha/(2*N), N-2)
+        Gc  = ((N-1)/np.sqrt(N))*np.sqrt(t**2/(N-2+t**2))
+        if G>Gc:
             out[idx[i]] = True
-            x = np.delete(x, i); idx = np.delete(idx, i); N -= 1
-        else:
-            break
-    mask = pd.Series(False, index=series.index)
+            x  = np.delete(x,i); idx = np.delete(idx,i); N-=1
+        else: break
+    mask = pd.Series(False,index=series.index)
     mask.iloc[np.where(out)[0]] = True
-    return mask, series.median()                       # замена = глобальная медиана
+    return mask, series.median()                               # глобальная замена
 
-# ---------------------------------------------------------------------------
-# 2.  ВИЗУАЛИЗАТОР
-# ---------------------------------------------------------------------------
-def plot_detector(ax, series, mask, replacement, title):
-    series.plot(ax=ax, color='steelblue', label='data')
+detectors = {'Robust Z': robust_z,
+             'Hampel':   hampel,
+             'Grubbs':   grubbs}
 
-    # исходные выбросы
-    ax.scatter(series.index[mask], series[mask],
-               color='limegreen', s=50, label='outliers', zorder=3)
+##############################################################################
+# 2.  ВИЗУАЛ: по 3×3 графика (метрика × тест)                                #
+##############################################################################
+fmtB = FuncFormatter(lambda x,_: f'{x/1e9:.1f} B')
+n_row, n_col = len(cols), len(detectors)
 
-    # значения‑замены
-    if isinstance(replacement, (int, float)):
-        rep = pd.Series(replacement, index=series.index[mask])
-    else:
-        rep = replacement[mask]
-    ax.scatter(rep.index, rep, color='red', s=50,
-               marker='o', label='replacement', zorder=4)
+fig, axes = plt.subplots(n_row, n_col,
+                         figsize=(5*n_col, 4*n_row),
+                         sharex='col')
 
-    ax.set_title(title, fontsize=11)
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda x,_: f'{x/1e9:.1f}B'))
-    ax.grid(alpha=.25); ax.legend(frameon=False, fontsize=8)
+if n_row==1: axes = np.expand_dims(axes,0)
+if n_col==1: axes = np.expand_dims(axes,1)
 
-# ---------------------------------------------------------------------------
-# 3.  СТРОИМ ГРАФИКИ ДЛЯ КАЖДОГО ИЗ 3 РЯДОВ
-# ---------------------------------------------------------------------------
-detectors = [('Robust Z‑score (MAD)', robust_z),
-             ('Hampel filter',        hampel),
-             ('Iterative Grubbs',     grubbs_mask)]
+for r,col in enumerate(cols):
+    s = df[col]
+    for c,(name,func) in enumerate(detectors.items()):
+        ax = axes[r,c]
+        mask, repl = func(s)
+        # исходные данные
+        ax.plot(s.index, s, color='steelblue', label='data', lw=.8)
+        # выбросы(orig)
+        ax.scatter(s.index[mask], s[mask], color='limegreen',
+                   s=30, label='outliers', zorder=3)
+        # точки‑замены
+        if isinstance(repl, (int,float)):
+            repl_vals = pd.Series(repl, index=s.index[mask])
+        else:
+            repl_vals = repl[mask]
+        ax.scatter(repl_vals.index, repl_vals, color='red',
+                   s=30, label='replacement', zorder=4)
+        ax.set_title(f'{col}   |   {name}')
+        ax.yaxis.set_major_formatter(fmtB)
+        ax.grid(alpha=.25)
+        if r==0 and c==0:
+            ax.legend(frameon=False, ncol=3)
 
-for col in ['incoming', 'outgoing', 'saldo']:
-    fig, axes = plt.subplots(3, 1, figsize=(15,9), sharex=True)
-    series = saldo_df[col]
-
-    for ax, (name, func) in zip(axes, detectors):
-        mask, repl = func(series)
-        plot_detector(ax, series, mask, repl, f'{col.capitalize()}  —  {name}')
-
-    fig.suptitle(f'Outlier detection for {col}', fontsize=14)
-    plt.tight_layout(rect=[0,0,1,0.96])
-    plt.show()
+plt.tight_layout()
