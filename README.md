@@ -1,110 +1,92 @@
+# ---------------------------------------------------------------------------
+# 0.  PREP |  берём данные как есть
+# ---------------------------------------------------------------------------
 import pandas as pd, numpy as np, matplotlib.pyplot as plt
-from scipy import stats
 from matplotlib.ticker import FuncFormatter
+from scipy import stats
 
-# --------------------------- helpers ---------------------------------------
+# удостоверимся, что дата — индекс
+saldo_df = saldo_df.set_index('dt_rep')
+
+if 'incoming' not in saldo_df.columns:
+    saldo_df['incoming'] = saldo_df['INCOMING_SUM_TRANS_total'].fillna(0)
+if 'outgoing' not in saldo_df.columns:
+    saldo_df['outgoing'] = -saldo_df['OUTGOING_SUM_TRANS_total'].fillna(0).abs()
+if 'saldo' not in saldo_df.columns:
+    saldo_df['saldo'] = saldo_df['incoming'] + saldo_df['outgoing']
+
+# ---------------------------------------------------------------------------
+# 1.  DETECTOR‑ФУНКЦИИ
+# ---------------------------------------------------------------------------
 def robust_z(series, thresh=3.5):
-    med = series.median(); mad = np.median(np.abs(series-med))
-    z = 0.6745*(series-med)/mad if mad else np.zeros_like(series)
+    med = series.median()
+    mad = np.median(np.abs(series - med))
+    z   = 0.6745*(series-med)/mad if mad else np.zeros_like(series)
     mask = np.abs(z) > thresh
-    repl = med
-    return mask, repl
+    return mask, med                                   # замена = глобальная медиана
 
 def hampel(series, window=15, n_sig=3):
     L = 1.4826
     med = series.rolling(window, center=True).median()
     diff = np.abs(series - med)
-    mad = L*diff.rolling(window, center=True).median()
+    mad  = L*diff.rolling(window, center=True).median()
     mask = (diff > n_sig*mad).fillna(False)
-    repl_series = med  # replacement point‑wise
-    return mask, repl_series
+    return mask, med                                   # замена = локальная медиана
 
 def grubbs_mask(series, alpha=.05):
-    """return boolean mask of outliers (iterative two‑sided Grubbs)"""
     x = series.dropna().values.copy(); N=len(x)
     out = np.zeros(N, dtype=bool); idx = np.arange(N)
-    while N>2:
+    while N > 2:
         z = np.abs(x - x.mean())/x.std(ddof=1)
         i = z.argmax(); G = z[i]
         t = stats.t.ppf(1-alpha/(2*N), N-2)
-        Gcrit=((N-1)/np.sqrt(N))*np.sqrt(t**2/(N-2+t**2))
-        if G>Gcrit:
+        Gcrit = ((N-1)/np.sqrt(N))*np.sqrt(t**2/(N-2+t**2))
+        if G > Gcrit:
             out[idx[i]] = True
-            x = np.delete(x,i); idx = np.delete(idx,i); N -= 1
+            x = np.delete(x, i); idx = np.delete(idx, i); N -= 1
         else:
             break
     mask = pd.Series(False, index=series.index)
     mask.iloc[np.where(out)[0]] = True
-    return mask
+    return mask, series.median()                       # замена = глобальная медиана
 
+# ---------------------------------------------------------------------------
+# 2.  ВИЗУАЛИЗАТОР
+# ---------------------------------------------------------------------------
 def plot_detector(ax, series, mask, replacement, title):
-    """series – исходный ряд
-       mask   – boolean‑маска выбросов
-       replacement:
-           • число  – глобальная медиана/среднее
-           • Series – локальная медиана окна (Hampel)
-    """
     series.plot(ax=ax, color='steelblue', label='data')
 
     # исходные выбросы
-    ax.scatter(series.index[mask], series[mask], color='limegreen',
-               s=40, label='outliers', zorder=3)
+    ax.scatter(series.index[mask], series[mask],
+               color='limegreen', s=50, label='outliers', zorder=3)
 
     # значения‑замены
     if isinstance(replacement, (int, float)):
-        repl_vals = pd.Series(replacement, index=series.index[mask])
-    else:                       # Series: берём только там, где mask=True
-        repl_vals = replacement[mask]
+        rep = pd.Series(replacement, index=series.index[mask])
+    else:
+        rep = replacement[mask]
+    ax.scatter(rep.index, rep, color='red', s=50,
+               marker='o', label='replacement', zorder=4)
 
-    ax.scatter(repl_vals.index, repl_vals, color='red',
-               s=40, label='replacement', marker='o', zorder=4)
+    ax.set_title(title, fontsize=11)
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda x,_: f'{x/1e9:.1f}B'))
+    ax.grid(alpha=.25); ax.legend(frameon=False, fontsize=8)
 
-    ax.set_title(title)
-    ax.yaxis.set_major_formatter(
-        FuncFormatter(lambda x,_: f'{x/1e9:.1f}B'))
-    ax.grid(alpha=.25)
-    ax.legend(frameon=False)
+# ---------------------------------------------------------------------------
+# 3.  СТРОИМ ГРАФИКИ ДЛЯ КАЖДОГО ИЗ 3 РЯДОВ
+# ---------------------------------------------------------------------------
+detectors = [('Robust Z‑score (MAD)', robust_z),
+             ('Hampel filter',        hampel),
+             ('Iterative Grubbs',     grubbs_mask)]
 
+for col in ['incoming', 'outgoing', 'saldo']:
+    fig, axes = plt.subplots(3, 1, figsize=(15,9), sharex=True)
+    series = saldo_df[col]
 
-# ------------------------- demo data ---------------------------------------
-rng = pd.date_range("2024-01-01","2024-04-30",freq='D')
-np.random.seed(0)
-series = pd.Series(np.random.lognormal(12,0.3,len(rng))*1e3, index=rng)
-# inject artificial spikes
-series.iloc[[20, 70, 110]] *= 5
+    for ax, (name, func) in zip(axes, detectors):
+        mask, repl = func(series)
+        plot_detector(ax, series, mask, repl, f'{col.capitalize()}  —  {name}')
 
-# ------------------------- plots -------------------------------------------
-fig, axes = plt.subplots(3,1, figsize=(14,10), sharex=True)
-
-# 1) Robust Z‑score
-mask_rz, repl_rz = robust_z(series)
-plot_detector(axes[0], series, mask_rz, series.median(), 'Robust Z‑score (MAD)')
-
-# 2) Hampel
-mask_hampel, repl_hampel = hampel(series)
-plot_detector(axes[1], series, mask_hampel, repl_hampel, 'Hampel Filter')
-
-# 3) Grubbs
-mask_grubbs = grubbs_mask(series)
-plot_detector(axes[2], series, mask_grubbs, series.median(), "Iterative Grubbs test")
-
-plt.tight_layout()
-
-fig, axes = plt.subplots(3, 1, figsize=(14,9), sharex=True)
-
-# 1) Robust‑Z
-mask_rz, repl_rz = robust_z(series)
-plot_detector(axes[0], series, mask_rz, series.median(),
-              'Robust Z‑score (MAD)')
-
-# 2) Hampel
-mask_hamp, repl_hamp = hampel(series)
-plot_detector(axes[1], series, mask_hamp, repl_hamp,
-              'Hampel filter')
-
-# 3) Grubbs
-mask_gr, _ = grubbs_mask(series), None
-plot_detector(axes[2], series, mask_gr, series.median(),
-              'Iterative Grubbs test')
-
-plt.tight_layout()
+    fig.suptitle(f'Outlier detection for {col}', fontsize=14)
+    plt.tight_layout(rect=[0,0,1,0.96])
+    plt.show()
