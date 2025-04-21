@@ -1,20 +1,37 @@
-### Добавляем анализ «попаданий» в заседания ЦБ и поиск разрывов  
-(*код ничего не меняет в структуре вашего `df` — работает ровно с тем, что вы уже получили из `agg_daily`*)
+##############################################################################
+# 0.  БЕРЁМ ГОТОВЫЙ df  (как в вашей ячейке)                                 #
+##############################################################################
+#   df.index            → DatetimeIndex (день)                               
+#   df['incoming']      → +                                                
+#   df['outgoing']      → – (мы уже abs() в исходной ячейке)                
+#   df['saldo']         → incoming + outgoing                               
+cols = ['incoming', 'outgoing', 'saldo']
 
-```python
-# ---------------------------------------------------------------------------
-# 0.  Исходная таблица   df  уже содержит:
-#     incoming | outgoing | saldo   (индекс = dt_rep  с freq='D')
-# ---------------------------------------------------------------------------
+##############################################################################
+# 1.  ФЛАГ «заседание ЦБ ± 3 дня»                                            #
+##############################################################################
+cb_dates = pd.to_datetime([
+    '2024-02-16','2024-03-22','2024-04-26','2024-06-07',
+    '2024-07-26','2024-09-13','2024-10-25','2024-12-13',
+    '2025-02-07','2025-03-28','2025-04-25','2025-06-06'
+])
+day_win = 3                                   # окно ±3 дня
+cb_window = cb_dates.union_many(
+    [pd.date_range(d-pd.Timedelta(days=day_win),
+                   d+pd.Timedelta(days=day_win)) for d in cb_dates]
+)
+df['around_cb'] = df.index.isin(cb_window)
 
-import pandas as pd, numpy as np
+##############################################################################
+# 2.  ТРИ ДЕТЕКТОРА (флаги на каждый ряд)                                    #
+##############################################################################
 from scipy import stats
+import numpy as np, pandas as pd
 
-# ────────────────── helpers‑детекторы (те же, что раньше) ──────────────────
 def robust_z(series, thresh=3.5):
     med = series.median(); mad = np.median(np.abs(series-med))
     z   = 0.6745*(series-med)/mad if mad else np.zeros_like(series)
-    return np.abs(z) > thresh          # boolean‑mask
+    return pd.Series(np.abs(z)>thresh, index=series.index)
 
 def hampel(series, window=15, n_sig=3):
     L=1.4826
@@ -25,7 +42,7 @@ def hampel(series, window=15, n_sig=3):
 
 def grubbs(series, alpha=.05):
     x = series.dropna().values.copy(); N=len(x)
-    out = np.zeros(N,dtype=bool); idx = np.arange(N)
+    out = np.zeros(N, dtype=bool); idx = np.arange(N)
     while N>2:
         z = np.abs(x-x.mean())/x.std(ddof=1)
         i,G = z.argmax(), z.max()
@@ -33,86 +50,67 @@ def grubbs(series, alpha=.05):
         Gc  = ((N-1)/np.sqrt(N))*np.sqrt(t**2/(N-2+t**2))
         if G>Gc:
             out[idx[i]] = True
-            x = np.delete(x,i); idx = np.delete(idx,i); N-=1
+            x  = np.delete(x,i); idx = np.delete(idx,i); N-=1
         else: break
-    mask = pd.Series(False,index=series.index)
+    mask = pd.Series(False, index=series.index)
     mask.iloc[np.where(out)[0]] = True
     return mask
 
-# ─────────────────── 1.  Маски выбросов для SALDO ──────────────────────────
-masks = {
-    'RobustZ' : robust_z(df['saldo']),
-    'Hampel'  : hampel(df['saldo']),
-    'Grubbs'  : grubbs(df['saldo'])
-}
+det_f = {'RobustZ': robust_z, 'Hampel': hampel, 'Grubbs': grubbs}
 
-# ─────────────────── 2.  Метка заседаний ЦБ (±0 дн) ────────────────────────
-cb_meetings = pd.to_datetime([
-    '2024-02-16','2024-03-22','2024-04-26','2024-06-07',
-    '2024-07-26','2024-09-13','2024-10-25','2024-12-13',
-    '2025-02-07','2025-03-28','2025-04-25','2025-06-06'
-])
-df['cb_meeting'] = df.index.isin(cb_meetings)
+##############################################################################
+# 3.  СТАТИСТИКА ПО МЕТОДАМ (только для SALDO — можно расширить)             #
+##############################################################################
+records = []
+mask_dict = {}
 
-# ─────────────────── 3.  Сводная статистика по методам ─────────────────────
-stats_rows = []
-for name,mask in masks.items():
-    total = int(mask.sum())
-    overlap = int((mask & df['cb_meeting']).sum())
-    stats_rows.append({
-        'method'       : name,
-        'outliers'     : total,
-        'CB_overlap'   : overlap,
-        'share_CB_%'   : round(overlap/total*100,2) if total else 0
-    })
-stats_tbl = pd.DataFrame(stats_rows)
+for name,func in det_f.items():
+    m = func(df['saldo'])
+    mask_dict[name] = m
+    total = int(m.sum())
+    in_cb = int((m & df['around_cb']).sum())
+    records.append({'method':name,
+                    'outliers':total,
+                    'within_±3d_CB':in_cb,
+                    'share_%': round(in_cb/total*100,2) if total else 0})
 
-print("\nСтатистика выбросов (по SALDO):")
-display(stats_tbl)
+stat_tbl = pd.DataFrame(records)
 
-# ─────────────────── 4.  Таблица самих выбросов (+ ЦБ‑метка) ───────────────
-for name,mask in masks.items():
-    if mask.any():
-        print(f"\n►  Первые 10 выбросов  —  {name}")
-        display(df.loc[mask, ['incoming','outgoing','saldo','cb_meeting']]
-                  .head(10))
+##############################################################################
+# 4.  ХРАНИМ ВЫБРОСЫ (по каждому тесту)                                      #
+##############################################################################
+detail_list = []
+for name,mask in mask_dict.items():
+    tmp = df.loc[mask, ['incoming','outgoing','saldo','around_cb']].copy()
+    tmp['detector'] = name
+    detail_list.append(tmp)
 
-# ─────────────────── 5.  Hampel‑clean  +  структурные разрывы  ─────────────
-# 5.1  заменяем точки‑‑выбросы Hampel локальной медианой окна
-hampel_mask = masks['Hampel']
-local_med   = df['saldo'].rolling(15, center=True).median()
-saldo_clean = df['saldo'].where(~hampel_mask, local_med)
+outlier_log = pd.concat(detail_list).sort_index()
 
-# 5.2  ищем change‑points
+##############################################################################
+# 5.  Hampel‑clean  +  структурные сдвиги                                    #
+##############################################################################
+# 5.1  заменяем выбросы Hampel локальной медианой
+med15 = df['saldo'].rolling(15, center=True, min_periods=1).median()
+saldo_clean = df['saldo'].where(~mask_dict['Hampel'], med15)
+
+# 5.2  ruptures  (если установлена)
 try:
     import ruptures as rpt
-    model = rpt.Pelt(model='rbf').fit(saldo_clean.values)
-    bkpts = model.predict(pen=1e11)        # подстройте pen под масштаб
-    df['struct_break_hampel'] = False
-    df.loc[df.index[bkpts[:-1]], 'struct_break_hampel'] = True
+    bkpts = rpt.Pelt(model='rbf').fit(saldo_clean.values).predict(pen=1e11)
+    df['struct_break'] = False
+    df.loc[df.index[bkpts[:-1]], 'struct_break'] = True
 except ModuleNotFoundError:
-    print("ruptures не установлен — пропускаю этап break‑points")
-    df['struct_break_hampel'] = False
+    df['struct_break'] = False
 
-print("\nНайдены структурные разрывы (Hampel‑clean):",
-      int(df['struct_break_hampel'].sum()))
-if df['struct_break_hampel'].any():
-    display(df.loc[df['struct_break_hampel'],
-                   ['incoming','outgoing','saldo']])
-```
+##############################################################################
+# 6.  ВЫВОД ------------------------------------------------------------------
+##############################################################################
+print("=== Сводная статистика (SALDO) ===")
+display(stat_tbl)
 
-**Что делает код**
+print("\n=== Первые 10 выбросов каждого метода ===")
+display(outlier_log.head(10))
 
-| Блок | Действие |
-|------|----------|
-| **1** | Строит маски выбросов **только для `saldo`** (Robust Z, Hampel, Grubbs). |
-| **2** | Добавляет булев признак `cb_meeting` для дат заседаний ЦБ. |
-| **3** | Формирует таблицу: *сколько* выбросов нашёл каждый метод, *сколько* из них попало на дату ЦБ и какова доля, %. |
-| **4** | Для каждого метода выводит первые 10 строк‑выбросов с колонками `incoming / outgoing / saldo / cb_meeting`, чтобы можно было глазами проверить. |
-| **5** | Берёт **только Hampel‑очищенный** ряд `saldo`, ищет точки разрыва `ruptures.Pelt`, ставит флаг `struct_break_hampel`. |
-
-> **Настройка:**  
-> • коэффициент `pen` у `ruptures` подберите: чем меньше `pen`, тем больше break‑points.  
-> • если `ruptures` не установлена — код отработает без ошибки, просто пропустит поиск разрывов.  
-
-Так у вас есть и количественная статистика по «попаданию» выбросов в заседания ЦБ, и список самих дат, и структурные сдвиги после очистки Hampel‑фильтром.
+print("\n=== Даты структурных разрывов (по Hampel‑clean) ===")
+display(df.loc[df['struct_break'], ['saldo','struct_break']])
