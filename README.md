@@ -1,101 +1,101 @@
-Точно — если в датасете уже лежат готовые поля **`rep_Y / rep_M / rep_W`**, то их и нужно использовать, а не придумывать новые. Ниже показано, как именно заменить мои «`dt_year | dt_month | dt_week`» на ваши столбцы и при этом избежать коллизий между разными годами.
+##############################################################################
+# ПОЛНЫЙ КОД: расчёт притоков / оттоков / сальдо и визуализация              #
+#  • дневной line‑plot (Incoming, Outgoing, Saldo)                           #
+#  • столбцы Thu→Wed‑неделя                                                  #
+#  • столбцы по месяцам                                                      #
+##############################################################################
 
----
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.ticker import StrMethodFormatter
 
-## 0  Быстрая подготовка сумм по дню  
-(осталось без изменений — работаем от даты `dt_rep`, она уже в `datetime64[ns]`)
+# ----------------------------------------------------------------------------
+# 0.  ИСХОДНЫЕ ДАННЫЕ --------------------------------------------------------
+#      saldo_df : обязательные колонки
+#        • dt_rep  (datetime64[ns])                      – дата операции
+#        • INCOMING_SUM_TRANS_total  (float,  +)        – входящие   суммы
+#        • OUTGOING_SUM_TRANS_total  (float,  ± / NaN)  – исходящие  суммы
+# ----------------------------------------------------------------------------
 
-```python
+# 0.1  Нормализуем суммы (исходящие делаем отрицательными)
+saldo_df = saldo_df.copy()
 saldo_df['INCOMING'] = saldo_df['INCOMING_SUM_TRANS_total'].fillna(0)
-saldo_df['OUTGOING'] = saldo_df['OUTGOING_SUM_TRANS_total'].fillna(0).abs()
 
-daily_totals = (
-    saldo_df
-      .groupby('dt_rep', as_index=False)
-      .agg(incoming_sum=('INCOMING','sum'),
-           outgoing_sum=('OUTGOING','sum'))
-)
+# если исходящие уже отрицательные – abs() не навредит
+saldo_df['OUTGOING'] = -saldo_df['OUTGOING_SUM_TRANS_total'].fillna(0).abs()
 
-daily_totals['saldo'] = daily_totals['incoming_sum'] - daily_totals['outgoing_sum']
-```
+# ----------------------------------------------------------------------------
+# 1.  ДНЕВНОЙ АГРЕГАТ --------------------------------------------------------
+# ----------------------------------------------------------------------------
+daily_totals = (saldo_df
+                .groupby('dt_rep', as_index=False)
+                .agg(incoming_sum=('INCOMING',  'sum'),
+                     outgoing_sum=('OUTGOING',  'sum')))
 
----
+daily_totals['saldo'] = daily_totals['incoming_sum'] + daily_totals['outgoing_sum']
 
-## 1  Календарные поля из **ваших** колонок  
+# календарные признаки (пригодятся позднее)
+daily_totals['dt_year']  = daily_totals['dt_rep'].dt.year
+daily_totals['dt_month'] = daily_totals['dt_rep'].dt.strftime('%Y-%m')   # «2025-04»
+daily_totals['dt_week']  = daily_totals['dt_rep'].dt.strftime('%G-W%V')  # ISO «2025-W16»
 
-```python
-# год уже есть
-daily_totals['rep_Y'] = saldo_df.drop_duplicates('dt_rep').set_index('dt_rep')['rep_Y']
+# ----------------------------------------------------------------------------
+# 2.  WEEK: Thu → Wed  (resample 'W-WED') ------------------------------------
+# ----------------------------------------------------------------------------
+weekly = (daily_totals.set_index('dt_rep')
+          .resample('W-WED').sum()
+          .rename_axis('week_end'))
 
-# месяц: склеиваем год + название месяца, чтобы не было «двух Январей»
-daily_totals['rep_YM'] = (
-    saldo_df.drop_duplicates('dt_rep')
-            .set_index('dt_rep')
-            .apply(lambda r: f"{r['rep_Y']}-{r['rep_M']}", axis=1)
-)
+weekly['week_start'] = weekly.index - pd.Timedelta(days=6)
+weekly['week_label'] = (weekly['week_start'].dt.strftime('%Y-%m-%d') +
+                        ' – ' +
+                        weekly.index.strftime('%Y-%m-%d'))
+weekly['saldo'] = weekly['incoming_sum'] + weekly['outgoing_sum']
+weekly = weekly.reset_index(drop=True)
 
-# неделя: у вас строка «2023.12.28-2024.01.03» уже уникальна → просто тащим её
-daily_totals['rep_W'] = saldo_df.drop_duplicates('dt_rep').set_index('dt_rep')['rep_W']
-```
+# ----------------------------------------------------------------------------
+# 3.  MONTH: календарный месяц ----------------------------------------------
+# ----------------------------------------------------------------------------
+monthly = (daily_totals
+           .groupby('dt_month', as_index=False)
+           .agg(incoming_sum=('incoming_sum','sum'),
+                outgoing_sum=('outgoing_sum','sum')))
+monthly['saldo'] = monthly['incoming_sum'] + monthly['outgoing_sum']
 
-> **Почему именно так?**  
-> * `drop_duplicates('dt_rep')` гарантирует, что каждой дате соответствует ровно один `rep_*`.  
-> * `set_index('dt_rep')` позволяет «примержить» признак к `daily_totals` по индексу без join‑ов.
+# ----------------------------------------------------------------------------
+# 4.  ФУНКЦИИ ОТРИСОВКИ ------------------------------------------------------
+# ----------------------------------------------------------------------------
+def line3plot(df, title):
+    fig, ax = plt.subplots(figsize=(14,5))
+    ax.plot(df['dt_rep'], df['incoming_sum'], label='Incoming (+)',  lw=1.4, color='forestgreen')
+    ax.plot(df['dt_rep'], df['outgoing_sum'], label='Outgoing (–)',  lw=1.4, color='firebrick')
+    ax.plot(df['dt_rep'], df['saldo'],        label='Saldo',         lw=1.6, color='dodgerblue')
+    ax.set_title(title, pad=10); ax.legend(frameon=False)
+    ax.yaxis.set_major_formatter(StrMethodFormatter('{x:,.0f}'))
+    ax.grid(alpha=.25); plt.tight_layout(); plt.show()
 
----
+def triple_bar(df, xlabels, title):
+    idx, w = np.arange(len(df)), .3
+    fig, ax = plt.subplots(figsize=(14,5))
+    ax.bar(idx-w, df['incoming_sum'],  w, label='Incoming (+)', color='forestgreen')
+    ax.bar(idx,   df['outgoing_sum'],  w, label='Outgoing (–)', color='firebrick')
+    colors = df['saldo'].apply(lambda v: 'lightgreen' if v >= 0 else 'lightcoral')
+    ax.bar(idx+w, df['saldo'],         w, label='Saldo',        color=colors)
 
-## 2  Агрегации по неделе и по месяцу  
+    ax.set_xticks(idx); ax.set_xticklabels(xlabels, rotation=45, ha='right')
+    ax.set_title(title, pad=10); ax.legend(ncol=3, frameon=False)
+    ax.yaxis.set_major_formatter(StrMethodFormatter('{x:,.0f}'))
+    ax.grid(alpha=.25, axis='y'); plt.tight_layout(); plt.show()
 
-```python
-# --- недельные ---
-weekly_totals = (
-    daily_totals
-      .groupby('rep_W', as_index=False)
-      .agg(incoming_sum=('incoming_sum','sum'),
-           outgoing_sum=('outgoing_sum','sum'))
-)
-weekly_totals['saldo'] = weekly_totals['incoming_sum'] - weekly_totals['outgoing_sum']
+# ----------------------------------------------------------------------------
+# 5.  РИСУЕМ ГРАФИКИ ---------------------------------------------------------
+# ----------------------------------------------------------------------------
+# 5.1  День‑к‑дню  (3 линии на одном графике)
+line3plot(daily_totals, 'Daily Incoming / Outgoing / Saldo')
 
-# --- месячные ---
-monthly_totals = (
-    daily_totals
-      .groupby('rep_YM', as_index=False)        # год‑месяц одно поле
-      .agg(incoming_sum=('incoming_sum','sum'),
-           outgoing_sum=('outgoing_sum','sum'))
-)
-monthly_totals['saldo'] = monthly_totals['incoming_sum'] - monthly_totals['outgoing_sum']
-```
+# 5.2  Недельный бар‑чарт (Thu→Wed)
+triple_bar(weekly, weekly['week_label'], 'Weekly Flows (Thu → Wed)')
 
----
-
-## 3  Графики  
-
-Код построения остаётся прежним, только передавайте новые имена столбцов‑ось‑X:
-
-```python
-# ===== линии день‑ко‑дню =====
-line_plot(daily_totals['dt_rep'], daily_totals['incoming_sum'],
-          'Дневные входящие переводы', '₽')
-line_plot(daily_totals['dt_rep'], daily_totals['outgoing_sum'],
-          'Дневные исходящие переводы', '₽')
-line_plot(daily_totals['dt_rep'], daily_totals['saldo'],
-          'Дневное сальдо (приток – отток)', '₽')
-
-# ===== «тройные» столбцы =====
-triple_bar(weekly_totals,  'rep_W',  'Недельные притоки / оттоки / сальдо')
-triple_bar(monthly_totals, 'rep_YM', 'Месячные притоки / оттоки / сальдо')
-```
-
----
-
-### Что изменилось — кратко
-
-| Было | Стало |
-|------|-------|
-| `dt_week` | `rep_W` — строка диапазона недель |
-| `dt_month` | `rep_YM` — «2025-Апрель», чтобы месяцы разных лет не смешивались |
-| `dt_year` | `rep_Y` (уже есть) |
-
-Теперь код опирается только на ваши реальные колонки, так что должен отработать «с ходу». Если где‑то названия отличаются по регистру или есть пробелы, просто подправьте их в примере выше, и всё.  
-
-Дайте знать, если понадобится доработать визуал или агрегировать по‑другому!
+# 5.3  Месячный бар‑чарт
+triple_bar(monthly, monthly['dt_month'], 'Monthly Flows')
