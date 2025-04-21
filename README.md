@@ -1,18 +1,22 @@
-##############################################################################
-# 1.  ФЛАГ «заседание ЦБ ± 3 дня»  (без union_many)                          #
-##############################################################################
-cb_dates = pd.to_datetime([
-    '2024-02-16','2024-03-22','2024-04-26','2024-06-07',
-    '2024-07-26','2024-09-13','2024-10-25','2024-12-13',
-    '2025-02-07','2025-03-28','2025-04-25','2025-06-06'
-])
+# --- подготовка очищенного ряда -----------------
+med15 = df['saldo'].rolling(15, center=True, min_periods=1).median()
+saldo_clean = df['saldo'].where(~mask_dict['Hampel'], med15)
 
-day_win = 3  # окно ±3 дня
+# --- CUSUM --------------------------------------
+import statsmodels.api as sm
+from statsmodels.stats.diagnostic import breaks_cusumolsresid
 
-# формируем список диапазонов, склеиваем и убираем дубликаты
-ranges = [pd.date_range(d - pd.Timedelta(days=day_win),
-                        d + pd.Timedelta(days=day_win)) for d in cb_dates]
+t = np.arange(len(saldo_clean))
+ols = sm.OLS(saldo_clean, sm.add_constant(t)).fit()
+stat, pval, crit = breaks_cusumolsresid(ols.resid, ddof=ols.df_model)
+print(f'CUSUM p = {pval:.4f}')
 
-cb_window = pd.DatetimeIndex(np.unique(np.concatenate(ranges)))
+# --- если p < 0.05, ищем точку макс. отклонения ----
+if pval < .05:
+    cusum = np.cumsum(ols.resid) / ols.resid.std(ddof=1)
+    tau = np.argmax(np.abs(cusum))
+    print('Candidate break at:', df.index[tau])
 
-df['around_cb'] = df.index.isin(cb_window)
+    # --- Chow‑test в найденной точке ---------------
+    fstat, pchow, _ = sm.stats.breaks_chow(saldo_clean, tau, sm.add_constant(t))
+    print(f'Chow test  p = {pchow:.4f}')
