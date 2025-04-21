@@ -1,101 +1,82 @@
 ##############################################################################
-# ПОЛНЫЙ КОД: расчёт притоков / оттоков / сальдо и визуализация              #
-#  • дневной line‑plot (Incoming, Outgoing, Saldo)                           #
-#  • столбцы Thu→Wed‑неделя                                                  #
-#  • столбцы по месяцам                                                      #
+# FULL PIPELINE  v2.0  (русские подписи, «каскад»‑бары, аккуратные кластеры) #
 ##############################################################################
-
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.ticker import StrMethodFormatter
+from matplotlib.ticker import FuncFormatter
 
-# ----------------------------------------------------------------------------
-# 0.  ИСХОДНЫЕ ДАННЫЕ --------------------------------------------------------
-#      saldo_df : обязательные колонки
-#        • dt_rep  (datetime64[ns])                      – дата операции
-#        • INCOMING_SUM_TRANS_total  (float,  +)        – входящие   суммы
-#        • OUTGOING_SUM_TRANS_total  (float,  ± / NaN)  – исходящие  суммы
-# ----------------------------------------------------------------------------
-
-# 0.1  Нормализуем суммы (исходящие делаем отрицательными)
+# ───────────────────────────── 0.  ДАННЫЕ ──────────────────────────────────
 saldo_df = saldo_df.copy()
 saldo_df['INCOMING'] = saldo_df['INCOMING_SUM_TRANS_total'].fillna(0)
+saldo_df['OUTGOING'] = -saldo_df['OUTGOING_SUM_TRANS_total'].fillna(0).abs()   # всегда «–»
 
-# если исходящие уже отрицательные – abs() не навредит
-saldo_df['OUTGOING'] = -saldo_df['OUTGOING_SUM_TRANS_total'].fillna(0).abs()
+# ───────────────────────────── 1.  ДЕНЬ ────────────────────────────────────
+daily = (saldo_df.groupby('dt_rep', as_index=False)
+                   .agg(incoming=('INCOMING','sum'),
+                        outgoing=('OUTGOING','sum')))
+daily['saldo'] = daily['incoming'] + daily['outgoing']
 
-# ----------------------------------------------------------------------------
-# 1.  ДНЕВНОЙ АГРЕГАТ --------------------------------------------------------
-# ----------------------------------------------------------------------------
-daily_totals = (saldo_df
-                .groupby('dt_rep', as_index=False)
-                .agg(incoming_sum=('INCOMING',  'sum'),
-                     outgoing_sum=('OUTGOING',  'sum')))
+# ────────────────────── 2.  НЕДЕЛЯ Thu→Wed (W-WED) ─────────────────────────
+weekly = (daily.set_index('dt_rep')
+               .resample('W-WED').sum()
+               .rename_axis('w_end'))
+weekly['w_start']  = weekly.index - pd.Timedelta(days=6)
+weekly['saldo']    = weekly['incoming'] + weekly['outgoing']
 
-daily_totals['saldo'] = daily_totals['incoming_sum'] + daily_totals['outgoing_sum']
-
-# календарные признаки (пригодятся позднее)
-daily_totals['dt_year']  = daily_totals['dt_rep'].dt.year
-daily_totals['dt_month'] = daily_totals['dt_rep'].dt.strftime('%Y-%m')   # «2025-04»
-daily_totals['dt_week']  = daily_totals['dt_rep'].dt.strftime('%G-W%V')  # ISO «2025-W16»
-
-# ----------------------------------------------------------------------------
-# 2.  WEEK: Thu → Wed  (resample 'W-WED') ------------------------------------
-# ----------------------------------------------------------------------------
-weekly = (daily_totals.set_index('dt_rep')
-          .resample('W-WED').sum()
-          .rename_axis('week_end'))
-
-weekly['week_start'] = weekly.index - pd.Timedelta(days=6)
-weekly['week_label'] = (weekly['week_start'].dt.strftime('%Y-%m-%d') +
-                        ' – ' +
-                        weekly.index.strftime('%Y-%m-%d'))
-weekly['saldo'] = weekly['incoming_sum'] + weekly['outgoing_sum']
+# (1)  Подпись «10‑16 апр» / «30 янв – 06 фев»
+ru_mon = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек']
+def week_label(row):
+    s, e = row['w_start'], row.name     # row.name == w_end
+    if s.month == e.month:
+        return f"{s.day:02d}-{e.day:02d} {ru_mon[e.month-1]}"
+    return f"{s.day:02d} {ru_mon[s.month-1]} – {e.day:02d} {ru_mon[e.month-1]}"
+weekly['label'] = weekly.apply(week_label, axis=1)
 weekly = weekly.reset_index(drop=True)
 
-# ----------------------------------------------------------------------------
-# 3.  MONTH: календарный месяц ----------------------------------------------
-# ----------------------------------------------------------------------------
-monthly = (daily_totals
-           .groupby('dt_month', as_index=False)
-           .agg(incoming_sum=('incoming_sum','sum'),
-                outgoing_sum=('outgoing_sum','sum')))
-monthly['saldo'] = monthly['incoming_sum'] + monthly['outgoing_sum']
+# ─────────────────────────── 3.  МЕСЯЦ ─────────────────────────────────────
+monthly = (daily.assign(m=lambda d: d['dt_rep'].dt.to_period('M'))
+                 .groupby('m').agg(incoming=('incoming','sum'),
+                                   outgoing=('outgoing','sum')))
+monthly['saldo'] = monthly['incoming'] + monthly['outgoing']
+monthly = monthly.reset_index()
+# (4)  Подпись «май 25»
+monthly['label'] = [f"{ru_mon[p.month-1]} {str(p.year)[2:]}" for p in monthly['m']]
 
-# ----------------------------------------------------------------------------
-# 4.  ФУНКЦИИ ОТРИСОВКИ ------------------------------------------------------
-# ----------------------------------------------------------------------------
-def line3plot(df, title):
+# ─────────────────────── 4.  ФОРМАТЕР «BILLIONS» ───────────────────────────
+def billions(x, pos):               # pos нужен FuncFormatter'у
+    return f"{x/1e9:,.1f}B".replace(',', ' ')   # узкая неразр. пробел
+
+fmtB = FuncFormatter(billions)
+
+# ─────────────────────── 5.  ФУНКЦИИ ОТРИСОВКИ ─────────────────────────────
+def stacked_bar(df, xlabels, title):
+    """(2)+(3) • каскад: incoming ↑, outgoing ↓    • кластеры close"""
+    n = len(df)
+    full_w, gap = 0.8, 0.2                 # ширина кластера / межкластерный зазор
+    w = (full_w - gap) / 2                 # ширина одного бара
+    centers = np.arange(n)                 # центр кластера
+
     fig, ax = plt.subplots(figsize=(14,5))
-    ax.plot(df['dt_rep'], df['incoming_sum'], label='Incoming (+)',  lw=1.4, color='forestgreen')
-    ax.plot(df['dt_rep'], df['outgoing_sum'], label='Outgoing (–)',  lw=1.4, color='firebrick')
-    ax.plot(df['dt_rep'], df['saldo'],        label='Saldo',         lw=1.6, color='dodgerblue')
-    ax.set_title(title, pad=10); ax.legend(frameon=False)
-    ax.yaxis.set_major_formatter(StrMethodFormatter('{x:,.0f}'))
-    ax.grid(alpha=.25); plt.tight_layout(); plt.show()
+    # Incoming
+    ax.bar(centers - w/2, df['incoming'],  width=w,
+           label='Incoming (+)', color='forestgreen')
+    # Outgoing: начинаем с «верхушки» incoming
+    ax.bar(centers - w/2, df['outgoing'], width=w,
+           bottom=df['incoming'], color='firebrick', label='Outgoing (–)')
+    # Saldo — ставим правее
+    colors = np.where(df['saldo'] >= 0, 'lightgreen', 'lightcoral')
+    ax.bar(centers + w/2, df['saldo'],    width=w,
+           color=colors, label='Saldo')
 
-def triple_bar(df, xlabels, title):
-    idx, w = np.arange(len(df)), .3
-    fig, ax = plt.subplots(figsize=(14,5))
-    ax.bar(idx-w, df['incoming_sum'],  w, label='Incoming (+)', color='forestgreen')
-    ax.bar(idx,   df['outgoing_sum'],  w, label='Outgoing (–)', color='firebrick')
-    colors = df['saldo'].apply(lambda v: 'lightgreen' if v >= 0 else 'lightcoral')
-    ax.bar(idx+w, df['saldo'],         w, label='Saldo',        color=colors)
+    ax.set_xticks(centers)
+    ax.set_xticklabels(xlabels, rotation=45, ha='right')
+    ax.set_title(title, pad=10)
+    ax.yaxis.set_major_formatter(fmtB)
+    ax.legend(frameon=False, ncol=3)
+    ax.grid(alpha=.25, axis='y')
+    plt.tight_layout(); plt.show()
 
-    ax.set_xticks(idx); ax.set_xticklabels(xlabels, rotation=45, ha='right')
-    ax.set_title(title, pad=10); ax.legend(ncol=3, frameon=False)
-    ax.yaxis.set_major_formatter(StrMethodFormatter('{x:,.0f}'))
-    ax.grid(alpha=.25, axis='y'); plt.tight_layout(); plt.show()
-
-# ----------------------------------------------------------------------------
-# 5.  РИСУЕМ ГРАФИКИ ---------------------------------------------------------
-# ----------------------------------------------------------------------------
-# 5.1  День‑к‑дню  (3 линии на одном графике)
-line3plot(daily_totals, 'Daily Incoming / Outgoing / Saldo')
-
-# 5.2  Недельный бар‑чарт (Thu→Wed)
-triple_bar(weekly, weekly['week_label'], 'Weekly Flows (Thu → Wed)')
-
-# 5.3  Месячный бар‑чарт
-triple_bar(monthly, monthly['dt_month'], 'Monthly Flows')
+# ─────────────────────────── 6.  ГРАФИКИ ───────────────────────────────────
+stacked_bar(weekly,  weekly['label'],  'Притоки / Оттоки / Сальдо  (Thu→Wed)')
+stacked_bar(monthly, monthly['label'], 'Притоки / Оттоки / Сальдо  (по месяцам)')
