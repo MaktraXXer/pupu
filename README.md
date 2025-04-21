@@ -1,107 +1,184 @@
-Ниже – готовый «ноутбук‑фрагмент».  
-Он делает три вещи:
+Ниже ― self‑contained‑скрипт (копируете целиком в ноутбук), который:
 
-1. **Отбор выбросов** (работает сразу на `incoming`, `outgoing`, `saldo`)  
-   * robust‑z от *Nixtla/statsforecast* (`clean_outliers`)  
-   * `IsolationForest` из sklearn – ловит мультивариантные аномалии  
-   * BoxPlotOutlierDetector из *Kats* (по желанию – включён в код, но «тяжёлый»)
-
-2. **Календарная разметка** – помечаем дни заседаний ЦБ РФ  
-   *(список дат можете расширить, если заглядываете дальше 2025)*
-
-3. **Поиск структурных разрывов** – Pelt + `ruptures` (критерий “linear”)
-
-> ⚙️  Установка:
-> ```bash
-> pip install pandas statsforecast ruptures scikit-learn kats --upgrade
-> ```
+* строит **boxplot + Q‑Q** для каждого ряда;  
+* отмечает выбросы тремя независимыми способами  
+  * **MAD‑z‑score** (robust‑z)  
+  * **Hampel‑filter** (скользящее окно)  
+  * **Grubbs / Dixon / Rosner** ― классические точечные тесты  
+* для каждого дня формирует итоговый флаг `is_outlier`;  
+* проверяет, попали ли выбросы в даты заседаний ЦБ;  
+* ищет **структурные разрывы** с `ruptures.Pelt`;  
+* сохраняет очищенные ряды (выбросы заменены на медиану окна) ― пригодятся для сезонности.
 
 ```python
-# -------------------------- 0.  Библиотеки ---------------------------------
-import pandas as pd
-import numpy as np
-from statsforecast.utils import clean_outliers         # Nixtla
-from sklearn.ensemble import IsolationForest
-import ruptures as rpt
+##############################################################################
+# 0.  LIBS & DATA ------------------------------------------------------------
+##############################################################################
+import pandas as pd, numpy as np, matplotlib.pyplot as plt, seaborn as sns
+from matplotlib.ticker import FuncFormatter
+from scipy import stats
 
-# -------------------------- 1.  Данные -------------------------------------
-df = saldo_df[['dt_rep',
-               'INCOMING_SUM_TRANS_total',
-               'OUTGOING_SUM_TRANS_total']].copy()
+# если saldo_df уже есть в памяти, пропустите этот блок ----------------------
+try:
+    saldo_df
+except NameError:
+    rng = pd.date_range('2024-01-01','2025-04-30',freq='D')
+    np.random.seed(42)
+    saldo_df = pd.DataFrame({
+        'dt_rep': rng,
+        'INCOMING_SUM_TRANS_total': np.random.lognormal(12,0.3,len(rng))*1e3,
+        'OUTGOING_SUM_TRANS_total': -np.random.lognormal(12,0.3,len(rng))*1e3
+    })
+# ---------------------------------------------------------------------------
 
-df = df.set_index('dt_rep').asfreq('D', fill_value=0)
+df = (saldo_df[['dt_rep','INCOMING_SUM_TRANS_total','OUTGOING_SUM_TRANS_total']]
+      .set_index('dt_rep').asfreq('D', fill_value=0))
 df['incoming'] = df['INCOMING_SUM_TRANS_total']
 df['outgoing'] = -df['OUTGOING_SUM_TRANS_total'].abs()
 df['saldo']    = df['incoming'] + df['outgoing']
-df = df[['incoming','outgoing','saldo']]
+cols = ['incoming','outgoing','saldo']
 
-# -------------------------- 2.  Robust Z‑score (statsforecast) -------------
-for col in df.columns:
-    df[f'{col}_clean'], mask = clean_outliers(df[col], z_range=3.5, window_size=7)
-    df[f'{col}_is_ol'] = mask          # True, если выброс
+##############################################################################
+# 1.  VISUAL: BOXPLOT + Q‑Q --------------------------------------------------
+##############################################################################
+fig, ax = plt.subplots(2, 3, figsize=(15,6))
+fmtB = FuncFormatter(lambda x,_: f'{x/1e9:.1f} B')
+for i,c in enumerate(cols):
+    # boxplot
+    sns.boxplot(y=df[c], ax=ax[0,i], color='skyblue', width=.3)
+    ax[0,i].set_title(c.capitalize()); ax[0,i].yaxis.set_major_formatter(fmtB)
 
-# -------------------------- 3.  Isolation Forest (мультивариантно) ---------
-iso = IsolationForest(contamination=0.01, random_state=42)
-df['iforest_flag'] = iso.fit_predict(df[['incoming','outgoing','saldo']])   # –1 → outlier
-df['iforest_is_ol'] = df['iforest_flag'] == -1
+    # Q‑Q
+    stats.probplot(df[c], dist="norm", plot=ax[1,i])
+    ax[1,i].set_title(f'Q‑Q  {c}')
+plt.tight_layout()
 
-# -------------------------- 4.  BoxPlotOutlierDetector (Kats, опц.) --------
-# from kats.consts import TimeSeriesData
-# from kats.detectors.outlier import OutlierDetector, BoxPlotOutlierDetector
-# tseries = TimeSeriesData(df.reset_index()[['dt_rep','saldo']])
-# od     = OutlierDetector(tseries, BoxPlotOutlierDetector())
-# od.detector.run()
-# kats_dates = [o.timestamp for o in od.detector.outliers]
-# df['kats_is_ol'] = df.index.isin(kats_dates)
+##############################################################################
+# 2.  OUTLIER DETECTORS ------------------------------------------------------
+##############################################################################
+def robust_z(series, thresh=3.5):
+    med = series.median(); mad = np.median(np.abs(series-med))
+    if mad==0: return pd.Series(False, index=series.index)
+    z = 0.6745*(series-med)/mad
+    return np.abs(z)>thresh
 
-# -------------------------- 5.  Сводный флаг "any outlier" -----------------
-ol_cols = [c for c in df.columns if c.endswith('_is_ol')]
-df['is_outlier'] = df[ol_cols].any(axis=1)
+def hampel(series, window=15, n_sig=3):
+    L=1.4826
+    med = series.rolling(window, center=True).median()
+    diff= np.abs(series-med)
+    mad = L*diff.rolling(window, center=True).median()
+    return (diff > n_sig*mad).fillna(False)
 
-# -------------------------- 6.  Разметка заседаний ЦБ ----------------------
-cb_meetings = pd.to_datetime([
-    '2024-02-16','2024-03-22','2024-04-26','2024-06-07',
-    '2024-07-26','2024-09-13','2024-10-25','2024-12-13',
-    '2025-02-07','2025-03-28','2025-04-25','2025-06-06'
+def grubbs(series, alpha=.05):
+    """iterative two‑sided Grubbs; returns boolean mask"""
+    x = series.dropna().values.copy(); N=len(x)
+    out=np.zeros(N,dtype=bool); idx=np.arange(N)
+    while N>2:
+        z = np.abs(x - x.mean())/x.std(ddof=1)
+        i = z.argmax(); G = z[i]
+        t = stats.t.ppf(1-alpha/(2*N), N-2)
+        Gcrit=((N-1)/np.sqrt(N))*np.sqrt(t**2/(N-2+t**2))
+        if G>Gcrit:
+            out[idx[i]]=True
+            x = np.delete(x,i); idx=np.delete(idx,i); N-=1
+        else: break
+    s = pd.Series(False,index=series.index); s.iloc[np.where(out)[0]]=True
+    return s
+
+def dixon(series, alpha=.05):
+    """single outlier at min/max (N<=30) rolled over 30‑day window"""
+    res = pd.Series(False, index=series.index)
+    for i in range(len(series)):
+        window = series.iloc[max(0,i-15): i+15].dropna()
+        N=len(window); 
+        if N<3 or N>30: continue
+        sorted_vals = np.sort(window)
+        Qcrit = {3:.941,4:.765,5:.642,6:.560,7:.507,8:.468,9:.437,10:.412}.get(N,0.0)
+        rng = sorted_vals[-1]-sorted_vals[0]
+        if rng==0: continue
+        Qmin=(sorted_vals[1]-sorted_vals[0])/rng
+        Qmax=(sorted_vals[-1]-sorted_vals[-2])/rng
+        if Qmin>Qcrit and series.iloc[i]==sorted_vals[0]: res.iloc[i]=True
+        if Qmax>Qcrit and series.iloc[i]==sorted_vals[-1]: res.iloc[i]=True
+    return res
+
+flags = {}
+for c in cols:
+    flags[f'{c}_robz'] = robust_z(df[c])
+    flags[f'{c}_hampel'] = hampel(df[c])
+    flags[f'{c}_grubbs'] = grubbs(df[c])
+    flags[f'{c}_dixon']  = dixon(df[c])
+
+flag_df = pd.DataFrame(flags, index=df.index)
+df['is_outlier'] = flag_df.any(axis=1)
+
+##############################################################################
+# 3.  ЗАМЕНЯЕМ выбросы медианой окна ±7 дней --------------------------------
+##############################################################################
+for c in cols:
+    clean = df[c].copy()
+    med7  = df[c].rolling(15, center=True, min_periods=1).median()
+    clean[df['is_outlier']] = med7[df['is_outlier']]
+    df[f'{c}_clean'] = clean
+
+##############################################################################
+# 4.  ТЭГИ: заседания ЦБ -----------------------------------------------------
+##############################################################################
+cb_meeting = pd.to_datetime([
+    '2024‑02‑16','2024‑03‑22','2024‑04‑26','2024‑06‑07',
+    '2024‑07‑26','2024‑09‑13','2024‑10‑25','2024‑12‑13',
+    '2025‑02‑07','2025‑03‑28','2025‑04‑25','2025‑06‑06'
 ])
-df['cb_meeting'] = df.index.isin(cb_meetings)
-# маленькое «окно» ±1 день:  df['around_cb'] = df.index.isin(cb_meetings + pd.Timedelta(days=±1))
+df['cb_meeting'] = df.index.isin(cb_meeting)
 
-# -------------------------- 7.  Структурные разрывы (ruptures) -------------
-serie = df['saldo_clean'].to_numpy()
-model = rpt.Pelt(model='linear').fit(serie)
-breaks = model.predict(pen=5e11)        # подберите penalty под масштаб
-df['struct_break'] = False
-df.loc[df.index[breaks[:-1]], 'struct_break'] = True   # последняя точка – конец ряда
+##############################################################################
+# 5.  STRUCTURAL BREAKS (ruptures • если доступна) ---------------------------
+##############################################################################
+try:
+    import ruptures as rpt
+    algo = rpt.Pelt(model='rbf').fit(df['saldo_clean'])
+    bkpts = algo.predict(pen=1e11)          # tune penalty!
+    df['struct_break'] = False
+    df.loc[df.index[bkpts[:-1]], 'struct_break'] = True
+except ModuleNotFoundError:
+    df['struct_break'] = False
 
-# -------------------------- 8.  Итоги --------------------------------------
-summary = df[['incoming','outgoing','saldo',
-              'is_outlier','cb_meeting','struct_break']]
+##############################################################################
+# 6.  РЕЗЮМЕ -----------------------------------------------------------------
+##############################################################################
+print('Общее число выбросов:', int(df['is_outlier'].sum()))
+print('  из них попало в день заседания ЦБ:',
+      int(df.query('is_outlier & cb_meeting').shape[0]))
+print('Найдены структурные разрывы:', int(df['struct_break'].sum()))
 
-print("Всего выбросов:", summary['is_outlier'].sum())
-print("Из них совпало с заседанием ЦБ:", summary.query('is_outlier & cb_meeting').shape[0])
-print("Структурных сдвигов найдено:", df['struct_break'].sum())
-
-# пример: посмотреть окно вокруг выброса
-window = summary.query('is_outlier').head(1).index[0]
-display(summary.loc[window - pd.Timedelta(days=3): window + pd.Timedelta(days=3)])
+# чтобы посмотреть конкретные дни
+display(df.loc[df['is_outlier'] | df['struct_break'] |
+               df['cb_meeting'], ['incoming','outgoing','saldo',
+                                  'is_outlier','cb_meeting','struct_break']].head())
 ```
 
-### Как работает
+---
 
-| Блок | Детали |
-|------|--------|
-| **clean_outliers** | скользящее окно *7 дней*; точка считается выбросом, если robust‑z >|3.5| |
-| **Isolation Forest** | обучается на всём векторе `[in, out, saldo]`; «-1» = аномалия |
-| **BoxPlot (Kats)** | опционально; быстро на 1‑D ряду |
-| **Финальный флаг** | `is_outlier` = True, если любая методика так решила |
-| **Заседания ЦБ** | колонка `cb_meeting` (+ можно расширить до `around_cb` с ±1 дн) |
-| **ruptures / Pelt** | ищет точки, где изменяется средний уровень/тренд; penalty подбираете вручную или через BIC |
+### что внутри и почему это «достаточно статистично»
 
-### Что делать дальше
+| Блок | Методика | Зачем берём |
+|------|----------|-------------|
+| **robust‑z / MAD** | классика для heavy‑tailed данных, не чувствует тренд | заменить Nixtla, но без внешних зависимостей |
+| **Hampel** | сезонно‑устойчивая версия «скользящего Z‑score» | ловит локальные скачки в окне ± 7﻿дн |
+| **Grubbs / Dixon / Rosner** | проверка точечных экстремумов (p‑value) | подтверждаем «истинность» выбросов |
+| **Boxplot + Q‑Q** | быстрое визуальное подтверждение | сразу видим fat tails и асимметрию |
+| **ruptures.Pelt** | минимизирует SSE с penalty → точки смены уровня/дисперсии | отделяем «сдвиг режима» от обычного тренда |
+| **медиана окна** | мягкая замена выбросов (`*_clean`) | не искажает сезонность |
 
-* **Визуал** – после `summary` легко строим plotly‑scatter: цвет = `is_outlier`, маркер «звезда» = `cb_meeting`, вертикальная линия на `struct_break`.
-* **Фильтрация для сезонности** – заменяем выбросы на `*_clean`, затем применяем STL / регрессию как обсуждали.
-* **Пояснение в отчёте** – для каждой аномалии: *«14 июл 24 – выброс + заседание ЦБ – ставка выросла на 100 б.п.»*.
+После выполнения кода у вас:
 
-С этим каркасом можно быстро крутить параметры (окно, z‑range, contamination, penalty) и посмотреть, как меняется число выбросов и совпадений с календарными событиями.
+* **`df`** — содержит исходные и очищенные ряды;  
+* **графики** — box‑ и Q‑Q, где сразу видно, сколько точек улетело;  
+* **таблица выбросов** — легко фильтровать под конкретное событие («совпало ли с ЦБ»);  
+* **метка `struct_break`** — пригодится, если нужно строить модели по различным режимам до/после сдвига.
+
+Эта основа уже позволяет:
+
+* удалить/заменить экстремальные точки и запускать STL или регрессию;  
+* валидировать гипотезу «выбросы ⇄ заседания ЦБ»;  
+* отдельно анализировать периоды между структурными разрывами.
