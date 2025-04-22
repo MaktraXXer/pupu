@@ -1,86 +1,121 @@
-Чтобы получить разрыв именно в майе 2024, можно:
+Ниже единый скрипт‑шаблон ―‑‑ копируйте целиком в ноутбук: он
 
-1. **Задать жестко число точек разрыва** (3–4) и посмотреть, не выпадет ли среди них нужная дата.  
-2. **Снизить порог** (penalty) в PELT, чтобы «уловить» более мелкие изменения.  
-3. **Прямо протестировать** май 2024 с помощью классического-шоу-­теста (Chow) на этой фикс‑дате.
-
-Ниже полный блок кода, в котором мы делаем сразу всё:
+* cшивает **ежедневное `saldo`** с вашими шести «премиями» ставок;
+* считает **Пирсона и Спирмена**  
+  – за весь период,  
+  – с 01 мая 2024,  
+  – в трёх «кусках» между найденными брейками  
+    `01‑05‑24 → 03‑06‑24 | 04‑06‑24 → 18‑02‑25 | 19‑02‑25 → конец`,  
+  – и отдельно **для каждого месяца**;
+* возвращает 4 аккуратные таблицы (`corr_all`, `corr_since`, `corr_segments`, `corr_month`).
 
 ```python
-import numpy as np
 import pandas as pd
-import ruptures as rpt
-import statsmodels.api as sm
-from scipy.stats import f
+from scipy.stats import spearmanr, pearsonr
 
-y = df['saldo'].values
-t = df.index
-n = len(y)
-k_params = 1  # число параметров в модели (только константа)
+# -----------------------------------------------------------------------
+# 0.  Данные
+# -----------------------------------------------------------------------
+# df            – уже агрегированный дневной поток (index = dt_rep, кол. 'saldo')
+# rate_diff_df  – (Date, Term, Rate)  ←  результат вашего кода выше
+# -----------------------------------------------------------------------
 
-# -------------------------------------------------------------------
-# 1) Binseg с 2 breakpoints (по умолчанию L2)                      #
-# -------------------------------------------------------------------
-algo_bs2 = rpt.Binseg(model="l2", min_size=30).fit(y)
-bk_bs2   = algo_bs2.predict(n_bkps=2)      # два разрыва + конец ряда
-breaks2  = t[bk_bs2[:-1]]
-print("Binseg (2 breaks):", [d.date() for d in breaks2])
+# --- пивотируем премии в wide‑формат -----------------------------------
+premium_wide = (rate_diff_df
+                .pivot(index='Date', columns='Term', values='Rate')
+                .rename(columns={
+                    90 :  'prm_90',
+                    180:  'prm_180',
+                    270:  'prm_270',
+                    365:  'prm_365',
+                    'максимальная ставка до 1 года'       : 'prm_max1Y',
+                    'среднее арифметическое ставок до 1 года': 'prm_mean1Y'
+                })
+                .asfreq('D').ffill())                # на всякий случай
 
-# -------------------------------------------------------------------
-# 2) PELT с пониженым penalty-factor                              #
-# -------------------------------------------------------------------
-sigma = np.std(y, ddof=1)
-# уменьшаем factor до 0.3 (по умолчанию мы брали 1.0)
-for factor in [0.3, 0.5, 0.8]:
-    pen   = 2 * sigma*sigma * np.log(n) * factor
-    algo  = rpt.Pelt(model="rbf", min_size=30).fit(y)
-    bk    = algo.predict(pen=pen)
-    dates = t[bk[:-1]]
-    print(f"PELT (factor={factor}) →", [d.date() for d in dates])
+# --- соединяем ---------------------------------------------------------
+daily = (df[['saldo']]
+         .join(premium_wide, how='left')
+         .dropna())                                   # дни, когда есть и saldo, и премия
 
-# -------------------------------------------------------------------
-# 3) Sup‑Chow brute‑force + тест в фикс‑дате 2024‑05‑01           #
-# -------------------------------------------------------------------
-def chow_F(i):
-    y1, y2 = y[:i], y[i:]
-    sse1   = ((y1 - y1.mean())**2).sum()
-    sse2   = ((y2 - y2.mean())**2).sum()
-    sseP   = ((y  - y.mean())**2).sum()
-    return ((sseP - (sse1+sse2))/k_params) / ((sse1+sse2)/(n-2*k_params))
+prem_cols = [c for c in daily.columns if c.startswith('prm_')]
 
-# 3.1 максимальное F — куда указывает strongest break
-F_vals = np.array([chow_F(i) for i in range(30, n-30)])
-i_max  = F_vals.argmax() + 30
-print(f"Sup‑Chow  → max F={F_vals.max():.1f} at {t[i_max].date()}")
+# -----------------------------------------------------------------------
+# 1.  функции корреляций
+# -----------------------------------------------------------------------
+def corr_mat(frame, cols_x, y='saldo', method='pearson'):
+    """возвращает DataFrame: индекс = cols_x, колонка=R"""
+    corrs = {}
+    for c in cols_x:
+        if method=='pearson':
+            r,_ = pearsonr(frame[y], frame[c])
+        else:
+            r,_ = spearmanr(frame[y], frame[c])
+        corrs[c] = r
+    return pd.Series(corrs, name=method).to_frame()
 
-# 3.2 Chow‑test именно на 2024‑05‑01
-date0 = pd.Timestamp('2024-05-01')
-i0    = df.index.get_loc(date0)
-F0    = chow_F(i0)
-# p‑value для F(k, n-2k)
-p0    = 1 - f.cdf(F0, k_params, n-2*k_params)
-print(f"Chow @ {date0.date()}  → F={F0:.1f}, p‑value={p0:.4f}")
+def both_corrs(sub):
+    return pd.concat([corr_mat(sub,prem_cols,'saldo','pearson'),
+                      corr_mat(sub,prem_cols,'saldo','spearman')],
+                     axis=1)
 
-# -------------------------------------------------------------------
-# 4) CUSUM‑OLS                                                      #
-# -------------------------------------------------------------------
-model = sm.OLS(y, np.ones_like(y)).fit()
-_, pval, _ = sm.stats.diagnostic.breaks_cusumolsresid(model.resid, ddof=0)
-print(f"CUSUM‑OLS  → p‑value = {pval:.4f}")
+# -----------------------------------------------------------------------
+# 2.  (а) весь период  |  (б) c 01‑05‑24
+# -----------------------------------------------------------------------
+corr_all   = both_corrs(daily)
+corr_since = both_corrs(daily.loc['2024-05-01':])
 
-# -------------------------------------------------------------------
-# 5) отмечаем в df                                                 #
-# -------------------------------------------------------------------
-df['break_binseg2'] = df.index.isin(breaks2)
-df['break_supchow'] = False; df.loc[t[i_max], 'break_supchow'] = True
-df['break_0501']    = False; df.loc[date0,   'break_0501']    = True
+# -----------------------------------------------------------------------
+# 3.  сегменты между брейками
+# -----------------------------------------------------------------------
+breaks = [pd.Timestamp('2024-05-01'),
+          pd.Timestamp('2024-06-04'),
+          pd.Timestamp('2025-02-19'),
+          daily.index.max()+pd.Timedelta(days=1)]     # правый край
+
+rows = []
+for i in range(len(breaks)-1):
+    seg = daily.loc[breaks[i]:breaks[i+1]-pd.Timedelta(days=1)]
+    seg_corr = both_corrs(seg)
+    seg_corr.columns = pd.MultiIndex.from_product(
+        [[f'{breaks[i].date()}–{(breaks[i+1]-pd.Timedelta(days=1)).date()}'],
+         seg_corr.columns])
+    rows.append(seg_corr)
+
+corr_segments = pd.concat(rows, axis=1)   # MultiIndex‑колонки
+
+# -----------------------------------------------------------------------
+# 4.  поквартальная / помесячная корреляция
+# -----------------------------------------------------------------------
+by_month = []
+for p, grp in daily.groupby(daily.index.to_period('M')):
+    by_month.append(both_corrs(grp)
+                    .rename(columns=lambda m: f'{p} {m[:3]}'))
+
+corr_month = pd.concat(by_month, axis=1)
+
+# -----------------------------------------------------------------------
+# 5.  вывод (пример)
+# -----------------------------------------------------------------------
+print("=== Корреляция за весь период ===")
+display(corr_all)
+
+print("=== Корреляция c 01‑05‑2024 ===")
+display(corr_since)
+
+print("=== Корреляция по сегментам ===")
+display(corr_segments)
+
+print("=== Корреляция по месяцам ===")
+display(corr_month)
 ```
 
-### Что получилось
+#### Как читать результаты
+| столбец | Pearson | Spearman |
+|---------|---------|----------|
+| **prm_90** | 0.42 | 0.39 |  
+| … | … | … |
 
-- **Binseg с 2 брейками** может вернуть сразу две даты, среди них может оказаться май 2024.  
-- **PELT** с малым `factor` ловит более мелкие сдвиги; пробуйте `factor=0.3…1.0`.  
-- **Sup‑Chow** покажет _самую сильную_ точку, а **Chow @ 2024‑05‑01** даст F‑stat + p‑value для _экспериментальной_ проверки именно вашего ожидания.  
-- **CUSUM‑OLS** скажет, есть ли вообще статистически значимые разрывы.
-
-Таким образом вы не полагаетесь лишь на «авто‑алгоритм», а проверяете конкретную дату 1 мая 2024 через классический **Chow‑test** и задаёте алгоритмам нужную чувствительность.
+* `prm_90` — премия Дом РФ vs Top‑10 на 90 дней.  
+* **Знак** (+/–) показывает, усиливает ли больший «спред» приток (или отток, если анализируете `saldo` с минусом).  
+* По сегментам можно увидеть, как чувствительность изменилась после роста лимита (май 2024) и после февр. 2025.
