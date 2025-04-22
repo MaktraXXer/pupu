@@ -1,88 +1,130 @@
-import numpy as np
+Ниже — полный скрипт для **недельных данных** `weekly` с тем же набором корреляций, но уже на агрегации Thu→Wed и с учётом ваших брейков:
+
+```python
 import pandas as pd
-import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter
-from scipy import stats
+from scipy.stats import spearmanr, pearsonr
 
-# -------------------------------------------------------------------
-# 0. Предполагаем, что у вас есть weekly:
-#    индекс — конец недели (W‑Wed), столбец weekly['saldo']
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------
+# 0.  Предполагаем, что у вас есть:
+# -----------------------------------------------------------------------
+# weekly        – DataFrame с индексом типа W‑Wed (конец недели)
+#                 и колонкой 'saldo'
+# rate_diff_df  – DataFrame с тремя колонками ['Date','Term','Rate']
+# -----------------------------------------------------------------------
 
-# 1) детекторы выбросов -----------------------------------------------
-def robust_z(series, thresh=3.5):
-    med = series.median()
-    mad = np.median(np.abs(series - med))
-    z = 0.6745*(series - med)/mad if mad else np.zeros(len(series))
-    mask = np.abs(z) > thresh
-    return mask, pd.Series(med, index=series.index)
+# 1) пивотируем премии в wide-на еженедельную сетку --------------------
+#    (средняя по датам внутри недели, потом ffill до каждой недели)
 
-def hampel(series, window=4, n_sig=3):
-    # окно = 4 наблюдения (4 недели)
-    med = series.rolling(window, center=True, min_periods=1).median()
-    diff = np.abs(series - med)
-    mad  = 1.4826 * diff.rolling(window, center=True, min_periods=1).median()
-    mask = (diff > n_sig * mad).fillna(False)
-    return mask, med
+# сначала пересоберём премии в daily_rate (ежедневно), как раньше:
+daily_rate = (
+    rate_diff_df
+      .pivot(index='Date', columns='Term', values='Rate')
+      .rename(columns={
+          90  :'prm_90',
+          180 :'prm_180',
+          270 :'prm_270',
+          365 :'prm_365',
+          'максимальная ставка до 1 года'       :'prm_max1Y',
+          'среднее арифметическое ставок до 1 года':'prm_mean1Y'
+      })
+      .asfreq('D')
+      .ffill()
+)
 
-def grubbs(series, alpha=.05):
-    x = series.dropna().values.copy()
-    N = len(x)
-    out = np.zeros(N, bool)
-    idx = np.arange(N)
-    while N > 2:
-        z = np.abs(x - x.mean())/x.std(ddof=1)
-        i = z.argmax(); G = z[i]
-        t = stats.t.ppf(1 - alpha/(2*N), N-2)
-        Gc = ((N-1)/np.sqrt(N)) * np.sqrt(t**2/(N-2+t**2))
-        if G > Gc:
-            out[idx[i]] = True
-            x = np.delete(x, i); idx = np.delete(idx, i); N -= 1
+# теперь агрегация в weekly_rate по той же частоте W‑Wed
+weekly_rate = (
+    daily_rate
+      .resample('W-WED')
+      .mean()
+      .reindex(weekly.index)  # чтобы были ровно те же недели
+      .ffill()
+)
+
+# склеиваем saldo + премии
+weekly_all = weekly[['saldo']].join(weekly_rate, how='left').dropna()
+prem_cols = [c for c in weekly_all.columns if c.startswith('prm_')]
+
+# -----------------------------------------------------------------------
+# 2.  функции корреляций (не менялись) ----------------------------------
+# -----------------------------------------------------------------------
+def corr_mat(frame, cols_x, y='saldo', method='pearson'):
+    corrs = {}
+    for c in cols_x:
+        x, yv = frame[c], frame[y]
+        if method=='pearson':
+            r,_ = pearsonr(yv, x)
         else:
-            break
-    mask = pd.Series(False, index=series.index)
-    mask.iloc[np.where(out)[0]] = True
-    return mask, pd.Series(series.median(), index=series.index)
+            r,_ = spearmanr(yv, x)
+        corrs[c] = r
+    return pd.Series(corrs, name=method).to_frame()
 
-detectors = [
-    ("Robust Z",  robust_z),
-    ("Hampel (4w)", hampel),
-    ("Grubbs",    grubbs),
+def both_corrs(df):
+    return pd.concat([
+        corr_mat(df, prem_cols, 'saldo','pearson'),
+        corr_mat(df, prem_cols, 'saldo','spearman')
+    ], axis=1)
+
+# -----------------------------------------------------------------------
+# 3.  (a) за весь период   |  (b) с 01‑05‑2024
+# -----------------------------------------------------------------------
+corr_all   = both_corrs(weekly_all)
+corr_since = both_corrs(weekly_all.loc['2024-05-01':])
+
+# -----------------------------------------------------------------------
+# 4.  три сегмента между брейками
+# -----------------------------------------------------------------------
+breaks = [
+    pd.Timestamp('2024-05-01'),
+    pd.Timestamp('2024-06-04'),
+    pd.Timestamp('2025-02-19'),
+    weekly_all.index.max() + pd.Timedelta(days=1)
 ]
 
-# 2) рисуем -----------------------------------------------------------
-plt.rcParams.update({
-    "figure.figsize": (8, 5),   # чуть больше
-    "xtick.labelsize": 8,
-    "ytick.labelsize": 8,
-    "axes.titlesize": 10,
-    "axes.labelsize": 9,
-})
+seg_dfs = []
+for i in range(len(breaks)-1):
+    start = breaks[i]
+    end   = breaks[i+1] - pd.Timedelta(days=1)
+    seg   = weekly_all.loc[start:end]
+    seg_c = both_corrs(seg)
+    seg_c.columns = pd.MultiIndex.from_product(
+        [[f'{start.date()}–{end.date()}'], seg_c.columns]
+    )
+    seg_dfs.append(seg_c)
+corr_segments = pd.concat(seg_dfs, axis=1)
 
-fmtB = FuncFormatter(lambda x, _: f"{x/1e9:.1f} B")
+# -----------------------------------------------------------------------
+# 5.  помесячная корреляция
+# -----------------------------------------------------------------------
+month_dfs = []
+for period, grp in weekly_all.groupby(weekly_all.index.to_period('M')):
+    mc = both_corrs(grp)
+    mc.columns = [
+        f'{period}_{("P" if m=="pearson" else "S")}'
+        for m in mc.columns
+    ]
+    month_dfs.append(mc)
+corr_month = pd.concat(month_dfs, axis=1)
 
-fig, axes = plt.subplots(len(detectors), 1, sharex=True)
+# -----------------------------------------------------------------------
+# 6.  вывод
+# -----------------------------------------------------------------------
+print("=== Корреляция за весь период ===")
+display(corr_all)
 
-for ax, (name, func) in zip(axes, detectors):
-    s = weekly["saldo"]
-    mask, repl = func(s)
-    
-    # исходный ряд
-    ax.plot(weekly.index, s, color="steelblue", lw=1, label="saldo")
-    # выбросы
-    ax.scatter(weekly.index[mask], s[mask],
-               color="limegreen", s=50, zorder=3, label="outliers")
-    # точки‑замены
-    ax.scatter(weekly.index[mask], repl[mask],
-               color="red", s=30, zorder=4, label="replacement")
-    
-    ax.set_title(name, pad=4)
-    ax.yaxis.set_major_formatter(fmtB)
-    ax.grid(alpha=0.3)
-    ax.legend(loc="upper left", frameon=False, fontsize=8)
+print("=== Корреляция с 01‑05‑2024 ===")
+display(corr_since)
 
-# аккуратные метки по оси X — _вдоль_ индекса
-axes[-1].set_xlabel("неделя (Thu→Wed)")
-fig.autofmt_xdate(rotation=30)
-plt.tight_layout()
-plt.show()
+print("=== Корреляция по сегментам ===")
+display(corr_segments)
+
+print("=== Корреляция по месяцам ===")
+display(corr_month)
+```
+
+**Что происходит**  
+1. **Премии** из `rate_diff_df` пивотируются в `daily_rate` и затем агрегируются по неделям Thu→Wed ( `.resample('W-WED').mean()` ).  
+2. Полученные средние недельные премии ( `weekly_rate` ) сшиваются с вашим `weekly[['saldo']]`.  
+3. Вычисляются **Pearson** и **Spearman** по четырём «кейсам» (весь период, с мая, три сегмента и помесячно).  
+4. В названиях колонок чётко проставлены границы и метки месяцев («2024‑07_P», «2024‑07_S»).  
+
+Теперь вы получите ровно ту же статистику, что и по ежедневным данным, но на **недельной агрегации**.
