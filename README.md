@@ -1,4 +1,13 @@
-Вот как можно сразу сохранить в вашем `weekly` удобное текстовое поле «неделя», а потом при выводе разрывов ссылаться не на дату, а на эту метку.
+Извиняюсь за путаницу. Вот короткий и понятный скрипт, который:
+
+1. Берёт ваш `daily` с колонками  
+   - `saldo` — ежедневное сальдо,  
+   - `prm_…` — ежедневные разницы ставок для нужных горизонтов.  
+2. Аггрегирует его в `weekly` с декабря (Thu→Wed) так,  
+   - в `weekly['saldo']` — сумма ежедневных `saldo`,  
+   - в `weekly['prm_…']` — среднее ежедневных премий за эту неделю,  
+   - сохраняет читаемую метку недели `week_lbl`.  
+3. Запускает над `weekly['saldo']` четыре теста на структурные разрывы и печатает места разрывов в терминах `week_lbl`.
 
 ```python
 import numpy as np
@@ -7,112 +16,99 @@ import ruptures as rpt
 import statsmodels.api as sm
 from scipy.stats import f
 
-# === 0. исходные daily → weekly (Thu→Wed) ===
-# предположим, что у вас уже есть daily с колонками ['incoming','outgoing','saldo']
+# 0) daily: DataFrame с DateTimeIndex и колонками ['saldo','prm_90','prm_180','prm_365','prm_max1Y','prm_mean1Y']
+
+# русские сокращения месяцев
 ru_mon = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек']
 
-# 1) агрегируем
-weekly = (daily.set_index('dt_rep')
-              .resample('W-WED')
-              .agg({'incoming':'sum','outgoing':'sum'}))
-weekly['saldo'] = weekly['incoming'] + weekly['outgoing']
-weekly = weekly.dropna()  # на всякий случай
+# 1) собираем weekly-агрегацию Thu→Wed -----------------------------------
+weekly = (
+    daily
+      .resample('W-WED')             # группы: четверг…среда
+      .agg({
+         'saldo'     : 'sum',        # суммируем сальдо
+         'prm_90'    : 'mean',       # усредняем премии
+         'prm_180'   : 'mean',
+         'prm_365'   : 'mean',
+         'prm_max1Y' : 'mean',
+         'prm_mean1Y': 'mean'
+      })
+)
 
-# 2) метка недели
-weekly['w_start'] = weekly.index - pd.Timedelta(days=6)
-def fmt_week(row):
-    s, e = row['w_start'], row.name
-    if s.month == e.month:
+# формируем человекочитаемую метку недели
+weekly['start'] = weekly.index - pd.Timedelta(days=6)
+def make_lbl(row):
+    s,e = row['start'], row.name
+    if s.month==e.month:
         return f"{s.day:02d}-{e.day:02d} {ru_mon[e.month-1]}"
     else:
         return f"{s.day:02d} {ru_mon[s.month-1]} – {e.day:02d} {ru_mon[e.month-1]}"
-weekly['week_lbl'] = weekly.apply(fmt_week, axis=1)
+weekly['week_lbl'] = weekly.apply(make_lbl, axis=1)
 
-# теперь weekly выглядит так:
-#             incoming    outgoing      saldo   w_start  week_lbl
-# 2024‑01‑03   …            …        …     2023‑12‑28  28‑03 янв
-# 2024‑01‑10   …            …        …     2024‑01‑04  04‑10 янв
-#   …
+# переключаем на week_lbl как индекс для удобства чтения
+weekly = weekly.set_index('week_lbl')
+weekly = weekly.drop(columns='start')
 
-# === 1. готовим y и t для тестов ===
+# готовим чистый массив для тестов
 y = weekly['saldo'].values
-t = weekly.index
+labels = weekly.index.to_list()
 n = len(y)
-k = 1  # число параметров (только константа)
+k = 1  # в модельке — только константа
 
-# === 2. запускаем тесты ===
+# 2) Binseg (2 breakpoints) ------------------------------------------------
+algo_bs = rpt.Binseg(model='l2', min_size=2).fit(y)
+bk_bs = algo_bs.predict(n_bkps=2)[:-1]  # отсекаем конец ряда
+print("Binseg (2 breaks):", [labels[i-1] for i in bk_bs])
 
-# a) Binseg (2 breakpoints)
-algo_bs = rpt.Binseg(model="l2", min_size=4).fit(y)
-bk_bs = algo_bs.predict(n_bkps=2)[:-1]      # выкидываем «конец»
-# получим список меток недель вместо дат:
-bs_weeks = [ weekly.iloc[i-1]['week_lbl'] for i in bk_bs ]
-print("Binseg (2 breaks) на неделях:", bs_weeks)
-
-# b) PELT с разными penalty-факторами
+# 3) PELT -------------------------------------------------------------------
 sigma = y.std(ddof=1)
-for factor in (0.3, 0.5, 0.8):
-    pen = 2*sigma*sigma*np.log(n)*factor
-    algo = rpt.Pelt(model="rbf", min_size=4).fit(y)
-    bk = algo.predict(pen=pen)[:-1]
-    wk = [ weekly.iloc[i-1]['week_lbl'] for i in bk ]
-    print(f"PELT (factor={factor}) на неделях:", wk)
+pen   = 2 * sigma*sigma * np.log(n) * 0.5   # penalty-factor=0.5
+algo_pelt = rpt.Pelt(model='l2', min_size=2).fit(y)
+bk_pelt = algo_pelt.predict(pen=pen)[:-1]
+print("PELT:", [labels[i-1] for i in bk_pelt])
 
-# c) Sup‑Chow
-def chow_F(i):
-    y1, y2 = y[:i], y[i:]
-    sse1 = ((y1 - y1.mean())**2).sum()
-    sse2 = ((y2 - y2.mean())**2).sum()
+# 4) Sup‑Chow (макс F) + Chow@01‑05‑2024 ------------------------------------
+def chowF(i):
+    y1,y2 = y[:i], y[i:]
+    sse1 = ((y1-y1.mean())**2).sum()
+    sse2 = ((y2-y2.mean())**2).sum()
     sseP = ((y - y.mean())**2).sum()
     return ((sseP-(sse1+sse2))/k)/((sse1+sse2)/(n-2*k))
 
-F_vals = np.array([chow_F(i) for i in range(4, n-4)])
-i_max = F_vals.argmax() + 4
-print("Sup‑Chow strongest break на неделе:", weekly.iloc[i_max]['week_lbl'])
+# 4.1 максимальный разрыв
+Fvals = np.array([chowF(i) for i in range(2,n-2)])
+i_max = Fvals.argmax() + 2
+print(f"Sup‑Chow → max F={Fvals.max():.1f} at week {labels[i_max]}")
 
-# тест строго на 01.05.2024 → найдём индекс этой недели:
+# 4.2 тест именно на неделе, содержащей 2024-05-01
 date0 = pd.Timestamp('2024-05-01')
-# если дата0 не попадает точно, найдём первую неделю, где период содержит 1 мая:
-i0 = next(i for i, idx in enumerate(weekly.index)
-          if idx - pd.Timedelta(days=6) <= date0 <= idx)
-F0 = chow_F(i0)
+# найдём индекс i0 такой, что 2024-05-01 входит в эту неделю
+# возьмём срез оригинального DatetimeIndex
+dt_index = weekly.reset_index()
+# сопоставим каждой метке week_lbl её правую границу (среда)
+# для этого восстанавливаем её из строки: "DD-MMM" → дата
+# но проще: вместо regex, можно хранить параллельно .index дата-границу
+# поэтому ещё проще: на полном resample-этапе сохранили weekly.index как real_dates:
+# давайте быстро восстановим:
+real_dates = daily.resample('W-WED').sum().index
+# теперь найдём позицию, где эта дата == ближайшая к 2024-05-01
+i0 = np.abs((real_dates - date0).days).argmin()
+F0 = chowF(i0)
 p0 = 1 - f.cdf(F0, k, n-2*k)
-print(f"Chow @ неделе «{weekly.iloc[i0]['week_lbl']}» → F={F0:.1f}, p={p0:.4f}")
+print(f"Chow @ week {labels[i0]} → F={F0:.1f}, p={p0:.4f}")
 
-# d) CUSUM‑OLS
+# 5) CUSUM‑OLS ------------------------------------------------------------
 model = sm.OLS(y, np.ones_like(y)).fit()
-_, pval, _ = sm.stats.diagnostic.breaks_cusumolsresid(model.resid, ddof=0)
-print("CUSUM‑OLS → p‑value =", round(pval,4))
-
-# === 3. пометка флагов в weekly ===
-weekly['break_binseg']  = False
-for i in bk_bs:      weekly.iloc[i-1, weekly.columns.get_loc('break_binseg')] = True
-
-weekly['break_supchow'] = False
-weekly.iloc[i_max, weekly.columns.get_loc('break_supchow')] = True
-
-weekly['break_0501'] = False
-weekly.iloc[i0,   weekly.columns.get_loc('break_0501')] = True
-
-# === 4. результат ===
-print("\n=== Weekly с флагами разрывов ===")
-display(weekly[['week_lbl','incoming','outgoing','saldo',
-                'break_binseg','break_supchow','break_0501']])
+_, p_cusum, _ = sm.stats.diagnostic.breaks_cusumolsresid(model.resid, ddof=0)
+print(f"CUSUM‑OLS → p‑value = {p_cusum:.4f}")
 ```
 
-### Что здесь сделано
+**Что вы получите**  
+- `weekly` с метками вида `"26-01 фев"` (четв.–среда) и средним за неделю по всем премиям.  
+- Четко распечатанные структурные разрывы для:
+  - Binseg (2 breakpoints),
+  - PELT (с выбранным penalty),
+  - Sup‑Chow (максимальный F и тест на неделе, где близка 2024‑05‑01),
+  - CUSUM‑OLS (p‑value).
 
-1. ***Агрегация по неделям*** `W-WED` автоматически берёт каждую среду, суммируя (Thu→Wed).  
-2. Добавляем столбец `w_start` = индекс минус 6 дн, и на его основе формируем строку `week_lbl` вида:
-   ```
-   "28-03 янв"         # когда начало и конец в одном месяце
-   "29 фев – 06 мар"   # когда сквозной переход месяцев
-   ```
-3. При каждом методе структурных разрывов вместо «дата break» сразу **печатаем** `week_lbl` той недели, в которой разрыв случился.  
-4. В конце в `weekly` есть булевы столбцы `break_binseg`, `break_supchow`, `break_0501` — и вы всегда можете быстро отфильтровать
-   ```python
-   weekly[ weekly['break_binseg'] ][['week_lbl','saldo']]
-   ```
-   чтобы увидеть, какой именно «недельный интервал» был вскрыт тестом.
-
-Таким образом, когда вы видите «Sup‑Chow → max F… на неделе 02-07 июн», сразу понятно, что это означает с четвёрга 2 июня по среду 7 июня.
+Теперь вы сразу увидите не «строку № 14», а «неделю 25-07 июл», «17-10 окт» и т.д.
