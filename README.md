@@ -1,92 +1,87 @@
-Понял — раз у вас уже есть готовый `weekly` (с индексом `week_lbl` и колонками `['saldo','prm_90',…]`), больше не нужно его пересобирать из `daily`. Вот «чистая» версия скрипта, которая сразу берёт ваш `weekly` и считает всё как раньше:
+Вот исправленный фрагмент: мы не резолвим строковые метки «01 май 24» вручную, а сразу превращаем ваш `weekly.index` в настоящий `DatetimeIndex` по дате окончания недели, а дальше уже удобно делать срезы и сегменты по дате.
 
 ```python
 import pandas as pd
 from scipy.stats import pearsonr, spearmanr
 
 # -----------------------------------------------------------------------
-# 0.  Ваш готовый weekly:
+# 0.  Ваш готовый weekly
 # -----------------------------------------------------------------------
-#   weekly.index  = строки вида "28 дек 23 – 03 янв 24"
-#   weekly.columns = ['saldo','prm_90','prm_180','prm_365','prm_max1Y','prm_mean1Y']
+# weekly.index  = метки вида "28 дек 23 – 03 янв 24"
+# weekly.columns = ['saldo','prm_90',…]
 # -----------------------------------------------------------------------
 
-# список «премий»
-prem_cols = [c for c in weekly.columns if c.startswith('prm_')]
+# 0.1. из строковых меток вытаскиваем часть после "–" и парсим в дату
+#     (дата окончания недели)
+ends = (weekly.index
+            .str.split('–')
+            .str[-1]
+            .str.strip()
+            .str.replace(' ',' ')   # неразрывные пробелы
+       )
+dt_end = pd.to_datetime(ends, format='%d %b %y', dayfirst=True)
+
+# 0.2. делаем новый DF с DatetimeIndex
+weekly_dt = weekly.copy()
+weekly_dt.index = dt_end
 
 # -----------------------------------------------------------------------
-# 1.  функции корреляций
+# 1.  корреляции
 # -----------------------------------------------------------------------
+prem_cols = [c for c in weekly_dt.columns if c.startswith('prm_')]
+
 def corr_mat(df, method):
-    """Series R для каждого столбца prem_cols по заданному методу."""
     res = {}
     for c in prem_cols:
-        x, y = df[c], df['saldo']
+        y = df['saldo']; x = df[c]
         if method=='pearson':
-            r,_ = pearsonr(y, x)
+            r,_ = pearsonr(y,x)
         else:
-            r,_ = spearmanr(y, x)
+            r,_ = spearmanr(y,x)
         res[c] = r
     return pd.Series(res, name=method)
 
 def both_corrs(df):
-    """DataFrame с двумя колонками: pearson и spearman."""
-    return pd.concat([
-        corr_mat(df, 'pearson'),
-        corr_mat(df, 'spearman')
-    ], axis=1)
+    return pd.concat([corr_mat(df,'pearson'),
+                      corr_mat(df,'spearman')], axis=1)
 
 # -----------------------------------------------------------------------
-# 2.  корреляция за весь период  |  с 01‑05‑2024
+# 2.  весь период  |  с 2024‑05‑01
 # -----------------------------------------------------------------------
-corr_all   = both_corrs(weekly)
-corr_since = both_corrs(weekly.loc['01 май 24':])  # с вашей меткой
+corr_all   = both_corrs(weekly_dt)
+corr_since = both_corrs(weekly_dt.loc['2024-05-01':])
 
 # -----------------------------------------------------------------------
 # 3.  три сегмента между брейками
 # -----------------------------------------------------------------------
-breaks_lbl = ['01 май 24','04 июн 24','19 фев 25','']  
-# пустая строка для правого края — возьмём конец weekly.index
-idx = list(weekly.index)
-# найдём позиции
-pos = {lbl: idx.index(lbl) for lbl in breaks_lbl if lbl in idx}
-# добавим конец
-pos[''] = len(idx)
+brks = [pd.Timestamp('2024-05-01'),
+        pd.Timestamp('2024-06-04'),
+        pd.Timestamp('2025-02-19'),
+        weekly_dt.index.max()+pd.Timedelta(days=1)]
 
-seg_dfs = []
-segs = [
-    ('01 май 24–03 июн 24', pos['01 май 24'], pos['04 июн 24']),
-    ('04 июн 24–18 фев 25', pos['04 июн 24'], pos['19 фев 25']),
-    ('19 фев 25–конец', pos['19 фев 25'], pos[''])
-]
-for name, i0, i1 in segs:
-    sub = weekly.iloc[i0:i1]
+seg_frames = []
+for i in range(len(brks)-1):
+    start, end = brks[i], brks[i+1] - pd.Timedelta(days=1)
+    sub = weekly_dt.loc[start:end]
     dfc = both_corrs(sub)
-    dfc.columns = pd.MultiIndex.from_product([[name], dfc.columns])
-    seg_dfs.append(dfc)
+    dfc.columns = pd.MultiIndex.from_product(
+        [[f'{start.date()}–{end.date()}'], dfc.columns]
+    )
+    seg_frames.append(dfc)
 
-corr_segments = pd.concat(seg_dfs, axis=1)
+corr_segments = pd.concat(seg_frames, axis=1)
 
 # -----------------------------------------------------------------------
 # 4.  помесячная корреляция
 # -----------------------------------------------------------------------
-month_dfs = []
-# переведём индекс-метку обратно в период для группировки
-# (предполагаем, что week_lbl начинается с даты-окончания: "DD MMM YY")
-end_dates = pd.to_datetime(weekly.index.str[-8:], format='%d %b %y')
-weekly2 = weekly.copy()
-weekly2['__dt__'] = end_dates
-weekly2 = weekly2.set_index('__dt__')
+month_frames = []
+for per, grp in weekly_dt.groupby(weekly_dt.index.to_period('M')):
+    dfm = both_corrs(grp)
+    dfm.columns = [f'{per}_{("P" if m=="pearson" else "S")}'
+                   for m in dfm.columns]
+    month_frames.append(dfm)
 
-for per, grp in weekly2.groupby(weekly2.index.to_period('M')):
-    mc = both_corrs(grp)
-    mc.columns = [
-        f'{per}_{("P" if m=="pearson" else "S")}'
-        for m in mc.columns
-    ]
-    month_dfs.append(mc)
-
-corr_month = pd.concat(month_dfs, axis=1)
+corr_month = pd.concat(month_frames, axis=1)
 
 # -----------------------------------------------------------------------
 # 5.  вывод
@@ -104,11 +99,7 @@ print("=== Корреляция по месяцам ===")
 display(corr_month)
 ```
 
-**Ключевые моменты:**
-
-1. **Не пересобираем** `weekly`: сразу берём его с вашими `week_lbl`.  
-2. Для «с 01‑05‑2024» просто делаем `weekly.loc['01 май 24':]` (зависит от точно вашего текста метки).  
-3. Сегменты делятся по индексам в `weekly.index` по тем же брейкам, что вы нашли (01 май 24, 04 июн 24, 19 фев 25).  
-4. Месяц группируем по фактическим датам окончания недели, воспроизведённым из метки.  
-
-Теперь весь расчёт корреляций работает прямо на вашем уже готовом `weekly` — никаких лишних resample/реиндексов.
+**Что изменилось:**
+1. Мы преобразовали ваши строковые метки недели в `DatetimeIndex` (`weekly_dt`), выхватывая из каждой метки часть после `–` и парся её через `pd.to_datetime(..., dayfirst=True)`.  
+2. Все срезы (`.loc[...]`) и группировки сейчас делаются по `weekly_dt.index` — по реальным `Timestamp` — поэтому `weekly_dt.loc['2024-05-01':]` больше не падает с `KeyError`.  
+3. Сегменты между брейками и помесячные кореляции работают точно так же, но над `weekly_dt`.
