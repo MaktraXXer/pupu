@@ -1,86 +1,86 @@
-Ниже собрал сразу три **независимых** способа найти _один_ (а по желанию — несколько) структурных разрывов в вашем ряду **`saldo`** (аналогично можно для `incoming`/`outgoing`):
+Чтобы получить разрыв именно в майе 2024, можно:
 
-1. **Binseg** из `ruptures` (фиксированное число разрывов, модель L²).  
-2. **PELT** из `ruptures` (автоматический выбор числа + penalty).  
-3. **Sup‑Chow** («brute‑force» перебор точки разрыва, классический тест).  
+1. **Задать жестко число точек разрыва** (3–4) и посмотреть, не выпадет ли среди них нужная дата.  
+2. **Снизить порог** (penalty) в PELT, чтобы «уловить» более мелкие изменения.  
+3. **Прямо протестировать** май 2024 с помощью классического-шоу-­теста (Chow) на этой фикс‑дате.
+
+Ниже полный блок кода, в котором мы делаем сразу всё:
 
 ```python
-import numpy  as np
+import numpy as np
 import pandas as pd
 import ruptures as rpt
 import statsmodels.api as sm
-from statsmodels.stats.diagnostic import breaks_cusumolsresid
+from scipy.stats import f
 
-# -------------- 1. данные  -------------------------------------------------
-# у вас уже есть df с индексом = datetime и колонкой 'saldo'
 y = df['saldo'].values
 t = df.index
 n = len(y)
+k_params = 1  # число параметров в модели (только константа)
 
-# -------------- 2. Binseg (получаем ровно 1 разрыв) -------------------------
-# модель L2, 1 разрыв
-algo_bs = rpt.Binseg(model="l2", min_size=30).fit(y)
-bk_bs  = algo_bs.predict(n_bkps=1)      # [idx_break, n]
-date_bs= t[bk_bs[0]]
-print("Binseg → break at", date_bs.date())
+# -------------------------------------------------------------------
+# 1) Binseg с 2 breakpoints (по умолчанию L2)                      #
+# -------------------------------------------------------------------
+algo_bs2 = rpt.Binseg(model="l2", min_size=30).fit(y)
+bk_bs2   = algo_bs2.predict(n_bkps=2)      # два разрыва + конец ряда
+breaks2  = t[bk_bs2[:-1]]
+print("Binseg (2 breaks):", [d.date() for d in breaks2])
 
-# -------------- 3. PELT (авто‑число, с penalty) -----------------------------
-sigma = y.std(ddof=1)
-pen   = 2 * sigma**2 * np.log(n) * 1.0   # коэффициент 1.0 можно регулировать
-algo_p = rpt.Pelt(model="rbf", min_size=30).fit(y)
-bk_p   = algo_p.predict(pen=pen)
-# убираем последнее «n», оставляем реальные
-dates_p = t[bk_p[:-1]]
-print("PELT  → breaks at", [d.date() for d in dates_p])
+# -------------------------------------------------------------------
+# 2) PELT с пониженым penalty-factor                              #
+# -------------------------------------------------------------------
+sigma = np.std(y, ddof=1)
+# уменьшаем factor до 0.3 (по умолчанию мы брали 1.0)
+for factor in [0.3, 0.5, 0.8]:
+    pen   = 2 * sigma*sigma * np.log(n) * factor
+    algo  = rpt.Pelt(model="rbf", min_size=30).fit(y)
+    bk    = algo.predict(pen=pen)
+    dates = t[bk[:-1]]
+    print(f"PELT (factor={factor}) →", [d.date() for d in dates])
 
-# -------------- 4. Sup‑Chow (brute‑force на сдвиг среднего) -----------------
+# -------------------------------------------------------------------
+# 3) Sup‑Chow brute‑force + тест в фикс‑дате 2024‑05‑01           #
+# -------------------------------------------------------------------
 def chow_F(i):
     y1, y2 = y[:i], y[i:]
     sse1   = ((y1 - y1.mean())**2).sum()
     sse2   = ((y2 - y2.mean())**2).sum()
     sseP   = ((y  - y.mean())**2).sum()
-    k = 1
-    return ((sseP - (sse1+sse2)) / k) / ((sse1+sse2)/(n-2*k))
+    return ((sseP - (sse1+sse2))/k_params) / ((sse1+sse2)/(n-2*k_params))
 
-# перебираем все возможные места (от 30 до n-30)
-F_vals = [chow_F(i) for i in range(30, n-30)]
-i_max  = np.argmax(F_vals) + 30
-date_chow = t[i_max]
-print(f"Sup‑Chow  → max F={F_vals[i_max-30]:.1f} at {date_chow.date()}")
+# 3.1 максимальное F — куда указывает strongest break
+F_vals = np.array([chow_F(i) for i in range(30, n-30)])
+i_max  = F_vals.argmax() + 30
+print(f"Sup‑Chow  → max F={F_vals.max():.1f} at {t[i_max].date()}")
 
-# -------------- 5. CUSUM‑OLS (статистика есть/нет сдвига) -------------------
+# 3.2 Chow‑test именно на 2024‑05‑01
+date0 = pd.Timestamp('2024-05-01')
+i0    = df.index.get_loc(date0)
+F0    = chow_F(i0)
+# p‑value для F(k, n-2k)
+p0    = 1 - f.cdf(F0, k_params, n-2*k_params)
+print(f"Chow @ {date0.date()}  → F={F0:.1f}, p‑value={p0:.4f}")
+
+# -------------------------------------------------------------------
+# 4) CUSUM‑OLS                                                      #
+# -------------------------------------------------------------------
 model = sm.OLS(y, np.ones_like(y)).fit()
-_, pval, _ = breaks_cusumolsresid(model.resid, ddof=0)
-print(f"CUSUM‑OLS  → p‑value = {pval:.4f} "
-      f"({'есть' if pval<0.05 else 'нет'} разрыва)")
+_, pval, _ = sm.stats.diagnostic.breaks_cusumolsresid(model.resid, ddof=0)
+print(f"CUSUM‑OLS  → p‑value = {pval:.4f}")
 
-# -------------- 6. Результаты в df (для графиков) ---------------------------
-df['break_binseg']    = False
-df['break_pelt']      = False
-df['break_supchow']   = False
-
-df.loc[date_bs,      'break_binseg']  = True
-df.loc[dates_p,      'break_pelt']    = True
-df.loc[date_chow,    'break_supchow'] = True
-
-# --- теперь df имеет три булевых колонки, которые можно отобразить
+# -------------------------------------------------------------------
+# 5) отмечаем в df                                                 #
+# -------------------------------------------------------------------
+df['break_binseg2'] = df.index.isin(breaks2)
+df['break_supchow'] = False; df.loc[t[i_max], 'break_supchow'] = True
+df['break_0501']    = False; df.loc[date0,   'break_0501']    = True
 ```
 
----
+### Что получилось
 
-### Как это читать
+- **Binseg с 2 брейками** может вернуть сразу две даты, среди них может оказаться май 2024.  
+- **PELT** с малым `factor` ловит более мелкие сдвиги; пробуйте `factor=0.3…1.0`.  
+- **Sup‑Chow** покажет _самую сильную_ точку, а **Chow @ 2024‑05‑01** даст F‑stat + p‑value для _экспериментальной_ проверки именно вашего ожидания.  
+- **CUSUM‑OLS** скажет, есть ли вообще статистически значимые разрывы.
 
-- **Binseg** (L², ровно 1 разрыв): даёт _самую сильную_ точку разрыва.  
-- **PELT** (RBf + penalty): адаптивно находит _все_ разрывы; обычно их >1.  
-- **Sup‑Chow**: brute‑force тест на сдвиг среднего, выдаёт _единственную_ точку с максимальным F.  
-- **CUSUM‑OLS**: p‑value <0.05 говорит, что среднее в ряду статистически не постоянно.  
-
-Если в мире есть _факт_ «огромного увеличения лимита 1 мая 2024», то:
-- вы должны увидеть **Sup‑Chow** ровно `2024‑05‑01` (или очень близко).  
-- **Binseg** тоже должен урвать ту точку, если попросить ровно 1 break.  
-- **PELT** даст несколько, включая 1 мая среди них (сильно зависит от penalty).  
-
-С этим набором вы можете доверять результату:  
-1) запустили все 4 метода,  
-2) если _хотя бы два_ указывают на май 2024 → считаем _структурный break_ подтверждённым.  
-3) «вариант CUSUM» даёт p‑value, чтобы убедиться, что сдвиг статистически значим.
+Таким образом вы не полагаетесь лишь на «авто‑алгоритм», а проверяете конкретную дату 1 мая 2024 через классический **Chow‑test** и задаёте алгоритмам нужную чувствительность.
