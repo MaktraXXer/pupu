@@ -1,112 +1,95 @@
-Ниже — полный скрипт для **недельных данных** `weekly` с тем же набором корреляций, но уже на агрегации Thu→Wed и с учётом ваших брейков:
+Понял — раз у вас уже есть готовый `weekly` (с индексом `week_lbl` и колонками `['saldo','prm_90',…]`), больше не нужно его пересобирать из `daily`. Вот «чистая» версия скрипта, которая сразу берёт ваш `weekly` и считает всё как раньше:
 
 ```python
 import pandas as pd
-from scipy.stats import spearmanr, pearsonr
+from scipy.stats import pearsonr, spearmanr
 
 # -----------------------------------------------------------------------
-# 0.  Предполагаем, что у вас есть:
+# 0.  Ваш готовый weekly:
 # -----------------------------------------------------------------------
-# weekly        – DataFrame с индексом типа W‑Wed (конец недели)
-#                 и колонкой 'saldo'
-# rate_diff_df  – DataFrame с тремя колонками ['Date','Term','Rate']
+#   weekly.index  = строки вида "28 дек 23 – 03 янв 24"
+#   weekly.columns = ['saldo','prm_90','prm_180','prm_365','prm_max1Y','prm_mean1Y']
 # -----------------------------------------------------------------------
 
-# 1) пивотируем премии в wide-на еженедельную сетку --------------------
-#    (средняя по датам внутри недели, потом ffill до каждой недели)
-
-# сначала пересоберём премии в daily_rate (ежедневно), как раньше:
-daily_rate = (
-    rate_diff_df
-      .pivot(index='Date', columns='Term', values='Rate')
-      .rename(columns={
-          90  :'prm_90',
-          180 :'prm_180',
-          270 :'prm_270',
-          365 :'prm_365',
-          'максимальная ставка до 1 года'       :'prm_max1Y',
-          'среднее арифметическое ставок до 1 года':'prm_mean1Y'
-      })
-      .asfreq('D')
-      .ffill()
-)
-
-# теперь агрегация в weekly_rate по той же частоте W‑Wed
-weekly_rate = (
-    daily_rate
-      .resample('W-WED')
-      .mean()
-      .reindex(weekly.index)  # чтобы были ровно те же недели
-      .ffill()
-)
-
-# склеиваем saldo + премии
-weekly_all = weekly[['saldo']].join(weekly_rate, how='left').dropna()
-prem_cols = [c for c in weekly_all.columns if c.startswith('prm_')]
+# список «премий»
+prem_cols = [c for c in weekly.columns if c.startswith('prm_')]
 
 # -----------------------------------------------------------------------
-# 2.  функции корреляций (не менялись) ----------------------------------
+# 1.  функции корреляций
 # -----------------------------------------------------------------------
-def corr_mat(frame, cols_x, y='saldo', method='pearson'):
-    corrs = {}
-    for c in cols_x:
-        x, yv = frame[c], frame[y]
+def corr_mat(df, method):
+    """Series R для каждого столбца prem_cols по заданному методу."""
+    res = {}
+    for c in prem_cols:
+        x, y = df[c], df['saldo']
         if method=='pearson':
-            r,_ = pearsonr(yv, x)
+            r,_ = pearsonr(y, x)
         else:
-            r,_ = spearmanr(yv, x)
-        corrs[c] = r
-    return pd.Series(corrs, name=method).to_frame()
+            r,_ = spearmanr(y, x)
+        res[c] = r
+    return pd.Series(res, name=method)
 
 def both_corrs(df):
+    """DataFrame с двумя колонками: pearson и spearman."""
     return pd.concat([
-        corr_mat(df, prem_cols, 'saldo','pearson'),
-        corr_mat(df, prem_cols, 'saldo','spearman')
+        corr_mat(df, 'pearson'),
+        corr_mat(df, 'spearman')
     ], axis=1)
 
 # -----------------------------------------------------------------------
-# 3.  (a) за весь период   |  (b) с 01‑05‑2024
+# 2.  корреляция за весь период  |  с 01‑05‑2024
 # -----------------------------------------------------------------------
-corr_all   = both_corrs(weekly_all)
-corr_since = both_corrs(weekly_all.loc['2024-05-01':])
+corr_all   = both_corrs(weekly)
+corr_since = both_corrs(weekly.loc['01 май 24':])  # с вашей меткой
 
 # -----------------------------------------------------------------------
-# 4.  три сегмента между брейками
+# 3.  три сегмента между брейками
 # -----------------------------------------------------------------------
-breaks = [
-    pd.Timestamp('2024-05-01'),
-    pd.Timestamp('2024-06-04'),
-    pd.Timestamp('2025-02-19'),
-    weekly_all.index.max() + pd.Timedelta(days=1)
-]
+breaks_lbl = ['01 май 24','04 июн 24','19 фев 25','']  
+# пустая строка для правого края — возьмём конец weekly.index
+idx = list(weekly.index)
+# найдём позиции
+pos = {lbl: idx.index(lbl) for lbl in breaks_lbl if lbl in idx}
+# добавим конец
+pos[''] = len(idx)
 
 seg_dfs = []
-for i in range(len(breaks)-1):
-    start = breaks[i]
-    end   = breaks[i+1] - pd.Timedelta(days=1)
-    seg   = weekly_all.loc[start:end]
-    seg_c = both_corrs(seg)
-    seg_c.columns = pd.MultiIndex.from_product(
-        [[f'{start.date()}–{end.date()}'], seg_c.columns]
-    )
-    seg_dfs.append(seg_c)
+segs = [
+    ('01 май 24–03 июн 24', pos['01 май 24'], pos['04 июн 24']),
+    ('04 июн 24–18 фев 25', pos['04 июн 24'], pos['19 фев 25']),
+    ('19 фев 25–конец', pos['19 фев 25'], pos[''])
+]
+for name, i0, i1 in segs:
+    sub = weekly.iloc[i0:i1]
+    dfc = both_corrs(sub)
+    dfc.columns = pd.MultiIndex.from_product([[name], dfc.columns])
+    seg_dfs.append(dfc)
+
 corr_segments = pd.concat(seg_dfs, axis=1)
 
 # -----------------------------------------------------------------------
-# 5.  помесячная корреляция
+# 4.  помесячная корреляция
 # -----------------------------------------------------------------------
 month_dfs = []
-for period, grp in weekly_all.groupby(weekly_all.index.to_period('M')):
+# переведём индекс-метку обратно в период для группировки
+# (предполагаем, что week_lbl начинается с даты-окончания: "DD MMM YY")
+end_dates = pd.to_datetime(weekly.index.str[-8:], format='%d %b %y')
+weekly2 = weekly.copy()
+weekly2['__dt__'] = end_dates
+weekly2 = weekly2.set_index('__dt__')
+
+for per, grp in weekly2.groupby(weekly2.index.to_period('M')):
     mc = both_corrs(grp)
     mc.columns = [
-        f'{period}_{("P" if m=="pearson" else "S")}'
+        f'{per}_{("P" if m=="pearson" else "S")}'
         for m in mc.columns
     ]
     month_dfs.append(mc)
+
 corr_month = pd.concat(month_dfs, axis=1)
 
 # -----------------------------------------------------------------------
-# 6.  вывод
+# 5.  вывод
 # -----------------------------------------------------------------------
 print("=== Корреляция за весь период ===")
 display(corr_all)
@@ -121,10 +104,11 @@ print("=== Корреляция по месяцам ===")
 display(corr_month)
 ```
 
-**Что происходит**  
-1. **Премии** из `rate_diff_df` пивотируются в `daily_rate` и затем агрегируются по неделям Thu→Wed ( `.resample('W-WED').mean()` ).  
-2. Полученные средние недельные премии ( `weekly_rate` ) сшиваются с вашим `weekly[['saldo']]`.  
-3. Вычисляются **Pearson** и **Spearman** по четырём «кейсам» (весь период, с мая, три сегмента и помесячно).  
-4. В названиях колонок чётко проставлены границы и метки месяцев («2024‑07_P», «2024‑07_S»).  
+**Ключевые моменты:**
 
-Теперь вы получите ровно ту же статистику, что и по ежедневным данным, но на **недельной агрегации**.
+1. **Не пересобираем** `weekly`: сразу берём его с вашими `week_lbl`.  
+2. Для «с 01‑05‑2024» просто делаем `weekly.loc['01 май 24':]` (зависит от точно вашего текста метки).  
+3. Сегменты делятся по индексам в `weekly.index` по тем же брейкам, что вы нашли (01 май 24, 04 июн 24, 19 фев 25).  
+4. Месяц группируем по фактическим датам окончания недели, воспроизведённым из метки.  
+
+Теперь весь расчёт корреляций работает прямо на вашем уже готовом `weekly` — никаких лишних resample/реиндексов.
