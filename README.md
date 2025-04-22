@@ -1,75 +1,162 @@
-import matplotlib.pyplot as plt
+Ниже — готовый шаблон, который для каждого из ваших пяти «премиальных» столбцов строит **отдельный** график:
+
+- столбцы баром (ежедневное `saldo`, млрд ₽)  
+- линия — ежедневная премия в %  
+- **светло‑зелёным** фоном отмечены границы месяцев  
+- в надписи внутри каждого «зелёного» прямоугольника подписаны корреляции Пирсона и Спирмена за соответствующий месяц  
+- вертикальными пунктирными линиями выделены структурные разрывы (15‑мая‑24 и 19‑февраля‑25)  
+
+```python
+import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 from scipy.stats import pearsonr, spearmanr
 
-# пары (колонка, заголовок)
-pairs = [
-    ('prm_90',    'Разница ставок 90 дней'),
-    ('prm_180',   'Разница ставок 180 дней'),
-    ('prm_365',   'Разница ставок 365 дней'),
-    ('prm_max1Y', 'Максимальная ставка до 1 года'),
-    ('prm_mean1Y','Средняя ставка до 1 года'),
-]
+# ваши ежедневные данные
+# daily.index = DateTimeIndex
+# daily['saldo'] (float), daily['prm_90'], ..., 'prm_mean1Y' (float)
 
 # структурные разрывы
-break1 = pd.Timestamp('2024-05-15')
-break2 = pd.Timestamp('2025-02-19')
+breaks = [pd.Timestamp('2024-05-15'), pd.Timestamp('2025-02-19')]
+
+# пары (имя колонки, заголовок)
+pairs = [
+    ('prm_90',    'Δ ставок 90 дн'),
+    ('prm_180',   'Δ ставок 180 дн'),
+    ('prm_365',   'Δ ставок 365 дн'),
+    ('prm_max1Y', 'макс ставка ≤1 г'),
+    ('prm_mean1Y','средняя ставка ≤1 г'),
+]
 
 for col, title in pairs:
-    fig, ax1 = plt.subplots(figsize=(14,6))
-    # — Бар / Saldo
-    ax1.bar(weekly_dt.index, weekly_dt['saldo']/1e9,
-            width=6, color='lightgray', align='center', label='Saldo (млрд ₽)')
+    fig, ax1 = plt.subplots(figsize=(16,6))
+    # — bar: saldo (млрд ₽)
+    ax1.bar(daily.index, daily['saldo']/1e9,
+            color='lightgray', width=1, align='center',
+            label='Saldo, млрд ₽')
     ax1.set_ylabel('Saldo, млрд ₽', color='gray')
     ax1.tick_params(axis='y', labelcolor='gray')
-
-    # — Линия / Premium
+    
+    # — line: premium %
     ax2 = ax1.twinx()
-    ax2.plot(weekly_dt.index, weekly_dt[col]*100,
-             color='steelblue', lw=2, label=title)
+    ax2.plot(daily.index, daily[col]*100,
+             color='steelblue', lw=1.5,
+             label=title)
     ax2.set_ylabel(f'{title}, %', color='steelblue')
     ax2.tick_params(axis='y', labelcolor='steelblue')
-
-    # — Разрывы
-    for b in (break1, break2):
-        ax1.axvline(b, color='red', ls='--', lw=1.5)
-        ax1.text(b, ax1.get_ylim()[1], b.strftime('%d.%m.%y'),
-                 color='red', rotation=90, va='bottom', ha='right',
-                 fontsize=10, backgroundcolor='white')
-
-    # — Корреляции до/после разрывов
-    y = weekly_dt['saldo']; x = weekly_dt[col]
-    mask1 = (weekly_dt.index >= break1) & (weekly_dt.index < break2)
-    mask2 = (weekly_dt.index >= break2)
-    r1P, r1S = pearsonr(x[mask1], y[mask1])[0], spearmanr(x[mask1], y[mask1])[0]
-    r2P, r2S = pearsonr(x[mask2], y[mask2])[0], spearmanr(x[mask2], y[mask2])[0]
-
-    # — Формируем подпись-таблицу
-    corr_text = (
-        f"Корреляции ({title}):\n"
-        f"  {break1.strftime('%d.%m.%y')} → {break2.strftime('%d.%m.%y')}: "
-        f"Pearson={r1P:.2f}, Spearman={r1S:.2f}\n"
-        f"  {break2.strftime('%d.%m.%y')} → конец: "
-        f"Pearson={r2P:.2f}, Spearman={r2S:.2f}"
+    
+    # — месячная заливка + корреляции внутри
+    ylim = ax1.get_ylim()
+    for period, grp in daily.groupby(daily.index.to_period('M')):
+        start = grp.index.min()
+        end   = grp.index.max()
+        # заливка
+        ax1.axvspan(start, end, facecolor='lightgreen', alpha=0.2)
+        # корреляции за месяц
+        rP = pearsonr(grp['saldo'], grp[col])[0]
+        rS = spearmanr(grp['saldo'], grp[col])[0]
+        # подпись в центре
+        mid = start + (end - start)/2
+        ax1.text(mid, ylim[1]*0.95,
+                 f"{period} — P={rP:.2f}, S={rS:.2f}",
+                 ha='center', va='top', fontsize=8,
+                 backgroundcolor='white', alpha=0.6)
+    
+    # — структурные разрывы
+    for b in breaks:
+        ax1.axvline(b, color='red', ls='--', lw=1.2)
+        ax1.text(b, ylim[1], b.strftime('%d.%m.%y'),
+                 color='red', rotation=90,
+                 va='bottom', ha='right',
+                 fontsize=9, backgroundcolor='white')
+    
+    # — метки по оси X: по месяцу
+    ax1.set_xlim(daily.index.min(), daily.index.max())
+    ax1.xaxis.set_major_locator(
+        plt.MaxNLocator(nbins=12, prune='both')
     )
-
-    # — Подпись под графиком
-    caption = (
-        f"Разрывы: {break1.strftime('%d.%m.%y')} и {break2.strftime('%d.%m.%y')}. "
-        f"Данные агрегированы Thu→Wed, ось X отмечает каждую 4‑ю неделю.\n"
-        f"{corr_text}"
-    )
-    fig.text(0.5, -0.10, caption,
-             ha='center', fontsize=11, color='gray')
-
-    # — Ось X: каждую 4‑ю неделю
-    ticks = weekly_dt.index[::4]
-    ax1.set_xticks(ticks)
-    ax1.set_xticklabels([d.strftime('%d %b %y') for d in ticks],
-                        rotation=45, ha='right')
-
-    ax1.set_title(f'{title} vs Saldo (еженедельно)', fontsize=14, pad=12)
+    fig.autofmt_xdate(rotation=30, ha='right')
+    
+    ax1.set_title(f'{title} vs Saldo (daily)', fontsize=14, pad=12)
     ax1.grid(alpha=0.25)
-
-    plt.tight_layout(rect=[0, 0.10, 1, 1])
+    
+    # — легенда
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax1.legend(h1+h2, l1+l2,
+               loc='upper left', frameon=False)
+    
+    plt.tight_layout()
     plt.show()
+```
+
+**Что здесь происходит**  
+1. **Баром** рисуем `saldo/1e9`, **линией** — `daily[col]*100`.  
+2. Для каждого месяца группируем `daily.groupby(...to_period('M'))`, заливаем фон (`axvspan`) и **вписываем** в центр месяца текст  
+   > `YYYY-MM — P=0.23, S=–0.05`  
+3. Горизонтальные **пунктирные красные** линии и подписи маркируют ваши структурные разрывы.  
+4. Ось X настроена на ~12 тиков (примерно по месяцу), и подписи повернуты на 30°.  
+
+Получите 5 отдельных, крупных, читаемых графиков, на каждом из которых чётко видно и месячные «сегменты», и корреляции по ним.
+
+
+Вы правы — в «daily» мы находили **три** разрыва:
+
+1. **Chow @ 2024‑05‑01**,  
+2. **Binseg/PELT @ 2024‑05‑15** (09–15 мая 24),  
+3. **Binseg/PELT @ 2025‑02‑19** (13–19 февр 25).
+
+В предыдущем шаблоне для графиков я отмечал только два — давайте сразу добавим все три.  
+
+Нужно просто заменить секцию
+
+```python
+# структурные разрывы
+breaks = [
+    pd.Timestamp('2024-05-15'),
+    pd.Timestamp('2025-02-19')
+]
+```
+
+на
+
+```python
+# структурные разрывы (три: Chow, Binseg & PELT)
+breaks = [
+    pd.Timestamp('2024-05-01'),  # Chow @ 01 мая 24
+    pd.Timestamp('2024-05-15'),  # Binseg/PELT 09‑15 мая 24
+    pd.Timestamp('2025-02-19'),  # Binseg/PELT 13‑19 февр 25
+]
+```
+
+и всё остальное в цикле останется без изменений — на графиках появятся три красные пунктирные линии с подписью по каждой дате.
+
+Вот полный фрагмент с этим правкой:
+
+```python
+# … ваши импорты, daily, пары (col, title) и т.д. …
+
+# три structural breaks из daily‑анализа
+breaks = [
+    pd.Timestamp('2024-05-01'),
+    pd.Timestamp('2024-05-15'),
+    pd.Timestamp('2025-02-19'),
+]
+
+for col, title in pairs:
+    fig, ax1 = plt.subplots(figsize=(16,6))
+    # … бар + линия + месячные заливки с корреляциями …    
+
+    # — три структурных разрыва
+    ylim = ax1.get_ylim()
+    for b in breaks:
+        ax1.axvline(b, color='red', ls='--', lw=1.2)
+        ax1.text(b, ylim[1], b.strftime('%d.%m.%y'),
+                 color='red', rotation=90,
+                 va='bottom', ha='right',
+                 fontsize=9, backgroundcolor='white')
+
+    # … остальной финтюнинг и show() …
+```
+
+Теперь на каждом из пяти графиков будут отмечены все три ваших разрыва.
