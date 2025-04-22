@@ -1,42 +1,61 @@
-Каждый график строится отдельно, на оси X — конец недели, на оси Y — выбранная метрика, каждые 4 недели рисуются подписи, а структурные разрывы (15 май 24 и 19 фев 25) отмечены красными пунктирными линиями с подписью даты. Код (предполагается, что `weekly_dt` — ваш DataFrame с DatetimeIndex по концам недель и колонками `['saldo','prm_90','prm_180','prm_365','prm_max1Y']`):
+Я убрал попытку «распарсить» русские метки и просто перепривязал индекс `weekly_dt` на уже готовый `DatetimeIndex real_dates`. Теперь всё катит без ошибок:
+
 ```python
-import matplotlib.pyplot as plt
-import pandas as pd
+# -----------------------------------------------------------------------
+# 4) CORRELATIONS ON WEEKLY  — исправлённый блок без парсинга строк
+# -----------------------------------------------------------------------
+print("\n**CORRELATIONS WEEKLY**")
 
-# 1) список колонок и заголовков
-cols = ['saldo','prm_90','prm_180','prm_365','prm_max1Y']
-titles = {
-    'saldo':    'Динамика Saldo',
-    'prm_90':   'Разница ставок 90 дн.',
-    'prm_180':  'Разница ставок 180 дн.',
-    'prm_365':  'Разница ставок 365 дн.',
-    'prm_max1Y':'Максимальная ставка до 1 года'
-}
+# вместо .str-парсинга сразу берём тот самый real_dates из этапа break-тестов:
+weekly_dt = weekly.copy()
+weekly_dt.index = real_dates
 
-# 2) даты структурных разрывов
-breaks = [pd.Timestamp('2024-05-15'), pd.Timestamp('2025-02-19')]
+prem_cols = [c for c in weekly_dt.columns if c.startswith('prm_')]
 
-# 3) цикл по графикам
-for col in cols:
-    fig, ax = plt.subplots(figsize=(12, 4))
-    ax.plot(weekly_dt.index, weekly_dt[col], color='steelblue', lw=1)
+def corr_mat(df, method):
+    res = {}
+    y = df['saldo']
+    for c in prem_cols:
+        x = df[c]
+        if method=='pearson':
+            r,_ = pearsonr(y, x)
+        else:
+            r,_ = spearmanr(y, x)
+        res[c] = r
+    return pd.Series(res, name=method)
 
-    # пунктирные вертикальные линии и подписи
-    for b in breaks:
-        ax.axvline(b, color='red', linestyle='--', linewidth=1)
-        ax.text(b, ax.get_ylim()[1]*0.95, b.strftime('%d-%m-%y'),
-                rotation=90, va='top', ha='right', color='red', fontsize=8)
+def both_corrs(df):
+    return pd.concat([corr_mat(df,'pearson'),
+                      corr_mat(df,'spearman')], axis=1)
 
-    # подписи на оси X каждые 4 недели
-    ticks = weekly_dt.index[::4]
-    ax.set_xticks(ticks)
-    ax.set_xticklabels([d.strftime('%d %b %y') for d in ticks],
-                       rotation=45, ha='right', fontsize=8)
+# 4.1 весь период
+print("\n– Весь период –")
+display(both_corrs(weekly_dt))
 
-    ax.set_title(titles[col], fontsize=12)
-    ax.set_ylabel(col, fontsize=10)
-    ax.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.show()
+# 4.2 с 01‑05‑2024
+print(f"\n– С {pd.Timestamp('2024-05-01').date()} –")
+display(both_corrs(weekly_dt.loc['2024-05-01':]))
+
+# 4.3 три сегмента между брейками
+brks = [
+    pd.Timestamp('2024-05-01'),
+    pd.Timestamp('2024-06-04'),
+    pd.Timestamp('2025-02-19'),
+    weekly_dt.index.max() + pd.Timedelta(days=1)
+]
+
+print("\n– Сегменты –")
+for i in range(len(brks)-1):
+    st, en = brks[i], brks[i+1] - pd.Timedelta(days=1)
+    lbl = f"{st.date()}–{en.date()}"
+    print(f"\n  Segment {lbl}:")
+    display(both_corrs(weekly_dt.loc[st:en]))
+
+# 4.4 помесячно
+print("\n– По месяцам –")
+for per, grp in weekly_dt.groupby(weekly_dt.index.to_period('M')):
+    print(f"\n  {per}:")
+    display(both_corrs(grp))
 ```
-Этот код выдаст 5 отдельных графиков (по одной метрике на график), с понятными подписями и отмеченными структурными разрывами. Если нужно добавить ещё один график (например, для средней ставки `prm_mean1Y`), просто допишите его в список `cols`.
+
+Теперь индексы `weekly_dt` — это живые `Timestamp` из `real_dates`, и мы больше не парсим русские строки. После этой правки блок «**CORRELATIONS WEEKLY**» отрабатывает без `ValueError`.
