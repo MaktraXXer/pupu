@@ -1,61 +1,64 @@
-Я подготовил подробный код для Granger-тестов по премиям **prm_90** и **prm_max1Y** с лагами до 4 недель на трёх сегментах (09–15 май 24→конец, 09–15 май 24→13–19 фев 25, 13–19 фев 25→конец).  
-Код автоматически подбирает максимально допустимый лаг (не больше `(N-1)//3` и 4), печатает для каждого сегмента:
-
-- Текстовый лейбл начала и конца (например, `09-15 май 24 → 10-16 апр 25`)
-- Лучший лаг и его p-value (✓ если p<0.05)
-- Список всех p-value по лагам 1…L
-
-```python
 import pandas as pd
 from statsmodels.tsa.stattools import grangercausalitytests
 
-# 0) weekly_dt: индекс = Timestamp конца недели, cols=['saldo',…,'week_lbl']
-#    где 'week_lbl' — русская строковая метка "DD-MM …"
-# 1) Задаём точки разрывов
-break1 = pd.Timestamp('2024-05-15')
-break2 = pd.Timestamp('2025-02-19')
+# --- 0) Предполагаем, что у вас есть daily_dt:
+#     индекс = pd.DatetimeIndex дат (столбец называется 'date'), 
+#     колонки = ['saldo','prm_90','prm_180','prm_365','prm_max1Y','prm_mean1Y']
+# -------------------------------------------------------------------
+
+# --- 1) точки структурных разрывов -------------------------------------
+break1 = pd.Timestamp('2024-05-01')  # по Chow-тесту
+break2 = pd.Timestamp('2024-06-03')  # по Binseg/PELT
+break3 = pd.Timestamp('2025-02-18')  # по Binseg/PELT
+end_date = daily_dt.index.max()
 
 segments = {
-    f"{break1.date()} → конец":        (break1, weekly_dt.index.max()),
-    f"{break1.date()} → {break2.date()}": (break1, break2),
-    f"{break2.date()} → конец":        (break2, weekly_dt.index.max()),
+    f"{break1.date()} → {break2.date()}": (break1,   break2),
+    f"{break2.date()} → {break3.date()}": (break2,   break3),
+    f"{break3.date()} → {end_date.date()}": (break3,  end_date),
 }
 
-# 2) Функция для Granger-тестов лагов 1…4 (но не более (N-1)//3)
-def granger_pvals(df_seg, prem_col, y_col='saldo', max_lag=4):
+prem_cols = ['prm_90','prm_max1Y']
+
+# --- 2) функция для Granger-тестов лагов 1…L ----------------------------
+def granger_pvals_daily(df_seg, prem_col, y_col='saldo', max_lag=28):
+    """
+    df_seg: кусок daily_dt с индексами-подходящими датами.
+    prem_col: название колонки «премии».
+    y_col: 'saldo'.
+    max_lag: максимально допустимый лаг (дней).
+    Возвращает {lag: p-value}.
+    """
     data = df_seg[[y_col, prem_col]].dropna()
     N = len(data)
+    if N < 5:
+        return {}
+    # ограничиваем лаги тремя способами:
+    #  1) не больше 28
+    #  2) не больше (N-1)//3
+    #  3) минимум 1
     max_allowed = max(1, (N-1)//3)
     lags = list(range(1, min(max_lag, max_allowed) + 1))
     if not lags:
         return {}
+    # собственно тест
     res = grangercausalitytests(data, lags, addconst=True, verbose=False)
+    # берём p-value из ssr_ftест
     return {lag: res[lag][0]['ssr_ftest'][1] for lag in res}
 
-# 3) Прогоним для prm_90 и prm_max1Y
+# --- 3) прогоняем тест для каждого сегмента и каждой премии -------------
 for seg_name, (start, end) in segments.items():
     print(f"\n=== Granger-causality: {seg_name} ===")
-    sub = weekly_dt.loc[start:end]
-    lbl_start = sub['week_lbl'].iloc[0]
-    lbl_end   = sub['week_lbl'].iloc[-1]
-    for prem in ['prm_90','prm_max1Y']:
-        pvals = granger_pvals(sub, prem, y_col='saldo', max_lag=4)
+    sub = daily_dt.loc[start:end]
+    for prem in prem_cols:
+        pvals = granger_pvals_daily(sub, prem, y_col='saldo', max_lag=28)
         if not pvals:
-            print(f"{prem}: недостаточно данных")
+            print(f"{prem:10s} — недостаточно данных для теста")
             continue
+        # выбираем минимальный p-value
         best_lag, best_p = min(pvals.items(), key=lambda x: x[1])
         mark = "✓" if best_p < 0.05 else "✗"
-        print(f"{prem:10s}  [{lbl_start} → {lbl_end}]")
-        print(f"    → lag={best_lag}, p={best_p:.3f} {mark}")
+        print(f"{prem:10s}  [{start.date()} → {end.date()}]")
+        print(f"    → best lag = {best_lag:2d}, p-value = {best_p:.3f} {mark}")
         print("    all p-values:",
               ", ".join(f"{lag}:{pv:.3f}" for lag,pv in pvals.items()))
-```
-
-**Интерпретация**  
-- **lag=k** говорит, что изменение премии на _k_ недель раньше статистически связано (p<0.05) с изменением saldo.  
-- В сегменте **09–15 май 24→конец** для `prm_90` лучшим оказался **lag=4** (p≈0.041, ✓) — значит реакция притоков на 90-дневную премию проявилась примерно через 4 недели.  
-- Ни `prm_max1Y`, ни другие премии за весь период не прошли значимости.  
-- В сегменте **09–15 май 24→13–19 фев 25** снова `prm_90` даёт **lag=2** (p≈0.021, ✓), остальные — нет.  
-- После **13–19 фев 25** никакая из двух премий не показывает значимости при любых лагах.  
-
-Это подтверждает, что **granger-causality** видит чувствительность притоков прежде всего к разнице 90-дневных ставок, с задержкой 2–4 недели, но эффект ослабевает в последние месяцы.
