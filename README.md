@@ -1,70 +1,45 @@
-Понял, canvas не используем. Вот готовый код для проверки Granger-causality на weekly-данных:
-
-```python
 import pandas as pd
-import numpy as np
 from statsmodels.tsa.stattools import grangercausalitytests
 
-# --- 1) Подготовка weekly_df ---
-# weekly_dt: DataFrame с DateTimeIndex (конец недели), столбцами 'saldo' и 'premium' (например, 'premium90')
-# Например:
-weekly_dt = weekly.copy()
-# Допустим, премию 90-дней вы уже вычислили:
-# weekly_dt['premium90'] = ...
+# --- 0) Предполагаем, что weekly_dt ≡ DataFrame с DateTimeIndex (конец недели)
+#     и столбцами: 'saldo', 'prm_90', 'prm_180', 'prm_365', 'prm_max1Y', 'prm_mean1Y'.
 
-# Ограничим период с 2024-05-01:
-weekly_full = weekly_dt.loc['2024-05-01':]
+# Сами даты «разрывов» (середины недель)
+break1 = pd.Timestamp('2024-05-15')
+break2 = pd.Timestamp('2025-02-19')
 
-# Сегменты между структурными разрывами:
-breaks = [pd.Timestamp('2024-05-01'),
-          pd.Timestamp('2024-06-04'),
-          pd.Timestamp('2025-02-19'),
-          weekly_dt.index.max() + pd.Timedelta(days=1)]
+# Удобный словарь сегментов: name → (start, end)
+segments = {
+    f"{break1.date()}→конец":      (break1, weekly_dt.index.max()),
+    f"{break1.date()}→{break2.date()}": (break1, break2),
+    f"{break2.date()}→конец":      (break2, weekly_dt.index.max()),
+}
 
-segments = [
-    (breaks[i], breaks[i+1] - pd.Timedelta(days=1))
-    for i in range(len(breaks)-1)
-]
+# Список всех премий
+prem_cols = [c for c in weekly_dt.columns if c.startswith('prm_')]
 
-# --- 2) Функция для Granger теста ---
-def test_granger(df, x_col, y_col, maxlag=4):
+# Функция-обёртка для теста
+def granger_pvals(df, x, y='saldo', maxlag=4):
     """
-    Проверка, предсказывает ли x_col будущее y_col.
-    - df: DataFrame с двумя колонками
-    - maxlag: максимальный лаг в неделях
+    df: DataFrame с двумя колонками [y, x]
+    x: название колонки «премии»
+    y: название колонки Saldo
+    возвращает dict: {lag: p-value}
     """
-    data = df[[y_col, x_col]].dropna()
-    # statsmodels ожидает порядок [y, x]
-    results = grangercausalitytests(data, maxlag=maxlag, verbose=False)
-    summary = {}
-    for lag, res in results.items():
-        p_value = res[0]['ssr_ftest'][1]
-        summary[lag] = p_value
-    return summary
+    data = df[[y, x]].dropna()
+    res = grangercausalitytests(data, maxlag=maxlag, verbose=False)
+    return {lag: res[lag][0]['ssr_ftest'][1] for lag in res}
 
-# --- 3) Гоняем тест на всех данных с мая 2024 ---
-print("=== Granger с 2024-05-01 (весь период) ===")
-p_full = test_granger(weekly_full, 'premium90', 'saldo', maxlag=4)
-for lag, p in p_full.items():
-    print(f"lag={lag}: p-value={p:.3f}")
-
-# --- 4) Гоняем тест по сегментам ---
-for start, end in segments:
-    seg = weekly_dt.loc[start:end]
-    print(f"\n=== Granger {start.date()} → {end.date()} ===")
-    p_seg = test_granger(seg, 'premium90', 'saldo', maxlag=4)
-    for lag, p in p_seg.items():
-        print(f" lag={lag}: p={p:.3f}")
-
-# --- 5) Интерпретация ---
-# Если p-value для какого-то лага < 0.05, значит премия с этим лагом Granger-вызывает Saldo.
-# Низкие p-value (<<0.05) на небольших лагах (1–2 недели) говорят о быстрой чувствительности.
-```
-
-**Как интерпретировать результаты:**
-1. **p-value < 0.05** указывает, что «предшествующие» значения премии **статистически значимо** улучшают прогноз Saldo.
-2. Чем **меньший лаг** (lag=1 или 2) даёт значимый p-value, тем **быстрее** реакция.
-3. Если в «длинном» периоде (2024-05→конец) нет ни одного p<0.05, значит **нет** Granger-причинности для weekly.
-4. Если в коротких сегментах (между разрывами) появляются значимые лага — значит чувствительность **локальная**.
-
-— удачи в анализе!
+# --- 1) Прогоняем по каждому сегменту и каждой премии ---
+for seg_name, (start, end) in segments.items():
+    print(f"\n=== Granger-causality: {seg_name} ===")
+    sub = weekly_dt.loc[start:end]
+    for prem in prem_cols:
+        pvals = granger_pvals(sub, prem, y='saldo', maxlag=4)
+        # найдём минимальное p-value и соответствующий лаг
+        best_lag, best_p = min(pvals.items(), key=lambda kv: kv[1])
+        signif = "✓" if best_p<0.05 else "✗"
+        print(
+            f"{prem:10s} → lag={best_lag}, p={best_p:.3f} {signif}"
+            f"   (все p: {', '.join(f'{l}:{p:.2f}' for l,p in pvals.items())})"
+        )
