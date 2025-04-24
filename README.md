@@ -172,6 +172,63 @@ for p, tbl in out.items():
         plt.yticks(rotation=0)
         plt.show()
 
+# -------------------------------------------------------------
+# 5.  RAW vs RESID графики (p = 4 и 13)   –- ИСПРАВЛЕНО
+# -------------------------------------------------------------
+def raw_resid_plot(col: str, ttl: str):
+    """Две частоты STL (p=4, p=13) × RAW / resid."""
+    fig, ax = plt.subplots(2, 2, figsize=(14, 6), sharex='col',
+                           gridspec_kw={'height_ratios': [2, 1]})
+
+    for j, p in enumerate((4, 13)):
+        # --- получаем остатки -------------------------------
+        _, _, rs_s = stl_full(weekly_dt['saldo'], p)
+        _, _, rs_p = stl_full(weekly_dt[col]   , p)
+
+        # --- RAW --------------------------------------------
+        ax0 = ax[0, j]
+        ax0.bar(weekly_dt.index, weekly_dt['saldo'] / 1e9,
+                color='lightgray', width=6, label='Saldo')
+        ax02 = ax0.twinx()
+        ax02.plot(weekly_dt.index, weekly_dt[col] * 100,
+                  color='steelblue', lw=1.8, label=ttl)
+        ax0.set_title(f'RAW  (STL p = {p})')
+        ax0.grid(alpha=.25)
+
+        # --- RESID ------------------------------------------
+        ax1 = ax[1, j]
+        ax1.bar(rs_s.index, rs_s / 1e9,
+                color='lightgray', width=6)
+        ax12 = ax1.twinx()
+        ax12.plot(rs_p.index, rs_p * 100,
+                  color='steelblue', lw=1.8)
+        ax1.set_title(f'RESID  (STL p = {p})')
+        ax1.grid(alpha=.25)
+
+        # --- break-points ----------------------------------
+        for b in breaks:
+            ax0.axvline(b, color='red', ls='--', lw=1)
+            ax1.axvline(b, color='red', ls='--', lw=1)
+
+    ax[0, 0].set_ylabel('Saldo, млрд ₽')
+    ax[1, 0].set_ylabel('Saldo resid')
+    plt.suptitle(f'{ttl} – RAW / RESID', y=1.01, fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+
+# -------------------------------------------------------------
+# 6.  Запуск «батареи»                              –- ИСПРАВЛЕНО
+# -------------------------------------------------------------
+def plot_battery():
+    for col, ttl in prem_cols.items():
+        plot_decomp(col)      # 4-панельная STL-картинка
+        plot_trends(col)      # тренды в одной плоскости
+        raw_resid_plot(col, ttl)
+
+# вызов:
+plot_battery()
+
 
 # -------------------------------------------------------------
 # 5.  RAW vs RESID графики (p = 4 и 13)
