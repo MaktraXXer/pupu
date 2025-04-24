@@ -1,302 +1,142 @@
+Ниже — **полный рабочий скрипт** (Python 3 / pandas), который:
+
+1. **читает** все входные Excel-файлы;  
+2. формирует «толстую» недельную панель **`weekly_panel_dt`**;  
+3. **добавляет**  
+   * среднюю ключевую ставку за неделю (`key_rate_wavg`),  
+   * dummy `kr_change` — было ли изменение КС внутри недели,  
+   * фазовые индикаторы, сезонные метки, лаги, показатели «на клиента»;  
+4. **сохраняет** результат ЕДИНСТВЕННО в `weekly_panel_dt.xlsx`  
+   (отдельный лист, без промежуточных parquet / pickle).
+
+> **Файлы, которые должны лежать рядом с скриптом**  
+> – `weekly_dt.xlsx` – ваша таблица притоков/премий (скрин 3).  
+> – `key_rate.xlsx`   – лист со столбцами **date | KR** (скрин 1).  
+> – `kc_events.xlsx` – лист со столбцом **DATE** – даты заседаний ЦБ (скрин 2).  
+> – `clients.xlsx`   – лист **dt_rep | clients** (месячные или ежедневные).
+
 ```python
 # =============================================================
-#  WEEKLY SENSITIVITY LAB — FULL SCRIPT                             
-#  -------------------------------------------------------------
-#  • Данные:  weekly_dt  (индекс = конец банковской недели)
-#             столбцы = saldo, prm_90, prm_max1Y, …
-#  • Задача:  STL-декомпозиция (p = 4 и 13) + Spearman-ρ
-#             ─ RAW                 (оба ряда «как есть»)
-#             ─ RES                 (остатки обоих рядов)
-#             ─ RESsaldo-RAWprem    (остаток SALDO × сырая премия)
-#             + удобные графики (decomp / trend / raw-resid)
+#  0. библиотеки и глобальные константы
 # =============================================================
+import pandas as pd
+import numpy as np
+from pathlib import Path
 
-import pandas as pd, numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy.stats import spearmanr
-from statsmodels.tsa.seasonal import STL
+# --- структурные разрывы ----------------------------------------------------
+BREAK_1 = pd.Timestamp('2024-05-15')
+BREAK_2 = pd.Timestamp('2024-08-28')
+BREAK_3 = pd.Timestamp('2025-02-19')
 
-# -------------------------------------------------------------
-# 0.  Конфигурация
-# -------------------------------------------------------------
-prem_cols = {
-    'prm_90'    : 'Премия 90 дней',
-    'prm_max1Y' : 'Премия max ≤ 1 год'
-}
+DATA = Path('.')                       # рабочая папка с Excel-ами
 
-breaks = [                               # вертикальные «красные» линии
-    pd.Timestamp('2024-05-15'),
-    pd.Timestamp('2024-08-28'),
-    pd.Timestamp('2025-02-19')
-]
+# =============================================================
+#  1. weekly_dt : saldo + премии  (готовый файл Excel)
+# =============================================================
+weekly_dt = (pd.read_excel(DATA/'weekly_dt.xlsx',  parse_dates=['dt_rep'])
+               .set_index('dt_rep')                # индекс = конец недели
+               .sort_index())                     # гарантируем порядок
 
-segments = {                             # лямбды → boolean-маска индекса
-    'до 15-05-24'          : lambda i:  i <  breaks[0],
-    '15-05 → 28-08'        : lambda i: (i>=breaks[0]) & (i<breaks[1]),
-    '28-08 → 19-02-25'     : lambda i: (i>=breaks[1]) & (i<breaks[2]),
-    '19-02-25 → конец'     : lambda i:  i>=breaks[2],
-    '28-08-24 → сейчас'    : lambda i:  i>=breaks[1]             # «длинный хвост»
-}
+# =============================================================
+#  2. фактическая ключевая ставка (daily)  key_rate.xlsx
+# =============================================================
+kr = (pd.read_excel(DATA/'key_rate.xlsx', parse_dates=['date'])
+        .rename(columns={'date':'Date', 'KR':'KR_%'}))
 
-# -------------------------------------------------------------
-# 1. STL-помощники
-# -------------------------------------------------------------
-def stl_full(series: pd.Series, period: int=4):
-    """
-    Robust-STL: возвращает (trend, seasonal, resid).
-    period=4 → «недельный месяц»; period=13 → «квартал».
-    """
-    res = STL(series, period=period, robust=True).fit()
-    return res.trend, res.seasonal, res.resid
+kr['key_rate'] = (kr['KR_%'].astype(str)
+                               .str.replace(',', '.')
+                               .str.rstrip('%')
+                               .astype(float)
+                               .div(100))              # в долях
 
+kr = (kr[['Date','key_rate']]
+        .set_index('Date')
+        .sort_index())
 
-# -------------------------------------------------------------
-# 2. Сохраняем все компоненты для каждого премиального ряда
-# -------------------------------------------------------------
-pairs = {}
-for col, title in prem_cols.items():
-    tr_s, se_s, re_s = stl_full(weekly_dt['saldo']  , period=4)
-    tr_p, se_p, re_p = stl_full(weekly_dt[col]      , period=4)
+# --- средняя КС за неделю (Thu-Wed) и флаг изменения ------------------------
+#   ① средневзвешенная = просто средняя daily
+#   ② изменение       = 1, если за неделю был ХОТЬ ОДИН сдвиг ставки
+kr_w = (kr.resample('W-THU')
+          .agg(key_rate_wavg = ('key_rate','mean'),
+               kr_change     = ('key_rate', lambda s: int(s.nunique()>1)))
+          .rename_axis('dt_rep'))
 
-    pairs[col] = dict(
-        title       = title,
-        orig_saldo  = weekly_dt['saldo'],
-        orig_prem   = weekly_dt[col],
-        trend_saldo = tr_s,  trend_prem = tr_p,
-        seas_saldo  = se_s,  seas_prem  = se_p,
-        resid_saldo = re_s,  resid_prem = re_p
-    )
+# =============================================================
+#  3. календарь заседаний ЦБ (kc_events.xlsx)
+#     нужен для Diff-in-Diff 👉 создаём dummy «после события»
+# =============================================================
+ev_dates = (pd.read_excel(DATA/'kc_events.xlsx', parse_dates=['DATE'])
+              .sort_values('DATE')['DATE']         # Series
+              .dt.normalize())                     # только дата
 
+# добавим в kr_w столбцы post_<date>
+for d in ev_dates:
+    kr_w[f'post_{d.strftime("%d%b%y")}'] = (kr_w.index >= d).astype(int)
 
-# -------------------------------------------------------------
-# 3.  Визуализация декомпозиции и трендов
-# -------------------------------------------------------------
-def plot_decomp(key: str):
-    """4-панельная картинка: original, trend, seasonal, remainder."""
-    d = pairs[key]; ttl = d['title']
-    fig, ax = plt.subplots(4, 1, figsize=(12, 7), sharex=True,
-                           gridspec_kw={'hspace': .15})
+# =============================================================
+#  4. клиенты  clients.xlsx («dt_rep | clients»)
+#     – если даты месячные → ffill до daily → weekly mean
+# =============================================================
+clients = (pd.read_excel(DATA/'clients.xlsx', parse_dates=['dt_rep'])
+             .dropna(subset=['clients'])
+             .set_index('dt_rep')
+             .sort_index())
 
-    ax[0].plot(d['orig_saldo']/1e9, color='gray', label='Saldo, млрд ₽')
-    ax[0].plot(d['orig_prem']*100 , color='steelblue', label=f'{ttl}, %')
-    ax[0].set_title('Original'); ax[0].legend()
+c_daily  = clients.asfreq('D').ffill()             # ежедневная прокладка
+c_weekly = (c_daily
+              .resample('W-THU')
+              .mean()
+              .rename_axis('dt_rep')
+              .rename(columns={'clients':'clients_mean'}))
 
-    ax[1].plot(d['trend_saldo']/1e9, color='gray')
-    ax[1].plot(d['trend_prem']*100 , color='steelblue')
-    ax[1].set_title('Trend')
+# =============================================================
+#  5. SCHEMA MERGE  → weekly_panel_dt
+# =============================================================
+panel = (weekly_dt
+           .join([kr_w, c_weekly], how='left')
+           .sort_index())
 
-    ax[2].plot(d['seas_saldo']/1e9, color='gray')
-    ax[2].plot(d['seas_prem']*100 , color='steelblue')
-    ax[2].set_title('Seasonal')
+# --- фазовые дамми -------------------------------------------
+panel['phase_II']  = ((panel.index >= BREAK_2) & (panel.index < BREAK_3)).astype(int)
+panel['phase_III'] =  (panel.index >= BREAK_3).astype(int)
 
-    ax[3].plot(d['resid_saldo']/1e9, color='gray')
-    ax[3].plot(d['resid_prem']*100 , color='steelblue')
-    ax[3].set_title('Remainder (de-seasoned & de-trended)')
+# --- ручная сезонность: неделя внутри месяца / «зарплатная» ---
+panel['week_of_month'] = panel.index.day.sub(1).floordiv(7).add(1)
+panel['salary_week']   = (panel['week_of_month'] == 3).astype(int)
 
-    for a in ax:
-        for b in breaks:
-            a.axvline(b, color='red', ls='--', lw=1)
-        a.grid(alpha=.25)
+# --- лаги для динамических моделей (p=4, q=0…3) ---------------
+for lag in range(1,5):                                   # p = 4
+    panel[f'saldo_lag{lag}'] = panel['saldo'].shift(lag)
 
-    plt.suptitle(f'STL, p=4 • {ttl} vs Saldo', y=1.02, fontsize=14)
-    plt.tight_layout(); plt.show()
+for lag in range(4):                                     # q = 0…3
+    for col in ['prm_90','prm_max1Y']:
+        panel[f'{col}_lag{lag}'] = panel[col].shift(lag)
 
+# --- «на клиента» --------------------------------------------
+for col in ['saldo','prm_90','prm_max1Y']:
+    panel[f'{col}_pc'] = panel[col] / panel['clients_mean']
 
-def plot_trends(key: str):
-    """Тренд saldo vs тренд премии (удобная шкала)."""
-    d = pairs[key]; ttl = d['title']
-    fig, ax = plt.subplots(figsize=(12, 3))
-    ax.plot(d['trend_saldo']/1e9, lw=2, color='gray', label='Trend Saldo')
-    ax2 = ax.twinx()
-    ax2.plot(d['trend_prem']*100 , lw=2, color='steelblue',
-             label=f'Trend {ttl}')
-    for b in breaks:
-        ax.axvline(b, color='red', ls='--', lw=1)
-    ax.grid(alpha=.25)
-    ax.legend(loc='upper left'); ax2.legend(loc='upper right')
-    ax.set_title(f'Trend comparison (p=4) – {ttl}')
-    plt.tight_layout(); plt.show()
+# =============================================================
+#  6. SAVE ▶ Excel (единственный файл)
+# =============================================================
+out_file = DATA/'weekly_panel_dt.xlsx'
+with pd.ExcelWriter(out_file, engine='xlsxwriter') as xl:
+    panel.to_excel(xl, sheet_name='panel', index=True)
 
-
-# -------------------------------------------------------------
-# 4.  Spearman-корреляции RAW / RES / RESsaldo-RAWprem
-# -------------------------------------------------------------
-def seg_corr(x: pd.Series, y: pd.Series, period: int):
-    """
-    Возвращает DataFrame(index = segment,
-                         columns = [RAW, RES, RESsaldo_RAWprem])
-    """
-    raw, res, mix = {}, {}, {}
-
-    x_tr, x_se, x_re = stl_full(x, period)
-    y_tr, y_se, y_re = stl_full(y, period)
-
-    for seg, mask_fn in segments.items():
-        mask = mask_fn(x.index)
-        if mask.sum() < 4:           # слишком мало точек
-            continue
-        # ρ RAW
-        raw[seg] = spearmanr(x[mask], y[mask])[0]
-        # ρ RES  (оба в остатках)
-        res[seg] = spearmanr(x_re[mask], y_re[mask])[0]
-        # ρ RESsaldo-RAWprem
-        mix[seg] = spearmanr(x[mask], y_re[mask])[0]
-
-    return pd.DataFrame({'RAW': raw, 'RES': res,
-                         'RESsaldo_RAWprem': mix})
-
-
-out = {}   # {period p: big-table}
-for p in (4, 13):         # p=4 «нед. месяц», p=13 «квартал»
-    frames = []
-    for col, title in prem_cols.items():
-        tbl = seg_corr(weekly_dt[col], weekly_dt['saldo'], p)
-        tbl.columns = pd.MultiIndex.from_product([[title], tbl.columns])
-        frames.append(tbl)
-    out[p] = pd.concat(frames, axis=1)
-
-# ---------- печать + heat-maps ----------
-for p, tbl in out.items():
-    print(f'\n##### STL period = {p}')
-    display(tbl.round(2))
-
-    for part in ('RAW', 'RES', 'RESsaldo_RAWprem'):
-        hm = (tbl.xs(part, level=1, axis=1)
-                  .rename(columns=lambda c: c.replace(' • '+part, '')))
-        plt.figure(figsize=(7, 3))
-        sns.heatmap(hm.T.astype(float),
-                    annot=True, fmt='.2f', vmin=-1, vmax=1,
-                    cmap='coolwarm', cbar=False)
-        plt.title(f"Spearman ρ – {part} – STL p={p}")
-        plt.yticks(rotation=0)
-        plt.show()
-
-# -------------------------------------------------------------
-# 5.  RAW vs RESID графики (p = 4 и 13)   –- ИСПРАВЛЕНО
-# -------------------------------------------------------------
-def raw_resid_plot(col: str, ttl: str):
-    """Две частоты STL (p=4, p=13) × RAW / resid."""
-    fig, ax = plt.subplots(2, 2, figsize=(14, 6), sharex='col',
-                           gridspec_kw={'height_ratios': [2, 1]})
-
-    for j, p in enumerate((4, 13)):
-        # --- получаем остатки -------------------------------
-        _, _, rs_s = stl_full(weekly_dt['saldo'], p)
-        _, _, rs_p = stl_full(weekly_dt[col]   , p)
-
-        # --- RAW --------------------------------------------
-        ax0 = ax[0, j]
-        ax0.bar(weekly_dt.index, weekly_dt['saldo'] / 1e9,
-                color='lightgray', width=6, label='Saldo')
-        ax02 = ax0.twinx()
-        ax02.plot(weekly_dt.index, weekly_dt[col] * 100,
-                  color='steelblue', lw=1.8, label=ttl)
-        ax0.set_title(f'RAW  (STL p = {p})')
-        ax0.grid(alpha=.25)
-
-        # --- RESID ------------------------------------------
-        ax1 = ax[1, j]
-        ax1.bar(rs_s.index, rs_s / 1e9,
-                color='lightgray', width=6)
-        ax12 = ax1.twinx()
-        ax12.plot(rs_p.index, rs_p * 100,
-                  color='steelblue', lw=1.8)
-        ax1.set_title(f'RESID  (STL p = {p})')
-        ax1.grid(alpha=.25)
-
-        # --- break-points ----------------------------------
-        for b in breaks:
-            ax0.axvline(b, color='red', ls='--', lw=1)
-            ax1.axvline(b, color='red', ls='--', lw=1)
-
-    ax[0, 0].set_ylabel('Saldo, млрд ₽')
-    ax[1, 0].set_ylabel('Saldo resid')
-    plt.suptitle(f'{ttl} – RAW / RESID', y=1.01, fontsize=14)
-    plt.tight_layout()
-    plt.show()
-
-
-# -------------------------------------------------------------
-# 6.  Запуск «батареи»                              –- ИСПРАВЛЕНО
-# -------------------------------------------------------------
-def plot_battery():
-    for col, ttl in prem_cols.items():
-        plot_decomp(col)      # 4-панельная STL-картинка
-        plot_trends(col)      # тренды в одной плоскости
-        raw_resid_plot(col, ttl)
-
-# вызов:
-plot_battery()
-
-
-# -------------------------------------------------------------
-# 5.  RAW vs RESID графики (p = 4 и 13)
-# -------------------------------------------------------------
-def raw_resid_plot(col: str, ttl: str):
-    fig, ax = plt.subplots(2, 2, figsize=(14, 6), sharex='col',
-                           gridspec_kw={'height_ratios': [2, 1]})
-    for j, p in enumerate((4, 13)):
-        sm_s, rs_s = stl_full(weekly_dt['saldo'], p)
-        sm_p, rs_p = stl_full(weekly_dt[col]   , p)
-
-        # --- RAW ---
-        ax0 = ax[0, j]
-        ax0.bar(weekly_dt.index, weekly_dt['saldo']/1e9,
-                width=6, color='lightgray', label='Saldo')
-        ax02 = ax0.twinx()
-        ax02.plot(weekly_dt.index, weekly_dt[col]*100,
-                  lw=1.8, color='steelblue', label=ttl)
-        ax0.set_title(f'RAW  (p={p})')
-        ax0.grid(alpha=.25)
-
-        # --- RESID ---
-        ax1 = ax[1, j]
-        ax1.bar(rs_s.index, rs_s/1e9, width=6, color='lightgray')
-        ax12 = ax1.twinx()
-        ax12.plot(rs_p.index, rs_p*100,
-                  lw=1.8, color='steelblue')
-        ax1.set_title(f'RESID  (p={p})')
-        ax1.grid(alpha=.25)
-
-        for b in breaks:
-            ax0.axvline(b, color='red', ls='--', lw=1)
-            ax1.axvline(b, color='red', ls='--', lw=1)
-
-    ax[0, 0].set_ylabel('Saldo, млрд ₽')
-    ax[1, 0].set_ylabel('Saldo resid')
-    plt.suptitle(f'{ttl} – RAW / RESID', y=1.01, fontsize=14)
-    plt.tight_layout(); plt.show()
-
-
-# -------------------------------------------------------------
-# 6.  Запуск полной «батареи»
-# -------------------------------------------------------------
-for col, ttl in prem_cols.items():
-    plot_decomp(col)       # 4-панельная STL-картинка
-    plot_trends(col)       # тренды в одной плоскости
-    raw_resid_plot(col, ttl)  # RAW vs RESID (p = 4 и 13)
+print('✓ weekly_panel_dt.xlsx создан :', len(panel), 'строк')
 ```
 
----
+### Что теперь лежит в `weekly_panel_dt.xlsx → лист panel`
 
-### Что в итоге делает скрипт
+| колонка                          | зачем моделей |
+|----------------------------------|---------------|
+| `saldo` / `prm_90` / `prm_max1Y` | базовые ряды |
+| `key_rate_wavg`                  | **средняя** ключевая ставка за неделю |
+| `kr_change` (0/1)                | было ли реальное изменение КС в этой неделе |
+| `post_<date>`                    | Дамми для event-study / Diff-in-Diff |
+| `phase_II`, `phase_III`          | переключатели август-24 и февраль-25 |
+| `week_of_month`, `salary_week`   | ручная недельная сезонность |
+| Лаги `saldo_lag*`, `prm*_lag*`   | ARDL / динамическая OLS |
+| `*_pc`                           | показатели «на одного клиента» |
 
-* **STL p = 4** (недельный «месяц») и **STL p = 13** (квази-квартал).  
-* Для каждого сегмента и каждой премии считает три варианта Spearman-ρ:  
-
-| Столбец                | Смысл                                    |
-|------------------------|------------------------------------------|
-| `RAW`                  | обе серии «как есть»                     |
-| `RES`                  | остатки STL и у saldo, и у премии        |
-| `RESsaldo_RAWprem`     | *остаток* saldo × *сырая* премия         |
-
-* Рисует:  
-  * 4-панельную декомпозицию (original / trend / seasonal / resid)  
-  * Сравнение трендов saldo vs премии  
-  * RAW vs RESID (две частоты STL)  
-
-> **При чтении результатов:** смотрите, насколько ρ падает или растёт, когда
->  – мы «очищаем» только saldo (`RESsaldo_RAWprem`),  
->  – и когда очищаем оба ряда (`RES`).  
-> Так видно, где связь обусловлена трендом/сезоном, а где — настоящей ценовой премией.
+Файл Excel — одна точка входа для **OLS, ARDL, SARIMAX** и event-анализа.
