@@ -1,58 +1,64 @@
 import pandas as pd
-import numpy as np
-from scipy.stats import pearsonr, spearmanr
+from collections import OrderedDict
+from statsmodels.tsa.stattools import grangercausalitytests
 
-# --- предположим, что weekly_dt у вас уже загружен ---
-# индекс = Timestamp конца недели (W-Wed), колонки = ['saldo','prm_90',...,'prm_max1Y',...]
+# ------------------------------------------------------------------
+# 0) weekly_dt: индекс = Timestamp конца недели (Thu→Wed),
+#    столбцы = ['saldo', 'prm_90', 'prm_max1Y', …, 'week_lbl']
+# ------------------------------------------------------------------
 
-# 0) добавляем колонку с текстовой меткой недели (Thu→Wed)
-weekly_dt = weekly_dt.copy()
-weekly_dt['week_lbl'] = (
-    weekly_dt.index.to_series()
-      .apply(lambda d: f"{(d - pd.Timedelta(days=6)).strftime('%d %b %y')}–{d.strftime('%d %b %y')}")
-)
+# --- 1. точки структурных разрывов --------------------------------
+break1 = pd.Timestamp('2024-05-15')   # «майский»
+break2 = pd.Timestamp('2024-08-28')   # «августовский»
+break3 = pd.Timestamp('2025-02-19')   # «февраль-25»
 
-# 1) задаём границы
-start  = pd.Timestamp('2024-05-15')    # первая точка
-break2 = pd.Timestamp('2025-02-19')    # фиксируем конец «первого» разрыва
-end    = weekly_dt.index.max()         # последний имеющийся индекс
+# 4 неперекрывающихся куска: «до b1», «b1→b2», «b2→b3», «b3→конец»
+segments = OrderedDict([
+    (f"начало → {break1.date()}",                (weekly_dt.index.min(), break1)),
+    (f"{break1.date()} → {break2.date()}",       (break1, break2)),
+    (f"{break2.date()} → {break3.date()}",       (break2, break3)),
+    (f"{break3.date()} → конец",                 (break3, weekly_dt.index.max())),
+])
 
-# 2) генерируем всех кандидатов на «вторую» точку разрыва
-candidates = []
-dt = start + pd.Timedelta(weeks=2)
-while dt < break2:
-    # выбираем ближайшую по времени дату из weekly_dt.index
-    i = weekly_dt.index.get_indexer([dt], method='nearest')[0]
-    actual = weekly_dt.index[i]
-    if actual not in candidates:
-        candidates.append(actual)
-    dt += pd.Timedelta(weeks=2)
+# --- 2. функция p-values для лагов 1…max_lag (но ≤ (N-1)//3) ------
+def granger_pvals(df_seg, prem_col, y_col='saldo', max_lag=4):
+    data = df_seg[[y_col, prem_col]].dropna()
+    N = len(data)
+    max_allowed = max(1, (N-1)//3)
+    lags = list(range(1, min(max_lag, max_allowed) + 1))
+    if not lags:
+        return {}
+    res = grangercausalitytests(data, lags, addconst=True, verbose=False)
+    # ssr_ftest: (F, p, df_denom, df_num)
+    return {lag: res[lag][0]['ssr_ftest'][1] for lag in res}
 
-# 3) функция для расчёта Pearson и Spearman
-def calc_corr(sub, prem):
-    x = sub['saldo'].to_numpy()
-    y = sub[prem].to_numpy()
-    mask = ~np.isnan(x) & ~np.isnan(y)
-    if mask.sum() < 5:
-        return np.nan, np.nan
-    return pearsonr(x[mask], y[mask])[0], spearmanr(x[mask], y[mask])[0]
+# --- 3. прогоняем по всем сегментам и двум премиям ----------------
+for seg_name, (start, end) in segments.items():
+    print(f"\n=== Granger-causality: {seg_name} ===")
+    sub = weekly_dt.loc[start:end]
+    if sub.empty:
+        print("   ⚠ сегмент пуст → пропускаем")
+        continue
 
-# 4) пробегаем по break-кандидатам и премиям
-for br in candidates:
-    lbl_br = weekly_dt.at[br, 'week_lbl']
-    print(f"\n=== Точка «второго» разрыва: {br.date()} ({lbl_br}) ===")
-    
-    segments = {
-        f"{start.date()} → {br.date()}":     (start, br),
-        f"{br.date()} → {break2.date()}":    (br, break2),
-        f"{br.date()} → {end.date()}":       (br, end),
-    }
-    
+    lbl_start = sub['week_lbl'].iloc[0]
+    lbl_end   = sub['week_lbl'].iloc[-1]
+
     for prem in ['prm_90', 'prm_max1Y']:
-        print(f"\n-- Премия {prem} --")
-        for name, (s, e) in segments.items():
-            seg = weekly_dt.loc[s:e]
-            r_p, r_s = calc_corr(seg, prem)
-            mark_p = '✓' if abs(r_p) >= 0.2 else ' '
-            mark_s = '✓' if abs(r_s) >= 0.2 else ' '
-            print(f"{name:25s} | Pearson={r_p:+.2f}{mark_p} | Spearman={r_s:+.2f}{mark_s}")
+        pvals = granger_pvals(sub, prem, y_col='saldo', max_lag=4)
+        if not pvals:
+            print(f"{prem:10s}: недостаточно наблюдений для теста")
+            continue
+
+        # «лучший» лаг = наименьший p-value
+        best_lag, best_p = min(pvals.items(), key=lambda x: x[1])
+        mark_best = "✓" if best_p < 0.05 else "✗"
+
+        print(f"{prem:10s} [{lbl_start} → {lbl_end}]")
+        print(f"    → best lag = {best_lag}, p = {best_p:.3f} {mark_best}")
+
+        # печать всех лагов с отметкой значимости
+        all_str = ", ".join(
+            f"{lag}:{pv:.3f}{'*' if pv < 0.05 else ''}"
+            for lag, pv in pvals.items()
+        )
+        print(f"    all p-values: {all_str}")
