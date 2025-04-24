@@ -1,109 +1,102 @@
-Чиним оба косяка разом:
+Ниже **цель — получить единый `weekly_panel_dt`**  
+(1 строка = конец банковской недели **Wed**, как у `weekly_dt`) с уже готовыми полями  
 
-* **`Index.sub`** не работает → считаем порядковый номер недели внутри месяца “руками”.
-* Вместо вороха `post_дата` делаем **один** бинарный признак `kr_meeting` = 1, если в эту недельную выборку попало **хотя бы одно** заседание ЦБ.
-
-Ниже ― полный, проверенный код без дыр в `key_rate_wavg`.
+| поле | как считается | зачем |
+|------|---------------|-------|
+| **key_rate_wavg** | среднее ключевой за Thu → Wed | контроль «цены денег» |
+| **kr_change** | 1, если в эту неделю было заседание ЦБ (дата из `kc_events`) | event-dummy для DiD / event-study |
+| **clients_wavg** | среднее -— либо end-of-day клиенты, либо ffill | нормировка ₽-потока «на клиента» |
+| *(дальше любые премии / saldo уже есть из `weekly_dt`)* |
 
 ```python
 import pandas as pd
 import numpy as np
-from pathlib import Path
 
-# ------------------------------------------------------------------
-# 1.  исходные Excel-файлы
-# ------------------------------------------------------------------
-DATA = Path('.')
-weekly_dt = (pd.read_excel(DATA/'weekly_dt.xlsx',  parse_dates=['dt_rep'])
-               .set_index('dt_rep').sort_index())
+# --------------------------------------------------------------
+# 0. входные DataFrame-ы УЖЕ в памяти  (см. ваши скриншоты)
+# --------------------------------------------------------------
+# kr_daily  : index=date         , col = 'key_rate'  (float,   0.055 = 5.5 %)
+# kc_events : Series/Index       , dtype=datetime64  (даты заседаний ЦБ)
+# clients   : index=dt_rep daily , col = 'clients'   (ffill уже сделан)
+# weekly_dt : index=dt_rep (Wed) , saldo / премии / week_lbl …
 
-kr_daily  = (pd.read_excel(DATA/'key_rate.xlsx',  parse_dates=['date'])
-               .assign(key_rate = lambda d:
-                       d['KR'].astype(str)
-                               .str.replace(',', '.')
-                               .str.rstrip('%')
-                               .astype(float)/100)
-               .set_index('date')[['key_rate']]
-               .asfreq('D')
-               .ffill())
+# --------------------------------------------------------------
+# 1. ключевая ставка – средняя за неделю Thu→Wed
+# --------------------------------------------------------------
+# убедимся, что кривых «дыр» нет
+kr_daily = (
+    kr_daily
+    .asfreq('D')            # Continuous calendar
+    .ffill()
+)
 
-kc_events = (pd.read_excel(DATA/'kc_events.xlsx', parse_dates=['DATE'])
-               ['DATE'].dt.normalize())
+# среднее по тем же неделям (Week-Wed = каждую среду)
+key_rate_wavg = (
+    kr_daily['key_rate']
+    .resample('W-WED')      # Thu-Wed окно
+    .mean()
+    .rename('key_rate_wavg')
+)
 
-clients   = (pd.read_excel(DATA/'clients.xlsx',   parse_dates=['dt_rep'])
-               .set_index('dt_rep')
-               .sort_index()
-               .asfreq('D').ffill())          # до daily
+# --------------------------------------------------------------
+# 2. бинарник «на этой неделе было заседание»
+# --------------------------------------------------------------
+# daily-флажки 0/1
+kr_change_daily = (
+    pd.Series(1, index=kc_events,
+              name='kr_change')
+    .reindex(kr_daily.index, fill_value=0)
+)
 
-# ------------------------------------------------------------------
-# 2.  агрегируем всё к недельной частоте (Thu-Wed)
-# ------------------------------------------------------------------
-kr_w = (kr_daily
-          .resample('W-THU')
-          .agg(key_rate_wavg=('key_rate','mean'),
-               kr_change    =('key_rate',lambda s:int(s.nunique()>1))))
+# агрегируем: если в неделе был ≥1 день с флажком → 1
+kr_change = (
+    kr_change_daily
+    .resample('W-WED')
+    .max()
+    .astype('int')
+)
 
-clients_w = (clients
-               .resample('W-THU')
-               .mean()
-               .rename(columns={'clients':'clients_mean'}))
+# --------------------------------------------------------------
+# 3. клиенты – среднее за неделю  (можно .last() — решайте)
+# --------------------------------------------------------------
+clients_wavg = (
+    clients['clients']
+    .asfreq('D').ffill()
+    .resample('W-WED')
+    .mean()                      # or .last()
+    .rename('clients_wavg')
+)
 
-# FLAG заседания ЦБ в текущей неделе
-kr_w['kr_meeting'] = 0
-for d in kc_events:
-    kr_w.loc[kr_w.index == kr_w.index.asof(d), 'kr_meeting'] = 1
+# --------------------------------------------------------------
+# 4. соединяем всё в единую панель
+# --------------------------------------------------------------
+weekly_panel_dt = (
+    weekly_dt
+      .join([key_rate_wavg, kr_change, clients_wavg], how='left')
+      .sort_index()
+)
 
-# ------------------------------------------------------------------
-# 3.  мержим с weekly_dt
-# ------------------------------------------------------------------
-panel = (weekly_dt
-           .join([kr_w, clients_w], how='left')
-           .sort_index())
+# --------------------------------------------------------------
+# 5. быстрая проверка & экспорт
+# --------------------------------------------------------------
+print(weekly_panel_dt.tail(3))
 
-# ------------------------------------------------------------------
-# 4.  фазы, сезонность, лаги, «на клиента»
-# ------------------------------------------------------------------
-BREAK_1 = pd.Timestamp('2024-05-15')
-BREAK_2 = pd.Timestamp('2024-08-28')
-BREAK_3 = pd.Timestamp('2025-02-19')
-
-panel['phase_II']  = ((panel.index>=BREAK_2)&(panel.index<BREAK_3)).astype(int)
-panel['phase_III'] = ( panel.index>=BREAK_3).astype(int)
-
-# неделя внутри месяца (1‒5)  /  «зарплатная» (третья)
-week_in_month = ((panel.index.day - 1)//7 + 1)
-panel['week_of_month'] = week_in_month
-panel['salary_week']   = (week_in_month == 3).astype(int)
-
-# лаги p=4  /  q=0…3
-for l in range(1,5):
-    panel[f'saldo_lag{l}'] = panel['saldo'].shift(l)
-
-for l in range(4):
-    for col in ['prm_90','prm_max1Y']:
-        panel[f'{col}_lag{l}'] = panel[col].shift(l)
-
-# показатели «на клиента»
-for col in ['saldo','prm_90','prm_max1Y']:
-    panel[f'{col}_pc'] = panel[col] / panel['clients_mean']
-
-# ------------------------------------------------------------------
-# 5.  export
-# ------------------------------------------------------------------
-out = DATA/'weekly_panel_dt.xlsx'
-with pd.ExcelWriter(out, engine='xlsxwriter') as xl:
-    panel.to_excel(xl, sheet_name='panel')
-
-print(f'✓ weekly_panel_dt.xlsx записан ({len(panel)} строк)')
+weekly_panel_dt.to_excel('weekly_panel_dt.xlsx',
+                         sheet_name='panel', engine='xlsxwriter')
+print('✓ weekly_panel_dt.xlsx создан —', len(weekly_panel_dt), 'строк')
 ```
 
-### что изменилось
+### что теперь готово
 
-| блок | исправление / добавка |
-|------|-----------------------|
-| **key-rate** | после `asfreq('D').ffill()` средние за неделю считаются без пропусков ⇒ `key_rate_wavg` больше не NaN |
-| **флаг заседания** | `kr_meeting` = 1, если в интервал Thu→Wed попала **любая** дата из `kc_events.xlsx` |
-| **сезонность** | `week_of_month` & `salary_week` вычислены векторно, без `.sub()` |
-| **лаги / pc-метрики** | те же, что нужны для OLS-, ARDL-, SARIMAX-моделей |
+* **`weekly_panel_dt`** содержит: `saldo`, все премии (`prm_90`, `prm_max1Y`, …), `key_rate_wavg`, `kr_change`, `clients_wavg`, `week_lbl`.  
+* лаги, взаимодействия, dummy-фазы добавляем прямо в ноутбуке перед конкретной моделью:
+  ```python
+  panel = weekly_panel_dt.copy()
+  panel['phase_II'] = (panel.index >= pd.Timestamp('2024-08-28')).astype(int)
+  panel['phase_III']= (panel.index >= pd.Timestamp('2025-02-19')).astype(int)
+  # примеры лагов:
+  for l in range(1,4):
+      panel[f'prm90_l{l}'] = panel['prm_90'].shift(l)
+  ```
 
-Файл `weekly_panel_dt.xlsx` теперь сразу готов для тестов чувствительности.
+Данных достаточно для **OLS / Newey-West, ARDL, SARIMAX, event-study** без лишнего шума.
