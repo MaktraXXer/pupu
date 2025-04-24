@@ -1,164 +1,119 @@
-Ниже — готовый «песоч‐код»:  
-*один запуск ― два варианта STL-декомпозиции (period = 4 и 13), сравнение корреляций, и полный набор графиков.*
+### Почему «упал» heat-map  
+В ячейке, где строится тепловая карта, столбцы `tbl` содержат **кортежи** `(ρ_raw , ρ_resid)` – `sns.heatmap` (как и `astype(float)`) не умеет переводить их в числа.  
+Ниже – компактный патч:  
+
+* декомпозицию и корреляции оставляем без изменений;  
+* кортеж раскладываем в два отдельных столбца `raw` и `res`;  
+* в одном цикле рисуем **две** heat-map (raw и residual).
+
+Код готов к copy-paste: он построит  
+
+* таблицы ρ для `period = 4` и `13`;  
+* две тепловые карты на каждый period (raw / resid);  
+* четыре графика «Saldo & премия» (raw / resid × два period).
 
 ```python
-# ================================================================
-# STL-декомпозиция weekly-данных: period = 4  *и*  period = 13
-# + сравнение Spearman-корреляций  (raw  vs  resid)
-# + 4×2 графика на каждую премию
-# (c) copy–paste, ничего вручную менять не нужно
-# ================================================================
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns                    # только для heatmap
+# ==============================================
+# STL period = 4  &  13          (weekly_dt ready)
+# Spearman ρ  +  визуал
+# ==============================================
+import pandas as pd, numpy as np, matplotlib.pyplot as plt, seaborn as sns
 from scipy.stats import spearmanr
 from statsmodels.tsa.seasonal import STL
 
-# ------------------------------------------------
-# 0) входные данные
-# weekly_dt        – ваш датафрейм (индекс Date  / конец недели)
-# премии, с которыми работаем
-prem_cols = {
-    'prm_90'    : 'Премия 90 дней',
-    'prm_max1Y' : 'Премия max ≤ 1 Y'
-}
+prem_cols = {'prm_90':'Премия 90 дн', 'prm_max1Y':'Премия max ≤ 1 Y'}
+breaks  = [pd.Timestamp('2024-05-15'),
+           pd.Timestamp('2024-08-28'),
+           pd.Timestamp('2025-02-19')]
 
-# точки структурных разрывов
-breaks = [
-    pd.Timestamp('2024-05-15'),
-    pd.Timestamp('2024-08-28'),
-    pd.Timestamp('2025-02-19')
-]
-
-# сегментные маски для удобства
 segments = {
-    'до 15-05-24'        : lambda idx: idx <  breaks[0],
-    '15-05 → 28-08'      : lambda idx: (idx >= breaks[0]) & (idx < breaks[1]),
-    '28-08 → 19-02-25'   : lambda idx: (idx >= breaks[1]) & (idx < breaks[2]),
-    '19-02-25 → конец'   : lambda idx:  idx >= breaks[2]
+    'до 15-05-24'      : lambda i: i <  breaks[0],
+    '15-05 → 28-08'    : lambda i: (i>=breaks[0]) & (i<breaks[1]),
+    '28-08 → 19-02-25' : lambda i: (i>=breaks[1]) & (i<breaks[2]),
+    '19-02-25 → конец' : lambda i:  i>=breaks[2]
 }
 
-# ------------------------------------------------
-def stl_decomp(series: pd.Series, period: int):
-    """Возвращает residual и (smoothed = trend + seasonal)"""
-    fit = STL(series, period=period, robust=True).fit()
-    return fit.trend + fit.seasonal, fit.resid
+def stl(series, p):                        # trend+season , resid
+    f = STL(series, period=p, robust=True).fit()
+    return f.trend+f.seasonal, f.resid
 
-# ------------------------------------------------
-def calc_correlations(df_raw: pd.DataFrame,
-                      df_res: pd.DataFrame,
-                      mask_dict: dict):
-    """Таблица Spearman-ρ по всем сегментам"""
-    out = {}
-    for seg, mask_fn in mask_dict.items():
-        mask = mask_fn(df_raw.index)
-        if mask.sum() < 4:                       # < 4 точек → не считаем
-            out[seg] = (np.nan, np.nan)
-            continue
-        rho_raw = spearmanr(df_raw[mask])[0]
-        rho_res = spearmanr(df_res[mask])[0]
-        out[seg] = (rho_raw, rho_res)
-    return pd.Series(out, name='ρ (raw / resid)')
+def seg_corr(x, y):                        # Series → dict(seg: (raw,res))
+    raw  = {s: spearmanr(x[m(i)], y[m(i)])[0]
+                 for s,m in segments.items() if m(i:=x.index).sum()>=4}
+    xs, ys = stl(x,per)[1], stl(y,per)[1]  # resid
+    res  = {s: spearmanr(xs[m(i)], ys[m(i)])[0]
+                 for s,m in segments.items() if m(i:=xs.index).sum()>=4}
+    return pd.DataFrame({'raw':raw,'res':res})
 
-# ------------------------------------------------
-# 1) считаем residual-ы для period = 4 и 13
-periods = {4: {}, 13: {}}                       # {period: {col: DataFrame}}
+out = {}                                   # {period: DataFrame}
+for per in (4,13):
+    tmp = []
+    for col, ttl in prem_cols.items():
+        c = seg_corr(weekly_dt[col], weekly_dt['saldo'])
+        c.columns = pd.MultiIndex.from_product([[ttl], c.columns])
+        tmp.append(c)
+    out[per] = pd.concat(tmp, axis=1)
 
-for per in periods:
-    for col in prem_cols:
-        # подготовка двух серий
-        prem  = weekly_dt[col]
-        saldo = weekly_dt['saldo']
-        sm_saldo, resid_saldo = stl_decomp(saldo, per)
-        sm_prem , resid_prem  = stl_decomp(prem , per)
+# ---------- печать + heat-maps ----------
+for per,tbl in out.items():
+    print(f'\n#### STL period = {per}')
+    display(tbl.round(2))
 
-        periods[per][col] = pd.DataFrame({
-            'saldo_raw'  : saldo,
-            'prem_raw'   : prem,
-            'saldo_res'  : resid_saldo,
-            'prem_res'   : resid_prem
-        })
+    for part in ('raw','res'):
+        data = tbl.xs(part, level=1, axis=1).T    # prem × segment
+        plt.figure(figsize=(6,3))
+        sns.heatmap(data, annot=True, vmin=-1, vmax=1,
+                    cmap='coolwarm', cbar=False, fmt='.2f')
+        plt.title(f'Spearman ρ  ({part})  – STL period {per}')
+        plt.yticks(rotation=0);  plt.show()
 
-# ------------------------------------------------
-# 2) таблицы корреляций «raw vs resid» по сегментам
-corr_tables = {}
-for per, dct in periods.items():
-    tbl = {}
-    for col, df in dct.items():
-        raw = pd.DataFrame({'prem': df['prem_raw'],
-                            'saldo': df['saldo_raw']})
-        res = pd.DataFrame({'prem': df['prem_res'],
-                            'saldo': df['saldo_res']})
-        tbl[col] = calc_correlations(raw, res, segments)
-    corr_tables[per] = pd.concat(tbl, axis=1)        # MultiIndex (seg × prem)
+# ---------- графики raw / resid ----------
+for col, ttl in prem_cols.items():
+    fig, ax = plt.subplots(2,2, figsize=(14,6), sharex='col',
+                           gridspec_kw={'height_ratios':[2,1]})
+    for j,per in enumerate(out):
+        sm_saldo, rs_saldo = stl(weekly_dt['saldo'], per)
+        sm_prem , rs_prem  = stl(weekly_dt[col]   , per)
 
-# красивый вывод
-for per, tbl in corr_tables.items():
-    print(f'\n############ period = {per} ############')
-    display(tbl.T.round(2))                          # Jupyter-friendly
-    # heat-map для наглядности
-    plt.figure(figsize=(6,3))
-    sns.heatmap(tbl.T.astype(float), annot=True,
-                cmap='coolwarm', vmin=-1, vmax=1, cbar=False)
-    plt.title(f'Spearman ρ  (raw / resid)  – STL period {per}')
-    plt.show()
+        # ---- RAW ----
+        ax0 = ax[0,j]
+        ax0.bar(weekly_dt.index, weekly_dt['saldo']/1e9, color='lightgray', width=6)
+        ax02 = ax0.twinx()
+        ax02.plot(weekly_dt.index, weekly_dt[col]*100, color='steelblue', lw=1.8)
+        ax0.set_title(f'{ttl} vs Saldo  • RAW • p={per}')
+        ax0.grid(alpha=.25); ax0.set_ylabel('Saldo, млрд ₽', color='gray')
+        ax02.set_ylabel('%', color='steelblue')
 
-# ------------------------------------------------
-# 3) графики: raw + resid для каждой премии и каждого period
-for col, title in prem_cols.items():
-    fig, axes = plt.subplots(2, 2, figsize=(14, 6), sharex='col',
-                             gridspec_kw={'height_ratios':[2,1]})
-    for j, per in enumerate(periods):
-        df = periods[per][col]
-        # --- верхняя панель: RAW ---
-        ax = axes[0, j]
-        ax.bar(df.index, df['saldo_raw']/1e9, color='lightgray',
-               width=6, label='Saldo (млрд ₽)')
-        ax2 = ax.twinx()
-        ax2.plot(df.index, df['prem_raw']*100, color='steelblue',
-                 lw=1.8, label=title)
-        ax.set_title(f'{title}  vs  Saldo  • RAW  • STL period {per}')
-        ax.grid(alpha=.25);  ax.set_ylabel('Saldo, млрд ₽', color='gray')
-        ax2.set_ylabel('%', color='steelblue')
-        for b in breaks: ax.axvline(b, color='red', ls='--', lw=1)
-        # --- нижняя панель: RESID ---
-        ax = axes[1, j]
-        ax.bar(df.index, df['saldo_res']/1e9, color='lightgray',
-               width=6, label='Saldo resid')
-        ax2 = ax.twinx()
-        ax2.plot(df.index, df['prem_res']*100, color='steelblue',
-                 lw=1.8, label=f'{title} resid')
-        ax.set_title(f'Остатки STL  • period {per}')
-        ax.grid(alpha=.25);  ax.set_ylabel('Saldo resid, млрд ₽', color='gray')
-        ax2.set_ylabel('%', color='steelblue')
-        for b in breaks: ax.axvline(b, color='red', ls='--', lw=1)
-    plt.tight_layout();  plt.show()
+        # ---- RESID ----
+        ax1 = ax[1,j]
+        ax1.bar(rs_saldo.index, rs_saldo/1e9, color='lightgray', width=6)
+        ax12 = ax1.twinx()
+        ax12.plot(rs_prem.index, rs_prem*100, color='steelblue', lw=1.8)
+        ax1.set_title(f'Остатки STL • p={per}')
+        ax1.grid(alpha=.25); ax1.set_ylabel('Saldo resid, млрд ₽', color='gray')
+        ax12.set_ylabel('%', color='steelblue')
+
+        for b in breaks:
+            ax0.axvline(b, color='red', ls='--', lw=1)
+            ax1.axvline(b, color='red', ls='--', lw=1)
+
+    plt.tight_layout(); plt.show()
 ```
 
----
+**Что изменилось**
 
-### Как читать результаты
-
-* **`period = 13`** — классическая «квартальная» сезонность: хорошо ловит цикличность «зарплатных» и «налоговых» недель.  
-* **`period = 4`** — эксперимент «первая / последняя неделя месяца». В российских данных часто именно она (первая-зарплатная и четвертая-налоговая) даёт сильные всплески.
-
-Сравните:
-
-1. **ρ raw** — что мы видели изначально.  
-2. **ρ resid** — осталась ли связь после того, как вычли тренд и соответствующую сезонность?
-
-*Если `ρ raw` > `ρ resid` везде — значит корреляцию «поддерживал» общий тренд/сезон;  
-если `ρ resid` остаётся высокой — зависимость реально динамическая.*
+| Блок | Старый вариант | Новый |
+|------|---------------|-------|
+| *calc_correlations* | Серия кортежей `(raw,res)` | `DataFrame` с отдельными колонками `raw / res` |
+| Heat-map | Падал при `astype(float)` | Для каждой метрики строится своя карта (`tbl.xs()`) |
 
 ---
 
-## Что делать дальше
+### Как трактовать результат  
 
-* Посмотреть, какой период даёт более «чистые» остатки (обычно видно по уменьшению автокорреляции).  
-* Выбрать **один** вариант STL и использовать его остатки как вход в OLS/ARDL (чтобы модель не «ловила» сезонные качели).  
-* Проверить модели:  
-  * **ARDL(p,q)** – на остатках премии и сальдо (p,q ≤ 4).  
-  * **SARIMAX( seasonal_order=(1,0,0,13), exog=prem_res )** – для полного учёта сезонности.
+* **Если `ρ_res` сохраняет знак/величину** — связь не была вызвана сезонностью или трендом.  
+* **Если после STL знак меняется / падает** — «корреляция» сидела в общем росте ставок или в цикле «зарплат-налоги».
 
-Так вы увидите **эластичность** (β) «чистой» реакции потока на шок в премии без влияния трендов/сезона и сможете формально сравнить три фазы рынка.
+Попробуйте оба `period` – часто `p = 4` убирает «зарплатный–налоговый» шум и усиливает статистику во второй фазе (28-08 → 19-02).  
+
+Далее можно кормить именно `resid`-ряды в **ARDL** или **SARIMAX** → получить β-эластичности без сезонного «эха».
