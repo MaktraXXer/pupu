@@ -1,85 +1,96 @@
-import pandas as pd
+# =============================================================
+#  SEGMENT-OLS  •  HAC-cov  •  предварительный масштабинг
+# =============================================================
+import pandas as pd, numpy as np
 import statsmodels.api as sm
-from statsmodels.stats.stattools import durbin_watson
 from statsmodels.stats.diagnostic import acorr_ljungbox
+from statsmodels.stats.stattools   import durbin_watson
 
-# ------------------------------------------------------------------
-# 0.  подхватываем итоговый weekly_panel_dt (у вас он уже в сессии)
-# ------------------------------------------------------------------
+# -------------------------------------------------------------
+# 0.  берём weekly_panel_dt  (индекс — ср. окончание недели)
+# -------------------------------------------------------------
 try:
-    panel = weekly_panel_dt.copy()             # ← возьмём из памяти
+    panel = weekly_panel_dt.copy()
 except NameError:
     raise RuntimeError("❌ weekly_panel_dt не найден в сессии!")
 
-# --- удобный список сегментов -------------------------------------
-BREAK1 = pd.Timestamp('2024‑05‑15')
-BREAK2 = pd.Timestamp('2024‑08‑28')
-BREAK3 = pd.Timestamp('2025‑02‑19')
+# -------------------------------------------------------------
+# 1.  предварительная подготовка масштаба ----------------------
+#     — чтобы коэффициенты легко читать
+# -------------------------------------------------------------
+panel = panel.assign(
+    saldo_mrd       = panel['saldo']        / 1e9,        # млрд ₽
+    prem90_bp       = panel['prm_90']       * 1e4,        # б.п.
+    premMax_bp      = panel['prm_max1Y']    * 1e4,        # б.п.
+    key_rate_pct    = panel['key_rate_wavg']* 100         # %
+)
 
+# -------------------------------------------------------------
+# 2.  сегменты времени
+# -------------------------------------------------------------
+B1, B2, B3 = map(pd.Timestamp, ('2024-05-15','2024-08-28','2025-02-19'))
 segments = {
-    "A  • до 15‑05‑24"        : panel.index <  BREAK1,
-    "B  • 15‑05 → 28‑08"      : (panel.index >= BREAK1) & (panel.index < BREAK2),
-    "C  • 28‑08 → 19‑02‑25"   : (panel.index >= BREAK2) & (panel.index < BREAK3),
-    "D  • 19‑02‑25 → конец"   :  panel.index >= BREAK3,
-    "E  • 15‑05‑24 → конец"   :  panel.index >= BREAK1,
-    "F  • 28‑08‑24 → конец"   :  panel.index >= BREAK2,
-    "G  • весь период"        :  panel.index.notnull()
+    "A  • до 15-05-24"      : panel.index <  B1,
+    "B  • 15-05 → 28-08"    : (panel.index>=B1)&(panel.index<B2),
+    "C  • 28-08 → 19-02-25" : (panel.index>=B2)&(panel.index<B3),
+    "D  • 19-02-25 → end"   : panel.index>=B3,
+    "E  • 15-05-24 → end"   : panel.index>=B1,
+    "F  • 28-08-24 → end"   : panel.index>=B2,
+    "G  • весь период"      : panel.index.notnull()
 }
 
-# ------------------------------------------------------------------
-# 1.  Хелпер: OLS + Newey‑West  (lag = 4 недели)
-# ------------------------------------------------------------------
+# -------------------------------------------------------------
+# 3.  helper: OLS + Newey-West (lag = 4 нед.)
+# -------------------------------------------------------------
 def hac_ols(df, y, X, lags=4):
-    df = df[[y] + X].dropna()
-    y_vec = df[y]
-    X_mat = sm.add_constant(df[X])
-    mdl    = sm.OLS(y_vec, X_mat).fit(cov_type='HAC', cov_kwds={'maxlags': lags})
-    dw     = durbin_watson(mdl.resid)
-    lb_p   = acorr_ljungbox(mdl.resid, lags=[lags], return_df=True)['lb_pvalue'].iloc[0]
+    df = df[[y]+X].dropna()
+    mdl = sm.OLS(df[y], sm.add_constant(df[X])).fit(
+              cov_type='HAC', cov_kwds={'maxlags':lags})
+    dw   = durbin_watson(mdl.resid)
+    lb_p = acorr_ljungbox(mdl.resid, lags=[lags],
+                          return_df=True)['lb_pvalue'].iloc[0]
     return mdl, dw, lb_p
 
-# ------------------------------------------------------------------
-# 2.  Гоняем все сегменты и складываем короткое резюме
-# ------------------------------------------------------------------
-results = []
+# -------------------------------------------------------------
+# 4.  прогоним все сегменты • две премии • базовая спецификация
+# -------------------------------------------------------------
+spec_X = ['prem', 'key_rate_pct']           # можно менять!
+out = []
 
-for nm, m in segments.items():
-    sub = panel.loc[m].copy()
-    if len(sub) < 10:
-        continue                                   # слишком мало точек
-    mdl, dw, lb_p = hac_ols(sub,
-                            y  ='saldo',
-                            X  =['prm_90', 'key_rate_wavg'])
+for prem_col, prem_tag in (('prem90_bp','β_90bp'),
+                           ('premMax_bp','β_maxbp')):
+    panel = panel.assign(prem = panel[prem_col])          # alias
+    for seg_name, msk in segments.items():
+        sub = panel.loc[msk]
+        if len(sub) < 10:
+            continue
+        mdl, dw, lb_p = hac_ols(sub, 'saldo_mrd', spec_X)
 
-    beta    = mdl.params['prm_90']
-    t_stat  = mdl.tvalues['prm_90']
-    p_val   = mdl.pvalues['prm_90']
+        out.append({
+            'segment' : seg_name,
+            'prem'    : prem_tag,
+            'n_obs'   : len(sub),
+            'beta'    : mdl.params['prem'],
+            't_stat'  : mdl.tvalues['prem'],
+            'p_val'   : mdl.pvalues['prem'],
+            'DW'      : dw,
+            'LB_p'    : lb_p,
+            'R2_adj'  : mdl.rsquared_adj
+        })
 
-    results.append({
-        'segment'  : nm,
-        'n_obs'    : len(sub),
-        'β_prem90' : beta,
-        't‑stat'   : t_stat,
-        'p‑value'  : p_val,
-        'DW'       : dw,
-        'Ljung‑Box p' : lb_p,
-        'R²_adj'   : mdl.rsquared_adj
-    })
-
-summary = (pd.DataFrame(results)
-             .set_index('segment')
-             .round(3)
+# -------------------------------------------------------------
+# 5.  компактная сводка + полный summary по фазе C
+# -------------------------------------------------------------
+summary = (pd.DataFrame(out)
+             .round({'beta':3,'t_stat':2,'p_val':3,'DW':2,'LB_p':3,'R2_adj':3})
+             .set_index(['segment','prem'])
              .sort_index())
 
-import ace_tools as tools; tools.display_dataframe_to_user("OLS_HAC_summary", summary)
+display(summary)                               # ← Jupyter-friendly
 
-# ------------------------------------------------------------------
-# 3.  Полный отчёт по одному сегменту (фаза C) ---------------
-# ------------------------------------------------------------------
-seg_name = "C  • 28‑08 → 19‑02‑25"
-sub = panel.loc[segments[seg_name]].dropna(subset=['saldo','prm_90','key_rate_wavg'])
-mdl, _, _ = hac_ols(sub, 'saldo', ['prm_90', 'key_rate_wavg'])
-
-print(f"\n===== Подробный отчёт SEGMENT {seg_name}  =====\n")
-print(mdl.summary())
-
+# полный отчёт: премия 90 дн, фаза C
+phaseC = panel.loc[segments["C  • 28-08 → 19-02-25"]].dropna(
+                     subset=['saldo_mrd','prem90_bp','key_rate_pct'])
+mdlC,_,_ = hac_ols(phaseC, 'saldo_mrd', ['prem90_bp','key_rate_pct'])
+print("\n=== OLS+HAC • фаза C • prem_90bp ===\n")
+print(mdlC.summary())
