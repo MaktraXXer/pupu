@@ -1,102 +1,85 @@
-Ниже **цель — получить единый `weekly_panel_dt`**  
-(1 строка = конец банковской недели **Wed**, как у `weekly_dt`) с уже готовыми полями  
-
-| поле | как считается | зачем |
-|------|---------------|-------|
-| **key_rate_wavg** | среднее ключевой за Thu → Wed | контроль «цены денег» |
-| **kr_change** | 1, если в эту неделю было заседание ЦБ (дата из `kc_events`) | event-dummy для DiD / event-study |
-| **clients_wavg** | среднее -— либо end-of-day клиенты, либо ffill | нормировка ₽-потока «на клиента» |
-| *(дальше любые премии / saldo уже есть из `weekly_dt`)* |
-
-```python
 import pandas as pd
-import numpy as np
+import statsmodels.api as sm
+from statsmodels.stats.stattools import durbin_watson
+from statsmodels.stats.diagnostic import acorr_ljungbox
 
-# --------------------------------------------------------------
-# 0. входные DataFrame-ы УЖЕ в памяти  (см. ваши скриншоты)
-# --------------------------------------------------------------
-# kr_daily  : index=date         , col = 'key_rate'  (float,   0.055 = 5.5 %)
-# kc_events : Series/Index       , dtype=datetime64  (даты заседаний ЦБ)
-# clients   : index=dt_rep daily , col = 'clients'   (ffill уже сделан)
-# weekly_dt : index=dt_rep (Wed) , saldo / премии / week_lbl …
+# ------------------------------------------------------------------
+# 0.  подхватываем итоговый weekly_panel_dt (у вас он уже в сессии)
+# ------------------------------------------------------------------
+try:
+    panel = weekly_panel_dt.copy()             # ← возьмём из памяти
+except NameError:
+    raise RuntimeError("❌ weekly_panel_dt не найден в сессии!")
 
-# --------------------------------------------------------------
-# 1. ключевая ставка – средняя за неделю Thu→Wed
-# --------------------------------------------------------------
-# убедимся, что кривых «дыр» нет
-kr_daily = (
-    kr_daily
-    .asfreq('D')            # Continuous calendar
-    .ffill()
-)
+# --- удобный список сегментов -------------------------------------
+BREAK1 = pd.Timestamp('2024‑05‑15')
+BREAK2 = pd.Timestamp('2024‑08‑28')
+BREAK3 = pd.Timestamp('2025‑02‑19')
 
-# среднее по тем же неделям (Week-Wed = каждую среду)
-key_rate_wavg = (
-    kr_daily['key_rate']
-    .resample('W-WED')      # Thu-Wed окно
-    .mean()
-    .rename('key_rate_wavg')
-)
+segments = {
+    "A  • до 15‑05‑24"        : panel.index <  BREAK1,
+    "B  • 15‑05 → 28‑08"      : (panel.index >= BREAK1) & (panel.index < BREAK2),
+    "C  • 28‑08 → 19‑02‑25"   : (panel.index >= BREAK2) & (panel.index < BREAK3),
+    "D  • 19‑02‑25 → конец"   :  panel.index >= BREAK3,
+    "E  • 15‑05‑24 → конец"   :  panel.index >= BREAK1,
+    "F  • 28‑08‑24 → конец"   :  panel.index >= BREAK2,
+    "G  • весь период"        :  panel.index.notnull()
+}
 
-# --------------------------------------------------------------
-# 2. бинарник «на этой неделе было заседание»
-# --------------------------------------------------------------
-# daily-флажки 0/1
-kr_change_daily = (
-    pd.Series(1, index=kc_events,
-              name='kr_change')
-    .reindex(kr_daily.index, fill_value=0)
-)
+# ------------------------------------------------------------------
+# 1.  Хелпер: OLS + Newey‑West  (lag = 4 недели)
+# ------------------------------------------------------------------
+def hac_ols(df, y, X, lags=4):
+    df = df[[y] + X].dropna()
+    y_vec = df[y]
+    X_mat = sm.add_constant(df[X])
+    mdl    = sm.OLS(y_vec, X_mat).fit(cov_type='HAC', cov_kwds={'maxlags': lags})
+    dw     = durbin_watson(mdl.resid)
+    lb_p   = acorr_ljungbox(mdl.resid, lags=[lags], return_df=True)['lb_pvalue'].iloc[0]
+    return mdl, dw, lb_p
 
-# агрегируем: если в неделе был ≥1 день с флажком → 1
-kr_change = (
-    kr_change_daily
-    .resample('W-WED')
-    .max()
-    .astype('int')
-)
+# ------------------------------------------------------------------
+# 2.  Гоняем все сегменты и складываем короткое резюме
+# ------------------------------------------------------------------
+results = []
 
-# --------------------------------------------------------------
-# 3. клиенты – среднее за неделю  (можно .last() — решайте)
-# --------------------------------------------------------------
-clients_wavg = (
-    clients['clients']
-    .asfreq('D').ffill()
-    .resample('W-WED')
-    .mean()                      # or .last()
-    .rename('clients_wavg')
-)
+for nm, m in segments.items():
+    sub = panel.loc[m].copy()
+    if len(sub) < 10:
+        continue                                   # слишком мало точек
+    mdl, dw, lb_p = hac_ols(sub,
+                            y  ='saldo',
+                            X  =['prm_90', 'key_rate_wavg'])
 
-# --------------------------------------------------------------
-# 4. соединяем всё в единую панель
-# --------------------------------------------------------------
-weekly_panel_dt = (
-    weekly_dt
-      .join([key_rate_wavg, kr_change, clients_wavg], how='left')
-      .sort_index()
-)
+    beta    = mdl.params['prm_90']
+    t_stat  = mdl.tvalues['prm_90']
+    p_val   = mdl.pvalues['prm_90']
 
-# --------------------------------------------------------------
-# 5. быстрая проверка & экспорт
-# --------------------------------------------------------------
-print(weekly_panel_dt.tail(3))
+    results.append({
+        'segment'  : nm,
+        'n_obs'    : len(sub),
+        'β_prem90' : beta,
+        't‑stat'   : t_stat,
+        'p‑value'  : p_val,
+        'DW'       : dw,
+        'Ljung‑Box p' : lb_p,
+        'R²_adj'   : mdl.rsquared_adj
+    })
 
-weekly_panel_dt.to_excel('weekly_panel_dt.xlsx',
-                         sheet_name='panel', engine='xlsxwriter')
-print('✓ weekly_panel_dt.xlsx создан —', len(weekly_panel_dt), 'строк')
-```
+summary = (pd.DataFrame(results)
+             .set_index('segment')
+             .round(3)
+             .sort_index())
 
-### что теперь готово
+import ace_tools as tools; tools.display_dataframe_to_user("OLS_HAC_summary", summary)
 
-* **`weekly_panel_dt`** содержит: `saldo`, все премии (`prm_90`, `prm_max1Y`, …), `key_rate_wavg`, `kr_change`, `clients_wavg`, `week_lbl`.  
-* лаги, взаимодействия, dummy-фазы добавляем прямо в ноутбуке перед конкретной моделью:
-  ```python
-  panel = weekly_panel_dt.copy()
-  panel['phase_II'] = (panel.index >= pd.Timestamp('2024-08-28')).astype(int)
-  panel['phase_III']= (panel.index >= pd.Timestamp('2025-02-19')).astype(int)
-  # примеры лагов:
-  for l in range(1,4):
-      panel[f'prm90_l{l}'] = panel['prm_90'].shift(l)
-  ```
+# ------------------------------------------------------------------
+# 3.  Полный отчёт по одному сегменту (фаза C) ---------------
+# ------------------------------------------------------------------
+seg_name = "C  • 28‑08 → 19‑02‑25"
+sub = panel.loc[segments[seg_name]].dropna(subset=['saldo','prm_90','key_rate_wavg'])
+mdl, _, _ = hac_ols(sub, 'saldo', ['prm_90', 'key_rate_wavg'])
 
-Данных достаточно для **OLS / Newey-West, ARDL, SARIMAX, event-study** без лишнего шума.
+print(f"\n===== Подробный отчёт SEGMENT {seg_name}  =====\n")
+print(mdl.summary())
+
