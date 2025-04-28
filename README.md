@@ -1,60 +1,48 @@
-import matplotlib.pyplot as plt
-
-# --- вспомогательная функция -----------------------------------------------
-def draw_scatter(spread_col: str, x_label: str):
-    """Строит scatter‑plot 'спред – общая пролонгация' для заданного столбца."""
-    mask = (
-        (df['TermBucketGrouping'] == 'Все бакеты') &
-        df['OpenedDeals'].notna() & df['ClosedDeals'].notna() &
-        df['Opened_Count_Prolong'].notna() & (df['Opened_Count_Prolong'] > 0) &
-        df['Opened_Count_NewNoProlong'].notna() & (df['Opened_Count_NewNoProlong'] > 0) &
-        df[spread_col].notna() &
-        df['Общая пролонгация'].notna()
-    )
-    data = df.loc[mask].copy()
-    data['Общая пролонгация_%'] = data['Общая пролонгация'] * 100
-
-    plt.figure(figsize=(8, 6))
-    below_or_equal = data['Общая пролонгация_%'] <= 100
-
-    plt.scatter(
-        data.loc[below_or_equal, spread_col],
-        data.loc[below_or_equal, 'Общая пролонгация_%'],
-        alpha=0.7
-    )
-    plt.scatter(
-        data.loc[~below_or_equal, spread_col],
-        data.loc[~below_or_equal, 'Общая пролонгация_%'],
-        color='red',
-        alpha=0.9,
-        label='Пролонгация > 100 %'
-    )
-
-    plt.axvline(0, linewidth=0.8, color='k')
-    plt.ylim(0, 120)
-    plt.xlabel(x_label)
-    plt.ylabel('Общая автопролонгация, %')
-    plt.title(f'Чувствительность: {x_label} vs доля пролонгации\nTermBucket = "Все бакеты"')
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
-
-# --- 1. Spread_New_vs_1y -----------------------------------------------------
-draw_scatter(
-    'Spread_New_vs_1y',
-    'Спред (новые без пролонгации – 1‑я автопролонгация), п.п.'
+WITH transfers AS (
+    SELECT
+        sbp.rep_W,
+        sbp.dt_rep,
+        sbp.bank_name_main,
+        sbp.is_big_transfer,
+        sbp.TRANSFER_TYPE,
+        sbp.INCOMING_SUM_TRANS_total,
+        sbp.OUTGOING_SUM_TRANS_total,
+        ISNULL(sbp.INCOMING_SUM_TRANS_total, 0) 
+          + ISNULL(sbp.OUTGOING_SUM_TRANS_total, 0) AS SALDO,
+        sbp.rep_Y,
+        sbp.rep_M
+    FROM [ALM].[ehd].[VW_transfers_FL_agg_dt] sbp WITH (NOLOCK)
+    WHERE sbp.rep_Y = '2025'
+      AND sbp.TRANSFER_TYPE = 'СБП-Перевод'
+      --AND sbp.rep_W = '2025.04.17-2025.04.23'
+      AND (sbp.spec_cat = 'Все категории' OR sbp.partner_code = 'Все категории')
+      AND sbp.direction_type = 'Переводы себе'
+      AND sbp.is_big_transfer = '1'
+      AND sbp.bank_name_main <> '!Все организации'
 )
-
-# --- 2. Spread_New_vs_2y -----------------------------------------------------
-draw_scatter(
-    'Spread_New_vs_2y',
-    'Спред (новые без пролонгации – 2‑я автопролонгация), п.п.'
-)
-
-# --- 3. Spread_New_vs_3y -----------------------------------------------------
-draw_scatter(
-    'Spread_New_vs_3y',
-    'Спред (новые без пролонгации – 3‑я автопролонгация), п.п.'
-)
+SELECT
+    t.rep_W,
+    t.dt_rep,
+    t.bank_name_main,
+    t.is_big_transfer,
+    t.TRANSFER_TYPE,
+    t.INCOMING_SUM_TRANS_total,
+    t.OUTGOING_SUM_TRANS_total,
+    t.SALDO,
+    -- Рейтинг по убыванию SALDO внутри каждой недели
+    RANK() OVER (
+        PARTITION BY t.rep_W
+        ORDER BY t.SALDO DESC
+    ) AS rank,
+    -- Рейтинг по убыванию абсолютного значения SALDO внутри каждой недели
+    RANK() OVER (
+        PARTITION BY t.rep_W
+        ORDER BY ABS(t.SALDO) DESC
+    ) AS rank_abs,
+    t.rep_Y,
+    t.rep_M
+FROM transfers t
+ORDER BY
+    t.rep_W,
+    t.dt_rep,
+    rank;
