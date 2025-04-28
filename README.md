@@ -1,4 +1,13 @@
-# 5. Отдельные waterfall‑графики и вывод недельных данных для каждого банка
+# 5. Отдельные waterfall-графики и вывод недельных данных для каждого банка
+
+# Переписываем w_lbl так, чтобы внутри использовались колонки w_start и w_end
+def w_lbl(r):
+    s = r['w_start']
+    e = r['w_end']
+    if s.month == e.month:
+        return f"{s.day:02d}-{e.day:02d} {ru_mon[e.month-1]}"
+    return f"{s.day:02d} {ru_mon[s.month-1]} – {e.day:02d} {ru_mon[e.month-1]}"
+
 selected = [
     'ПАО Сбербанк',
     'АО "АЛЬФА-БАНК"',
@@ -8,7 +17,6 @@ selected = [
 ]
 
 for bank in selected:
-    # Фильтрация по банку из общего df_saldo
     df_bank = df_saldo[df_saldo['bank_name_main'] == bank]
 
     # Ежедневная агрегация
@@ -20,7 +28,7 @@ for bank in selected:
     )
     daily_bank['saldo'] = daily_bank['incoming'] + daily_bank['outgoing']
 
-    # Недельная агрегация (четверг→среда), сохраняем w_end и w_start
+    # Недельная агрегация (четверг→среда)
     weekly_bank = (
         daily_bank
         .set_index('dt_rep')
@@ -31,15 +39,11 @@ for bank in selected:
     )
     weekly_bank['w_start'] = weekly_bank['w_end'] - pd.Timedelta(days=6)
     weekly_bank['saldo']   = weekly_bank['incoming'] + weekly_bank['outgoing']
-    weekly_bank['label']   = weekly_bank.apply(w_lbl, axis=1).to_numpy()
+    weekly_bank['label']   = weekly_bank.apply(w_lbl, axis=1)
 
     # Вывод таблицы с недельными данными
     print(f"\n--- {bank} — недельные данные ---")
-    print(
-        weekly_bank[
-            ['w_start','w_end','incoming','outgoing','saldo','label']
-        ].to_string(index=False)
-    )
+    print(weekly_bank[['w_start','w_end','incoming','outgoing','saldo','label']].to_string(index=False))
 
     # Построение waterfall-графика
     waterfall_mpl(
