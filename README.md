@@ -1,62 +1,56 @@
-# 6. Примечательные оттоки/притоки за последнюю неделю — вариант без MultiIndex
+# --- 6. «Примечательные» притоки / оттоки за последнюю неделю ----------------
+# (топ-3 по +saldo ≥ 100 млн и топ-3 по –|saldo| ≥ 100 млн, кроме big-5)
 
-# Предполагается, что ранее определены: df_saldo, w_lbl, bln_formatter, selected
-
-# 6.1 Ежедневная агрегация по всем банкам (если daily_bank_all ещё не была)
-daily_bank_all = (
+# 6-A. Недельная агрегация ПО КАЖДОМУ банку
+weekly_by_bank = (
     df_saldo
-    .groupby(['bank_name_main', 'dt_rep'], as_index=False)
-    .agg(incoming=('INCOMING','sum'),
-         outgoing=('OUTGOING','sum'))
+      .set_index('dt_rep')                                  # dt_rep уже datetime
+      .groupby('bank_name_main')                            # ← сначала банк
+      .resample('W-WED')                                    #   потом «четв→ср»
+      .agg(incoming=('INCOMING','sum'),
+           outgoing=('OUTGOING','sum'))
+      .reset_index()                                        # bank_name_main | w_end
 )
-daily_bank_all['saldo'] = daily_bank_all['incoming'] + daily_bank_all['outgoing']
 
-# 6.2 Недельная агрегация (четверг→среда) с помощью параметра on
-weekly_all = (
-    daily_bank_all
-    .groupby('bank_name_main')
-    .resample('W-WED', on='dt_rep')
-    .sum()
-    .reset_index()
-    .rename(columns={'dt_rep':'w_end'})
+weekly_by_bank['saldo']   = weekly_by_bank['incoming'] + weekly_by_bank['outgoing']
+weekly_by_bank['w_start'] = weekly_by_bank['dt_rep'] - pd.Timedelta(days=6)
+
+# метка вида «17-23 апр»
+weekly_by_bank['label'] = weekly_by_bank.apply(
+    lambda r: (f"{r['w_start'].day:02d}-{r['dt_rep'].day:02d} "
+               f"{ru_mon[r['dt_rep'].month-1]}"),
+    axis=1
 )
-weekly_all['w_start'] = weekly_all['w_end'] - pd.Timedelta(days=6)
-weekly_all['label']   = weekly_all.apply(w_lbl, axis=1)
 
-# 6.3 Берём только последнюю неделю
-last_week_end = weekly_all['w_end'].max()
-week_slice    = weekly_all[weekly_all['w_end'] == last_week_end]
+# 6-B. Последняя отчётная неделя
+last_week_end = weekly_by_bank['dt_rep'].max()
+week_last     = weekly_by_bank[weekly_by_bank['dt_rep'] == last_week_end]
 
-# 6.4 Исключаем уже использованные пять банков
-others = week_slice[~week_slice['bank_name_main'].isin(selected)]
+# 6-C. Отбрасываем «большую пятёрку»
+others = week_last[~week_last['bank_name_main'].isin(selected)]
 
-# 6.5 Топ‑3 по положительному сальдо ≥100 млн и топ‑3 по отрицательному сальдо ≤−100 млн
+# 6-D. Топ-3 положительных и топ-3 отрицательных (|saldo| ≥ 100 млн)
 pos_top3 = others[others['saldo'] >= 1e8].nlargest(3, 'saldo')
 neg_top3 = others[others['saldo'] <= -1e8].nsmallest(3, 'saldo')
+remarkable = pd.concat([pos_top3, neg_top3]).reset_index(drop=True)
 
-remarkable = pd.concat([pos_top3, neg_top3], ignore_index=True)
-
-# 6.6 Построение комбинированного бар‑чарта
-fig, ax = plt.subplots(figsize=(12,6))
-colors = ['forestgreen'] * len(pos_top3) + ['firebrick'] * len(neg_top3)
-
+# 6-E. Баркчарт (зелёные — притоки, красные — оттоки)
+fig, ax = plt.subplots(figsize=(10,6))
+colors = ['forestgreen' if v >= 0 else 'firebrick' for v in remarkable['saldo']]
 ax.bar(remarkable['bank_name_main'], remarkable['saldo'], color=colors)
 
-# Добавляем подписи
-max_abs = remarkable['saldo'].abs().max()
-for i, saldo in enumerate(remarkable['saldo']):
-    offset = (max_abs * 0.05) * (1 if saldo >= 0 else -1)
-    va = 'bottom' if saldo >= 0 else 'top'
-    ax.text(i, saldo + offset, f"{saldo/1e9:.2f}",
-            ha='center', va=va,
-            fontsize=10, fontweight='bold',
-            color=colors[i])
+# подписи на столбцах
+peak = remarkable['saldo'].abs().max()
+for i, v in enumerate(remarkable['saldo']):
+    offset = peak * 0.05 * (1 if v >= 0 else -1)
+    ax.text(i, v + offset, f"{v/1e9:.2f}",
+            ha='center', va=('bottom' if v >= 0 else 'top'),
+            fontweight='bold', fontsize=9, color=colors[i])
 
-# Оформление оси Y и заголовка
+# оформление
 ax.yaxis.set_major_formatter(bln_formatter)
 ax.set_ylabel('млрд руб.')
-week_label = remarkable['label'].iat[0] if not remarkable.empty else ''
-ax.set_title(f'Примечательные притоки/оттоки за неделю {week_label}', pad=12)
+ax.set_title(f'Примечательные притоки / оттоки за неделю {remarkable['label'].iat[0]}')
 ax.grid(alpha=.25, axis='y')
 plt.xticks(rotation=45, ha='right')
 plt.tight_layout()
