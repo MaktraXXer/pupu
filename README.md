@@ -1,70 +1,47 @@
-# ────────────────────────────────────────────────────────────────────────────
-# 6. Примечательные притоки / оттоки за ПОСЛЕДНЮЮ неделю (≥|100 млн|)
-# ────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
+# 7. ВСЕ «примечательные» банки (|saldo| ≥ 100 млн) за ВСЕ недели
+# ────────────────────────────────────────────────────────────────
 
-THRESHOLD = 1e8        # 100 млн руб.
-TOP_N     = 3          # сколько банки выводить в плюс / минус
-
-# --- 6-A. недельная агрегация «банк × Thu→Wed» -----------------------------
-weekly_bank = (
+# weekly_by_bank: банк × неделя  (четверг→среда)
+weekly_by_bank = (
     df_saldo
-      .groupby(['bank_name_main',              # ← банк
-                pd.Grouper(key='dt_rep', freq='W-WED')])   # ← недельный факт
+      .groupby(
+          ['bank_name_main',
+           pd.Grouper(key='dt_rep', freq='W-WED')]        # dt_rep → w_end
+      )
       .agg(incoming=('INCOMING','sum'),
            outgoing=('OUTGOING','sum'))
       .reset_index()
-      .rename(columns={'dt_rep': 'w_end'})     # чтобы было понятно
+      .rename(columns={'dt_rep': 'w_end'})
 )
+weekly_by_bank['saldo']   = weekly_by_bank['incoming'] + weekly_by_bank['outgoing']
+weekly_by_bank['w_start'] = weekly_by_bank['w_end'] - pd.Timedelta(days=6)
 
-weekly_bank['saldo']   = weekly_bank['incoming'] + weekly_bank['outgoing']
-weekly_bank['w_start'] = weekly_bank['w_end'] - pd.Timedelta(days=6)
-weekly_bank['label']   = weekly_bank.apply(
+# метка «дд–дд мес»
+weekly_by_bank['label'] = weekly_by_bank.apply(
     lambda r: f"{r.w_start.day:02d}-{r.w_end.day:02d} {ru_mon[r.w_end.month-1]}",
     axis=1
 )
 
-# --- 6-B. последняя неделя --------------------------------------------------
-last_week_end = weekly_bank['w_end'].max()
-wk_last       = weekly_bank[weekly_bank['w_end'] == last_week_end]
+# отсеиваем «большую пятёрку» и применяем порог 100 млн
+mask = (~weekly_by_bank['bank_name_main'].isin(selected)) & \
+       (weekly_by_bank['saldo'].abs() >= 1e8)
+remarkable_all = weekly_by_bank.loc[mask].copy()
 
-# --- 6-C. без big-5 ---------------------------------------------------------
-others = wk_last[~wk_last['bank_name_main'].isin(selected)]
+# сортируем, чтобы удобнее просматривать
+remarkable_all.sort_values(
+    ['w_end', 'saldo'], ascending=[False, False], inplace=True
+)
 
-# --- 6-D. отбор топов -------------------------------------------------------
-pos_top = (others[others['saldo'] >=  THRESHOLD]
-           .nlargest(TOP_N, 'saldo'))
-neg_top = (others[others['saldo'] <= -THRESHOLD]
-           .nsmallest(TOP_N, 'saldo'))
-
-remarkable = pd.concat([pos_top, neg_top]).reset_index(drop=True)
-
-# --- 6-E. проверка ----------------------------------------------------------
-print("\n=== Примечательные притоки / оттоки (кроме big-5) ===")
-if remarkable.empty:
-    print(f"- За неделю {wk_last['label'].iat[0]} нет банков с |сальдо| ≥ {THRESHOLD/1e6:.0f} млн ₽")
-else:
-    print(remarkable[['bank_name_main','saldo']]
-          .to_string(index=False,
-                     formatters={'saldo':lambda x:f'{x/1e9:.2f} млрд'}))
-
-# --- 6-F. график, если есть данные -----------------------------------------
-if not remarkable.empty:
-    fig, ax = plt.subplots(figsize=(10,6))
-    colors = ['forestgreen' if v >= 0 else 'firebrick' for v in remarkable['saldo']]
-    ax.bar(remarkable['bank_name_main'], remarkable['saldo'], color=colors)
-
-    # подписи на барах
-    max_abs = remarkable['saldo'].abs().max()
-    for i, v in enumerate(remarkable['saldo']):
-        off = max_abs * 0.05 * (1 if v >= 0 else -1)   # 5 % смещение
-        ax.text(i, v + off, f"{v/1e9:.2f}",
-                ha='center', va='bottom' if v >= 0 else 'top',
-                fontweight='bold', fontsize=9, color=colors[i])
-
-    ax.yaxis.set_major_formatter(bln_formatter)
-    ax.set_ylabel('млрд руб.')
-    ax.set_title(f"Примечательные притоки / оттоки за неделю {remarkable['label'].iat[0]}")
-    ax.grid(alpha=.25, axis='y')
-    plt.xticks(rotation=45, ha='right')
-    plt.tight_layout()
-    plt.show()
+# выводим в удобном формате
+pd.set_option('display.max_rows', None)
+print("\n=== ВСЕ недели с |сальдо| ≥ 100 млн (кроме big-5) ===")
+print(
+    remarkable_all[
+        ['label', 'bank_name_main', 'saldo']
+    ]
+    .assign(saldo_bln=lambda d: (d['saldo'] / 1e9).round(3))
+    .rename(columns={'label':'Неделя', 'bank_name_main':'Банк', 'saldo_bln':'Сальдо, млрд'})
+    .to_string(index=False)
+)
+pd.reset_option('display.max_rows')
