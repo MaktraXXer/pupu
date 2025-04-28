@@ -56,4 +56,10 @@ else:
     n = len(banks)
     x = np.linspace(0.02, 0.98, n)          # позиции по X внутри [0,1]
     for xi, bank in zip(x, banks):
-        leg_ax.add_patch(plt.Rectangle((xi-0.
+        leg_ax.add_patch(plt.Rectangle((xi-0.015, 0.3), 0.03, 0.4, color=clr[bank], transform=leg_ax.transAxes))
+        leg_ax.text(xi, 0.1, bank, transform=leg_ax.transAxes,
+                    ha='center', va='center', fontsize=8)
+
+    leg_ax.set_title('Банки, попавшие в топ-3 / bottom-3', pad=6)
+    plt.tight_layout()
+    plt.show()
