@@ -1,77 +1,75 @@
-# ── 8. Функция: показать «примечательные» банки для любой недели ──────────
-import matplotlib.colors as mcolors
+# ───────── 8. «Топ-3 / Bottom-3» по каждой неделе – общий график ──────────
+from matplotlib.cm import get_cmap
 
-def plot_remarkable_week(week_end=None, thr=1e8):
-    """
-    Строит bar-чарт top-3 положительных и top-3 отрицательных банков
-    (не входящих в selected) за указанную неделю (четверг→среда).
+# 8-A. недельная агрегация (как раньше, но на все недели)
+wk = (
+    df_saldo
+      .groupby(['bank_name_main',
+                pd.Grouper(key='dt_rep', freq='W-WED')])
+      .agg(incoming=('INCOMING','sum'),
+           outgoing=('OUTGOING','sum'))
+      .reset_index()
+      .rename(columns={'dt_rep':'w_end'})
+)
+wk['saldo']   = wk['incoming'] + wk['outgoing']
+wk['w_start'] = wk['w_end'] - pd.Timedelta(days=6)
+wk['w_lbl']   = wk.apply(
+    lambda r: f"{r.w_start.day:02d}-{r.w_end.day:02d} {ru_mon[r.w_end.month-1]}",
+    axis=1
+)
 
-    week_end  – дата конца недели (datetime, среда). Если None → берётся последняя полная.
-    thr       – порог |saldo|, по умолчанию 100 млн.
-    """
-    # 1. Сформируем недельный срез «банк×неделя»
-    weekly = (
-        df_saldo
-          .groupby(['bank_name_main',
-                    pd.Grouper(key='dt_rep', freq='W-WED')])
-          .agg(incoming=('INCOMING','sum'),
-               outgoing=('OUTGOING','sum'))
-          .reset_index()
-          .rename(columns={'dt_rep': 'w_end'})
-    )
-    weekly['saldo'] = weekly['incoming'] + weekly['outgoing']
-    weekly['w_start'] = weekly['w_end'] - pd.Timedelta(days=6)
-    
-    # выбираем неделю
-    if week_end is None:
-        week_end = weekly['w_end'].max()
-    week_df = weekly[weekly['w_end'] == pd.to_datetime(week_end)]
-    if week_df.empty:
-        print("❌ Нет такой недели.")
-        return
-    
-    # 2. исключаем большую 5-ку + порог
-    mask = (~week_df['bank_name_main'].isin(selected)) & (week_df['saldo'].abs() >= thr)
-    candidates = week_df.loc[mask]
-    if candidates.empty:
-        print("⚠️  За эту неделю нет банков с |сальдо| ≥ {:.0f} млн.".format(thr/1e6))
-        return
-    
-    pos_top3 = candidates[candidates['saldo'] > 0].nlargest(3, 'saldo')
-    neg_top3 = candidates[candidates['saldo'] < 0].nsmallest(3, 'saldo')
-    data = pd.concat([pos_top3, neg_top3]).reset_index(drop=True)
-    if data.empty:
-        print("⚠️  Никто не прошёл в топ-3 по заданному порогу.")
-        return
+# 8-B. убираем big-5
+wk = wk[~wk['bank_name_main'].isin(selected)]
 
-    # 3. Цвета (один и тот же для банка всегда)
-    palette = list(mcolors.TABLEAU_COLORS.values()) + list(mcolors.CSS4_COLORS.values())
-    bank_colors = {b: palette[i % len(palette)] for i, b in enumerate(sorted(data['bank_name_main'].unique()))}
-    bar_colors = [bank_colors[b] for b in data['bank_name_main']]
-    
-    # 4. График
-    fig, ax = plt.subplots(figsize=(10,6))
-    ax.bar(data['bank_name_main'], data['saldo'], color=bar_colors)
-    
-    # подписи
-    max_abs = data['saldo'].abs().max()
-    for i, (bank, val) in enumerate(zip(data['bank_name_main'], data['saldo'])):
-        off  = max_abs * 0.05 * (1 if val >= 0 else -1)
-        va   = 'bottom' if val >= 0 else 'top'
-        ax.text(i, val + off, f"{val/1e9:.2f}", ha='center', va=va,
-                fontsize=9, fontweight='bold', color=bank_colors[bank])
-    
+# 8-C. строим таблицу «неделя × банк» только для top3/bottom3 (|saldo| ≥ 100 млн)
+records = []
+for _, grp in wk.groupby('w_end', sort=True):
+    pos = grp[grp['saldo'] >= 1e8].nlargest(3, 'saldo')
+    neg = grp[grp['saldo'] <= -1e8].nsmallest(3, 'saldo')
+    records.extend(pos.to_dict('records'))
+    records.extend(neg.to_dict('records'))
+
+plot_df = pd.DataFrame(records)
+if plot_df.empty:
+    print("⚠️  Нет недель, где другие банки имеют |сальдо| ≥ 100 млн.")
+else:
+    # 8-D. цвет каждому банку (из cmap, чтобы одинаково любой неделе)
+    banks = plot_df['bank_name_main'].unique()
+    cmap  = get_cmap('tab20', len(banks))          # до 20 уникальных цветов
+    bank2color = {b: cmap(i) for i, b in enumerate(banks)}
+
+    # 8-E. рисуем «двусторонний» bar-chart
+    fig, ax = plt.subplots(figsize=(14,6))
+    weeks   = sorted(plot_df['w_end'].unique())
+    x = np.arange(len(weeks))
+    bar_w   = 0.25
+
+    for bank in banks:
+        sub = plot_df[plot_df['bank_name_main'] == bank]
+        # положительные и отрицательные отдельно, чтобы bar_position = 0
+        ax.bar(
+            x=np.searchsorted(weeks, sub['w_end']),
+            height=sub['saldo'],
+            width=bar_w,
+            color=bank2color[bank],
+            label=bank
+        )
+
+    # подписи оси X
+    week_labels = [
+        f"{(w- pd.Timedelta(days=6)).day:02d}-{w.day:02d} {ru_mon[w.month-1]}"
+        for w in weeks
+    ]
+    ax.set_xticks(x)
+    ax.set_xticklabels(week_labels, rotation=45, ha='right')
+
+    # формат оси Y
     ax.yaxis.set_major_formatter(bln_formatter)
     ax.set_ylabel('млрд руб.')
-    s = data['w_start'].iloc[0]; e = data['w_end'].iloc[0]
-    ax.set_title(f"Притоки / Оттоки {s:%d %b} – {e:%d %b %Y}", pad=14)
+
+    # сетка / легенда
     ax.grid(alpha=.25, axis='y')
-    plt.xticks(rotation=45, ha='right')
+    ax.set_title('Топ-3 притока (↑) и топ-3 оттока (↓) для прочих банков по неделям')
+    ax.legend(title='Банк', bbox_to_anchor=(1.02,1), loc='upper left')
     plt.tight_layout()
     plt.show()
-
-# ── 9. Пример вызова: последняя полная неделя ─────────────────────────────
-plot_remarkable_week()          # берёт week_end=max automatically
-
-# ▪ Чтобы построить, напр., неделю, которая заканчивается 2025-04-23:
-# plot_remarkable_week('2025-04-23')
