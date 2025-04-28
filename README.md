@@ -1,71 +1,59 @@
-# Formatter для оси Y (млрд руб., с одним десятичным знаком)
-def fmt_bln(x, pos):
-    return f"{x/1e9:.1f}"  # например: 0.5, 1.0, 1.5
+# 6. Примечательные оттоки/притоки за последнюю неделю
 
-bln_formatter = FuncFormatter(fmt_bln)
+# Группируем по банку и неделе (четверг→среда)
+daily_bank_all = (
+    df_saldo
+    .groupby(['bank_name_main','dt_rep'], as_index=False)
+    .agg(incoming=('INCOMING','sum'),
+         outgoing=('OUTGOING','sum'))
+)
+daily_bank_all['saldo'] = daily_bank_all['incoming'] + daily_bank_all['outgoing']
 
-def waterfall_mpl(df, labels, title):
-    n, gap, w = len(df), 0.35, 0.25
-    offs = np.arange(n) * (3*w + gap)
-    fig, ax = plt.subplots(figsize=(16,5))
+weekly_all = (
+    daily_bank_all
+    .set_index('dt_rep')
+    .groupby('bank_name_main')
+    .resample('W-WED')
+    .sum()
+    .rename_axis(['bank_name_main','w_end'])
+    .reset_index()
+)
+weekly_all['w_start'] = weekly_all['w_end'] - pd.Timedelta(days=6)
+weekly_all['saldo']   = weekly_all['incoming'] + weekly_all['outgoing']
+weekly_all['label']   = weekly_all.apply(w_lbl, axis=1)
 
-    ax.bar(offs,       df['incoming'],  width=w, label='Incoming (+)', color='forestgreen')
-    ax.bar(offs + w,   df['outgoing'],  width=w,
-           bottom=df['incoming'], label='Outgoing (–)', color='firebrick')
-    saldo_colors = np.where(df['saldo'] >= 0, 'lightgreen', 'lightcoral')
-    ax.bar(offs + 2*w, df['saldo'],     width=w, color=saldo_colors, label='Saldo')
+# Выбираем последнюю неделю
+last_week_end = weekly_all['w_end'].max()
+week_slice = weekly_all[weekly_all['w_end'] == last_week_end]
 
-    # подписи на бар-чартах
-    for i in range(n):
-        inc = df['incoming'].iloc[i]
-        out = -df['outgoing'].iloc[i]
-        sal = df['saldo'].iloc[i]
-        ax.text(offs[i], inc,      f"{inc/1e9:.1f}",  ha='center', va='bottom', fontsize=8)
-        ax.text(offs[i]+w, inc-out,f"{out/1e9:.1f}",  ha='center', va='bottom', fontsize=8)
-        va = 'bottom' if sal >= 0 else 'top'
-        ax.text(offs[i]+2*w, sal,  f"{sal/1e9:.1f}",  ha='center', va=va,       fontsize=8)
+# Исключаем базовый список банков
+other = week_slice[~week_slice['bank_name_main'].isin(selected)]
 
-    # границы: от мин. значения до макс +20%
-    y_all = np.concatenate([df['incoming'], df['incoming']+df['outgoing'], df['saldo']])
-    y_min, y_max = y_all.min(), y_all.max()
-    margin = (y_max - y_min) * 0.2
-    ax.set_ylim(y_min, y_max + margin)
+# Отбираем топ‑3 по положительному сальдо ≥100 млн и по отрицательному (модуль) ≥100 млн
+pos_top3 = other[other['saldo'] >= 1e8].nlargest(3, 'saldo')
+neg_top3 = other[other['saldo'] <= -1e8].nsmallest(3, 'saldo')
 
-    # подписи и форматирование оси Y
-    ax.yaxis.set_major_formatter(bln_formatter)
-    ax.set_ylabel('млрд руб.')
+remarkable = pd.concat([pos_top3, neg_top3]).reset_index(drop=True)
 
-    # X-ось
-    ax.set_xticks(offs + w)
-    ax.set_xticklabels(labels, rotation=45, ha='right')
+# Строим бар‑чарт: вверх – притоки, вниз – оттоки
+fig, ax = plt.subplots(figsize=(10,6))
+colors = ['forestgreen'] * len(pos_top3) + ['firebrick'] * len(neg_top3)
+ax.bar(remarkable['bank_name_main'], remarkable['saldo'], color=colors)
 
-    ax.set_title(title, pad=12)
-    ax.legend(frameon=False, ncol=3)
-    ax.grid(alpha=.25, axis='y')
-    plt.tight_layout()
-    plt.show()
+# Подписи над/в середине баров
+for i, row in remarkable.iterrows():
+    v = row['saldo']
+    # смещение подписи: небольшой отступ от вершины
+    offset = (remarkable['saldo'].abs().max() * 0.05) * (1 if v>=0 else -1)
+    va = 'bottom' if v>=0 else 'top'
+    ax.text(i, v + offset, f"{v/1e9:.2f}", ha='center', va=va,
+            fontsize=9, fontweight='bold', color=colors[i])
 
-
-def bar_mpl(df, labels, title):
-    fig, ax = plt.subplots(figsize=(16,5))
-    ax.bar(labels, df['saldo'], color='steelblue')
-
-    for i, v in enumerate(df['saldo']):
-        va = 'bottom' if v >= 0 else 'top'
-        ax.text(i, v, f"{v/1e9:.1f}", ha='center', va=va, fontsize=8)
-
-    # границы: от мин. значения до макс +20%
-    y_vals = df['saldo'].values
-    y_min, y_max = y_vals.min(), y_vals.max()
-    margin = (y_max - y_min) * 0.2
-    ax.set_ylim(y_min, y_max + margin)
-
-    # форматирование оси Y
-    ax.yaxis.set_major_formatter(bln_formatter)
-    ax.set_ylabel('млрд руб.')
-
-    ax.set_title(title, pad=12)
-    ax.grid(alpha=.25, axis='y')
-    plt.xticks(rotation=45, ha='right')
-    plt.tight_layout()
-    plt.show()
+# Форматируем ось Y
+ax.yaxis.set_major_formatter(bln_formatter)
+ax.set_ylabel('млрд руб.')
+ax.set_title(f'Примечательные притоки/оттоки за неделю {remarkable["label"].iat[0]}', pad=12)
+ax.grid(alpha=.25, axis='y')
+plt.xticks(rotation=45, ha='right')
+plt.tight_layout()
+plt.show()
