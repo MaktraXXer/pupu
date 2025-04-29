@@ -1,84 +1,126 @@
-В строке с `groupby` действительно опечатка: Python не понимает «распаковку» `*(hue, )`.  
-Ниже — рабочая версия `make_plot`, где список групповых колонок собирается обычным способом.
-
-```python
-import matplotlib.pyplot as plt
+import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
 
-def make_plot(df_, hue=None, style=None, title=''):
-    """
-    Рисует scatter:
-      • hue  → цвет          (например, PROD_NAME)
-      • style → маркер       (например, TermBucketGrouping)
-    Легенда вынесена за правый край.
-    """
-    fig, ax = plt.subplots(figsize=(9, 6))
-    
-    # --- подготовка палитры и маркеров --------------------------------------
-    if hue:
-        hue_vals   = df_[hue].unique()
-        colors     = plt.cm.tab10(np.linspace(0, 1, len(hue_vals)))
-        hue_to_col = dict(zip(hue_vals, colors))
-    if style:
-        style_vals   = df_[style].unique()
-        markers      = ['o', 's', '^', 'D', 'v', 'P', 'X', '*', '>', '<']
-        style_to_mrk = dict(zip(style_vals, markers))
-    
-    # --- группировка --------------------------------------------------------
-    group_cols = []
-    if hue:   group_cols.append(hue)
-    if style: group_cols.append(style)
-    
-    if not group_cols:                      # без раскраски
-        ax.scatter(df_['SpreadSigned'], df_['Общая пролонгация_%'], alpha=0.75)
+# ---------- 0. Load prepared dataframe --------------------------------------
+#
+# Assumes you have already executed the data‑cleaning cell that produces `df`
+# with columns:
+#   Spread_New_vs_AllProlong, Общая пролонгация, TermBucketGrouping, PROD_NAME
+# and applied all masks (>100 % removed, NaNs cleaned).
+#
+# If df is not in memory, try loading the enriched file (optional fallback):
+if 'df' not in globals():
+    enriched = Path('prolong_enriched.xlsx')
+    if enriched.exists():
+        df = pd.read_excel(enriched)
     else:
-        combos = df_.groupby(group_cols)
-        for keys, sub in combos:
-            # keys может быть скаляром или tuple
-            if isinstance(keys, tuple):
-                key_hue   = keys[0] if hue   else None
-                key_style = keys[-1] if style else None
-            else:
-                key_hue   = keys if hue   else None
-                key_style = keys if style else None
-            
-            color  = hue_to_col[key_hue]   if hue   else 'C0'
-            marker = style_to_mrk[key_style] if style else 'o'
-            label_parts = []
-            if hue:   label_parts.append(str(key_hue))
-            if style: label_parts.append(str(key_style))
-            label = ' / '.join(label_parts)
-            
-            ax.scatter(sub['SpreadSigned'], sub['Общая пролонгация_%'],
-                       color=color, marker=marker, alpha=0.8, label=label)
-    
-    # --- оформление ---------------------------------------------------------
-    ax.axvline(0, lw=0.8, color='k')
-    ax.set_ylim(0, 120)
-    ax.set_xlabel('Спред (-)(п.п.)')
-    ax.set_ylabel('Общая автопролонгация, %')
-    ax.set_title(title)
-    
-    # легенду уводим за правую границу и даём место графику
-    if group_cols:
-        ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left',
-                  borderaxespad=0, title=' / '.join(group_cols))
-        plt.subplots_adjust(right=0.78)
-    else:
-        plt.subplots_adjust(right=0.9)
-    
-    ax.grid(True)
+        raise RuntimeError("DataFrame `df` not found – run the cleaning cell first")
+
+# ---------- 1. Common mask (same as in plotting) ----------------------------
+target_products = ['Мой дом без опций', 'Доходный+', 'ДОМа лучше']
+spread_col = 'Spread_New_vs_AllProlong'
+
+mask = (
+    (df['TermBucketGrouping'] != 'Все бакеты') &
+    (df['PROD_NAME'] != 'Все продукты') &
+    df['PROD_NAME'].isin(target_products) &
+    df[spread_col].notna() &
+    df['Общая пролонгация'].notna() &
+    (df['Общая пролонгация'] <= 1)
+)
+
+data = df.loc[mask].copy()
+data['SpreadSigned'] = -data[spread_col]               # X
+data['Prolong_pct']  = data['Общая пролонгация'] * 100 # Y (0‑100)
+
+# ---------- 2. Helper: fit several simple models and pick best by R² --------
+def fit_models(x, y):
+    """
+    Returns dict with keys:
+      best_name, best_pred, results{model_name:{r2,params,pred}}
+    Models tested: linear, quadratic, exponential.
+    """
+    results = {}
+    # linear
+    coef = np.polyfit(x, y, 1)
+    y_pred = np.polyval(coef, x)
+    r2 = 1 - np.sum((y - y_pred)**2) / np.sum((y - y.mean())**2)
+    results['linear'] = {'r2': r2, 'params': coef, 'pred': y_pred}
+    # quadratic
+    coef2 = np.polyfit(x, y, 2)
+    y_pred2 = np.polyval(coef2, x)
+    r2_2 = 1 - np.sum((y - y_pred2)**2) / np.sum((y - y.mean())**2)
+    results['quadratic'] = {'r2': r2_2, 'params': coef2, 'pred': y_pred2}
+    # exponential y = a*exp(bx), require y>0
+    if np.all(y > 0):
+        ln_y = np.log(y)
+        coef_e = np.polyfit(x, ln_y, 1)
+        y_pred_e = np.exp(np.polyval(coef_e, x))
+        r2_e = 1 - np.sum((y - y_pred_e)**2) / np.sum((y - y.mean())**2)
+        results['exponential'] = {'r2': r2_e, 'params': coef_e, 'pred': y_pred_e}
+    # choose best
+    best_name = max(results.items(), key=lambda kv: kv[1]['r2'])[0]
+    return {'best_name': best_name, 'best_pred': results[best_name]['pred'], 'results': results}
+
+# ---------- 3. Plot function -------------------------------------------------
+def plot_with_curve(df_subset, title):
+    x = df_subset['SpreadSigned'].values
+    y = df_subset['Prolong_pct'].values
+    fit = fit_models(x, y)
+    best_name = fit['best_name']
+    y_pred = fit['best_pred']
+    r2_best = fit['results'][best_name]['r2']
+
+    plt.figure(figsize=(8,6))
+    plt.scatter(x, y, alpha=0.6, label='наблюдения')
+    # sort for smooth curve
+    order = np.argsort(x)
+    plt.plot(x[order], y_pred[order], color='red', linewidth=2,
+             label=f'лучшая модель: {best_name} (R²={r2_best:.2f})')
+    plt.axvline(0, color='k', lw=0.8)
+    plt.ylim(0, 120)
+    plt.xlabel('Спред (‑)(п.п.)')
+    plt.ylabel('Общая автопролонгация, %')
+    plt.title(title)
+    plt.legend(bbox_to_anchor=(1.02,1), loc='upper left', borderaxespad=0)
+    plt.subplots_adjust(right=0.78)
+    plt.grid(True)
     plt.show()
-```
 
-Использование остаётся тем же:
+    return r2_best, best_name
 
-```python
-make_plot(data, title='Все наблюдения')                              # без раскраски
-make_plot(data, hue='PROD_NAME', title='Цвет = продукт')             # цвет = продукт
-make_plot(data, hue='TermBucketGrouping', title='Цвет = срок')       # цвет = срок
-make_plot(data, hue='PROD_NAME', style='TermBucketGrouping',
-          title='Цвет = продукт, маркер = срок')                     # оба
-```
+# ---------- 4. 1) Глобальная модель -----------------------------------------
+r2_global, model_global = plot_with_curve(data,
+    'Зависимость автопролонгации от спреда (все сроки и продукты)')
 
-Легенды теперь всегда справа и не перекрывают сам график.
+# ---------- 5. 2) По каждому сроку ------------------------------------------
+term_r2 = {}
+for term in sorted(data['TermBucketGrouping'].unique()):
+    subset = data[data['TermBucketGrouping'] == term]
+    if len(subset) < 5:
+        continue
+    r2, _ = plot_with_curve(subset,
+        f'Зависимость по сроку: {term}')
+    term_r2[term] = r2
+
+# ---------- 6. 3) По каждому продукту ---------------------------------------
+prod_r2 = {}
+for prod in sorted(data['PROD_NAME'].unique()):
+    subset = data[data['PROD_NAME'] == prod]
+    if len(subset) < 5:
+        continue
+    r2, _ = plot_with_curve(subset,
+        f'Зависимость по продукту: {prod}')
+    prod_r2[prod] = r2
+
+# ---------- 7. Print summary -------------------------------------------------
+print("Best R² (global):", r2_global, "model:", model_global)
+print("\nR² by TermBucket:")
+for k,v in term_r2.items():
+    print(f"  {k}: {v:.2f}")
+print("\nR² by Product:")
+for k,v in prod_r2.items():
+    print(f"  {k}: {v:.2f}")
+
