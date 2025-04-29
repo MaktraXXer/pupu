@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Полный скрипт: от Excel до взвешенных кривых чувствительности.
-Точки теперь «bubble-plot» — размер ~ объёму автопролонгаций.
+Bubble-кривые чувствительности (WLS) – параметризуемая метрика.
+METRIC_KEY ∈ {'overall', '1y', '2y', '3y'}
 """
 # ======================================================
 # 0. Библиотеки
@@ -15,11 +15,45 @@ except ImportError:
     HAVE_SKLEARN = False
 
 # ======================================================
-# 1. Импорт и подготовка
+# 1. Конфигурация
+# ======================================================
+METRIC_KEY = 'overall'          # ← меняйте здесь: 'overall' | '1y' | '2y' | '3y'
+
+col_map = {
+    'overall':  {
+        'metric': 'Общая пролонгация',
+        'spread': 'Spread_New_vs_AllProlong',
+        'weight': 'Opened_Sum_ProlongRub',
+        'title':  'Общая автопролонгация'
+    },
+    '1y': {
+        'metric': '1-я автопролонгация',
+        'spread': 'Spread_New_vs_1y',
+        'weight': 'Opened_Sum_1yProlong_Rub',
+        'title':  '1-я автопролонгация'
+    },
+    '2y': {
+        'metric': '2-я автопролонгация',
+        'spread': 'Spread_New_vs_2y',
+        'weight': 'Opened_Sum_2yProlong_Rub',
+        'title':  '2-я автопролонгация'
+    },
+    '3y': {
+        'metric': '3-я автопролонгация',
+        'spread': 'Spread_New_vs_3y',
+        'weight': 'Opened_Sum_3yProlong_Rub',
+        'title':  '3-я автопролонгация'
+    }
+}
+
+CFG = col_map[METRIC_KEY]
+
+# ======================================================
+# 2. Импорт и очистка (тот же блок, что раньше)
 # ======================================================
 df = pd.read_excel('prolong.xlsx', sheet_name='Sheet1')
 
-for l, r, new in [
+for l,r,new in [
     ('Summ_ClosedBalanceRub','Summ_ClosedBalanceRub_int','Closed_Total_with_pct'),
     ('Closed_Sum_NewNoProlong','Closed_Sum_NewNoProlong_int','Closed_Sum_NewNoProlong_with_pct'),
     ('Closed_Sum_1yProlong_Rub','Closed_Sum_1yProlong_Rub_int','Closed_Sum_1yProlong_with_pct'),
@@ -49,81 +83,69 @@ df['Spread_New_vs_2y'] = df['Opened_WeightedRate_NewNoProlong'] - df['Opened_Wei
 df['Spread_New_vs_3y'] = df['Opened_WeightedRate_NewNoProlong'] - df['Opened_WeightedRate_3y']
 
 # ======================================================
-# 2. Отбор данных
+# 3. Формируем выборку под указанную метрику
 # ======================================================
 target_products = ['Мой дом без опций','Доходный+','ДОМа лучше']
-spread_col = 'Spread_New_vs_AllProlong'
 
 mask = (
     (df['TermBucketGrouping']!='Все бакеты') &
     (df['PROD_NAME']!='Все продукты') &
     df['PROD_NAME'].isin(target_products) &
-    df[spread_col].notna() &
-    df['Общая пролонгация'].notna() &
-    (df['Общая пролонгация']<=1)
+    df[CFG['spread']].notna() &
+    df[CFG['metric']].notna() &
+    (df[CFG['metric']] <= 1)
 )
 
 data = df.loc[mask].copy()
-data['x'] = -data[spread_col]
-data['y'] = data['Общая пролонгация']*100
-data['w'] = data['Opened_Sum_ProlongRub'].fillna(0)
+data['x'] = -data[CFG['spread']]
+data['y'] = data[CFG['metric']] * 100
+data['w'] = data[CFG['weight']].fillna(0)
 
 # ======================================================
-# 3. Взвешенные R² и модели
+# 4. WLS-фиты и bubble-plot (функции те же, что раньше)
 # ======================================================
 def w_r2(y,yhat,w):
-    ybar = np.average(y,weights=w)
-    return 1 - np.sum(w*(y-yhat)**2)/np.sum(w*(y-ybar)**2)
+    ybar=np.average(y,weights=w)
+    return 1-np.sum(w*(y-yhat)**2)/np.sum(w*(y-ybar)**2)
 
 def fit_three(x,y,w):
-    out={}
-    c=polyfit(x,y,1,w=w);  out['linear']={'pred':polyval(x,c),'r2':w_r2(y,polyval(x,c),w)}
-    c2=polyfit(x,y,2,w=w); out['quadratic']={'pred':polyval(x,c2),'r2':w_r2(y,polyval(x,c2),w)}
+    res={}
+    res['linear']={'pred':polyval(x,(c:=polyfit(x,y,1,w=w))), 'r2':w_r2(y,polyval(x,c),w)}
+    res['quadratic']={'pred':polyval(x,(c:=polyfit(x,y,2,w=w))), 'r2':w_r2(y,polyval(x,c),w)}
     if (y>0).all():
-        ce=polyfit(x,np.log(y),1,w=w)
-        yhat=np.exp(polyval(x,ce)); out['exponential']={'pred':yhat,'r2':w_r2(y,yhat,w)}
-    best=max(out,key=lambda k:out[k]['r2'])
-    return best,out[best]['pred'],out[best]['r2']
+        ce=polyfit(x,np.log(y),1,w=w); yhat=np.exp(polyval(x,ce))
+        res['exponential']={'pred':yhat,'r2':w_r2(y,yhat,w)}
+    best=max(res,key=lambda k:res[k]['r2'])
+    return best,res[best]['pred'],res[best]['r2']
 
 def mono_best(x,y,w):
     fits=[]
-    # lin neg
-    c=polyfit(x,y,1,w=w); c[1]=-abs(c[1]); yhat=polyval(x,c)
-    fits.append({'n':'lin_neg','p':yhat,'r2':w_r2(y,yhat,w)})
-    # exp decay
+    c=polyfit(x,y,1,w=w); c[1]=-abs(c[1]); fits.append({'n':'lin_neg','p':polyval(x,c),'r2':w_r2(y,polyval(x,c),w)})
     if (y>0).all():
-        ce=polyfit(x,np.log(y),1,w=w); ce[1]=-abs(ce[1]); yhat=np.exp(polyval(x,ce))
-        fits.append({'n':'exp_decay','p':yhat,'r2':w_r2(y,yhat,w)})
-    # recip
-    if (y>0).all():
+        ce=polyfit(x,np.log(y),1,w=w); ce[1]=-abs(ce[1]); fits.append({'n':'exp_decay','p':np.exp(polyval(x,ce)),'r2':w_r2(y,np.exp(polyval(x,ce)),w)})
         inv=1/y; cr=polyfit(x,inv,1,w=w)
         a=1/cr[1] if cr[1]!=0 else None; b=cr[0]*a if a else None
-        if a and a>0 and b>0:
-            yhat=a/(1+b*x); fits.append({'n':'recip','p':yhat,'r2':w_r2(y,yhat,w)})
-    # isotonic
+        if a and a>0 and b>0: yhat=a/(1+b*x); fits.append({'n':'recip','p':yhat,'r2':w_r2(y,yhat,w)})
     if HAVE_SKLEARN:
         iso=IsotonicRegression(increasing=False).fit(x,y,sample_weight=w)
-        yhat=iso.predict(x); fits.append({'n':'isotonic','p':yhat,'r2':w_r2(y,yhat,w)})
-    return max(fits,key=lambda d:d['r2']) if fits else None
+        fits.append({'n':'isotonic','p':iso.predict(x),'r2':w_r2(y,iso.predict(x),w)})
+    return max(fits,key=lambda d:d['r2'])
 
-# ======================================================
-# 4. Bubble-plot с кривой
-# ======================================================
 def plot_curve(dfsub,title,mode='old'):
-    x,y,w = dfsub['x'].values, dfsub['y'].values, dfsub['w'].values
+    x,y,w=dfsub['x'].values,dfsub['y'].values,dfsub['w'].values
     if mode=='old':
         name,yhat,r2=fit_three(x,y,w)
     else:
         res=mono_best(x,y,w); name,yhat,r2=res['n'],res['p'],res['r2']
-    sizes=20+180*(w/w.max())          # масштабир. радиус
+    sizes=20+180*(w/w.max())
     order=np.argsort(x)
     plt.figure(figsize=(9,6))
     plt.scatter(x,y,s=sizes,alpha=0.5,edgecolor='k',linewidth=0.3,label='наблюдения (размер=объём ₽)')
     plt.plot(x[order],yhat[order],'r',lw=2,label=f'{name}, R²={r2:.2f}')
     plt.axvline(0,color='k',lw=0.8); plt.ylim(0,120)
-    plt.xlabel('Спред (-)(п.п.)'); plt.ylabel('Автопролонгация, %')
-    plt.title(title); plt.grid(True)
-    plt.legend(bbox_to_anchor=(1.02,1),loc='upper left')
+    plt.xlabel('Спред (-)(п.п.)'); plt.ylabel(f'{CFG["title"]}, %')
+    plt.title(f'{title} – {CFG["title"]}')
+    plt.legend(bbox_to_anchor=(1.02,1),loc='upper left'); plt.grid(True)
     plt.subplots_adjust(right=0.78); plt.show()
 
 # ======================================================
