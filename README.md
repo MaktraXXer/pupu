@@ -1,40 +1,63 @@
 USE [ALM];
 GO
-------------------------------------------------------------------
+/*-----------------------------------------------------------------*/
 ALTER VIEW UREP.VW_transfers_FL_AGG_user
 AS
-;WITH w AS
-(
-    /* — сразу нумеруем недели и тут же отбрасываем всё, что старше топ-8 — */
-    SELECT *
-    FROM (
-        SELECT  t.*,
+/* ---------- 1. границы окна от текущей даты -------------------- */
+WITH borders AS (
+    /* «последний» четверг, который уже наступил относительно TODAY */
+    SELECT
+        latest_thu = CAST(
+            DATEADD(
+                day,
+                1 - DATEPART(weekday, DATEADD(day,-3, GETDATE())),
+                GETDATE()
+            ) AS date),
 
-                /* начало недели (четверг)  — формула не зависит от DATEFIRST */
-                wk_start = CAST(
-                             DATEADD(day,-((DATEPART(weekday,t.dt_rep)+2)%7), t.dt_rep)
-                             AS date
-                           ),
-
-                /* 1 = самая свежая, 2 = предыдущая, …  */
-                wk_rank  = DENSE_RANK() OVER (
-                            ORDER BY CAST(
-                                      DATEADD(day,-((DATEPART(weekday,t.dt_rep)+2)%7), t.dt_rep)
-                                      AS date
-                                    ) DESC
-                          )
-        FROM    ehd.transfers_FL_AGG AS t WITH (NOLOCK)
-    ) z
-    WHERE z.wk_rank <= 8          -- <-- срез прямо здесь
+        -- первый четверг восьминедельного окна
+        first_thu  = CAST(
+            DATEADD(
+                day,
+               -56,   -- 8 недель * 7 дней
+                DATEADD(
+                    day,
+                    1 - DATEPART(weekday, DATEADD(day,-3, GETDATE())),
+                    GETDATE()
+                )
+            ) AS date)
 )
-SELECT  w.*,
-        YEAR(w.dt_rep)                                 AS rep_Y,
-        FORMAT(w.dt_rep, N'MMMM', N'ru-RU')            AS rep_M,
-        CONCAT(
-            FORMAT(w.wk_start             ,'yyyy.MM.dd'),
-            N'-',
-            FORMAT(DATEADD(day,6,w.wk_start),'yyyy.MM.dd')
-        )                                              AS rep_W,
-        ISNULL(INCOMING_SUM_TRANS_total,0)
-      + ISNULL(OUTGOING_SUM_TRANS_total,0)             AS NET_SUM_TRANS_total;
+/* ---------- 2. данные из окна + привычные колонки -------------- */
+SELECT
+        /* ------ бизнес-поля исходной таблицы -------------------- */
+        t.*,
+
+        /* ------ календарные колонки ----------------------------- */
+        YEAR(t.dt_rep)                                   AS rep_Y,
+        FORMAT(t.dt_rep, N'MMMM', N'ru-RU')              AS rep_M,
+
+        /*   ВАША исходная формула «четверг-среда»   */
+        rep_W = CONCAT(
+                   FORMAT(
+                       DATEADD(
+                           day,
+                           1 - DATEPART(weekday, DATEADD(day,-3, t.dt_rep)),
+                           t.dt_rep),
+                       'yyyy.MM.dd'),
+                   N'-',
+                   FORMAT(
+                       DATEADD(
+                           day,
+                           7 - DATEPART(weekday, DATEADD(day,-3, t.dt_rep)),
+                           t.dt_rep),
+                       'yyyy.MM.dd')
+               ),
+
+        /* ------ совокупная сумма -------------------------------- */
+        ISNULL(t.INCOMING_SUM_TRANS_total,0)
+      + ISNULL(t.OUTGOING_SUM_TRANS_total,0)             AS NET_SUM_TRANS_total
+/* --------------------------------------------------------------- */
+FROM    ehd.transfers_FL_AGG AS t WITH (NOLOCK)
+CROSS   JOIN borders b
+WHERE   t.dt_rep >= b.first_thu            -- начало 8-й (самой старой) недели
+  AND   t.dt_rep <  DATEADD(day,7,b.latest_thu); -- конец «текущей» недели
 GO
