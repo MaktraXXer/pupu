@@ -3,7 +3,12 @@
         cmap     = plt.cm.get_cmap('tab10', len(loanages))
         colors   = {h: cmap(i) for i, h in enumerate(loanages)}
 
-        # helper: пунктирная кривая сравнения
+        # есть ли у нас unconstrained-данные?
+        has_un = hasattr(self, 'CPR_fitted_unconstrained') and not self.CPR_fitted_unconstrained.empty
+        if has_un:
+            CPR_un = self.CPR_fitted_unconstrained.copy()
+
+        # helper: пунктирная кривая сравнения с внешним эталоном
         def add_compare(ax, date, xgrid, age=None):
             if self.compare_coefs.empty:
                 return
@@ -16,9 +21,11 @@
             for _, row in cmp.iterrows():
                 h = int(row['LoanAge'])
                 b = row[[f'b{i}' for i in range(7)]].values.astype(float)
-                y = b[0] \
-                    + b[1]*np.arctan(b[2] + b[3]*xgrid) \
-                    + b[4]*np.arctan(b[5] + b[6]*xgrid)
+                y = (
+                    b[0]
+                    + b[1] * np.arctan(b[2] + b[3]*xgrid)
+                    + b[4] * np.arctan(b[5] + b[6]*xgrid)
+                )
                 ax.plot(
                     xgrid, y,
                     ls='--', lw=1.8, alpha=0.55,
@@ -26,11 +33,13 @@
                     label=f'compare h={h}'
                 )
 
-        # подготовка гистограмм TotalDebtBln
+        # предрасчёт гистограмм TotalDebtBln
         x_min, x_max = data_all['Incentive'].min(), data_all['Incentive'].max()
-        bins = (np.arange(x_min, x_max + self.hist_bins, self.hist_bins)
-                if isinstance(self.hist_bins, float)
-                else self.hist_bins)
+        bins = (
+            np.arange(x_min, x_max + self.hist_bins, self.hist_bins)
+            if isinstance(self.hist_bins, float)
+            else self.hist_bins
+        )
         hist_all = {}
         for h in loanages:
             msk = data_all['LoanAge'] == h
@@ -44,28 +53,48 @@
 
         # цикл по датам
         for dt in self.periods:
+            # constrained
             cur = (
                 self.CPR_fitted[self.CPR_fitted['Date'] == dt]
                 .set_index('Incentive')
                 .drop(columns='Date')
             )
+            if has_un:
+                cur_un = (
+                    CPR_un[CPR_un['Date'] == dt]
+                    .set_index('Incentive')
+                    .drop(columns='Date')
+                )
 
-            # 1) только линии (fixed и auto)
+            # 1) только линии (fixed & auto)
             def plot_lines(auto=False):
                 fig, ax = plt.subplots(figsize=(7, 4))
                 for col in cur.columns:
                     h = int(col.split('_')[-1])
+                    # constrained
                     ax.plot(
                         cur.index, cur[col],
-                        lw=2, color=colors[h], label=f'h={h}'
+                        lw=2, color=colors[h],
+                        label=f'constr S, h={h}'
                     )
+                    # unconstrained
+                    if has_un:
+                        ax.plot(
+                            cur_un.index, cur_un[col],
+                            ls=':', lw=1.5, alpha=0.7,
+                            color=colors[h],
+                            label=f'unconstr S, h={h}'
+                        )
                 add_compare(ax, dt, cur.index)
                 ax.grid(ls='--', alpha=0.3)
                 ax.set_xlabel('Incentive, п.п.')
                 ax.set_ylabel('CPR_fitted, % год.')
                 ax.set_xlim(x_min, x_max)
-                ax.set_ylim(0, (cur.max().max() * 1.05) if auto else 0.45)
-                ax.legend(ncol=4, fontsize=8, framealpha=0.95)
+                ax.set_ylim(
+                    0,
+                    (cur.max().max() * 1.05) if auto else 0.45
+                )
+                ax.legend(ncol=3, fontsize=7, framealpha=0.8)
                 lab = '_auto' if auto else ''
                 fig.tight_layout()
                 fig.savefig(
@@ -74,16 +103,26 @@
                 )
                 plt.close(fig)
 
-            # 2) full graph (fixed и auto)
+            # 2) full graph (fixed & auto)
             def plot_full(auto=False):
                 fig, axL = plt.subplots(figsize=(10, 6))
                 # S-кривые
                 for col in cur.columns:
                     h = int(col.split('_')[-1])
+                    # constrained
                     axL.plot(
                         cur.index, cur[col],
-                        lw=2, color=colors[h], label=f'S, h={h}'
+                        lw=2, color=colors[h],
+                        label=f'constr S, h={h}'
                     )
+                    # unconstrained
+                    if has_un:
+                        axL.plot(
+                            cur_un.index, cur_un[col],
+                            ls=':', lw=1.5, alpha=0.7,
+                            color=colors[h],
+                            label=f'unconstr S, h={h}'
+                        )
                 add_compare(axL, dt, cur.index)
                 # scatter фактический CPR
                 m_dt = data_all['Date'] == dt
@@ -91,7 +130,8 @@
                     axL.scatter(
                         grp['Incentive'], grp['CPR'],
                         s=25, color=colors[h], alpha=0.8,
-                        edgecolors='none', label=f'CPR, h={h}'
+                        edgecolors='none',
+                        label=f'CPR, h={h}'
                     )
                 axL.set_xlabel('Incentive, п.п.')
                 axL.set_ylabel('CPR, % год.')
@@ -106,13 +146,20 @@
                         centers, hv, bottom=bottom,
                         width=(centers[1] - centers[0]) * 0.9,
                         color=colors[h], alpha=0.25,
-                        edgecolor='none', label=f'Debt, h={h}'
+                        edgecolor='none',
+                        label=f'Debt, h={h}'
                     )
                     bottom += hv
                 ymax_cpr  = max(cur.max().max(), data_all.loc[m_dt, 'CPR'].max())
                 ymax_debt = bottom.max()
-                axL.set_ylim(0, (ymax_cpr * 1.05) if auto else 0.45)
-                axR.set_ylim(0, (ymax_debt * 1.1) if auto else max_debt_global * 1.1)
+                axL.set_ylim(
+                    0,
+                    (ymax_cpr * 1.05) if auto else 0.45
+                )
+                axR.set_ylim(
+                    0,
+                    (ymax_debt * 1.1) if auto else max_debt_global * 1.1
+                )
                 axR.set_ylabel('TotalDebtBln, млрд руб.')
 
                 # общая легенда
@@ -120,7 +167,7 @@
                 for ax in (axL, axR):
                     h, l = ax.get_legend_handles_labels()
                     hdl += h; lbl += l
-                axL.legend(hdl, lbl, ncol=3, fontsize=8, framealpha=0.95)
+                axL.legend(hdl, lbl, ncol=4, fontsize=7, framealpha=0.8)
                 lab = '_auto' if auto else ''
                 axL.set_title(f'Full graph {lab} {dt:%Y-%m-%d}')
                 fig.tight_layout()
@@ -130,41 +177,60 @@
                 )
                 plt.close(fig)
 
-            # 3) per-LoanAge (fixed и auto)
+            # 3) per-LoanAge (fixed & auto)
             def plot_one(h, auto=False):
                 centers, hv = hist_all[h]
                 grp_h = data_all[
                     (data_all['Date'] == dt) & (data_all['LoanAge'] == h)
                 ]
                 fig, axL = plt.subplots(figsize=(7, 4))
+                # constrained S
                 axL.plot(
                     cur.index, cur[f'CPR_fitted_{h}'],
-                    lw=2, color=colors[h], label='S-curve'
+                    lw=2, color=colors[h],
+                    label='constr S-curve'
                 )
-                add_compare(axL, dt, cur.index, age=h)
+                # unconstrained S
+                if has_un:
+                    axL.plot(
+                        cur_un.index, cur_un[f'CPR_fitted_{h}'],
+                        ls=':', lw=1.5, alpha=0.7,
+                        color=colors[h],
+                        label='unconstr S-curve'
+                    )
+                # фактический CPR
                 axL.scatter(
                     grp_h['Incentive'], grp_h['CPR'],
                     s=25, color=colors[h], alpha=0.8,
-                    edgecolors='none', label='CPR фактич.'
+                    edgecolors='none',
+                    label='CPR фактич.'
                 )
-
+                # долговой столбец
                 axR = axL.twinx()
                 axR.bar(
                     centers, hv,
                     width=(centers[1] - centers[0]) * 0.9,
-                    color=colors[h], alpha=0.25, edgecolor='none',
+                    color=colors[h], alpha=0.25,
+                    edgecolor='none',
                     label='Debt'
                 )
+
                 axL.grid(ls='--', alpha=0.3)
                 axL.set_xlabel('Incentive, п.п.')
                 axL.set_ylabel('CPR, % год.')
                 axR.set_ylabel('TotalDebtBln, млрд руб.')
                 axL.set_xlim(x_min, x_max)
                 ymax_c = max(cur[f'CPR_fitted_{h}'].max(), grp_h['CPR'].max())
-                axL.set_ylim(0, (ymax_c * 1.05) if auto else 0.45)
-                axR.set_ylim(0, (hv.max() * 1.1) if auto else max_debt_global * 1.1)
-                axL.legend(fontsize=8)
-                axR.legend(fontsize=8, loc='upper right')
+                axL.set_ylim(
+                    0,
+                    (ymax_c * 1.05) if auto else 0.45
+                )
+                axR.set_ylim(
+                    0,
+                    (hv.max() * 1.1) if auto else max_debt_global * 1.1
+                )
+                axL.legend(fontsize=7)
+                axR.legend(fontsize=7, loc='upper right')
                 lab = '_auto' if auto else ''
                 axL.set_title(f'date={dt:%Y-%m-%d} h={h}{lab}')
                 fig.tight_layout()
@@ -174,7 +240,7 @@
                 )
                 plt.close(fig)
 
-            # рисуем
+            # финальные вызовы
             plot_lines(False); plot_lines(True)
             plot_full(False);  plot_full(True)
             for h in loanages:
