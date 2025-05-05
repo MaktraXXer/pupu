@@ -1,17 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-scurves.py ─ расчёт S‑кривых (с ограничениями и без), построение графиков и сравнение
-c «эталонными» β‑коэффициентами и без огрничений.
+scurves.py ─ расчёт S-кривых (с ограничениями и без), построение графиков и сравнение
+с «эталонными» β-коэффициентами и между собой.
 
-Сохраняет структуру папки
-
+Структура выходной папки:
     <folder_path>/<timestamp>/
         CPR_fitted.csv
         coefs.csv
         CPR_fitted_unconstrained.csv
         coefs_unconstrained.csv
-        ... (графики)
+        YYYY-MM-DD_scurves.png
+        YYYY-MM-DD_scurves_auto.png
+        YYYY-MM-DD_full.png
+        YYYY-MM-DD_full_auto.png
+        YYYY-MM-DD_h{n}.png
+        YYYY-MM-DD_h{n}_auto.png
+        YYYY-MM-DD_h{n}_сравнение.png   <-- новые
 """
+
 import os
 import numpy as np
 import pandas as pd
@@ -22,19 +28,28 @@ plt.rcParams['axes.formatter.useoffset'] = False
 
 
 class scurves:
+    # ------------------------------------------------------------------ #
     def __init__(self,
                  source_excel_path='SCurvesCache.xlsx',
-                 folder_path=r'C:\SCurve_results',
-                 hist_bins=0.25,
+                 folder_path      =r'C:\SCurve_results',
+                 hist_bins        =0.25,
                  compare_coefs_path=None):
-        self.source_excel_path = source_excel_path
-        self.folder_path = folder_path
-        self.hist_bins = hist_bins
+        """
+        :param source_excel_path: Excel с колонками ['LoanAge','Date','Incentive','CPR','PartialCPR' или 'TotalDebtBln']
+        :param folder_path: куда сохранять результаты
+        :param hist_bins: ширина бина для гистограммы TotalDebtBln
+        :param compare_coefs_path: путь к Excel/CSV с эталонными β (столбцы Date, LoanAge, b0..b6)
+        """
+        self.source_excel_path  = source_excel_path
+        self.folder_path        = folder_path
+        self.hist_bins          = hist_bins
         self.compare_coefs_path = compare_coefs_path
-        # load reference betas
+
+        # загружаем эталонные β, если указано
         self.compare_coefs = pd.DataFrame()
         if compare_coefs_path and os.path.exists(compare_coefs_path):
-            cmp = (pd.read_excel(compare_coefs_path) if compare_coefs_path.lower().endswith('.xlsx')
+            cmp = (pd.read_excel(compare_coefs_path)
+                   if compare_coefs_path.lower().endswith('.xlsx')
                    else pd.read_csv(compare_coefs_path))
             cmp.rename(columns=lambda c: c.strip(), inplace=True)
             rename_map = {f'Beta{i}': f'b{i}' for i in range(7)}
@@ -42,111 +57,201 @@ class scurves:
             need = ['Date', 'LoanAge'] + [f'b{i}' for i in range(7)]
             miss = [c for c in need if c not in cmp.columns]
             if miss:
-                raise ValueError(f'Missing columns in compare_coefs: {miss}')
-            cmp['Date'] = pd.to_datetime(cmp['Date']).dt.normalize()
+                raise ValueError(f'В файле {compare_coefs_path} нет колонок: {miss}')
+            cmp['Date']    = pd.to_datetime(cmp['Date']).dt.normalize()
             cmp['LoanAge'] = cmp['LoanAge'].astype(int)
             self.compare_coefs = cmp[need].copy()
-            print(f'[INFO] Loaded {len(self.compare_coefs)} rows of reference betas')
+            print(f'[INFO] Загрузил {len(self.compare_coefs)} строк эталонных β')
         elif compare_coefs_path:
-            print(f'[WARN] Reference file not found, comparison disabled')
-        # placeholders
-        self.new_data = pd.DataFrame()
-        self.periods = []
-        self.CPR_fitted = pd.DataFrame()
-        self.coefs = pd.DataFrame()
-        self.CPR_fitted_un = pd.DataFrame()
-        self.coefs_un = pd.DataFrame()
+            print(f'[WARN] Файл {compare_coefs_path} не найден → сравнение отключено')
 
+        # placeholders
+        self.new_data             = pd.DataFrame()
+        self.periods              = []
+        self.CPR_fitted           = pd.DataFrame()
+        self.coefs                = pd.DataFrame()
+        self.CPR_fitted_unconstr  = pd.DataFrame()
+        self.coefs_unconstr       = pd.DataFrame()
+
+    # ------------------------------------------------------------------ #
+    #  чтение основной Excel-таблицы
+    # ------------------------------------------------------------------ #
     def check_new(self):
         if not os.path.exists(self.source_excel_path):
             raise FileNotFoundError(self.source_excel_path)
         df = pd.read_excel(self.source_excel_path)
         df['Date'] = pd.to_datetime(df['Date'])
+        # PartialCPR -> TotalDebtBln
         if 'TotalDebtBln' not in df.columns and 'PartialCPR' in df.columns:
             df.rename(columns={'PartialCPR': 'TotalDebtBln'}, inplace=True)
         if 'TotalDebtBln' not in df.columns:
             df['TotalDebtBln'] = 1.0
         self.new_data = df
-        self.periods = sorted(df['Date'].dt.normalize().unique())
+        self.periods  = sorted(df['Date'].dt.normalize().unique())
 
+    # ------------------------------------------------------------------ #
     def calculate(self):
         self.check_new()
         if self.new_data.empty:
-            print('No data to compute'); return
+            print('Excel пуст – нечего считать')
+            return
         self.calculate_scurves(self.new_data, plot_curves=True)
-        if input('Save coefs to Excel? (Y) ').strip().upper() == 'Y':
+        if input('Сохранить coefs в Excel? (Y) ').strip().upper() == 'Y':
             self.update_excel('SCurvesParameters.xlsx')
-            print('Updated SCurvesParameters.xlsx')
+            print('Файл SCurvesParameters.xlsx обновлён.')
 
+    # ------------------------------------------------------------------ #
     def calculate_scurves(self, data2use: pd.DataFrame, plot_curves=True):
-        # compute both constrained and unconstrained
+        # 1) constrained
         self.CPR_fitted, self.coefs = self._scurve_by_tenor_constrained(data2use)
-        self.CPR_fitted_un, self.coefs_un = self._scurve_by_tenor_unconstrained(data2use)
+        # 2) unconstrained
+        self.CPR_fitted_unconstr, self.coefs_unconstr = self._scurve_by_tenor_unconstrained(data2use)
 
-        ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        # общая папка вывода
+        ts      = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
         out_dir = os.path.join(self.folder_path, ts)
         os.makedirs(out_dir, exist_ok=True)
-        # save csvs
-        self.CPR_fitted.to_csv(os.path.join(out_dir, 'CPR_fitted.csv'), index=False, encoding='utf-8-sig')
-        self.coefs.to_csv(os.path.join(out_dir, 'coefs.csv'), index=False, encoding='utf-8-sig')
-        self.CPR_fitted_un.to_csv(os.path.join(out_dir, 'CPR_fitted_unconstrained.csv'), index=False, encoding='utf-8-sig')
-        self.coefs_un.to_csv(os.path.join(out_dir, 'coefs_unconstrained.csv'), index=False, encoding='utf-8-sig')
+
+        # сохраняем CSV
+        self.CPR_fitted.to_csv(os.path.join(out_dir, 'CPR_fitted.csv'),
+                               index=False, encoding='utf-8-sig')
+        self.coefs.to_csv(os.path.join(out_dir, 'coefs.csv'),
+                          index=False, encoding='utf-8-sig')
+
+        self.CPR_fitted_unconstr.to_csv(os.path.join(out_dir, 'CPR_fitted_unconstrained.csv'),
+                                        index=False, encoding='utf-8-sig')
+        self.coefs_unconstr.to_csv(os.path.join(out_dir, 'coefs_unconstrained.csv'),
+                                   index=False, encoding='utf-8-sig')
 
         if plot_curves:
             self._plot_everything(data_all=data2use, output_dir=out_dir)
 
-    # original plotting left unchanged, then additional plots added
+    # ------------------------------------------------------------------ #
+    #                       P L O T T I N G
+    # ------------------------------------------------------------------ #
     def _plot_everything(self, data_all: pd.DataFrame, output_dir: str):
-        # ... insert your existing _plot_everything code here unchanged ...
-        # after all existing plotting calls, append new comparisons:
+        # сюда вставьте ваш существующий _plot_everything целиком (без изменений)
+        # ... (ваш код: plot_lines, plot_full, plot_one) ...
+
+        # а затем — дополнительные графики сравнения constrained vs unconstrained
         loanages = sorted(data_all['LoanAge'].unique())
         for dt in self.periods:
-            # prepare data for constrained and unconstrained
-            cur_con = (self.CPR_fitted[self.CPR_fitted['Date']==dt]
-                       .set_index('Incentive').drop(columns='Date'))
-            cur_un  = (self.CPR_fitted_un[self.CPR_fitted_un['Date']==dt]
-                       .set_index('Incentive').drop(columns='Date'))
-            xgrid = cur_con.index.values
-            # for each loanage plot comparison
+            # constrained и unconstrained кривые
+            cur_c = (self.CPR_fitted[self.CPR_fitted['Date']==dt]
+                     .set_index('Incentive').drop(columns='Date'))
+            cur_u = (self.CPR_fitted_unconstr[self.CPR_fitted_unconstr['Date']==dt]
+                     .set_index('Incentive').drop(columns='Date'))
+            xgrid = cur_c.index.values
+
             for h in loanages:
                 fig, ax = plt.subplots(figsize=(7,4))
                 # constrained
-                ax.plot(xgrid, cur_con[f'CPR_fitted_{h}'], label='c_огр', lw=2)
+                ax.plot(xgrid, cur_c[f'CPR_fitted_{h}'],
+                        lw=2, label='с ограничениями')
                 # unconstrained
-                ax.plot(xgrid, cur_un[f'CPR_fitted_{h}'], ls='--', label='без_огр', lw=2)
-                # factual
+                ax.plot(xgrid, cur_u[f'CPR_fitted_{h}'],
+                        ls='--', lw=2, label='без ограничений')
+                # фактические точки
                 grp = data_all[(data_all['Date']==dt)&(data_all['LoanAge']==h)]
-                ax.scatter(grp['Incentive'], grp['CPR'], s=25, label='фактический')
-                ax.set_title(f'{dt:%Y-%m-%d} h={h}')
-                ax.set_xlabel('Incentive'); ax.set_ylabel('CPR')
-                ax.legend(); ax.grid(ls='--', alpha=0.3)
+                ax.scatter(grp['Incentive'], grp['CPR'],
+                           s=25, color='black', alpha=0.6,
+                           label='фактический CPR')
+                ax.set_xlabel('Incentive')
+                ax.set_ylabel('CPR')
+                ax.set_title(f'{dt:%Y-%m-%d} h={h} сравнение')
+                ax.legend(loc='best', fontsize=8)
+                ax.grid(ls='--', alpha=0.3)
                 fig.tight_layout()
-                fig.savefig(os.path.join(output_dir, f'{dt:%Y-%m-%d}_h{h}_сравнение.png'), dpi=300)
+                fig.savefig(os.path.join(output_dir,
+                                         f'{dt:%Y-%m-%d}_h{h}_сравнение.png'),
+                            dpi=300)
                 plt.close(fig)
 
+    # ------------------------------------------------------------------ #
     def _scurve_by_tenor_constrained(self, data: pd.DataFrame):
-        # original _scurve_by_tenor code here (uses NonlinearConstraint)
-        # ... copy-paste your existing constrained implementation ...
-        return CPR_fitted_full, coefs_full
+        """
+        Оригинальный алгоритм S-кривых с упорядочивающими ограничениями
+        """
+        # === полностью вставьте сюда ваш существующий метод _scurve_by_tenor ===
+        # ……………………… (код без изменений) …………………………
+        # в конце должны быть:
+        #   return CPR_fitted_full, coefs_full
+        raise NotImplementedError("Вставьте сюда ваш констрейнт-алгоритм")
 
+    # ------------------------------------------------------------------ #
     def _scurve_by_tenor_unconstrained(self, data: pd.DataFrame):
-        # same as above but remove NonlinearConstraint usage
-        # and fit each tenor independently
-        # ... implement unconstrained version ...
-        return CPR_fitted_full_un, coefs_full_un
+        """
+        Тот же алгоритм, но без NonlinearConstraint.
+        Каждая выдержка считает коэффициенты независимо.
+        """
+        # копируем и нормализуем
+        df = data.copy()
+        df['Date'] = pd.to_datetime(df['Date'])
+        step = 0.1
+        x_min = df['Incentive'].min()
+        x_max = df['Incentive'].max()
+        idx = np.round(np.arange(x_min, x_max+step/2, step), 1)
 
+        CPR_fitted_full = pd.DataFrame()
+        coefs_full      = []
+
+        dates = sorted(df['Date'].dt.normalize().unique())
+        for dt in dates:
+            slice_dt = df[df['Date']==dt]
+            cpr_dt = pd.DataFrame(index=idx)
+            cpr_dt['Date'] = dt
+            for h in sorted(slice_dt['LoanAge'].unique()):
+                grp = slice_dt[slice_dt['LoanAge']==h]
+                # fit без ограничений
+                x = np.array(grp['Incentive'])
+                y = np.array(grp['CPR'])
+                w = np.array(grp['TotalDebtBln'])
+                w = w/w.sum() if w.sum()>0 else np.ones_like(w)
+                def f(b, xx):
+                    return (b[0]
+                            + b[1]*np.arctan(b[2]+b[3]*xx)
+                            + b[4]*np.arctan(b[5]+b[6]*xx))
+                def obj(b): return np.sum(w*(y - f(b, x))**2)
+                bounds = [[-np.inf, np.inf],
+                          [0, np.inf],
+                          [-np.inf, 0],
+                          [0, 4],
+                          [0, np.inf],
+                          [0, np.inf],
+                          [0, 1]]
+                start = [0.2,0.05,-2,2.2,0.07,2,0.2]
+                res = minimize(obj, x0=start, bounds=bounds,
+                               method='SLSQP', options={'ftol':1e-9})
+                betas = res.x
+                # записываем в coefs
+                coefs_full.append([dt, h] + betas.tolist())
+                # строим кривую
+                xclip = np.clip(idx, -100, 40)
+                s_curve = f(betas, xclip)
+                cpr_dt[f'CPR_fitted_{h}'] = s_curve
+            # добавляем
+            CPR_fitted_full = pd.concat([CPR_fitted_full, cpr_dt])
+        # coefs -> DataFrame
+        coefs_full = pd.DataFrame(coefs_full,
+                                  columns=['Date','LoanAge']+[f'b{i}' for i in range(7)])
+        coefs_full['ID'] = range(1, len(coefs_full)+1)
+        return CPR_fitted_full.reset_index().rename(columns={'index':'Incentive'}), coefs_full
+
+    # ------------------------------------------------------------------ #
     def update_excel(self, file_path='SCurvesParameters.xlsx', truncate=False):
         if self.coefs.empty:
-            print('No coefs to write'); return
-        df = self.coefs if truncate or not os.path.exists(file_path) else pd.concat([pd.read_excel(file_path), self.coefs], ignore_index=True)
+            print('coefs пуст – нечего писать'); return
+        df = (self.coefs if truncate or not os.path.exists(file_path)
+              else pd.concat([pd.read_excel(file_path), self.coefs], ignore_index=True))
         df.to_excel(file_path, sheet_name='SCurvesParameters', index=False)
 
 
+# ---------------------------------------------------------------------- #
 if __name__ == '__main__':
     sc = scurves(
-        source_excel_path=r'C:\path\to\SCurvesCache.xlsx',
-        folder_path=r'C:\path\to\SCurve_results',
-        hist_bins=0.25,
-        compare_coefs_path=r'C:\path\to\reference.xlsx'
+        source_excel_path=r'C:\path\SCurvesCache.xlsx',
+        folder_path      =r'C:\path\SCurve_results',
+        hist_bins        =0.25,
+        compare_coefs_path=r'C:\path\reference.xlsx'
     )
     sc.calculate()
