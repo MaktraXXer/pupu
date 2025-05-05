@@ -1,290 +1,181 @@
-# -*- coding: utf-8 -*-
-"""
-scurves.py ─ расчёт S-кривых, построение графиков и сравнение
-с «эталонными» β-коэффициентами и без упорядочивания.
-
-Сохраняет структуру папки
-
-    <folder_path>\<timestamp>\
-        CPR_fitted.csv
-        coefs.csv
-        coefs_unconstrained.csv
-        ... (все старые графики)
-        YYYY-MM-DD_scurves_без_огр.png
-        YYYY-MM-DD_full_без_огр.png
-        YYYY-MM-DD_h{n}_без_огр.png
-"""
-import os
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from scipy.optimize import minimize, NonlinearConstraint
-from datetime import datetime
-plt.rcParams['axes.formatter.useoffset'] = False
-
-class scurves:
-    def __init__(self,
-                 source_excel_path='SCurvesCache.xlsx',
-                 folder_path      =r'C:\SCurve_results',
-                 hist_bins        =0.25,
-                 compare_coefs_path=None):
-        # исходные пути и параметры
-        self.source_excel_path  = source_excel_path
-        self.folder_path        = folder_path
-        self.hist_bins          = hist_bins
-        self.compare_coefs_path = compare_coefs_path
-
-        # загрузка «эталонных» бета, если указано
-        self.compare_coefs = pd.DataFrame()
-        if compare_coefs_path and os.path.exists(compare_coefs_path):
-            cmp = (pd.read_excel(compare_coefs_path)
-                   if compare_coefs_path.lower().endswith('.xlsx')
-                   else pd.read_csv(compare_coefs_path))
-            cmp.rename(columns=lambda c: c.strip(), inplace=True)
-            cmp.rename(columns={f'Beta{i}':f'b{i}' for i in range(7)}, inplace=True)
-            need = ['Date','LoanAge'] + [f'b{i}' for i in range(7)]
-            miss = [c for c in need if c not in cmp.columns]
-            if miss:
-                raise ValueError(f'В {compare_coefs_path} нет колонок: {miss}')
-            cmp['Date']=pd.to_datetime(cmp['Date']).dt.normalize()
-            cmp['LoanAge']=cmp['LoanAge'].astype(int)
-            self.compare_coefs = cmp[need].copy()
-            print(f'[INFO] Загрузил {len(self.compare_coefs)} эталонных β')
-        elif compare_coefs_path:
-            print(f'[WARN] Файл {compare_coefs_path} не найден → сравнение отключено')
-
-        # сюда запишем данные после чтения
-        self.new_data   = pd.DataFrame()
-        self.periods    = []
-        self.CPR_fitted = pd.DataFrame()
-        self.coefs      = pd.DataFrame()
-
-    def check_new(self):
-        # читаем Excel и нормализуем
-        if not os.path.exists(self.source_excel_path):
-            raise FileNotFoundError(self.source_excel_path)
-        df = pd.read_excel(self.source_excel_path)
-        df['Date'] = pd.to_datetime(df['Date'])
-        if 'TotalDebtBln' not in df.columns and 'PartialCPR' in df.columns:
-            df.rename(columns={'PartialCPR':'TotalDebtBln'}, inplace=True)
-        if 'TotalDebtBln' not in df.columns:
-            df['TotalDebtBln'] = 1.0
-        self.new_data = df
-        self.periods  = sorted(df['Date'].dt.normalize().unique())
-
-    def calculate(self):
-        # основной сценарий
-        self.check_new()
-        if self.new_data.empty:
-            print('Excel пуст – нечего считать'); return
-        self.calculate_scurves(self.new_data, plot_curves=True)
-        if input('Сохранить coefs в Excel? (Y) ').strip().upper()=='Y':
-            self.update_excel('SCurvesParameters.xlsx')
-            print('SCurvesParameters.xlsx обновлён.')
-
-    def calculate_scurves(self, data2use: pd.DataFrame, plot_curves=True):
-        # рассчитываем и сохраняем оба набора: с ограничениями и без
-        self.CPR_fitted, self.coefs = self._scurve_by_tenor(data2use, constrained=True)
-        # coefs без ограничений
-        _, coefs_un = self._scurve_by_tenor(data2use, constrained=False)
-        # timestamp и папка
-        ts      = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-        out_dir = os.path.join(self.folder_path, ts)
-        os.makedirs(out_dir, exist_ok=True)
-        # сохраняем
-        self.CPR_fitted.to_csv(os.path.join(out_dir,'CPR_fitted.csv'),
-                               index=False, encoding='utf-8-sig')
-        self.coefs     .to_csv(os.path.join(out_dir,'coefs.csv'),
-                               index=False, encoding='utf-8-sig')
-        coefs_un      .to_csv(os.path.join(out_dir,'coefs_unconstrained.csv'),
-                               index=False, encoding='utf-8-sig')
-        if plot_curves:
-            # старые графики
-            self._plot_everything(data_all=data2use, output_dir=out_dir)
-            # новые сравнения с unconstrained
-            self._plot_compare_unconstrained(data_all=data2use,
-                                             out_dir=out_dir)
-
-    # --------------------- старый метод рисования (не трогаем) ----------------------
     def _plot_everything(self, data_all: pd.DataFrame, output_dir: str):
-        # <ваша старая реализация полностью>
-
-        ...
-
-    # --------------- новая функция: сравнить фактич. + unconstrained ---------------
-    def _plot_compare_unconstrained(self, data_all: pd.DataFrame, out_dir: str):
-        import numpy as np
         loanages = sorted(data_all['LoanAge'].unique())
         cmap     = plt.cm.get_cmap('tab10', len(loanages))
-        colors   = {h:cmap(i) for i,h in enumerate(loanages)}
-        x_min,x_max = data_all['Incentive'].min(), data_all['Incentive'].max()
+        colors   = {h: cmap(i) for i, h in enumerate(loanages)}
 
-        # вспомогалка: получить unconstrained S-кривую для данн. dt,h
-        def get_unconst(dt,h,xgrid):
-            # найдём беты из coefs_unconstrained.csv
-            df_un = pd.read_csv(os.path.join(out_dir,'coefs_unconstrained.csv'))
-            df_un['Date']=pd.to_datetime(df_un['Date']).dt.normalize()
-            row = df_un[(df_un['Date']==pd.Timestamp(dt).normalize()) &
-                        (df_un['LoanAge']==h)]
-            if row.empty: return None
-            b = row[[f'b{i}' for i in range(7)]].values.flatten().astype(float)
-            return b[0] + b[1]*np.arctan(b[2]+b[3]*xgrid) \
-                     + b[4]*np.arctan(b[5]+b[6]*xgrid)
+        # helper: пунктирная кривая сравнения
+        def add_compare(ax, date, xgrid, age=None):
+            if self.compare_coefs.empty:
+                return
+            date = pd.Timestamp(date).normalize()
+            cmp  = self.compare_coefs[self.compare_coefs['Date'] == date]
+            if age is not None:
+                cmp = cmp[cmp['LoanAge'] == age]
+            if cmp.empty:
+                return
+            for _, row in cmp.iterrows():
+                h = int(row['LoanAge'])
+                b = row[[f'b{i}' for i in range(7)]].values.astype(float)
+                y = b[0] \
+                    + b[1]*np.arctan(b[2] + b[3]*xgrid) \
+                    + b[4]*np.arctan(b[5] + b[6]*xgrid)
+                ax.plot(
+                    xgrid, y,
+                    ls='--', lw=1.8, alpha=0.55,
+                    color=colors.get(h, 'grey'),
+                    label=f'compare h={h}'
+                )
+
+        # подготовка гистограмм TotalDebtBln
+        x_min, x_max = data_all['Incentive'].min(), data_all['Incentive'].max()
+        bins = (np.arange(x_min, x_max + self.hist_bins, self.hist_bins)
+                if isinstance(self.hist_bins, float)
+                else self.hist_bins)
+        hist_all = {}
+        for h in loanages:
+            msk = data_all['LoanAge'] == h
+            hist, edges = np.histogram(
+                data_all.loc[msk, 'Incentive'],
+                bins=bins,
+                weights=data_all.loc[msk, 'TotalDebtBln']
+            )
+            hist_all[h] = ((edges[:-1] + edges[1:]) / 2, hist)
+        max_debt_global = sum(v[1] for v in hist_all.values()).max()
 
         # цикл по датам
         for dt in self.periods:
-            # фактич. кривые из self.CPR_fitted
-            cur = (self.CPR_fitted[self.CPR_fitted['Date']==dt]
-                   .set_index('Incentive').drop(columns='Date'))
-            xgrid = cur.index.values
+            cur = (
+                self.CPR_fitted[self.CPR_fitted['Date'] == dt]
+                .set_index('Incentive')
+                .drop(columns='Date')
+            )
 
-            # 1) линии: фактич. vs unconstrained
-            fig,ax = plt.subplots(figsize=(8,5))
+            # 1) только линии (fixed и auto)
+            def plot_lines(auto=False):
+                fig, ax = plt.subplots(figsize=(7, 4))
+                for col in cur.columns:
+                    h = int(col.split('_')[-1])
+                    ax.plot(
+                        cur.index, cur[col],
+                        lw=2, color=colors[h], label=f'h={h}'
+                    )
+                add_compare(ax, dt, cur.index)
+                ax.grid(ls='--', alpha=0.3)
+                ax.set_xlabel('Incentive, п.п.')
+                ax.set_ylabel('CPR_fitted, % год.')
+                ax.set_xlim(x_min, x_max)
+                ax.set_ylim(0, (cur.max().max() * 1.05) if auto else 0.45)
+                ax.legend(ncol=4, fontsize=8, framealpha=0.95)
+                lab = '_auto' if auto else ''
+                fig.tight_layout()
+                fig.savefig(
+                    os.path.join(output_dir, f'{dt:%Y-%m-%d}_scurves{lab}.png'),
+                    dpi=300
+                )
+                plt.close(fig)
+
+            # 2) full graph (fixed и auto)
+            def plot_full(auto=False):
+                fig, axL = plt.subplots(figsize=(10, 6))
+                # S-кривые
+                for col in cur.columns:
+                    h = int(col.split('_')[-1])
+                    axL.plot(
+                        cur.index, cur[col],
+                        lw=2, color=colors[h], label=f'S, h={h}'
+                    )
+                add_compare(axL, dt, cur.index)
+                # scatter фактический CPR
+                m_dt = data_all['Date'] == dt
+                for h, grp in data_all[m_dt].groupby('LoanAge'):
+                    axL.scatter(
+                        grp['Incentive'], grp['CPR'],
+                        s=25, color=colors[h], alpha=0.8,
+                        edgecolors='none', label=f'CPR, h={h}'
+                    )
+                axL.set_xlabel('Incentive, п.п.')
+                axL.set_ylabel('CPR, % год.')
+                axL.grid(ls='--', alpha=0.3)
+                axL.set_xlim(x_min, x_max)
+
+                # гистограмма долгов
+                axR, bottom = axL.twinx(), np.zeros_like(hist_all[loanages[0]][1])
+                for h in loanages:
+                    centers, hv = hist_all[h]
+                    axR.bar(
+                        centers, hv, bottom=bottom,
+                        width=(centers[1] - centers[0]) * 0.9,
+                        color=colors[h], alpha=0.25,
+                        edgecolor='none', label=f'Debt, h={h}'
+                    )
+                    bottom += hv
+                ymax_cpr  = max(cur.max().max(), data_all.loc[m_dt, 'CPR'].max())
+                ymax_debt = bottom.max()
+                axL.set_ylim(0, (ymax_cpr * 1.05) if auto else 0.45)
+                axR.set_ylim(0, (ymax_debt * 1.1) if auto else max_debt_global * 1.1)
+                axR.set_ylabel('TotalDebtBln, млрд руб.')
+
+                # общая легенда
+                hdl, lbl = [], []
+                for ax in (axL, axR):
+                    h, l = ax.get_legend_handles_labels()
+                    hdl += h; lbl += l
+                axL.legend(hdl, lbl, ncol=3, fontsize=8, framealpha=0.95)
+                lab = '_auto' if auto else ''
+                axL.set_title(f'Full graph {lab} {dt:%Y-%m-%d}')
+                fig.tight_layout()
+                fig.savefig(
+                    os.path.join(output_dir, f'{dt:%Y-%m-%d}_full{lab}.png'),
+                    dpi=300
+                )
+                plt.close(fig)
+
+            # 3) per-LoanAge (fixed и auto)
+            def plot_one(h, auto=False):
+                centers, hv = hist_all[h]
+                grp_h = data_all[
+                    (data_all['Date'] == dt) & (data_all['LoanAge'] == h)
+                ]
+                fig, axL = plt.subplots(figsize=(7, 4))
+                axL.plot(
+                    cur.index, cur[f'CPR_fitted_{h}'],
+                    lw=2, color=colors[h], label='S-curve'
+                )
+                add_compare(axL, dt, cur.index, age=h)
+                axL.scatter(
+                    grp_h['Incentive'], grp_h['CPR'],
+                    s=25, color=colors[h], alpha=0.8,
+                    edgecolors='none', label='CPR фактич.'
+                )
+
+                axR = axL.twinx()
+                axR.bar(
+                    centers, hv,
+                    width=(centers[1] - centers[0]) * 0.9,
+                    color=colors[h], alpha=0.25, edgecolor='none',
+                    label='Debt'
+                )
+                axL.grid(ls='--', alpha=0.3)
+                axL.set_xlabel('Incentive, п.п.')
+                axL.set_ylabel('CPR, % год.')
+                axR.set_ylabel('TotalDebtBln, млрд руб.')
+                axL.set_xlim(x_min, x_max)
+                ymax_c = max(cur[f'CPR_fitted_{h}'].max(), grp_h['CPR'].max())
+                axL.set_ylim(0, (ymax_c * 1.05) if auto else 0.45)
+                axR.set_ylim(0, (hv.max() * 1.1) if auto else max_debt_global * 1.1)
+                axL.legend(fontsize=8)
+                axR.legend(fontsize=8, loc='upper right')
+                lab = '_auto' if auto else ''
+                axL.set_title(f'date={dt:%Y-%m-%d} h={h}{lab}')
+                fig.tight_layout()
+                fig.savefig(
+                    os.path.join(output_dir, f'{dt:%Y-%m-%d}_h{h}{lab}.png'),
+                    dpi=300
+                )
+                plt.close(fig)
+
+            # рисуем
+            plot_lines(False); plot_lines(True)
+            plot_full(False);  plot_full(True)
             for h in loanages:
-                ax.plot(xgrid, cur[f'CPR_fitted_{h}'],
-                        lw=2, color=colors[h], label=f'упорядоч h={h}')
-                y_un = get_unconst(dt,h,xgrid)
-                if y_un is not None:
-                    ax.plot(xgrid,y_un, ls='--', lw=2,
-                            color=colors[h], alpha=0.7,
-                            label=f'без_огр h={h}')
-            ax.set_xlim(x_min,x_max); ax.set_ylim(0,0.5)
-            ax.grid(ls='--',alpha=0.3)
-            ax.set_xlabel('Incentive')
-            ax.set_ylabel('CPR_fitted')
-            ax.legend(ncol=3,fontsize=8)
-            fig.tight_layout()
-            fig.savefig(os.path.join(out_dir,
-                                     f'{dt:%Y-%m-%d}_scurves_без_огр.png'),
-                        dpi=300)
-            plt.close(fig)
-
-            # 2) full+гисто
-            fig,axL = plt.subplots(figsize=(10,6))
-            # фактич. + unconstrained
-            for h in loanages:
-                axL.plot(xgrid, cur[f'CPR_fitted_{h}'],
-                         lw=2, color=colors[h])
-                y_un = get_unconst(dt,h,xgrid)
-                if y_un is not None:
-                    axL.plot(xgrid,y_un, ls='--', lw=2,
-                             color=colors[h], alpha=0.7)
-            # scatter фактич.
-            for h,grp in data_all[data_all['Date']==dt].groupby('LoanAge'):
-                axL.scatter(grp['Incentive'],grp['CPR'],
-                            s=20,color=colors[h],alpha=0.6)
-            axL.set_xlim(x_min,x_max); axL.set_xlabel('Incentive'); axL.set_ylabel('CPR')
-            axL.grid(ls='--',alpha=0.3)
-            # гистограмма дебта (как раньше)...
-            axR = axL.twinx(); bottom=0
-            for h in loanages:
-                grp = data_all[(data_all['Date']==dt)&(data_all['LoanAge']==h)]
-                hist,edges = np.histogram(grp['Incentive'],
-                                          bins=np.arange(x_min,x_max+self.hist_bins,self.hist_bins),
-                                          weights=grp['TotalDebtBln'])
-                centers=(edges[:-1]+edges[1:])/2
-                axR.bar(centers,hist,bottom=bottom,
-                        width=self.hist_bins*0.9,
-                        color=colors[h],alpha=0.3,edgecolor='none')
-                bottom+=hist
-            axR.set_ylabel('TotalDebtBln')
-            fig.tight_layout()
-            fig.savefig(os.path.join(out_dir,
-                                     f'{dt:%Y-%m-%d}_full_без_огр.png'),
-                        dpi=300)
-            plt.close(fig)
-
-    def _scurve_by_tenor(self, data: pd.DataFrame, constrained: bool=True):
-        """
-        Единая сетка Incentive; если constrained=True — упорядочиваем
-        (direction up/down), иначе считаем каждую кривую без ограничений.
-        """
-        data = data.copy()
-        data['Date'] = pd.to_datetime(data['Date'])
-        # сетка
-        step  = 0.1
-        xmin  = data['Incentive'].min()
-        xmax  = data['Incentive'].max()
-        idx   = np.round(np.arange(xmin, xmax+step/2, step),1)
-
-        CPR_full = pd.DataFrame(); coefs_full = pd.DataFrame()
-        dates = sorted(data['Date'].dt.normalize().unique())
-
-        # constrained
-        def scurve_constrained(inp):
-            # <ваш существующий scurve_from_arctan с NonlinearConstraint>
-            # на выходе возвращает {'s_curve':..., 'coefs':...}
-            return scurve_from_arctan(inp)  # переиспользуем
-
-        # unconstrained
-        def scurve_unconstrained(inp):
-            x = np.array(inp['Incentive']); y=np.array(inp['CPR'])
-            d = np.array(inp['TotalDebtBln'])
-            lb = inp.get('lb_rate',-100); ub=inp.get('ub_rate',40)
-            mask=(x>=lb)&(x<=ub); x,y,d = x[mask],y[mask],d[mask]
-            w = np.ones_like(d) if d.sum()==0 else d/d.sum()
-            def f(b,xx):
-                return (b[0] + b[1]*np.arctan(b[2]+b[3]*xx)
-                        + b[4]*np.arctan(b[5]+b[6]*xx))
-            def cost(b): return np.sum(w*(y-f(b,x))**2)
-            bounds=[[ -np.inf,np.inf],[0,np.inf],[-np.inf,0],[0,4],
-                    [0,np.inf],[0,np.inf],[0,1]]
-            start=[0.2,0.05,-2,2.2,0.07,2,0.2]
-            res=minimize(cost, x0=start, bounds=bounds,
-                         method='SLSQP', options={'ftol':1e-9})
-            betas=res.x
-            xgrid=inp['xgrid']; xclip=np.clip(xgrid,lb,ub)
-            return {'s_curve':f(betas,xclip).tolist(), 'coefs':betas}
-
-        for dt in dates:
-            dfp = data[data['Date']==dt].copy()
-            frame = pd.DataFrame(index=idx); frame['Date']=dt
-            cf_list=[]
-            # most represented tenor
-            rep = dfp.groupby('LoanAge')['TotalDebtBln'].sum().idxmax()
-            tenors = sorted(dfp['LoanAge'].unique())
-            # для каждого tenor
-            prev_coefs=None
-            for h in ([rep]+[t for t in tenors if t<rep][::-1]+[t for t in tenors if t>rep]):
-                aux = dfp[dfp['LoanAge']==h]
-                inp = {'Incentive':aux['Incentive'],
-                       'CPR':aux['CPR'],
-                       'TotalDebtBln':aux['TotalDebtBln'],
-                       'lb_rate':-100,'ub_rate':40,
-                       'xgrid':idx}
-                if constrained and prev_coefs is not None:
-                    inp['coefs']=prev_coefs
-                    inp['direction']='up' if h<rep else 'down'
-                    out = scurve_constrained(inp)
-                else:
-                    out = scurve_unconstrained(inp)
-                frame[f'CPR_fitted_{h}']=out['s_curve']
-                prev_coefs = out['coefs']
-                cf_list.append([dt,h,*out['coefs']])
-            # сохраняем
-            frame = frame[['Date']+[f'CPR_fitted_{t}' for t in tenors]]
-            CPR_full = pd.concat([CPR_full, frame])
-            cf = pd.DataFrame(cf_list, columns=['Date','LoanAge']+[f'b{i}' for i in range(7)])
-            coefs_full = pd.concat([coefs_full, cf])
-
-        coefs_full = coefs_full.sort_values(['Date','LoanAge']).reset_index(drop=True)
-        coefs_full['ID'] = coefs_full.index+1
-        CPR_full = CPR_full.rename_axis('Incentive').reset_index()
-        return CPR_full, coefs_full
-
-    def update_excel(self, file_path='SCurvesParameters.xlsx', truncate=False):
-        if self.coefs.empty:
-            print('coefs пуст – нечего писать'); return
-        base = pd.read_excel(file_path) if (not truncate and os.path.exists(file_path)) else pd.DataFrame()
-        df = pd.concat([base, self.coefs], ignore_index=True)
-        df.to_excel(file_path, sheet_name='SCurvesParameters', index=False)
-
-
-if __name__=='__main__':
-    sc = scurves(
-        source_excel_path=r'C:\SCurvesCache.xlsx',
-        folder_path=r'C:\SCurve_results',
-        hist_bins=0.25,
-        compare_coefs_path=r'C:\pashaparametersmarch.xlsx'
-    )
-    sc.calculate()
+                plot_one(h, False); plot_one(h, True)
