@@ -1,4 +1,4 @@
-    def _plot_everything(self, data_all: pd.DataFrame, output_dir: str):
+ def _plot_everything(self, data_all: pd.DataFrame, output_dir: str):
         loanages = sorted(data_all['LoanAge'].unique())
         cmap     = plt.cm.get_cmap('tab10', len(loanages))
         colors   = {h: cmap(i) for i, h in enumerate(loanages)}
