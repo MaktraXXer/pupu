@@ -1,29 +1,17 @@
-SELECT dk.*,
-       CA.BaseRate
-INTO   #DailyBaseRate        -- временная таблица
-FROM   DealKeys dk
-CROSS APPLY (
-    SELECT TOP (1) bc.BaseRate
-    FROM   BaseCandidates bc
-    JOIN   BalanceBuckets bbSrc
-           ON bc.BalanceBucket = bbSrc.BALANCE_GROUP
-    WHERE  bc.SEG_NAME             = dk.SEG_NAME
-      AND  bc.PROD_NAME            = dk.PROD_NAME
-      AND  bc.CUR                  = dk.CUR
-      AND  bc.TermBucket           = dk.TermBucket
-      AND  bc.IS_OPTION            = dk.IS_OPTION
-      AND  bc.NEW_CONVENTION_NAME  = dk.NEW_CONVENTION_NAME
-      /* окно по датам ±@DayWindow */
-      AND  ABS(DATEDIFF(DAY, bc.DT_OPEN, dk.DT_OPEN)) <= @DayWindow
-      /* направление по бакетам */
-      AND (
-            (dk.BucketUpper <= 1500000  AND bbSrc.BucketOrder <= dk.BucketOrder)  -- вниз
-         OR (dk.BucketUpper  > 1500000  AND bbSrc.BucketOrder >= dk.BucketOrder)  -- вверх
-          )
-    ORDER BY
-         ABS(DATEDIFF(DAY, bc.DT_OPEN, dk.DT_OPEN)) ASC,           -- ближе по дате
-         CASE WHEN dk.BucketUpper <= 1500000                       -- ближе по объёму
-              THEN dk.BucketOrder - bbSrc.BucketOrder              -- вниз
-              ELSE bbSrc.BucketOrder - dk.BucketOrder              -- вверх
-         END ASC
-) CA;
+,DealsWithDiscount AS (                     -- добавляем дисконт
+    SELECT dwp.*,
+           dbr.BaseRate,
+           (dbr.BaseRate - dwp.ConvertedRate)                    AS DiscountAbs,
+           CASE WHEN dbr.BaseRate IS NOT NULL AND dbr.BaseRate <> 0
+                THEN (dwp.ConvertedRate / dbr.BaseRate) - 1 END AS DiscountRel
+    FROM DealsWithProlong dwp
+    JOIN DailyBaseRate   dbr
+      ON dbr.DT_OPEN             = dwp.DT_OPEN
+     AND dbr.SEG_NAME            = dwp.SEG_NAME
+     AND dbr.PROD_NAME           = dwp.PROD_NAME
+     AND dbr.CUR                 = dwp.CUR
+     AND dbr.TermBucket          = dwp.TermBucket
+     AND dbr.BalanceBucket       = dwp.BalanceBucket
+     AND dbr.IS_OPTION           = dwp.IS_OPTION
+     AND dbr.NEW_CONVENTION_NAME = dwp.NEW_CONVENTION_NAME
+)
