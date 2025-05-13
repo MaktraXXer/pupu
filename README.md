@@ -1,12 +1,14 @@
 /* -------- остаток по remaining life -------- */
 WITH src AS (
     SELECT
-        /* выбираем реальную дату закрытия: фактическая, плановая, расчётная */
-        ISNULL(NULLIF(DT_CLOSE_FACT,'4444-01-01'),
-               NULLIF(DT_CLOSE_PLAN,'4444-01-01'),
-               NULLIF(DT_CLOSE     ,'4444-01-01'))           AS real_close,
-        dt_rep,
-        out_rub
+        /* выбираем «живую» дату закрытия (!= 4444-01-01) */
+        COALESCE(
+            NULLIF(DT_CLOSE_FACT , '4444-01-01'),
+            NULLIF(DT_CLOSE_PLAN, '4444-01-01'),
+            NULLIF(DT_CLOSE     , '4444-01-01')
+        )                                           AS real_close,
+        DT_REP,
+        OUT_RUB
     FROM  ALM.dbo.balance_rest_all WITH (NOLOCK)
     WHERE MAP_IS_CASH   = 1
       AND TSEGMENTNAME  IN (N'ДЧБО', N'Розничный бизнес')
@@ -15,22 +17,22 @@ WITH src AS (
       AND SECTION_NAME  IN (N'Срочные', N'До востребования', N'Накопительный счёт')
       AND DT_REP        = '2025-05-11'
 )
-/* -------- рассчитываем дней до выхода -------- */
+
+/* -------- «сколько жить осталось» -------- */
 , lifetable AS (
     SELECT
         CASE
-             /* бессрочный: нет даты или спец-значение 4444-01-01 */
-             WHEN real_close IS NULL THEN N'бессрочно'
-             WHEN real_close = '4444-01-01' THEN N'бессрочно'
-             /* иначе — число дней до погашения */
-             ELSE CAST(DATEDIFF(DAY, dt_rep, real_close) AS varchar(20))
-        END            AS days_left,
-        out_rub
+             WHEN real_close IS NULL
+                  THEN N'бессрочно'                                -- нет даты или 4444-01-01
+             ELSE CAST(DATEDIFF(DAY, DT_REP, real_close) AS varchar(20))
+        END                                        AS days_left,
+        OUT_RUB
     FROM src
 )
+
 SELECT
-    days_left                          AS [дней до погашения],
-    SUM(out_rub)/1e6   AS total_mln    -- итог в млн руб
+    days_left                               AS [дней до погашения],
+    SUM(OUT_RUB) / 1e6  AS total_mln        -- сумма в млн руб
 FROM lifetable
 GROUP BY days_left
 ORDER BY
