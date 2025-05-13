@@ -1,203 +1,173 @@
+# -*- coding: utf-8 -*-
+"""
+Универсальный пайплайн «Импорт ➜ очистка ➜ выбор метрики ➜ взвешенные модели + bubble‑plot».
 
+✔ Меняйте только:
+    • EXCEL_FILE   – имя файла Excel
+    • METRIC_KEY   – 'overall' | '1y' | '2y' | '3y'
+    • фильтры      – списки products / segments
 
-Согласен, исследования не нужны. Вот точное изменение кода, чтобы **агрегация шла по неделям с четверга по среду**.
+Остальное (очистка, расчёты, WLS‑кривые) не трогается.
+"""
+# ====================================================== 
+# 0. P A R A M S
+# ======================================================
+EXCEL_FILE = 'prolong.xlsx'        # имя файла
+METRIC_KEY = 'overall'             # 'overall' | '1y' | '2y' | '3y'
 
----
+# -- фильтры по продуктам / сегментам (оставьте [] чтобы не фильтровать)
+FILTER_PRODUCTS = ['Мой дом без опций', 'Доходный+', 'ДОМа лучше']
+FILTER_SEGMENTS = []               # пример: ['Розница']
 
-### 🔧 Что заменить в коде:
+# ======================================================
+# 1.  I M P O R T  +  C L E A N  (общий для всех метрик)
+# ======================================================
+import pandas as pd, numpy as np, matplotlib.pyplot as plt
+from numpy.polynomial.polynomial import polyfit, polyval
+try:
+    from sklearn.isotonic import IsotonicRegression
+    HAVE_SKLEARN = True
+except ImportError:
+    HAVE_SKLEARN = False
 
-Замените этот старый блок:
+df = pd.read_excel(EXCEL_FILE, sheet_name='Sheet1')
 
-```python
-data['week_start'] = data['dt_rep'].dt.to_period('W').apply(lambda p: p.start_time)
-data['week_end']   = data['week_start'] + pd.Timedelta(days=6)
-```
+# --- расчёт «total with %» --------------------------------------------------
+for l, r, new in [
+    ('Summ_ClosedBalanceRub','Summ_ClosedBalanceRub_int','Closed_Total_with_pct'),
+    ('Closed_Sum_NewNoProlong','Closed_Sum_NewNoProlong_int','Closed_Sum_NewNoProlong_with_pct'),
+    ('Closed_Sum_1yProlong_Rub','Closed_Sum_1yProlong_Rub_int','Closed_Sum_1yProlong_with_pct'),
+    ('Closed_Sum_2yProlong_Rub','Closed_Sum_2yProlong_Rub_int','Closed_Sum_2yProlong_with_pct'),
+]:
+    df[new] = df[l].fillna(0) + df[r].fillna(0)
 
-на **вот этот код**, который сдвигает начало недели на четверг:
+safe_div = lambda n,d: np.where(d==0, np.nan, n/d)
+df['Общая пролонгация']   = safe_div(df['Opened_Sum_ProlongRub'],  df['Closed_Total_with_pct'])
+df['1-я автопролонгация'] = safe_div(df['Opened_Sum_1yProlong_Rub'], df['Closed_Sum_NewNoProlong_with_pct'])
+df['2-я автопролонгация'] = safe_div(df['Opened_Sum_2yProlong_Rub'], df['Closed_Sum_1yProlong_with_pct'])
+df['3-я автопролонгация'] = safe_div(df['Opened_Sum_3yProlong_Rub'], df['Closed_Sum_2yProlong_with_pct'])
 
-```python
-# Неделя начинается с четверга, поэтому отнимаем 3 дня (чтобы четверг стал "понедельником")
-data['week_start'] = data['dt_rep'] - pd.to_timedelta((data['dt_rep'].dt.weekday - 3) % 7, unit='d')
-data['week_end']   = data['week_start'] + pd.Timedelta(days=6)
-```
+# --- ставки: 0 → NaN где нет сделок -----------------------------------------
+rate_guard = {
+    'Opened_WeightedRate_NewNoProlong': 'Opened_Count_NewNoProlong',
+    'Opened_WeightedRate_AllProlong':   'Opened_Count_Prolong',
+    'Opened_WeightedRate_1y':           'Opened_Count_1yProlong',
+    'Opened_WeightedRate_2y':           'Opened_Count_2yProlong',
+    'Opened_WeightedRate_3y':           'Opened_Count_3yProlong',
+}
+for r,c in rate_guard.items():
+    df.loc[df[c].fillna(0)==0, r] = np.nan
 
----
+# --- спреды -----------------------------------------------------------------
+df['Spread_New_vs_AllProlong'] = df['Opened_WeightedRate_NewNoProlong'] - df['Opened_WeightedRate_AllProlong']
+df['Spread_New_vs_1y'] = df['Opened_WeightedRate_NewNoProlong'] - df['Opened_WeightedRate_1y']
+df['Spread_New_vs_2y'] = df['Opened_WeightedRate_NewNoProlong'] - df['Opened_WeightedRate_2y']
+df['Spread_New_vs_3y'] = df['Opened_WeightedRate_NewNoProlong'] - df['Opened_WeightedRate_3y']
 
-### 🎯 Объяснение:
+# ======================================================
+# 2.  M E T R I C   C O N F I G
+# ======================================================
+cfg = {
+    'overall': dict(metric='Общая пролонгация',
+                    spread='Spread_New_vs_AllProlong',
+                    weight='Opened_Sum_ProlongRub',
+                    title='Общая автопролонгация'),
+    '1y':      dict(metric='1-я автопролонгация',
+                    spread='Spread_New_vs_1y',
+                    weight='Opened_Sum_1yProlong_Rub',
+                    title='1-я автопролонгация'),
+    '2y':      dict(metric='2-я автопролонгация',
+                    spread='Spread_New_vs_2y',
+                    weight='Opened_Sum_2yProlong_Rub',
+                    title='2-я автопролонгация'),
+    '3y':      dict(metric='3-я автопролонгация',
+                    spread='Spread_New_vs_3y',
+                    weight='Opened_Sum_3yProlong_Rub',
+                    title='3-я автопролонгация')
+}[METRIC_KEY]
 
-* `data['dt_rep'].dt.weekday` выдаёт номер дня недели (0 — понедельник, 6 — воскресенье).
-* `(weekday - 3) % 7` — сдвигает так, чтобы **четверг стал «нулевым» днём**.
-* Таким образом, неделя будет начинаться с **четверга** и заканчиваться **средой**.
-
----
-
-### 💡 Остальное в коде можно оставить без изменений:
-
-```python
-data['Неделя'] = (data['week_start'].dt.day.astype(str).str.zfill(2) + '-' +
-                  data['week_end'].dt.day.astype(str).str.zfill(2)   + ' ' +
-                  data['week_end'].dt.month.map(lambda m: RU_MON[m-1]))
-```
-
-Если нужно — выведу финальную версию всего кода с этим куском уже встроенным.
-
-
-
-Ниже ― «заготовка» на pandas, полностью повторяющая вашу логику, только вместо колонки **сальдо** использует
-`NET_SUM_TRANS_total`, а нужные фильтры заданы ровно так, как вы описали.
-
-```python
-import numpy as np
-import pandas as pd
-import math, re
-
-###############################################################################
-# 0.  Исходные данные ― DataFrame `df` (прочитали CSV / Excel и т.д.)
-###############################################################################
-# df = pd.read_excel('raw.xlsx', parse_dates=['dt_rep'])   # пример чтения
-
-###############################################################################
-# 1.  Фильтр: direction_type = «Переводы себе»  и  partner_code = '-'
-#     Остальные поля («(Все)») не трогаем
-###############################################################################
-flt = (
-    (df['direction_type'] == 'Переводы себе')
-    & (df['partner_code']   == '-')
-)
-data = df.loc[flt].copy()
-
-###############################################################################
-# 2.  Неделя ‒ удобная «человеческая» метка в формате дд–дд МММ
-#     (можно заменить на rep_W, если он вас устраивает)
-###############################################################################
-# если в датафрейме уже есть готовая строка rep_W вида '2025.01.16-2025.01.22',
-# то просто:  data['Неделя'] = data['rep_W']
-# Ниже ‒ вариант «от даты»:
-data['week_start'] = data['dt_rep'].dt.to_period('W').apply(lambda p: p.start_time)
-data['week_end']   = data['week_start'] + pd.Timedelta(days=6)
-RU_MON = ['янв', 'фев', 'мар', 'апр', 'май', 'июн',
-          'июл', 'авг', 'сен', 'окт', 'ноя', 'дек']
-data['Неделя'] = (data['week_start'].dt.day.astype(str).str.zfill(2) + '-' +
-                  data['week_end'].dt.day.astype(str).str.zfill(2)   + ' ' +
-                  data['week_end'].dt.month.map(lambda m: RU_MON[m-1]))
-
-###############################################################################
-# 3.  Считаем недельное сальдо по каждому банку
-###############################################################################
-wb = (data
-      .groupby(['Неделя', 'bank_name_main'], as_index=False)['NET_SUM_TRANS_total']
-      .sum()
-      .rename(columns={'NET_SUM_TRANS_total': 'сальдо'}))
-
-###############################################################################
-# 4.  «Заметные» банки  — те, у кого |сальдо| ≥ THR хотя бы один раз.
-#     Порог можно менять (по умолчанию 100 млн).
-###############################################################################
-THR = 1e8                # 100 000 000
-wb['sal_big'] = wb['сальдо'].where(wb['сальдо'].abs() >= THR, np.nan)
-BANKS_BIG = wb.loc[wb['sal_big'].notna(), 'bank_name_main'].unique()
-
-###############################################################################
-# 5.  Пивот: недели × банки-«звёзды», значение = sal_big (иначе NaN)
-###############################################################################
-pivot = (wb[wb['bank_name_main'].isin(BANKS_BIG)]
-         .pivot(index='Неделя',
-                columns='bank_name_main',
-                values='sal_big')
-         .sort_index())
-
-###############################################################################
-# 6.  Колонка «Остальные банки» = общее недельное сальдо − сумма отображённых
-###############################################################################
-total_week = wb.groupby('Неделя')['сальдо'].sum()
-pivot['Остальные банки'] = total_week - pivot.fillna(0).sum(axis=1)
-
-###############################################################################
-# 7.  Красиво выводим: перевод в млрд с двумя знаками, NaN не трогаем
-###############################################################################
-pivot_fmt = pivot.applymap(
-    lambda x: np.nan if pd.isna(x) else round(x/1e6, 2)   # → млн; поменяйте /1e9 для млрд
+# ======================================================
+# 3.  F I L T E R S   +   D A T A S E T
+# ======================================================
+mask = (
+    (df['TermBucketGrouping']!='Все бакеты') &
+    (df['PROD_NAME']!='Все продукты') &
+    df[cfg['spread']].notna() &
+    df[cfg['metric']].notna() &
+    (df[cfg['metric']]<=1)
 )
 
-pd.set_option('display.max_columns', None)
-print('\n=== Сальдо (|≥100 млн|) по неделям, млн руб. ===')
-print(pivot_fmt.to_string())
-pd.reset_option('display.max_columns')
+if FILTER_PRODUCTS:
+    mask &= df['PROD_NAME'].isin(FILTER_PRODUCTS)
+if FILTER_SEGMENTS:
+    mask &= df['SegmentGrouping'].isin(FILTER_SEGMENTS)
 
-###############################################################################
-# 8.  Сохраняем в Excel / CSV
-###############################################################################
-pivot_fmt.to_excel('сальдо_по_банкам_недели.xlsx')
-# pivot_fmt.to_csv('сальдо_по_банкам_недели.csv')
-```
+d = df.loc[mask].copy()
+d['x'] = -d[cfg['spread']]
+d['y'] = d[cfg['metric']]*100
+d['w'] = d[cfg['weight']].fillna(0)
 
-### Что можно оперативно поменять
+# ======================================================
+# 4.  M O D E L   H E L P E R S
+# ======================================================
+def w_r2(y,yhat,w):
+    ybar=np.average(y,weights=w); return 1-np.sum(w*(y-yhat)**2)/np.sum(w*(y-ybar)**2)
 
-| Параметр          | За что отвечает              | Типичное изменение                                  |
-| ----------------- | ---------------------------- | --------------------------------------------------- |
-| `THR`             | порог «заметности» банка     | `1.5e8`, `5e7`, `0` (показать всех)                 |
-| `Неделя`          | метка периода                | заменить на `data['rep_W']`, если строка уже готова |
-| `round(x/1e6, 2)` | перевод в млн и число знаков | `/1e9` → млрд, `3` → три знака                      |
+def fit_three(x,y,w):
+    out={}
+    out['linear']={'p':polyval(x,(c:=polyfit(x,y,1,w=w))),'r2':w_r2(y,polyval(x,c),w)}
+    out['quadratic']={'p':polyval(x,(c:=polyfit(x,y,2,w=w))),'r2':w_r2(y,polyval(x,c),w)}
+    if (y>0).all():
+        ce=polyfit(x,np.log(y),1,w=w); yp=np.exp(polyval(x,ce))
+        out['exponential']={'p':yp,'r2':w_r2(y,yp,w)}
+    best=max(out,key=lambda k:out[k]['r2'])
+    return best,out[best]['p'],out[best]['r2']
 
-Код можно вставлять как есть: достаточно заменить имя датафрейма `df`, если у вас другое, и указать путь к файлу при чтении / сохранении.
+def mono_best(x,y,w):
+    fits=[]
+    c=polyfit(x,y,1,w=w); c[1]=-abs(c[1]); fits.append({'n':'lin_neg','p':polyval(x,c),'r2':w_r2(y,polyval(x,c),w)})
+    if (y>0).all():
+        ce=polyfit(x,np.log(y),1,w=w); ce[1]=-abs(ce[1]); yp=np.exp(polyval(x,ce))
+        fits.append({'n':'exp_decay','p':yp,'r2':w_r2(y,yp,w)})
+        inv=1/y; cr=polyfit(x,inv,1,w=w); a=1/cr[1] if cr[1]!=0 else None; b=cr[0]*a if a else None
+        if a and a>0 and b>0:
+            yp=a/(1+b*x); fits.append({'n':'recip','p':yp,'r2':w_r2(y,yp,w)})
+    if HAVE_SKLEARN:
+        iso=IsotonicRegression(increasing=False).fit(x,y,sample_weight=w)
+        yp=iso.predict(x); fits.append({'n':'isotonic','p':yp,'r2':w_r2(y,yp,w)})
+    return max(fits,key=lambda z:z['r2'])
 
+def plot_curve(dfsub,title,mode='old'):
+    x,y,w=dfsub['x'].values,dfsub['y'].values,dfsub['w'].values
+    if mode=='old':
+        name,yhat,r2=fit_three(x,y,w)
+    else:
+        res=mono_best(x,y,w); name,yhat,r2=res['n'],res['p'],res['r2']
+    sizes=20+180*(w/w.max())
+    o=np.argsort(x)
+    plt.figure(figsize=(9,6))
+    plt.scatter(x,y,s=sizes,alpha=0.5,edgecolor='k',linewidth=0.3,label='наблюдения (bubble=₽)')
+    plt.plot(x[o],yhat[o],'r',lw=2,label=f'{name}, R²={r2:.2f}')
+    plt.axvline(0,lw=0.8,color='k'); plt.ylim(0,120)
+    plt.xlabel('Спред (-)(п.п.)'); plt.ylabel(f'{cfg["title"]}, %')
+    plt.title(f'{title} – {cfg["title"]}')
+    plt.legend(bbox_to_anchor=(1.02,1),loc='upper left'); plt.grid(True)
+    plt.subplots_adjust(right=0.78); plt.show()
 
+# ======================================================
+# 5.  P L O T S
+# ======================================================
+plot_curve(d,'WLS‑старые: все сроки/продукты',mode='old')
+plot_curve(d,'WLS‑монотонные: все сроки/продукты',mode='new')
 
+for term in sorted(d['TermBucketGrouping'].unique()):
+    sub=d[d['TermBucketGrouping']==term]
+    if len(sub)>=5:
+        plot_curve(sub,f'WLS‑старые — срок {term}',mode='old')
+        plot_curve(sub,f'WLS‑монотонные — срок {term}',mode='new')
 
-```python
-import pandas as pd
-import numpy as np
-
-# Загрузка данных (предполагается, что данные уже загружены в DataFrame df)
-# df = pd.read_excel('ваши_данные.xlsx')
-
-# Применение фильтров
-filtered = df[
-    (df['direction_type'] == 'Переводы себе') &
-    (df['partner_code'] == '-')
-]
-
-# Группировка по неделе и банку с суммированием сальдо
-grouped = filtered.groupby(['rep_W', 'bank_name_main'], as_index=False)['NET_SUM_TRANS_total'].sum()
-
-# Определение банков с большим сальдо (порог 100 млн)
-THR = 100_000_000
-bank_max = grouped.groupby('bank_name_main')['NET_SUM_TRANS_total'].apply(lambda x: x.abs().max())
-BANKS_BIG = bank_max[bank_max >= THR].index.tolist()
-
-# Добавление форматированной даты и метки недели
-grouped[['start_str', 'end_str']] = grouped['rep_W'].str.split('-', expand=True)
-grouped['w_end'] = pd.to_datetime(grouped['end_str'], format='%Y.%m.%d')
-RU_MON = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек']
-grouped['Неделя'] = grouped['w_end'].apply(lambda x: f"{x.day:02d}-{(x + pd.DateOffset(days=6)).day:02d} {RU_MON[x.month-1]}")
-
-# Создание столбца с отфильтрованным сальдо
-grouped['saldo_filtered'] = np.where(
-    (grouped['bank_name_main'].isin(BANKS_BIG)) & 
-    (grouped['NET_SUM_TRANS_total'].abs() >= THR),
-    grouped['NET_SUM_TRANS_total'],
-    np.nan
-)
-
-# Создание сводной таблицы
-pivot = grouped.pivot(index='Неделя', columns='bank_name_main', values='saldo_filtered')
-
-# Добавление колонки "Остальные банки"
-total_per_week = grouped.groupby('Неделя')['NET_SUM_TRANS_total'].sum()
-pivot['Остальные банки'] = total_per_week - pivot.fillna(0).sum(axis=1)
-
-# Форматирование и сохранение
-pivot_formatted = pivot.applymap(lambda x: f"{round(x/1e6, 2)}M" if pd.notnull(x) else np.nan)
-pivot_formatted.to_excel('сальдо_по_неделям_и_банкам.xlsx')
-
-print("Таблица успешно сохранена в файл 'сальдо_по_неделям_и_банкам.xlsx'")
-``` 
-
-Этот код:
-1. Фильтрует данные по заданным условиям
-2. Группирует сальдо по неделям и банкам
-3. Определяет банки с большими транзакциями
-4. Создает удобный формат отображения недель
-5. Формирует итоговую таблицу с наном для малых значений
-6. Добавляет колонку для остальных банков
-7. Сохраняет результат в Excel с форматированием в миллионах
+for prod in sorted(d['PROD_NAME'].unique()):
+    sub=d[d['PROD_NAME']==prod]
+    if len(sub)>=5:
+        plot_curve(sub,f'WLS‑старые — продукт {prod}',mode='old')
+        plot_curve(sub,f'WLS‑монотонные — продукт {prod}',mode='new')
