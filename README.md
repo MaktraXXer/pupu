@@ -1,231 +1,158 @@
-/*=====================================================================
-  Витрина автопролонгаций ФЛ (версия с явными правилами BaseRate)
-  ---------------------------------------------------------------------
-  • ProlongCount = 0  →  BaseRate = ConvertedRate,  Discount = 0
-  • ProlongCount > 0, но база не найдена → BaseRate = NULL, Discount = NULL
-=====================================================================*/
-USE ALM_TEST;
-GO
-SET ANSI_NULLS , QUOTED_IDENTIFIER ON;
-GO
+Ниже ― «заготовка» на pandas, полностью повторяющая вашу логику, только вместо колонки **сальдо** использует
+`NET_SUM_TRANS_total`, а нужные фильтры заданы ровно так, как вы описали.
 
-DECLARE @DayWindow int = 3;               -- ±N дней поиска базы
-/*--------------------------------------------------------------------*/
-WITH
-ISOPT AS (
-    SELECT b.CON_ID,
-           CASE WHEN ISNULL(b.OptionRate_TRF,0) < 0 THEN 1 ELSE 0 END AS IS_OPTION
-    FROM   LIQUIDITY.liq.InterestsRateForDeposit b WITH (NOLOCK)
-),
-cteMonths AS ( SELECT CONVERT(date,'2025‑01‑31') AS MonthEnd ),
-/*--------------------------------------------------------------------*/
-DealsInMonthRates AS (
-    SELECT
-        M.MonthEnd,
-        dc.CON_ID,
-        dc.CLI_ID,
-        dc.SEG_NAME,
-        ISNULL(dc.PROD_NAME,'Без типа')            AS PROD_NAME,
-        dc.CUR,
-        dc.DT_OPEN,
-        dc.DT_CLOSE,
-        dc.BALANCE_RUB,
-        dc.RATE,
-        DATEDIFF(DAY,dc.DT_OPEN,dc.DT_CLOSE_PLAN)  AS MATUR,
-        conv.NEW_CONVENTION_NAME,
-        DATEDIFF(DAY,dc.DT_OPEN,dc.DT_CLOSE)       AS DaysLived,
-        ISNULL(snap.MonthlyCONV_RATE,
-               LIQUIDITY.liq.fnc_IntRate(
-                   (dc.RATE+0.0048)/0.9525,
-                   conv.NEW_CONVENTION_NAME,
-                   'monthly',
-                   DATEDIFF(DAY,dc.DT_OPEN,dc.DT_CLOSE_PLAN),
-                   1) *0.9525 -0.0048)            AS ConvertedRate
-    FROM   cteMonths M
-    JOIN   LIQUIDITY.liq.DepositContract_all dc WITH (NOLOCK)
-           ON dc.DT_OPEN >= DATEADD(DAY,1,EOMONTH(M.MonthEnd,-1))
-          AND dc.DT_OPEN <  DATEADD(DAY,1,M.MonthEnd)
-          AND dc.CLI_SUBTYPE = 'INDIV'
-          AND dc.PROD_NAME  <> 'Эскроу'
-          AND dc.CONVENTION <> 'ON_DEMAND'
-          AND dc.DT_CLOSE_PLAN <> '4444‑01‑01'
-          AND DATEDIFF(DAY,dc.DT_OPEN,dc.DT_CLOSE) > 10
-    JOIN   LIQUIDITY.liq.man_CONVENTION conv WITH (NOLOCK)
-           ON conv.CONVENTION_NAME = dc.CONVENTION
-    LEFT  JOIN ALM_TEST.WORK.DepositInterestsRateSnap snap WITH (NOLOCK)
-           ON snap.CON_ID = dc.CON_ID
-    WHERE  dc.CON_ID NOT IN (SELECT CON_ID
-                             FROM LIQUIDITY.liq.man_FloatContracts WITH (NOLOCK))
-),
-/*--------------------------------------------------------------------*/
-DealsInMonthBucket AS (
-    SELECT dmr.*,
-           tg.TERM_GROUP             AS TermBucket,
-           bal.BALANCE_GROUP         AS BalanceBucket,
-           CAST(ISNULL(opt.IS_OPTION,0) AS nvarchar) AS IS_OPTION
-    FROM   DealsInMonthRates dmr
-    LEFT  JOIN ALM_TEST.WORK.man_TermGroup tg  WITH (NOLOCK)
-           ON dmr.MATUR BETWEEN tg.TERM_FROM AND tg.TERM_TO
-    LEFT  JOIN ALM_TEST.WORK.man_BalanceGroup bal WITH (NOLOCK)
-           ON dmr.BALANCE_RUB >= bal.BALANCE_FROM
-          AND dmr.BALANCE_RUB <  bal.BALANCE_TO
-    LEFT  JOIN ISOPT opt WITH (NOLOCK)
-           ON opt.CON_ID = dmr.CON_ID
-),
-/*--------------------------------------------------------------------*/
-RecursiveChain AS (
-    SELECT CAST(CON_ID AS bigint) AS StartConId,
-           CAST(CON_ID AS bigint) AS CurrentConId,
-           0 AS Lvl
-    FROM DealsInMonthBucket
-    UNION ALL
-    SELECT rc.StartConId,
-           CAST(p.CON_ID_REL AS bigint),
-           rc.Lvl + 1
-    FROM RecursiveChain rc
-    JOIN ALM.ehd.conrel_prolongations p WITH (NOLOCK)
-           ON p.CON_ID = rc.CurrentConId
-          AND p.CON_REL_TYPE  = 'PREVIOUS'
-    WHERE rc.Lvl < 5
-),
-ChainDepth AS (
-    SELECT StartConId,
-           CASE WHEN MAX(Lvl)>5 THEN 5 ELSE MAX(Lvl) END AS ProlongCount
-    FROM   RecursiveChain
-    GROUP BY StartConId
-),
-FirstProlong AS (
-    SELECT StartConId,
-           MIN(CurrentConId) AS Old1
-    FROM RecursiveChain
-    WHERE Lvl = 1
-    GROUP BY StartConId
-),
-PrevInfo AS (
-    SELECT fp.StartConId,
-           old.BALANCE_RUB AS PrevBalance,
-           LIQUIDITY.liq.fnc_IntRate(
-                 old.RATE,
-                 conv_prev.NEW_CONVENTION_NAME,
-                 'monthly',
-                 DATEDIFF(DAY,old.DT_OPEN,old.DT_CLOSE_PLAN),
-                 1)                            AS PrevConvertedRate
-    FROM FirstProlong fp
-    JOIN LIQUIDITY.liq.DepositContract_all old WITH (NOLOCK)
-           ON old.CON_ID = fp.Old1
-    JOIN LIQUIDITY.liq.man_CONVENTION conv_prev WITH (NOLOCK)
-           ON conv_prev.CONVENTION_NAME = old.CONVENTION
-),
-DealsWithProlong AS (
-    SELECT dmb.*,
-           ISNULL(cd.ProlongCount,0)    AS ProlongCount,
-           ISNULL(pi.PrevBalance,0)     AS PrevBalance,
-           ISNULL(pi.PrevConvertedRate,0) AS PrevConvertedRate
-    FROM DealsInMonthBucket dmb
-    LEFT JOIN ChainDepth cd ON cd.StartConId  = dmb.CON_ID
-    LEFT JOIN PrevInfo  pi ON pi.StartConId   = dmb.CON_ID
-),
-/*--------------------------------------------------------------------*/
-/*  Подготовка для поиска базовой ставки                              */
-/*--------------------------------------------------------------------*/
-BalanceBuckets AS (
-    SELECT BALANCE_GROUP,
-           BALANCE_FROM,
-           BALANCE_TO,
-           ROW_NUMBER() OVER(ORDER BY BALANCE_FROM) AS BucketOrder
-    FROM ALM_TEST.WORK.man_BalanceGroup
-),
-BaseCandidates AS (
-    SELECT dwp.DT_OPEN,
-           dwp.SEG_NAME, dwp.PROD_NAME, dwp.CUR,
-           dwp.TermBucket,
-           bb.BucketOrder,
-           dwp.BalanceBucket,
-           dwp.IS_OPTION,
-           dwp.NEW_CONVENTION_NAME,
-           AVG(dwp.ConvertedRate)       AS BaseRate
-    FROM DealsWithProlong dwp
-    JOIN BalanceBuckets bb ON bb.BALANCE_GROUP = dwp.BalanceBucket
-    WHERE dwp.ProlongCount = 0
-    GROUP BY dwp.DT_OPEN, dwp.SEG_NAME, dwp.PROD_NAME, dwp.CUR,
-             dwp.TermBucket, bb.BucketOrder, dwp.BalanceBucket,
-             dwp.IS_OPTION, dwp.NEW_CONVENTION_NAME
-),
-DealKeys AS (
-    SELECT DISTINCT
-           d.DT_OPEN,
-           d.SEG_NAME,
-           d.PROD_NAME,
-           d.CUR,
-           d.TermBucket,
-           d.IS_OPTION,
-           bb.BucketOrder,
-           bb.BALANCE_TO            AS BucketUpper,
-           d.BalanceBucket,
-           d.NEW_CONVENTION_NAME
-    FROM DealsWithProlong d
-    JOIN BalanceBuckets bb ON bb.BALANCE_GROUP = d.BalanceBucket
-),
-BestBase AS (
-    SELECT dk.*,
-           bc.BaseRate,
-           ROW_NUMBER() OVER (
-                 PARTITION BY dk.DT_OPEN, dk.SEG_NAME, dk.PROD_NAME,
-                              dk.CUR,     dk.TermBucket, dk.IS_OPTION,
-                              dk.NEW_CONVENTION_NAME,    dk.BalanceBucket
-                 ORDER BY
-                     CASE WHEN bc.BaseRate IS NULL THEN 1 ELSE 0 END,
-                     ABS(DATEDIFF(DAY, bc.DT_OPEN, dk.DT_OPEN)),
-                     CASE WHEN dk.BucketUpper<=1500000
-                          THEN dk.BucketOrder - ISNULL(bbSrc.BucketOrder,dk.BucketOrder)
-                          ELSE ISNULL(bbSrc.BucketOrder,dk.BucketOrder) - dk.BucketOrder
-                     END,
-                     CASE WHEN bc.DT_OPEN < dk.DT_OPEN THEN 0 ELSE 1 END
-           ) AS rn
-    FROM DealKeys dk
-    LEFT JOIN BaseCandidates bc
-           ON bc.SEG_NAME            = dk.SEG_NAME
-          AND bc.PROD_NAME           = dk.PROD_NAME
-          AND bc.CUR                 = dk.CUR
-          AND bc.TermBucket          = dk.TermBucket
-          AND bc.IS_OPTION           = dk.IS_OPTION
-          AND bc.NEW_CONVENTION_NAME = dk.NEW_CONVENTION_NAME
-          AND ABS(DATEDIFF(DAY, bc.DT_OPEN, dk.DT_OPEN)) <= @DayWindow
-          AND ( (dk.BucketUpper<=1500000 AND bc.BucketOrder<=dk.BucketOrder)
-             OR  (dk.BucketUpper> 1500000 AND bc.BucketOrder>=dk.BucketOrder) )
-    LEFT JOIN BalanceBuckets bbSrc ON bbSrc.BALANCE_GROUP = bc.BalanceBucket
-),
-DailyBaseRate AS (
-    SELECT * FROM BestBase WHERE rn = 1         -- ровно одна строка
-),
-/*--------------------------------------------------------------------*/
-/*  Финальная таблица с учётом правил                                 */
-/*--------------------------------------------------------------------*/
-DealsWithDiscount AS (
-    SELECT dwp.*,
-           /* --- Правило 1: Prolong = 0 → BaseRate = ConvertedRate --- */
-           CASE WHEN dwp.ProlongCount = 0
-                THEN dwp.ConvertedRate
-                ELSE dbr.BaseRate END           AS BaseRate,
-           /* --- Discount --- */
-           CASE WHEN dwp.ProlongCount = 0
-                THEN 0
-                WHEN dbr.BaseRate IS NULL
-                THEN NULL
-                ELSE dwp.ConvertedRate - dbr.BaseRate END AS Discount
-    FROM DealsWithProlong dwp
-    LEFT JOIN DailyBaseRate dbr
-           ON  dbr.DT_OPEN            = dwp.DT_OPEN
-          AND dbr.SEG_NAME           = dwp.SEG_NAME
-          AND dbr.PROD_NAME          = dwp.PROD_NAME
-          AND dbr.CUR                = dwp.CUR
-          AND dbr.TermBucket         = dwp.TermBucket
-          AND dbr.BalanceBucket      = dwp.BalanceBucket
-          AND dbr.IS_OPTION          = dwp.IS_OPTION
-          AND dbr.NEW_CONVENTION_NAME= dwp.NEW_CONVENTION_NAME
+```python
+import numpy as np
+import pandas as pd
+import math, re
+
+###############################################################################
+# 0.  Исходные данные ― DataFrame `df` (прочитали CSV / Excel и т.д.)
+###############################################################################
+# df = pd.read_excel('raw.xlsx', parse_dates=['dt_rep'])   # пример чтения
+
+###############################################################################
+# 1.  Фильтр: direction_type = «Переводы себе»  и  partner_code = '-'
+#     Остальные поля («(Все)») не трогаем
+###############################################################################
+flt = (
+    (df['direction_type'] == 'Переводы себе')
+    & (df['partner_code']   == '-')
 )
-/*--------------------------------------------------------------------*/
-SELECT *
-FROM   DealsWithDiscount
-OPTION (RECOMPILE, MAXDOP 4);
-GO
+data = df.loc[flt].copy()
+
+###############################################################################
+# 2.  Неделя ‒ удобная «человеческая» метка в формате дд–дд МММ
+#     (можно заменить на rep_W, если он вас устраивает)
+###############################################################################
+# если в датафрейме уже есть готовая строка rep_W вида '2025.01.16-2025.01.22',
+# то просто:  data['Неделя'] = data['rep_W']
+# Ниже ‒ вариант «от даты»:
+data['week_start'] = data['dt_rep'].dt.to_period('W').apply(lambda p: p.start_time)
+data['week_end']   = data['week_start'] + pd.Timedelta(days=6)
+RU_MON = ['янв', 'фев', 'мар', 'апр', 'май', 'июн',
+          'июл', 'авг', 'сен', 'окт', 'ноя', 'дек']
+data['Неделя'] = (data['week_start'].dt.day.astype(str).str.zfill(2) + '-' +
+                  data['week_end'].dt.day.astype(str).str.zfill(2)   + ' ' +
+                  data['week_end'].dt.month.map(lambda m: RU_MON[m-1]))
+
+###############################################################################
+# 3.  Считаем недельное сальдо по каждому банку
+###############################################################################
+wb = (data
+      .groupby(['Неделя', 'bank_name_main'], as_index=False)['NET_SUM_TRANS_total']
+      .sum()
+      .rename(columns={'NET_SUM_TRANS_total': 'сальдо'}))
+
+###############################################################################
+# 4.  «Заметные» банки  — те, у кого |сальдо| ≥ THR хотя бы один раз.
+#     Порог можно менять (по умолчанию 100 млн).
+###############################################################################
+THR = 1e8                # 100 000 000
+wb['sal_big'] = wb['сальдо'].where(wb['сальдо'].abs() >= THR, np.nan)
+BANKS_BIG = wb.loc[wb['sal_big'].notna(), 'bank_name_main'].unique()
+
+###############################################################################
+# 5.  Пивот: недели × банки-«звёзды», значение = sal_big (иначе NaN)
+###############################################################################
+pivot = (wb[wb['bank_name_main'].isin(BANKS_BIG)]
+         .pivot(index='Неделя',
+                columns='bank_name_main',
+                values='sal_big')
+         .sort_index())
+
+###############################################################################
+# 6.  Колонка «Остальные банки» = общее недельное сальдо − сумма отображённых
+###############################################################################
+total_week = wb.groupby('Неделя')['сальдо'].sum()
+pivot['Остальные банки'] = total_week - pivot.fillna(0).sum(axis=1)
+
+###############################################################################
+# 7.  Красиво выводим: перевод в млрд с двумя знаками, NaN не трогаем
+###############################################################################
+pivot_fmt = pivot.applymap(
+    lambda x: np.nan if pd.isna(x) else round(x/1e6, 2)   # → млн; поменяйте /1e9 для млрд
+)
+
+pd.set_option('display.max_columns', None)
+print('\n=== Сальдо (|≥100 млн|) по неделям, млн руб. ===')
+print(pivot_fmt.to_string())
+pd.reset_option('display.max_columns')
+
+###############################################################################
+# 8.  Сохраняем в Excel / CSV
+###############################################################################
+pivot_fmt.to_excel('сальдо_по_банкам_недели.xlsx')
+# pivot_fmt.to_csv('сальдо_по_банкам_недели.csv')
+```
+
+### Что можно оперативно поменять
+
+| Параметр          | За что отвечает              | Типичное изменение                                  |
+| ----------------- | ---------------------------- | --------------------------------------------------- |
+| `THR`             | порог «заметности» банка     | `1.5e8`, `5e7`, `0` (показать всех)                 |
+| `Неделя`          | метка периода                | заменить на `data['rep_W']`, если строка уже готова |
+| `round(x/1e6, 2)` | перевод в млн и число знаков | `/1e9` → млрд, `3` → три знака                      |
+
+Код можно вставлять как есть: достаточно заменить имя датафрейма `df`, если у вас другое, и указать путь к файлу при чтении / сохранении.
+
+
+
+
+```python
+import pandas as pd
+import numpy as np
+
+# Загрузка данных (предполагается, что данные уже загружены в DataFrame df)
+# df = pd.read_excel('ваши_данные.xlsx')
+
+# Применение фильтров
+filtered = df[
+    (df['direction_type'] == 'Переводы себе') &
+    (df['partner_code'] == '-')
+]
+
+# Группировка по неделе и банку с суммированием сальдо
+grouped = filtered.groupby(['rep_W', 'bank_name_main'], as_index=False)['NET_SUM_TRANS_total'].sum()
+
+# Определение банков с большим сальдо (порог 100 млн)
+THR = 100_000_000
+bank_max = grouped.groupby('bank_name_main')['NET_SUM_TRANS_total'].apply(lambda x: x.abs().max())
+BANKS_BIG = bank_max[bank_max >= THR].index.tolist()
+
+# Добавление форматированной даты и метки недели
+grouped[['start_str', 'end_str']] = grouped['rep_W'].str.split('-', expand=True)
+grouped['w_end'] = pd.to_datetime(grouped['end_str'], format='%Y.%m.%d')
+RU_MON = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек']
+grouped['Неделя'] = grouped['w_end'].apply(lambda x: f"{x.day:02d}-{(x + pd.DateOffset(days=6)).day:02d} {RU_MON[x.month-1]}")
+
+# Создание столбца с отфильтрованным сальдо
+grouped['saldo_filtered'] = np.where(
+    (grouped['bank_name_main'].isin(BANKS_BIG)) & 
+    (grouped['NET_SUM_TRANS_total'].abs() >= THR),
+    grouped['NET_SUM_TRANS_total'],
+    np.nan
+)
+
+# Создание сводной таблицы
+pivot = grouped.pivot(index='Неделя', columns='bank_name_main', values='saldo_filtered')
+
+# Добавление колонки "Остальные банки"
+total_per_week = grouped.groupby('Неделя')['NET_SUM_TRANS_total'].sum()
+pivot['Остальные банки'] = total_per_week - pivot.fillna(0).sum(axis=1)
+
+# Форматирование и сохранение
+pivot_formatted = pivot.applymap(lambda x: f"{round(x/1e6, 2)}M" if pd.notnull(x) else np.nan)
+pivot_formatted.to_excel('сальдо_по_неделям_и_банкам.xlsx')
+
+print("Таблица успешно сохранена в файл 'сальдо_по_неделям_и_банкам.xlsx'")
+``` 
+
+Этот код:
+1. Фильтрует данные по заданным условиям
+2. Группирует сальдо по неделям и банкам
+3. Определяет банки с большими транзакциями
+4. Создает удобный формат отображения недель
+5. Формирует итоговую таблицу с наном для малых значений
+6. Добавляет колонку для остальных банков
+7. Сохраняет результат в Excel с форматированием в миллионах
