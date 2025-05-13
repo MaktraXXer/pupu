@@ -1,101 +1,104 @@
-# -*- coding: utf-8 -*-
 import pandas as pd, numpy as np, matplotlib.pyplot as plt
-from pathlib import Path
 
-# ----------  Настройки  -------------------------------------------------
-EXCEL_FILE       = 'dataprolong.xlsx'
-TARGET_PRODUCTS  = ['Мой дом без опций', 'Доходный+', 'ДОМа лучше']
-METRICS_TO_DRAW  = ['overall', '1y', '2y']            # → будет 3 × 3 = 9 PNG
-SPREAD_COL       = 'Spread_New_vs_AllProlong'          # или '_1y', '_2y', …
+# ---------- 0. «Словарь» метрика → discount / коэффициент / подпись ----------
+METRICS = {
+    'overall': dict(
+        metric='Общая пролонгация',
+        disc  ='Opened_WeightedDiscount_AllProlong',
+        title ='Общая автопролонгация'
+    ),
+    '1y': dict(
+        metric='1-я автопролонгация',
+        disc  ='Opened_WeightedDiscount_1y',
+        title ='1-я автопролонгация'
+    ),
+    '2y': dict(
+        metric='2-я автопролонгация',
+        disc  ='Opened_WeightedDiscount_2y',
+        title ='2-я автопролонгация'
+    ),
+}
 
-# ---------- 1. Чтение + базовые расчёты --------------------------------
-df = pd.read_excel(EXCEL_FILE)
+# ---------- 1. Базовые фильтры ------------------------------------------------
+TARGET_PROD = ['Мой дом без опций', 'Доходный+', 'ДОМа лучше']
 
-for l, r, new in [
-    ('Summ_ClosedBalanceRub','Summ_ClosedBalanceRub_int','Closed_Total_with_pct'),
-    ('Closed_Sum_NewNoProlong','Closed_Sum_NewNoProlong_int','Closed_Sum_NewNoProlong_with_pct'),
-    ('Closed_Sum_1yProlong_Rub','Closed_Sum_1yProlong_Rub_int','Closed_Sum_1yProlong_with_pct'),
-    ('Closed_Sum_2yProlong_Rub','Closed_Sum_2yProlong_Rub_int','Closed_Sum_2yProlong_with_pct'),
-]:
-    df[new] = df[l].fillna(0) + df[r].fillna(0)
+base_mask = (
+    (df['TermBucketGrouping'] != 'Все бакеты') &
+    (df['PROD_NAME']          != 'Все продукты') &
+    df['PROD_NAME'].isin(TARGET_PROD) &
+    (df['Opened_Count_Prolong']          > 0) &
+    (df['Opened_Count_NewNoProlong']     > 0)
+)
 
-safe_div = lambda n,d: np.where(d==0, np.nan, n/d)
-df['overall'] = safe_div(df['Opened_Sum_ProlongRub'],  df['Closed_Total_with_pct'])
-df['1y']      = safe_div(df['Opened_Sum_1yProlong_Rub'], df['Closed_Sum_NewNoProlong_with_pct'])
-df['2y']      = safe_div(df['Opened_Sum_2yProlong_Rub'], df['Closed_Sum_1yProlong_with_pct'])
-# (если нужна 3-я пролонгация — добавьте ‘3y’ аналогично)
+# ---------- 2. Раскраска / маркеры -------------------------------------------
+def palette(values):
+    """возвращает dict value → RGB (таблица Tab10)."""
+    cmap = plt.cm.get_cmap('tab10', len(values))
+    return {v: cmap(i) for i, v in enumerate(values)}
 
-df['SpreadSigned'] = -df[SPREAD_COL]      # «правее» = выгоднее открыть заново
+marker_set = ['o', 's', '^', 'D', 'P', 'X', 'v', '<', '>']
 
-# ---------- 2. Палитры --------------------------------------------------
-prod_list = df['PROD_NAME'].dropna().unique()
-term_list = df['TermBucketGrouping'].dropna().unique()
+# ---------- 3. Функция одного графика ----------------------------------------
+def plot_scatter(dat, title, color_key=None, marker_key=None):
+    """
+    dat        – DataFrame с колонками x, y
+    color_key  – имя столбца, значения которого окрашиваем  (или None)
+    marker_key – имя столбца, значения которого меняем маркер (или None)
+    """
+    plt.figure(figsize=(8, 6))
 
-prod_colors = dict(zip(prod_list, plt.cm.tab10(range(len(prod_list)))))
-term_colors = dict(zip(term_list, plt.cm.viridis(np.linspace(0,1,len(term_list)))))
+    if color_key:
+        colors = palette(dat[color_key].unique())
+    if marker_key:
+        markers = {v: marker_set[i % len(marker_set)]
+                   for i, v in enumerate(dat[marker_key].unique())}
 
-# ---------- 3. Функция одного набора трёх графиков ----------------------
-def draw_three_plots(metric_key: str):
-    # ---- фильтр (тот же, что раньше) ----
-    m = (
-        (df['TermBucketGrouping']!='Все бакеты') &
-        (df['PROD_NAME']!='Все продукты') &
-        df['PROD_NAME'].isin(TARGET_PRODUCTS) &
-        df[metric_key].notna() &
-        df['Opened_Count_Prolong'].gt(0) &
-        df['Opened_Count_NewNoProlong'].gt(0) &
-        df['SpreadSigned'].notna() &
-        (df[metric_key] <= 1)
-    )
-    d = df.loc[m, ['SpreadSigned', metric_key, 'PROD_NAME', 'TermBucketGrouping']].copy()
-    d['y_pct'] = d[metric_key]*100
+    for _, row in dat.iterrows():
+        c = colors[row[color_key]]   if color_key  else 'steelblue'
+        m = markers[row[marker_key]] if marker_key else 'o'
+        plt.scatter(row['x'], row['y'], color=c, marker=m, alpha=0.75, s=50)
 
-    save_dir = Path('quick_plots')/metric_key; save_dir.mkdir(parents=True, exist_ok=True)
+    if color_key and not marker_key:   # легенда по цвету
+        plt.legend([plt.Line2D([0], [0], marker='o', color='w',
+                               markerfacecolor=colors[v], markersize=8)
+                    for v in colors],
+                   colors.keys(), title=color_key, loc='upper right')
+    if marker_key and color_key:       # отдельные легенды «цвет» + «маркер»
+        leg1 = plt.legend([plt.Line2D([0], [0], marker='o', color='w',
+                                      markerfacecolor=colors[v], markersize=8)
+                           for v in colors],
+                          colors.keys(), title=color_key, loc='upper left')
+        plt.gca().add_artist(leg1)
+        plt.legend([plt.Line2D([0], [0], marker=markers[v], color='k',
+                               linestyle='None', markersize=8)
+                    for v in markers],
+                   markers.keys(), title=marker_key, loc='lower right')
 
-    # ── A. «Все одним цветом» ───────────────────────────
-    plt.figure(figsize=(8,6))
-    plt.scatter(d['SpreadSigned'], d['y_pct'], alpha=0.7)
-    plt.axvline(0, lw=0.8, color='k'); plt.ylim(0,120)
-    plt.xlabel('Спред, п.п.'); plt.ylabel(f'{metric_key} пролонгация, %')
-    plt.title(f'{metric_key}: все точки')
-    plt.tight_layout(); plt.savefig(save_dir/f'{metric_key}_all.png', dpi=300); plt.show()
+    plt.axvline(0, lw=0.8, color='k')
+    plt.ylim(0, 120)
+    plt.xlabel('Discount, п.п.')
+    plt.ylabel('Автопролонгация, %')
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
 
-    # ── B. Цвет = продукт ──────────────────────────────
-    plt.figure(figsize=(8,6))
-    for p, sub in d.groupby('PROD_NAME'):
-        plt.scatter(sub['SpreadSigned'], sub['y_pct'],
-                    color=prod_colors[p], label=p, alpha=0.8)
-    plt.axvline(0, lw=0.8, color='k'); plt.ylim(0,120)
-    plt.xlabel('Спред, п.п.'); plt.ylabel(f'{metric_key} пролонгация, %')
-    plt.title(f'{metric_key}: цвет = продукт')
-    plt.legend(); plt.tight_layout()
-    plt.savefig(save_dir/f'{metric_key}_byProd.png', dpi=300); plt.show()
+# ---------- 4. Цикл: 3 метрики × 3 варианта графика --------------------------
+for key, cfg in METRICS.items():
+    m = base_mask & df[cfg['metric']].notna() & df[cfg['disc']].notna() \
+        & (df[cfg['metric']] <= 1)
 
-    # ── C. Цвет = срок (TermBucket) ────────────────────
-    plt.figure(figsize=(8,6))
-    for t, sub in d.groupby('TermBucketGrouping'):
-        plt.scatter(sub['SpreadSigned'], sub['y_pct'],
-                    color=term_colors[t], label=t, alpha=0.8)
-    plt.axvline(0, lw=0.8, color='k'); plt.ylim(0,120)
-    plt.xlabel('Спред, п.п.'); plt.ylabel(f'{metric_key} пролонгация, %')
-    plt.title(f'{metric_key}: цвет = срок')
-    plt.legend(title='TermBucket', bbox_to_anchor=(1.05,1), loc='upper left')
-    plt.tight_layout(); plt.savefig(save_dir/f'{metric_key}_byTerm.png', dpi=300); plt.show()
+    dat = df.loc[m, ['PROD_NAME', 'TermBucketGrouping',
+                     cfg['disc'], cfg['metric']]].copy()
+    dat.rename(columns={cfg['disc']: 'x', cfg['metric']: 'y'}, inplace=True)
+    dat['y'] *= 100            # в процентах
 
-    # ── (D) если нужен «цвет-продукт + маркер-срок», раскомментируйте ниже ─
-    # markers = ['o','s','^','v','D','P','X','<','>']
-    # term_mark = {t: markers[i%len(markers)] for i,t in enumerate(term_list)}
-    # plt.figure(figsize=(8,6))
-    # for _,row in d.iterrows():
-    #     plt.scatter(row['SpreadSigned'], row['y_pct'],
-    #                 color=prod_colors[row['PROD_NAME']],
-    #                 marker=term_mark[row['TermBucketGrouping']], alpha=0.8, s=60)
-    # plt.axvline(0, lw=0.8, color='k'); plt.ylim(0,120)
-    # plt.xlabel('Спред, п.п.'); plt.ylabel(f'{metric_key} пролонгация, %')
-    # plt.title(f'{metric_key}: цвет=продукт, маркер=срок')
-    # plt.tight_layout(); plt.savefig(save_dir/f'{metric_key}_prod_term.png', dpi=300); plt.show()
+    # 1. без детальной раскраски
+    plot_scatter(dat, f"{cfg['title']} • все точки")
 
+    # 2. цвет = продукт
+    plot_scatter(dat, f"{cfg['title']} • цвет = продукт",
+                 color_key='PROD_NAME')
 
-# ---------- 4. Запуск для трёх метрик -----------------------------------
-for mkey in METRICS_TO_DRAW:
-    draw_three_plots(mkey)
+    # 3. цвет = срок (TermBucket)
+    plot_scatter(dat, f"{cfg['title']} • цвет = срок",
+                 color_key='TermBucketGrouping')
