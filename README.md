@@ -1,101 +1,63 @@
-# -*- coding: utf-8 -*-
-import pandas as pd, numpy as np, matplotlib.pyplot as plt
-from pathlib import Path
+USE ALM;
+GO
+DECLARE @date_prev  date = '2025-02-28';  -- «старая» дата
+DECLARE @date_curr  date = '2025-03-31';  -- «новая» дата
 
-# ----------  Настройки  -------------------------------------------------
-EXCEL_FILE       = 'dataprolong.xlsx'
-TARGET_PRODUCTS  = ['Мой дом без опций', 'Доходный+', 'ДОМа лучше']
-METRICS_TO_DRAW  = ['overall', '1y', '2y']            # → будет 3 × 3 = 9 PNG
-SPREAD_COL       = 'Spread_New_vs_AllProlong'          # или '_1y', '_2y', …
+/*===== агрегируем баланс на каждую дату =====*/
+WITH balance_agg AS (
+    SELECT
+        dt_rep,
+        cli_id,
+        SUM(out_rub)/1e6                                           AS total_rub,
+        SUM(CASE WHEN section_name = N'Срочные'           THEN out_rub END)/1e6 AS term_rub,
+        SUM(CASE WHEN section_name = N'До востребования'  THEN out_rub END)/1e6 AS dvs_rub,
+        SUM(CASE WHEN section_name = N'Накопительный счёт' THEN out_rub END)/1e6 AS ns_rub,
+        MAX(CASE WHEN TSEGMENTNAME = N'ДЧБО'             THEN 1 ELSE 0 END)     AS DCHBO_flag,
+        MAX(CASE WHEN TSEGMENTNAME = N'Розничный бизнес' THEN 1 ELSE 0 END)     AS RB_flag
+    FROM  ALM.dbo.balance_rest_all WITH (NOLOCK)
+    WHERE od_flag = 1
+      AND block_name = N'Привлечение ФЛ'
+      AND section_name NOT IN (N'Аккредитивы', N'Брокерское обслуживание',
+                               N'Аккредитив под строительство')
+      AND dt_rep IN (@date_prev, @date_curr)
+    GROUP BY dt_rep, cli_id
+),
 
-# ---------- 1. Чтение + базовые расчёты --------------------------------
-df = pd.read_excel(EXCEL_FILE)
+/*===== ищем новых клиентов: есть @date_curr, нет @date_prev =====*/
+new_clients AS (
+    SELECT c.*
+    FROM   balance_agg              AS c
+    LEFT   JOIN balance_agg AS p
+           ON  p.cli_id = c.cli_id
+           AND p.dt_rep = @date_prev
+    WHERE  c.dt_rep = @date_curr
+      AND  p.cli_id IS NULL          -- не было в старой дате
+)
 
-for l, r, new in [
-    ('Summ_ClosedBalanceRub','Summ_ClosedBalanceRub_int','Closed_Total_with_pct'),
-    ('Closed_Sum_NewNoProlong','Closed_Sum_NewNoProlong_int','Closed_Sum_NewNoProlong_with_pct'),
-    ('Closed_Sum_1yProlong_Rub','Closed_Sum_1yProlong_Rub_int','Closed_Sum_1yProlong_with_pct'),
-    ('Closed_Sum_2yProlong_Rub','Closed_Sum_2yProlong_Rub_int','Closed_Sum_2yProlong_with_pct'),
-]:
-    df[new] = df[l].fillna(0) + df[r].fillna(0)
+/*===== итоговая сводка по трём сегментам =====*/
+SELECT Segment,
+       COUNT(*)                                    AS [Количество клиентов],
+       AVG(total_rub)                              AS [средний объём ТОТАЛ],
+       AVG(dvs_rub)                                AS [средний объём ДВС],
+       AVG(ns_rub)                                 AS [средний объём НС],
+       AVG(term_rub)                               AS [средний объём Срочные]
+FROM (
+    SELECT 'RB_only' AS Segment, *
+    FROM   new_clients
+    WHERE  RB_flag = 1 AND DCHBO_flag = 0
 
-safe_div = lambda n,d: np.where(d==0, np.nan, n/d)
-df['overall'] = safe_div(df['Opened_Sum_ProlongRub'],  df['Closed_Total_with_pct'])
-df['1y']      = safe_div(df['Opened_Sum_1yProlong_Rub'], df['Closed_Sum_NewNoProlong_with_pct'])
-df['2y']      = safe_div(df['Opened_Sum_2yProlong_Rub'], df['Closed_Sum_1yProlong_with_pct'])
-# (если нужна 3-я пролонгация — добавьте ‘3y’ аналогично)
+    UNION ALL
+    SELECT 'DCHBO', *
+    FROM   new_clients
+    WHERE  DCHBO_flag = 1
 
-df['SpreadSigned'] = -df[SPREAD_COL]      # «правее» = выгоднее открыть заново
-
-# ---------- 2. Палитры --------------------------------------------------
-prod_list = df['PROD_NAME'].dropna().unique()
-term_list = df['TermBucketGrouping'].dropna().unique()
-
-prod_colors = dict(zip(prod_list, plt.cm.tab10(range(len(prod_list)))))
-term_colors = dict(zip(term_list, plt.cm.viridis(np.linspace(0,1,len(term_list)))))
-
-# ---------- 3. Функция одного набора трёх графиков ----------------------
-def draw_three_plots(metric_key: str):
-    # ---- фильтр (тот же, что раньше) ----
-    m = (
-        (df['TermBucketGrouping']!='Все бакеты') &
-        (df['PROD_NAME']!='Все продукты') &
-        df['PROD_NAME'].isin(TARGET_PRODUCTS) &
-        df[metric_key].notna() &
-        df['Opened_Count_Prolong'].gt(0) &
-        df['Opened_Count_NewNoProlong'].gt(0) &
-        df['SpreadSigned'].notna() &
-        (df[metric_key] <= 1)
-    )
-    d = df.loc[m, ['SpreadSigned', metric_key, 'PROD_NAME', 'TermBucketGrouping']].copy()
-    d['y_pct'] = d[metric_key]*100
-
-    save_dir = Path('quick_plots')/metric_key; save_dir.mkdir(parents=True, exist_ok=True)
-
-    # ── A. «Все одним цветом» ───────────────────────────
-    plt.figure(figsize=(8,6))
-    plt.scatter(d['SpreadSigned'], d['y_pct'], alpha=0.7)
-    plt.axvline(0, lw=0.8, color='k'); plt.ylim(0,120)
-    plt.xlabel('Спред, п.п.'); plt.ylabel(f'{metric_key} пролонгация, %')
-    plt.title(f'{metric_key}: все точки')
-    plt.tight_layout(); plt.savefig(save_dir/f'{metric_key}_all.png', dpi=300); plt.show()
-
-    # ── B. Цвет = продукт ──────────────────────────────
-    plt.figure(figsize=(8,6))
-    for p, sub in d.groupby('PROD_NAME'):
-        plt.scatter(sub['SpreadSigned'], sub['y_pct'],
-                    color=prod_colors[p], label=p, alpha=0.8)
-    plt.axvline(0, lw=0.8, color='k'); plt.ylim(0,120)
-    plt.xlabel('Спред, п.п.'); plt.ylabel(f'{metric_key} пролонгация, %')
-    plt.title(f'{metric_key}: цвет = продукт')
-    plt.legend(); plt.tight_layout()
-    plt.savefig(save_dir/f'{metric_key}_byProd.png', dpi=300); plt.show()
-
-    # ── C. Цвет = срок (TermBucket) ────────────────────
-    plt.figure(figsize=(8,6))
-    for t, sub in d.groupby('TermBucketGrouping'):
-        plt.scatter(sub['SpreadSigned'], sub['y_pct'],
-                    color=term_colors[t], label=t, alpha=0.8)
-    plt.axvline(0, lw=0.8, color='k'); plt.ylim(0,120)
-    plt.xlabel('Спред, п.п.'); plt.ylabel(f'{metric_key} пролонгация, %')
-    plt.title(f'{metric_key}: цвет = срок')
-    plt.legend(title='TermBucket', bbox_to_anchor=(1.05,1), loc='upper left')
-    plt.tight_layout(); plt.savefig(save_dir/f'{metric_key}_byTerm.png', dpi=300); plt.show()
-
-    # ── (D) если нужен «цвет-продукт + маркер-срок», раскомментируйте ниже ─
-    # markers = ['o','s','^','v','D','P','X','<','>']
-    # term_mark = {t: markers[i%len(markers)] for i,t in enumerate(term_list)}
-    # plt.figure(figsize=(8,6))
-    # for _,row in d.iterrows():
-    #     plt.scatter(row['SpreadSigned'], row['y_pct'],
-    #                 color=prod_colors[row['PROD_NAME']],
-    #                 marker=term_mark[row['TermBucketGrouping']], alpha=0.8, s=60)
-    # plt.axvline(0, lw=0.8, color='k'); plt.ylim(0,120)
-    # plt.xlabel('Спред, п.п.'); plt.ylabel(f'{metric_key} пролонгация, %')
-    # plt.title(f'{metric_key}: цвет=продукт, маркер=срок')
-    # plt.tight_layout(); plt.savefig(save_dir/f'{metric_key}_prod_term.png', dpi=300); plt.show()
-
-
-# ---------- 4. Запуск для трёх метрик -----------------------------------
-for mkey in METRICS_TO_DRAW:
-    draw_three_plots(mkey)
+    UNION ALL
+    SELECT 'All_new', *
+    FROM   new_clients
+) s
+GROUP BY Segment
+ORDER BY CASE Segment
+             WHEN 'RB_only' THEN 1
+             WHEN 'DCHBO'  THEN 2
+             ELSE 3
+         END;
