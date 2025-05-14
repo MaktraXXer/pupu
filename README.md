@@ -1,175 +1,88 @@
-# ──────────────────────────────────────────────────────────────────────────────
-#  bubble_only.py
-# ──────────────────────────────────────────────────────────────────────────────
-import numpy as np, pandas as pd, matplotlib.pyplot as plt
-from pathlib import Path
+/*-----------------------------------------------------------
+  ТОП-20 клиентов по совокупному остатку
+  Период: с 23 января 2025 г. по «сегодня»
+  Платформа: MS SQL Server
+-----------------------------------------------------------*/
 
-# 1 ─────────────────────  ПОДГОТОВКА  ДАННЫХ  ────────────────────────────────
-def load_metric(excel_file      : str,
-                metric_key      : str = 'overall',        # overall | 1y | 2y | 3y
-                products        : list[str] | None = None,
-                segments        : list[str] | None = None):
-    """
-    Возвращает датафрейм с полями:
-        x – discount  (п.п.)          (знак НЕ меняем!)
-        y – пролонгация, %            (0-100)
-        w – ₽-объём                  (для размера «пузыря»)
-        TermBucketGrouping / PROD_NAME  (для раскраски)
-    """
-    df = pd.read_excel(excel_file, sheet_name=0)
+DECLARE @date_start  date = '2025-01-23';        -- начало интервала
+DECLARE @date_end    date = CONVERT(date, GETDATE());  -- сегодня
+DECLARE @top_n       int  = 20;                  -- сколько клиентов берём в TOP-N
 
-    # 1.1  объёмы «закрытые + %»  (чтобы работали safe_div’ы)  ────────────
-    for l, r, new in [
-        ('Summ_ClosedBalanceRub','Summ_ClosedBalanceRub_int','Closed_Total_with_pct'),
-        ('Closed_Sum_NewNoProlong','Closed_Sum_NewNoProlong_int','Closed_Sum_NewNoProlong_with_pct'),
-        ('Closed_Sum_1yProlong_Rub','Closed_Sum_1yProlong_Rub_int','Closed_Sum_1yProlong_with_pct'),
-        ('Closed_Sum_2yProlong_Rub','Closed_Sum_2yProlong_Rub_int','Closed_Sum_2yProlong_with_pct'),
-    ]:
-        df[new] = df[l].fillna(0) + df[r].fillna(0)
+/* 1. Суточный total-остаток каждого клиента  ----------------*/
+;WITH daily_balances AS (
+    SELECT
+        dt_rep,                    -- дата отчёта
+        cli_id,                    -- клиент
+        SUM(out_rub) / 1_000_000.0 AS total_baln_mln  -- остаток, млн руб
+    FROM ALM.ALM.balance_rest_all WITH (NOLOCK)
+    WHERE dt_rep BETWEEN @date_start AND @date_end
+      AND od_flag    = 1
+      AND block_name = N'Привлечение ФЛ'
+      AND section_name NOT IN (N'Аккредитивы',
+                               N'Аккредитив под строительство',
+                               N'Брокерское обслуживание')
+    GROUP BY dt_rep, cli_id
+),
 
-    safe_div = lambda n,d: np.where(d==0, np.nan, n/d)
-    df['Общая пролонгация']   = safe_div(df['Opened_Sum_ProlongRub'],  df['Closed_Total_with_pct'])
-    df['1-я автопролонгация'] = safe_div(df['Opened_Sum_1yProlong_Rub'], df['Closed_Sum_NewNoProlong_with_pct'])
-    df['2-я автопролонгация'] = safe_div(df['Opened_Sum_2yProlong_Rub'], df['Closed_Sum_1yProlong_with_pct'])
-    df['3-я автопролонгация'] = safe_div(df['Opened_Sum_3yProlong_Rub'], df['Closed_Sum_2yProlong_with_pct'])
+/* 2. Совокупный остаток за период на клиента ----------------*/
+client_total AS (
+    SELECT
+        cli_id,
+        SUM(total_baln_mln) AS sum_baln_mln   -- тотал за весь период
+    FROM daily_balances
+    GROUP BY cli_id
+),
 
-    cfg = {
-        'overall': dict(metric='Общая пролонгация',
-                        disc='Opened_WeightedDiscount_AllProlong',
-                        weight='Opened_Sum_ProlongRub',
-                        title='Общая пролонгация'),
-        '1y':      dict(metric='1-я автопролонгация',
-                        disc='Opened_WeightedDiscount_1y',
-                        weight='Opened_Sum_1yProlong_Rub',
-                        title='1-я автопролонгация'),
-        '2y':      dict(metric='2-я автопролонгация',
-                        disc='Opened_WeightedDiscount_2y',
-                        weight='Opened_Sum_2yProlong_Rub',
-                        title='2-я автопролонгация'),
-        '3y':      dict(metric='3-я автопролонгация',
-                        disc='Opened_WeightedDiscount_3y',
-                        weight='Opened_Sum_3yProlong_Rub',
-                        title='3-я автопролонгация')
-    }[metric_key]
+/* 3. Фиксируем пул ТОП-N клиентов ---------------------------*/
+top_clients AS (
+    SELECT TOP (@top_n)  cli_id, sum_baln_mln
+    FROM client_total
+    ORDER BY sum_baln_mln DESC
+),
 
-    m  = (df['TermBucketGrouping']!='Все бакеты') \
-       & (df['PROD_NAME']!='Все продукты') \
-       & df[cfg['metric']].notna() \
-       & df[cfg['disc']].notna() \
-       & (df[cfg['metric']]<=1) \
-       & (df[cfg['weight']]>0)
+/* 4. Баланс «старт / финиш» и дельта ------------------------*/
+first_last AS (
+    SELECT
+        tc.cli_id,
 
-    if products: m &= df['PROD_NAME'].isin(products)
-    if segments: m &= df['SegmentGrouping'].isin(segments)
+        MAX(CASE WHEN db.dt_rep = @date_start THEN db.total_baln_mln END) AS start_baln_mln,
+        MAX(CASE WHEN db.dt_rep = @date_end   THEN db.total_baln_mln END) AS end_baln_mln
+    FROM top_clients    tc
+    JOIN daily_balances db ON db.cli_id = tc.cli_id
+    GROUP BY tc.cli_id
+)
 
-    d = df.loc[m,['TermBucketGrouping','PROD_NAME',
-                  cfg['disc'], cfg['metric'], cfg['weight']]].copy()
-    d.columns = ['Term','Prod','x','y_raw','w']
-    d['y'] = d['y_raw']*100       # %
-    d.drop(columns='y_raw', inplace=True)
-
-    return d, cfg['title']
+/*-----------------------------------------------------------
+  >>> Итог 1: перечень ТОП-20 + суммарный остаток за период
+-----------------------------------------------------------*/
+SELECT
+    ROW_NUMBER() OVER (ORDER BY t.sum_baln_mln DESC) AS rn,
+    t.cli_id,
+    ROUND(t.sum_baln_mln, 2)   AS total_for_period_mln
+FROM top_clients t
+ORDER BY t.sum_baln_mln DESC;
 
 
-# 2 ─────────────────────  ГРАФИКИ  (три вида)  ───────────────────────────────
-def bubble_plot(df, title, style='plain', cmap_name='tab10', save_to:Path|None=None):
-    """
-    style:
-        plain         – все точки одним цветом
-        by_prod       – цвет = Prod
-        by_term       – цвет = Term
-        prod_term     – цвет = Prod , маркер = Term
-    """
-    prods = df['Prod'].unique()
-    terms = df['Term'].unique()
-
-    # цвета
-    cmap   = plt.cm.get_cmap(cmap_name, len(prods))
-    p2col  = {p: cmap(i) for i,p in enumerate(prods)}
-    t_mark = ['o','s','^','v','D','P','X','<','>']
-    t2mrk  = {t: t_mark[i%len(t_mark)] for i,t in enumerate(terms)}
-
-    sizes = 20 + 180*(df['w']/df['w'].max())     # радиус пузыря
-
-    plt.figure(figsize=(8,6))
-
-    if style=='plain':
-        plt.scatter(df['x'], df['y'], s=sizes, alpha=0.6, color='steelblue',
-                    edgecolor='k', lw=.3)
-
-    elif style=='by_prod':
-        for p in prods:
-            sub = df[df['Prod']==p]
-            plt.scatter(sub['x'], sub['y'], s=20+180*(sub['w']/df['w'].max()),
-                        color=p2col[p], alpha=0.75, label=p, edgecolor='k', lw=.3)
-
-    elif style=='by_term':
-        cmap_t = plt.cm.get_cmap('viridis', len(terms))
-        for i,t in enumerate(terms):
-            sub = df[df['Term']==t]
-            plt.scatter(sub['x'], sub['y'], s=20+180*(sub['w']/df['w'].max()),
-                        color=cmap_t(i), alpha=0.75, label=t, edgecolor='k', lw=.3)
-
-    elif style=='prod_term':
-        for _,r in df.iterrows():
-            plt.scatter(r['x'], r['y'],
-                        color=p2col[r['Prod']],
-                        marker=t2mrk[r['Term']],
-                        s=60 + 240*(r['w']/df['w'].max()),
-                        alpha=0.80,
-                        edgecolor='k', lw=.3)
-        # легенды вручную
-        h_prod = [plt.Line2D([0],[0],marker='o',ls='',color=p2col[p]) for p in prods]
-        h_term = [plt.Line2D([0],[0],marker=t2mrk[t],ls='',color='k') for t in terms]
-        l1 = plt.legend(h_prod, prods, title='Продукт', loc='upper right')
-        plt.gca().add_artist(l1)
-        plt.legend(h_term, terms, title='Срок', loc='lower right')
-
-    if style in ('plain','by_prod','by_term'):
-        plt.legend(title='Продукт' if style=='by_prod' else
-                             'Срок' if style=='by_term' else None,
-                   bbox_to_anchor=(1.02,1), loc='upper left')
-
-    plt.axvline(0, lw=.8, color='k')
-    plt.ylim(0,120)
-    plt.xlabel('Discount (п.п.)')
-    plt.ylabel('Автопролонгация, %')
-    plt.title(title)
-    plt.grid(True)
-    plt.tight_layout()
-
-    if save_to:
-        save_to.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_to, dpi=300, bbox_inches='tight')
-    plt.show()
+/*-----------------------------------------------------------
+  >>> Итог 2: старт / финиш / дельта для тех же клиентов
+-----------------------------------------------------------*/
+SELECT
+    f.cli_id,
+    ROUND(f.start_baln_mln, 2)        AS balance_start_mln,
+    ROUND(f.end_baln_mln,   2)        AS balance_end_mln,
+    ROUND(f.end_baln_mln - COALESCE(f.start_baln_mln,0), 2) AS delta_mln
+FROM first_last f
+ORDER BY ABS(f.end_baln_mln - COALESCE(f.start_baln_mln,0)) DESC;
 
 
-# 3 ─────────────────────  ПРИМЕР  ЗАПУСКА  ───────────────────────────────────
-if __name__ == '__main__':
-    FILE = 'dataprolong.xlsx'                        # ваша выгрузка
-
-    for key in ('overall','1y','2y'):                # нужные метрики
-        df,key_title = load_metric(FILE, metric_key=key,
-                                   products=None, segments=None)
-
-        out_dir = Path('results_bubble')/key
-
-        # 1. global “plain”
-        bubble_plot(df, f'{key_title}: все наблюдения',
-                    style='plain',
-                    save_to=out_dir/'global_plain.png')
-
-        # 2. split по TermBucket
-        bubble_plot(df, f'{key_title}: цвет = срок',
-                    style='by_term',
-                    save_to=out_dir/'by_term.png')
-
-        # 3. split по Prod
-        bubble_plot(df, f'{key_title}: цвет = продукт',
-                    style='by_prod',
-                    save_to=out_dir/'by_prod.png')
-
-        # 4. комбинированный (цвет Prod, маркер Term)
-        bubble_plot(df, f'{key_title}: продукт & срок',
-                    style='prod_term',
-                    save_to=out_dir/'prod_term.png')
+/*-----------------------------------------------------------
+  >>> Итог 3: суточная динамика по каждому из ТОП-20
+              (можно отправлять в BI / Excel)
+-----------------------------------------------------------*/
+SELECT
+    db.dt_rep,
+    db.cli_id,
+    ROUND(db.total_baln_mln, 2) AS total_baln_mln
+FROM daily_balances db
+JOIN top_clients   tc ON tc.cli_id = db.cli_id
+ORDER BY db.dt_rep, db.cli_id;
