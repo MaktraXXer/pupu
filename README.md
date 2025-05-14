@@ -1,53 +1,111 @@
-Разберу сразу — по порядку — где именно могут «усыхать» ваши ­0,17 п.п. до «0,004».
+# build_table.py
+# -----------------------------------------------------------
+import numpy as np
+import pandas as pd
+from pathlib import Path
 
-| Шаг                                              | Что происходит в коде                                                                                 | Где может «пропасть» масштаб                                                                                                                                                                                    |
-| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **1. Excel → `df`**                              | `df[cfg['disc']]` берётся **как есть** из файла, если колонка уже существует.                         | <u>Ошибки тут бывают только две</u>:<br>• колонка названа по-другому → берётся NaN → записывается 0 после `.notna()` фильтра;<br>• в исходнике значение дисконта уже хранится «в долях» (-0,0017 вместо -0,17). |
-| **2. ensure\_discounts()**<br>(если колонки нет) | `discount = Rate_new – Rate_prolong` и результат кладётся в ту же шкалу, **в которой лежали ставки**. | Если ставки в файле уже «делены на 100» (0,0325 = 3,25 %), то и дисконты вычислятся в долях процента (-0,0017).                                                                                                 |
-| **3. `select_metric()`**                         | `d['x'] = d[cfg['disc']]` — никаких преобразований.                                                   | Масштаб остаётся ровно таким, как прочитан.                                                                                                                                                                     |
-| **4. График**                                    | ось X подписана «Discount (п.п.)», но значение *не* умножается на 100.                                | Если в файле лежит -0,0017 (доля), на графике будет -0,0017 — и выглядит «0,004».                                                                                                                               |
+# ------------------------------ настройки ------------------
+EXCEL_FILE   = 'dataprolong.xlsx'           # исходный файл
+METRIC_KEY   = 'overall'                    # 'overall'|'1y'|'2y'|'3y'
+FILTER_PROD  = ['Мой дом без опций', 'Доходный+', 'ДОМа лучше']
+FILTER_SEG   = ['Розница']
+# -----------------------------------------------------------
 
-### Как быстро проверить где «сидит» масштаб
 
-```python
-# после select_metric():
-print(df_sel[['x']].describe())
+def ensure_discounts(df: pd.DataFrame, col_disc: str,
+                     col_rate_new: str, col_rate_prol: str) -> pd.DataFrame:
+    """
+    Если discount-колонки нет ― пересчитываем: ставка_нов – ставка_прол.
+    Шкала наследуется от ставок (доли или %); ниже мы *всегда* переводим
+    в п.п. умножением ×100.
+    """
+    if col_disc in df.columns:
+        return df                           # уже есть – ничего не делаем
+    df[col_disc] = df[col_rate_new] - df[col_rate_prol]
+    return df
 
-# или прямо из Excel, до любых расчётов:
-raw = pd.read_excel('dataprolong.xlsx')
-print(raw[['Opened_WeightedDiscount_AllProlong']].dropna().head())
-```
 
-* Если в выводе увидите числа порядка **−0.0017** — значит в выгрузке
-  дисконты хранятся «в единицах», а не в проц. пунктах.
-  Тогда нужно **масштабировать** ось:
+def select_table(excel_file, metric_key,
+                 products=None, segments=None) -> pd.DataFrame:
+    # ---------- чтение ---------------------------------------------------
+    df = pd.read_excel(excel_file)
 
-```python
-d['x'] = d[cfg['disc']] * 100      # ← добавить в select_metric()
-plt.xlabel('Discount (п.п.)')
-```
+    # ---------- вспом. сложения (с %-начислениями) -----------------------
+    for l, r, new in [
+        ('Summ_ClosedBalanceRub',    'Summ_ClosedBalanceRub_int',    'Closed_Total_with_pct'),
+        ('Closed_Sum_NewNoProlong',  'Closed_Sum_NewNoProlong_int',  'Closed_Sum_NewNoProlong_with_pct'),
+        ('Closed_Sum_1yProlong_Rub', 'Closed_Sum_1yProlong_Rub_int', 'Closed_Sum_1yProlong_with_pct'),
+        ('Closed_Sum_2yProlong_Rub', 'Closed_Sum_2yProlong_Rub_int', 'Closed_Sum_2yProlong_with_pct'),
+    ]:
+        if new not in df.columns:
+            df[new] = df[l].fillna(0) + df[r].fillna(0)
 
-* Если в Excel действительно −0,17 (а не −0,0017), но в `d['x']`
-  уже стало «0», значит имя колонки не совпало и сработала
-  ветка **ensure\_discounts()**. Проверьте,
-  как именно называется ваш столбец с дисконтом
-  и поправьте список `cfg[...]` в словаре:
+    # ---------- коэффициенты пролонгации ---------------------------------
+    safe_div = lambda n, d: np.where(d == 0, np.nan, n / d)
+    df['Общая пролонгация']   = safe_div(df['Opened_Sum_ProlongRub'],   df['Closed_Total_with_pct'])
+    df['1-я автопролонгация'] = safe_div(df['Opened_Sum_1yProlong_Rub'], df['Closed_Sum_NewNoProlong_with_pct'])
+    df['2-я автопролонгация'] = safe_div(df['Opened_Sum_2yProlong_Rub'], df['Closed_Sum_1yProlong_with_pct'])
+    df['3-я автопролонгация'] = safe_div(df['Opened_Sum_3yProlong_Rub'], df['Closed_Sum_2yProlong_with_pct'])
 
-```python
-cfg = {
-    'overall': dict(metric='Общая пролонгация',
-                    disc='<точное-имя-вашего-столбца>',
-                    ...
-```
+    # ---------- конфигурация метрик/discount/веса ------------------------
+    cfg = {
+        'overall': dict(metric='Общая пролонгация',
+                        disc='Opened_WeightedDiscount_AllProlong',
+                        w   ='Opened_Sum_ProlongRub',
+                        rate_new='Opened_WeightedRate_NewNoProlong',
+                        rate_prol='Opened_WeightedRate_AllProlong'),
+        '1y':      dict(metric='1-я автопролонгация',
+                        disc='Opened_WeightedDiscount_1y',
+                        w   ='Opened_Sum_1yProlong_Rub',
+                        rate_new='Opened_WeightedRate_NewNoProlong',
+                        rate_prol='Opened_WeightedRate_1y'),
+        '2y':      dict(metric='2-я автопролонгация',
+                        disc='Opened_WeightedDiscount_2y',
+                        w   ='Opened_Sum_2yProlong_Rub',
+                        rate_new='Opened_WeightedRate_NewNoProlong',
+                        rate_prol='Opened_WeightedRate_2y'),
+        '3y':      dict(metric='3-я автопролонгация',
+                        disc='Opened_WeightedDiscount_3y',
+                        w   ='Opened_Sum_3yProlong_Rub',
+                        rate_new='Opened_WeightedRate_NewNoProlong',
+                        rate_prol='Opened_WeightedRate_3y'),
+    }[metric_key]
 
-### Итог
+    # ---------- гарантируем discount-колонку -----------------------------
+    df = ensure_discounts(df, cfg['disc'], cfg['rate_new'], cfg['rate_prol'])
 
-* **Ось X** сейчас отображает *ровно те числа*, которые лежат в колонке
-  `Opened_WeightedDiscount_*`.  В ваших графиках это «0,004», потому что
-  в файле колонка хранится в **долях процента** (0,004 % = 0,00004 в p.p.).
-* **Ограничений по величине дисконта** в коде нет: фильтр лишь требует
-  `notna()`.  Могли «выпасть» только строки, у которых `weight == 0`.
+    # ---------- фильтры ---------------------------------------------------
+    m  = (df['TermBucketGrouping'] == 'Все бакеты') \
+       & (df['PROD_NAME']          != 'Все продукты') \
+       & (df['IS_OPTION']          == 0) \
+       & df[cfg['metric']].notna() \
+       & df[cfg['disc']].notna() \
+       & (df[cfg['metric']] <= 1) \
+       & (df[cfg['w']]      > 0)
+    if products: m &= df['PROD_NAME'].isin(products)
+    if segments: m &= df['SegmentGrouping'].isin(segments)
 
-Исправьте масштаб (×100) — и увидите свои ожидаемые −0,17 п.п.
-Если останутся расхождения — проверьте, что имя discount-колонки
-совпадает с тем, что указано в `cfg`.
+    d = df.loc[m, :].copy()
+
+    # ---------- финальные поля -------------------------------------------
+    d['x_ppt'] = d[cfg['disc']] * 100        # перевод в п.п.
+    d['y_pct'] = d[cfg['metric']] * 100
+    d['w_rub'] = d[cfg['w']]
+
+    cols_keep = ['MonthEnd', 'PROD_NAME', 'TermBucketGrouping',
+                 'x_ppt', 'y_pct', 'w_rub']
+    return d[cols_keep].reset_index(drop=True)
+
+
+# ---------------------- main ---------------------------------------------
+if __name__ == '__main__':
+    table = select_table(EXCEL_FILE, METRIC_KEY,
+                         products=FILTER_PROD,
+                         segments=FILTER_SEG)
+
+    # куда сохранять
+    out_dir = Path('results') / METRIC_KEY / 'global'
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    table.to_excel(out_dir / 'table.xlsx', index=False)
+    print(table.head())
