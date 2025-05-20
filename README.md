@@ -1,111 +1,225 @@
-# build_table.py
-# -----------------------------------------------------------
-import numpy as np
-import pandas as pd
+ # -*- coding: utf-8 -*-
+"""
+prolong_charts.py
+• select_metric()  ─ подготавливает выборку  (x – discount, y – %, w – ₽)
+• plot_metric()    ─ строит «4-кривые» bubble-scatter +   сохраняет PNG+Excel
+                   ─ если split_col != None → дополнительно строит
+                     ‘raw-scatter’ без кривых, но с цветами по категориям
+"""
+
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+from numpy.polynomial.polynomial import polyfit, polyval
 from pathlib import Path
-
-# ------------------------------ настройки ------------------
-EXCEL_FILE   = 'dataprolong.xlsx'           # исходный файл
-METRIC_KEY   = 'overall'                    # 'overall'|'1y'|'2y'|'3y'
-FILTER_PROD  = ['Мой дом без опций', 'Доходный+', 'ДОМа лучше']
-FILTER_SEG   = ['Розница']
-# -----------------------------------------------------------
+try:
+    from sklearn.isotonic import IsotonicRegression
+    HAVE_SKLEARN = True
+except ImportError:
+    HAVE_SKLEARN = False
 
 
-def ensure_discounts(df: pd.DataFrame, col_disc: str,
-                     col_rate_new: str, col_rate_prol: str) -> pd.DataFrame:
+# ──────────────── 1. SELECT_METRIC ──────────────────────────────────────
+def select_metric(excel_file : str | pd.DataFrame,
+                  metric_key : str = 'overall',            # 'overall'|'1y'|'2y'|'3y'
+                  products   : list[str] | None = None,
+                  segments   : list[str] | None = None):
     """
-    Если discount-колонки нет ― пересчитываем: ставка_нов – ставка_прол.
-    Шкала наследуется от ставок (доли или %); ниже мы *всегда* переводим
-    в п.п. умножением ×100.
+    Готовит датафрейм с полями
+        x – discount (п.п., ≤0), y – пролонгация (0-100), w – объём ₽
+    Возвращает: df_subset, cfg, base_dir (results/<metric_key>/)
     """
-    if col_disc in df.columns:
-        return df                           # уже есть – ничего не делаем
-    df[col_disc] = df[col_rate_new] - df[col_rate_prol]
-    return df
-
-
-def select_table(excel_file, metric_key,
-                 products=None, segments=None) -> pd.DataFrame:
     # ---------- чтение ---------------------------------------------------
-    df = pd.read_excel(excel_file)
+    df = (pd.read_excel(excel_file) if isinstance(excel_file, str)
+          else excel_file.copy())
 
-    # ---------- вспом. сложения (с %-начислениями) -----------------------
+    # ---------- расчёт сумм с % ------------------------------------------
     for l, r, new in [
         ('Summ_ClosedBalanceRub',    'Summ_ClosedBalanceRub_int',    'Closed_Total_with_pct'),
         ('Closed_Sum_NewNoProlong',  'Closed_Sum_NewNoProlong_int',  'Closed_Sum_NewNoProlong_with_pct'),
         ('Closed_Sum_1yProlong_Rub', 'Closed_Sum_1yProlong_Rub_int', 'Closed_Sum_1yProlong_with_pct'),
         ('Closed_Sum_2yProlong_Rub', 'Closed_Sum_2yProlong_Rub_int', 'Closed_Sum_2yProlong_with_pct'),
     ]:
-        if new not in df.columns:
-            df[new] = df[l].fillna(0) + df[r].fillna(0)
+        df[new] = df[l].fillna(0) + df[r].fillna(0)
 
-    # ---------- коэффициенты пролонгации ---------------------------------
     safe_div = lambda n, d: np.where(d == 0, np.nan, n / d)
-    df['Общая пролонгация']   = safe_div(df['Opened_Sum_ProlongRub'],   df['Closed_Total_with_pct'])
+    df['Общая пролонгация']   = safe_div(df['Opened_Sum_ProlongRub'],  df['Closed_Total_with_pct'])
     df['1-я автопролонгация'] = safe_div(df['Opened_Sum_1yProlong_Rub'], df['Closed_Sum_NewNoProlong_with_pct'])
     df['2-я автопролонгация'] = safe_div(df['Opened_Sum_2yProlong_Rub'], df['Closed_Sum_1yProlong_with_pct'])
     df['3-я автопролонгация'] = safe_div(df['Opened_Sum_3yProlong_Rub'], df['Closed_Sum_2yProlong_with_pct'])
 
-    # ---------- конфигурация метрик/discount/веса ------------------------
+    # ---------- конфигурация по ключу ------------------------------------
     cfg = {
         'overall': dict(metric='Общая пролонгация',
                         disc='Opened_WeightedDiscount_AllProlong',
-                        w   ='Opened_Sum_ProlongRub',
-                        rate_new='Opened_WeightedRate_NewNoProlong',
-                        rate_prol='Opened_WeightedRate_AllProlong'),
+                        weight='Opened_Sum_ProlongRub',
+                        title='Общая автопролонгация'),
         '1y':      dict(metric='1-я автопролонгация',
                         disc='Opened_WeightedDiscount_1y',
-                        w   ='Opened_Sum_1yProlong_Rub',
-                        rate_new='Opened_WeightedRate_NewNoProlong',
-                        rate_prol='Opened_WeightedRate_1y'),
+                        weight='Opened_Sum_1yProlong_Rub',
+                        title='1-я автопролонгация'),
         '2y':      dict(metric='2-я автопролонгация',
                         disc='Opened_WeightedDiscount_2y',
-                        w   ='Opened_Sum_2yProlong_Rub',
-                        rate_new='Opened_WeightedRate_NewNoProlong',
-                        rate_prol='Opened_WeightedRate_2y'),
+                        weight='Opened_Sum_2yProlong_Rub',
+                        title='2-я автопролонгация'),
         '3y':      dict(metric='3-я автопролонгация',
                         disc='Opened_WeightedDiscount_3y',
-                        w   ='Opened_Sum_3yProlong_Rub',
-                        rate_new='Opened_WeightedRate_NewNoProlong',
-                        rate_prol='Opened_WeightedRate_3y'),
+                        weight='Opened_Sum_3yProlong_Rub',
+                        title='3-я автопролонгация')
     }[metric_key]
-
-    # ---------- гарантируем discount-колонку -----------------------------
-    df = ensure_discounts(df, cfg['disc'], cfg['rate_new'], cfg['rate_prol'])
 
     # ---------- фильтры ---------------------------------------------------
     m  = (df['TermBucketGrouping'] == 'Все бакеты') \
        & (df['PROD_NAME']          != 'Все продукты') \
        & (df['IS_OPTION']          == 0) \
+       & (df['BalanceBucketGrouping'] != 'Все бакеты') \
        & df[cfg['metric']].notna() \
        & df[cfg['disc']].notna() \
        & (df[cfg['metric']] <= 1) \
-       & (df[cfg['w']]      > 0)
+       & (df[cfg['weight']]  > 0)
+
     if products: m &= df['PROD_NAME'].isin(products)
     if segments: m &= df['SegmentGrouping'].isin(segments)
 
     d = df.loc[m, :].copy()
+    d['x'] = d[cfg['disc']]
 
-    # ---------- финальные поля -------------------------------------------
-    d['x_ppt'] = d[cfg['disc']] * 100        # перевод в п.п.
-    d['y_pct'] = d[cfg['metric']] * 100
-    d['w_rub'] = d[cfg['w']]
+    # ---------- NEW 1 ▸ дисконты >0 → 0 ----------------------------------
+    d.loc[d['x'] > 0, 'x'] = 0
 
-    cols_keep = ['MonthEnd', 'PROD_NAME', 'TermBucketGrouping',
-                 'x_ppt', 'y_pct', 'w_rub']
-    return d[cols_keep].reset_index(drop=True)
+    d['y'] = d[cfg['metric']] * 100
+    d['w'] = d[cfg['weight']]
+
+    # ---------- рабочий каталог ------------------------------------------
+    base_dir = Path('results') / metric_key
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    return d, cfg, base_dir
 
 
-# ---------------------- main ---------------------------------------------
+# ──────────────── 2. PLOT_METRIC ────────────────────────────────────────
+def plot_metric(df_subset,
+                cfg,
+                base_dir: Path,
+                split_col=None):                 # None | 'TermBucketGrouping' | 'PROD_NAME' | ...
+    """
+    Строит:
+      1. bubble-scatter + 4 кривые (как раньше)
+      2. (### NEW)  raw-scatter без кривых, но с цветом по split-категориям
+         ─ только если split_col задан.
+    PNG и Excel →  results/<metric>/< split | global >/…
+    """
+
+    # ---------- helpers ---------------------------------------------------
+    def safe_name(s):
+        return ''.join(ch for ch in s if ch.isalnum() or ch in ' _-')[:80]
+
+    def r2(y, yh, w):
+        yb = np.average(y, weights=w)
+        ss_res = np.sum(w * (y - yh) ** 2)
+        ss_tot = np.sum(w * (y - yb) ** 2)
+        return 1 - ss_res / ss_tot if ss_tot else np.nan
+
+    def fit_three(x, y, w):
+        cand = {}
+        c = polyfit(x, y, 1, w=w);                cand['linear']     = (c,  polyval(x, c))
+        c = polyfit(x, y, 2, w=w);                cand['quadratic']  = (c,  polyval(x, c))
+        if (y > 0).all():
+            c = polyfit(x, np.log(y), 1, w=w);    cand['exponential'] = (c,  np.exp(polyval(x, c)))
+        name, (par, pred) = max(cand.items(), key=lambda kv: r2(y, kv[1][1], w))
+        return name, par, pred, r2(y, pred, w)
+
+    def fit_mono(x, y, w):
+        cand = {}
+        c = polyfit(x, y, 1, w=w); c[1] = abs(c[1]); cand['lin_neg'] = (c, polyval(x, c))
+        if (y > 0).all():
+            ce = polyfit(x, np.log(y), 1, w=w); ce[1] = abs(ce[1])
+            cand['exp_decay'] = (ce, np.exp(polyval(x, ce)))
+            inv = 1 / y; cr = polyfit(x, inv, 1, w=w)
+            a = 1 / cr[1] if cr[1] else None; b = cr[0] * a if a else None
+            if a and a > 0 and b and b > 0:
+                cand['recip'] = ((a, b), a / (1 + b * x))
+        if HAVE_SKLEARN:
+            iso = IsotonicRegression(increasing=True).fit(x, y, sample_weight=w)
+            cand['isotonic'] = (None, iso.predict(x))
+        name, (par, pred) = max(cand.items(), key=lambda kv: r2(y, kv[1][1], w))
+        return name, par, pred, r2(y, pred, w)
+
+    # ---------- группировка ----------------------------------------------
+    groups = df_subset.groupby(split_col) if split_col else [(None, df_subset)]
+    subdir = base_dir / (split_col or 'global'); subdir.mkdir(exist_ok=True)
+
+    # ---------- палитра для raw-scatter (### NEW) -------------------------
+    if split_col:
+        cat_list = sorted(df_subset[split_col].unique())
+        cmap = plt.cm.get_cmap('tab10', len(cat_list))
+        col_map = {c: cmap(i) for i, c in enumerate(cat_list)}
+
+    for gname, gdf in groups:
+        if len(gdf) < 5 or gdf['w'].sum() == 0:
+            continue
+
+        x, y, w = gdf['x'].values, gdf['y'].values, gdf['w'].values
+        order   = np.argsort(x)
+        sizes   = 20 + 180 * (w / w.max())
+
+        # ----- модели -----------------------------------------------------
+        n_ow, p_ow, y_ow, r_ow = fit_three(x, y, w)
+        n_mw, p_mw, y_mw, r_mw = fit_mono (x, y, w)
+
+        ones    = np.ones_like(w)
+        n_oo, p_oo, y_oo, r_oo = fit_three(x, y, ones)
+        n_mo, p_mo, y_mo, r_mo = fit_mono (x, y, ones)
+
+        # ----- график 1: кривые ------------------------------------------
+        plt.figure(figsize=(9, 6))
+        plt.scatter(x, y, s=sizes, alpha=0.5, edgecolor='k', lw=0.3,
+                    label='bubble = объём ₽')
+
+        plt.plot(x[order], y_ow[order], 'r' , lw=2, label=f'old-WLS  ({n_ow})  R²={r_ow:.2f}')
+        plt.plot(x[order], y_mw[order], 'g' , lw=2, label=f'mono-WLS ({n_mw}) R²={r_mw:.2f}')
+        plt.plot(x[order], y_oo[order], 'r--', lw=2, label=f'old-OLS  ({n_oo})  R²={r_oo:.2f}')
+        plt.plot(x[order], y_mo[order], 'g--', lw=2, label=f'mono-OLS ({n_mo}) R²={r_mo:.2f}')
+
+        plt.axvline(0, lw=0.8, color='k'); plt.ylim(0, 120)
+        plt.xlabel('Discount (п.п.)');     plt.ylabel(f"{cfg['title']}, %")
+        plt.title(f"{cfg['title']} — {gname or 'вся выборка'}")
+        plt.grid(True); plt.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+        plt.subplots_adjust(right=0.78)
+
+        fname = safe_name(cfg['title'] if gname is None else f"{cfg['title']} — {gname}")
+        plt.savefig(subdir / f"{fname}.png", dpi=300, bbox_inches='tight')
+        gdf[['x', 'y', 'w']].to_excel(subdir / f"{fname}.xlsx", index=False)
+        plt.close()
+
+        # ----- NEW 2: raw-scatter без кривых ------------------------------
+        if split_col:
+            plt.figure(figsize=(8, 6))
+            for cat, dcat in gdf.groupby(split_col):
+                plt.scatter(dcat['x'], dcat['y'],
+                            s=20 + 180 * (dcat['w'] / w.max()),
+                            alpha=0.75, color=col_map[cat],
+                            label=str(cat))
+            plt.axvline(0, lw=0.8, color='k'); plt.ylim(0, 120)
+            plt.xlabel('Discount (п.п.)'); plt.ylabel(f"{cfg['title']}, %")
+            plt.title(f"{cfg['title']} — scatter по {split_col}")
+            plt.grid(True); plt.legend(title=split_col, bbox_to_anchor=(1.02,1), loc='upper left')
+            plt.subplots_adjust(right=0.78)
+
+            fname2 = safe_name(f"{cfg['title']} — {split_col}-scatter")
+            plt.savefig(subdir / f"{fname2}.png", dpi=300, bbox_inches='tight')
+            plt.close()
+
+
+# ─────────────────── PRIMER ─────────────────────────────────────────────
 if __name__ == '__main__':
-    table = select_table(EXCEL_FILE, METRIC_KEY,
-                         products=FILTER_PROD,
-                         segments=FILTER_SEG)
+    df_sel, cfg, root = select_metric(
+        'dataprolong.xlsx',
+        metric_key='2y',                             # overall / 1y / 2y / 3y
+        products=['Мой дом без опций', 'Доходный+', 'ДОМа лучше'],
+        segments=['Розница']
+    )
 
-    # куда сохранять
-    out_dir = Path('results') / METRIC_KEY / 'global'
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    table.to_excel(out_dir / 'table.xlsx', index=False)
-    print(table.head())
+    # глобально + три разреза
+    plot_metric(df_sel, cfg, base_dir=root)                                # global
+    plot_metric(df_sel, cfg, base_dir=root, split_col='TermBucketGrouping')
+    plot_metric(df_sel, cfg, base_dir=root, split_col='PROD_NAME')
+    plot_metric(df_sel, cfg, base_dir=root, split_col='BalanceBucketGrouping')
