@@ -1,147 +1,194 @@
-# ──────────────── 2. PLOT_METRIC ────────────────────────────────────────
-def plot_metric(df_subset: pd.DataFrame,
-                cfg: dict,
-                base_dir: Path,
-                split_col: str | None = None):
-    """
-    ▸ Если split_col == None         → один файл с кривыми (старый функционал).
-    ▸ Если split_col задан           → для КАЖДОЙ категории
-          – файл  <title>.png        : bubble-scatter + 4 кривые (WLS/OLS × old/mono)
-          – файл  <title>.xlsx       : x-y-w с данными этой категории
-       + дополнительный общий файл
-          – <title> — <split_col>-scatter_all.png  : scatter ВСЕХ точек,
-                                                     цвет / маркер = категория.
-    """
+# -*- coding: utf-8 -*-
+"""
+visualize_deposits.py
+=====================
+Скрипт читает Excel/CSV‑файл с колонками
 
-    # ---------- утилиты ---------------------------------------------------
-    def safe_name(s: str) -> str:
-        return ''.join(ch for ch in s if ch.isalnum() or ch in ' _-')[:80]
+    section_name | region | Сумма, тыс руб | Ставка внешняя | ТС | margin
 
-    def r2(y, yh, w):
-        y_bar = np.average(y, weights=w)
-        ss_res = np.sum(w * (y - yh) ** 2)
-        ss_tot = np.sum(w * (y - y_bar) ** 2)
-        return 1 - ss_res / ss_tot if ss_tot else np.nan
+и строит набор статичных png‑картинок:
 
-    # --- old-family: linear / quadratic / exponential --------------------
-    def fit_three(x, y, w):
-        cand = {}
-        c = polyfit(x, y, 1, w=w);                 cand['linear']    = (c, polyval(x, c))
-        c = polyfit(x, y, 2, w=w);                 cand['quadratic'] = (c, polyval(x, c))
-        if (y > 0).all():
-            c = polyfit(x, np.log(y), 1, w=w);     cand['exponential'] = (c, np.exp(polyval(x, c)))
-        name, (par, pred) = max(cand.items(), key=lambda kv: r2(y, kv[1][1], w))
-        return name, par, pred, r2(y, pred, w)
+1. Столбчатые диаграммы «Сумма» и «margin» по регионам
+   (две серии: «Срочные» и «Накопительный счёт»).
+2. Точечный график «margin vs Сумма» с цветовой группировкой по продукту.
+3. (Опционально) Хороплет‑карты для каждого продукта, если передан путь к
+   шейп‑файлу регионов РФ.
 
-    # --- monotone pack ----------------------------------------------------
-    def fit_mono(x, y, w):
-        cand = {}
-        c = polyfit(x, y, 1, w=w);  c[1] = abs(c[1]);              cand['lin_neg'] = (c, polyval(x, c))
-        if (y > 0).all():
-            ce = polyfit(x, np.log(y), 1, w=w);  ce[1] = abs(ce[1]); cand['exp_decay'] = (ce, np.exp(polyval(x, ce)))
-            inv = 1 / y; cr = polyfit(x, inv, 1, w=w)
-            a = 1 / cr[1] if cr[1] else None;  b = cr[0] * a if a else None
-            if a and a > 0 and b and b > 0:
-                cand['recip'] = ((a, b), a / (1 + b * x))
-        if HAVE_SKLEARN:
-            iso = IsotonicRegression(increasing=True).fit(x, y, sample_weight=w)
-            cand['isotonic'] = (None, iso.predict(x))
-        name, (par, pred) = max(cand.items(), key=lambda kv: r2(y, kv[1][1], w))
-        return name, par, pred, r2(y, pred, w)
+Запуск:
+    python visualize_deposits.py data.xlsx --shape russia_regions.shp --outdir charts
 
-    # --- формула / узлы для подписи --------------------------------------
-    def eq_str(name, par, x_raw=None):
-        if name in ('linear', 'lin_neg'):
-            b0, b1 = par; return f"y = {b0:+.3f} + {b1:+.3f}·x"
-        if name == 'quadratic':
-            b0, b1, b2 = par; return f"y = {b0:+.3f} + {b1:+.3f}·x {b2:+.3f}·x²"
-        if name in ('exponential', 'exp_decay'):
-            a = np.exp(par[0]); b = par[1]; return f"y = {a:.3f}·e^({b:+.3f}·x)"
-        if name == 'recip':
-            return "y = a / (1 + b·x)"
-        if name == 'isotonic':
-            y_hat = par
-            idx = np.where(np.diff(y_hat) != 0)[0] + 1
-            kx  = np.concatenate(([x_raw.min()], x_raw[idx], [x_raw.max()]))
-            ky  = np.concatenate(([y_hat[0]],    y_hat[idx], [y_hat[-1]]))
-            pairs = [f"[x={xi:+.2f}; {yi:.0f}]" for xi, yi in zip(kx, ky)]
-            if len(pairs) > 6: pairs = pairs[:3] + ['…'] + pairs[-3:]
-            return " → ".join(pairs)
-        return ""
+Папка *outdir* создаётся автоматически и будет содержать PNG‑файлы.
 
-    # ---------- подготовка каталогов -------------------------------------
-    groups  = df_subset.groupby(split_col) if split_col else [(None, df_subset)]
-    subdir  = base_dir / (split_col or 'global')
-    subdir.mkdir(parents=True, exist_ok=True)
+Зависимости: pandas, matplotlib, geopandas (а также shapely, pyproj).
+"""
 
-    # ---------- палитра для общего scatter --------------------------------
-    if split_col:
-        cats = sorted(df_subset[split_col].unique())
-        cmap = plt.cm.get_cmap('tab10', len(cats))
-        color_of = {c: cmap(i) for i, c in enumerate(cats)}
-        markers  = ['o', 's', '^', 'D', 'v', '<', '>', 'P', 'X'] * 10
-        marker_of = {c: markers[i] for i, c in enumerate(cats)}
+from __future__ import annotations
 
-    # ---------- цикл по категориям (рисунки с кривыми) --------------------
-    for gname, gdf in groups:
-        if len(gdf) < 5 or gdf['w'].sum() == 0:
-            continue
+import argparse
+from pathlib import Path
 
-        x, y, w  = gdf['x'].values, gdf['y'].values, gdf['w'].values
-        order    = np.argsort(x)
-        sizes    = 20 + 180 * (w / w.max())
+import pandas as pd
+import matplotlib.pyplot as plt
 
-        # --- модели ---
-        n_ow, p_ow, y_ow, r_ow = fit_three(x, y, w)
-        n_mw, p_mw, y_mw, r_mw = fit_mono (x, y, w)
-        ones = np.ones_like(w)
-        n_oo, p_oo, y_oo, r_oo = fit_three(x, y, ones)
-        n_mo, p_mo, y_mo, r_mo = fit_mono (x, y, ones)
+# "geopandas" и вся географическая часть импортируем лениво,
+# чтобы скрипт работал даже при отсутствии этой библиотеки,
+# если пользователю нужны только обычные графики.
+try:
+    import geopandas as gpd  # type: ignore
+except ImportError:
+    gpd = None  # noqa: N816
 
-        # --- график ---
-        plt.figure(figsize=(9, 6))
-        plt.scatter(x, y, s=sizes, alpha=0.5, edgecolor='k', lw=0.3,
-                    label='bubble = объём ₽')
-        plt.plot(x[order], y_ow[order], 'r' , lw=2, label=f'old-WLS  ({n_ow})  R²={r_ow:.2f}')
-        plt.plot(x[order], y_mw[order], 'g' , lw=2, label=f'mono-WLS ({n_mw}) R²={r_mw:.2f}')
-        plt.plot(x[order], y_oo[order], 'r--', lw=2, label=f'old-OLS  ({n_oo})  R²={r_oo:.2f}')
-        plt.plot(x[order], y_mo[order], 'g--', lw=2, label=f'mono-OLS ({n_mo}) R²={r_mo:.2f}')
+RUSSIAN_RENAME_MAP = {
+    "Сумма, тыс руб": "sum",
+    "Ставка внешняя": "ext_rate",
+    "ТС": "ts",
+    "margin": "margin",
+    "section_name": "section",
+    "region": "region",
+}
 
-        plt.axvline(0, lw=.8, color='k'); plt.ylim(0, 120)
-        plt.xlabel('Discount (п.п.)');    plt.ylabel(f"{cfg['title']}, %")
-        plt.title(f"{cfg['title']} — {gname or 'вся выборка'}")
-        plt.grid(True); plt.legend(bbox_to_anchor=(1.02,1), loc='upper left')
-        plt.subplots_adjust(right=0.78)
 
-        # --- формулы ---
-        text_old  = f"old-WLS : {eq_str(n_ow,p_ow,x)}\nold-OLS : {eq_str(n_oo,p_oo,x)}"
-        text_mono = f"mono-WLS: {eq_str(n_mw,y_mw if n_mw=='isotonic' else p_mw,x)}\n" \
-                    f"mono-OLS: {eq_str(n_mo,y_mo if n_mo=='isotonic' else p_mo,x)}"
-        plt.figtext(0.98,0.02,text_old ,ha='right',va='bottom',fontsize=8,
-                    bbox=dict(boxstyle='round,pad=0.3',fc='white',ec='grey',lw=0.5))
-        plt.figtext(0.01,-0.10,text_mono,ha='left' ,va='top'   ,fontsize=9,linespacing=1.2)
+def load_data(path: Path) -> pd.DataFrame:
+    """Load CSV/Excel and normalise column names to Latin."""
+    if path.suffix.lower() in {".xls", ".xlsx"}:
+        df = pd.read_excel(path)
+    else:
+        df = pd.read_csv(path, encoding="utf-8")
 
-        fname = safe_name(cfg['title'] if gname is None else f"{cfg['title']} — {gname}")
-        plt.savefig(subdir / f"{fname}.png", dpi=300, bbox_inches='tight')
-        gdf[['x','y','w']].to_excel(subdir / f"{fname}.xlsx", index=False)
-        plt.show(); plt.close()
+    df = df.rename(columns=RUSSIAN_RENAME_MAP)
+    # Оставляем только нужные колонки в фиксированном порядке
+    expected = [
+        "section",
+        "region",
+        "sum",
+        "ext_rate",
+        "ts",
+        "margin",
+    ]
+    return df[expected]
 
-    # ---------- совокупный raw-scatter -----------------------------------
-    if split_col:
-        plt.figure(figsize=(8,6))
-        for cat, d in df_subset.groupby(split_col):
-            plt.scatter(d['x'], d['y'],
-                        s = 20 + 180*(d['w']/df_subset['w'].max()),
-                        color  = color_of[cat],
-                        marker = marker_of[cat],
-                        alpha=.75,
-                        label=str(cat))
-        plt.axvline(0,lw=.8,color='k'); plt.ylim(0,120)
-        plt.xlabel('Discount (п.п.)'); plt.ylabel(f"{cfg['title']}, %")
-        plt.title(f"{cfg['title']} — scatter по {split_col} (все категории)")
-        plt.grid(True); plt.legend(title=split_col, bbox_to_anchor=(1.02,1), loc='upper left')
-        plt.subplots_adjust(right=0.78)
 
-        fname = safe_name(f"{cfg['title']} — {split_col}-scatter_all")
-        plt.savefig(subdir / f"{fname}.png", dpi=300, bbox_inches='tight')
-        plt.show(); plt.close()
+# --------------------------------------------------
+# Визуализации без карты
+# --------------------------------------------------
+
+def bar_compare(df: pd.DataFrame, value_col: str, outfile: Path) -> None:
+    """Draw side‑by‑side bar chart for two products across regions."""
+    pivot = (
+        df.pivot_table(index="region", columns="section", values=value_col, aggfunc="sum")
+        .fillna(0)
+        .sort_values(by=df["region"].unique().tolist())
+    )
+
+    ax = pivot.plot(kind="bar", figsize=(14, 6), edgecolor="black")
+    ax.set_title(f"{value_col} by region and product")
+    ax.set_ylabel(value_col)
+    ax.set_xlabel("Region")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig(outfile, dpi=300)
+    plt.close()
+
+
+def scatter_margin_vs_sum(df: pd.DataFrame, outfile: Path) -> None:
+    """Draw scatter for margin vs sum with product hue."""
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for section, grp in df.groupby("section"):
+        ax.scatter(grp["sum"], grp["margin"], label=section, s=60, alpha=0.7)
+    ax.set_xlabel("Sum (thousand RUB)")
+    ax.set_ylabel("Margin")
+    ax.set_title("Margin vs Volume")
+    ax.legend(title="Product")
+    plt.tight_layout()
+    plt.savefig(outfile, dpi=300)
+    plt.close()
+
+
+# --------------------------------------------------
+# География (choropleth)
+# --------------------------------------------------
+
+def choropleth(
+    df: pd.DataFrame,
+    shapefile_path: Path,
+    value_col: str,
+    section: str,
+    outfile: Path,
+) -> None:
+    if gpd is None:
+        raise RuntimeError("geopandas is required for choropleth maps")
+
+    gdf_regions = gpd.read_file(shapefile_path)
+
+    # Приводим строки к единому стилю, убираем пробелы
+    gdf_regions["region"] = gdf_regions["region"].str.strip()
+    data_section = df[df["section"] == section][["region", value_col]].copy()
+
+    merged = gdf_regions.merge(data_section, on="region", how="left")
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    merged.plot(
+        column=value_col,
+        ax=ax,
+        cmap="OrRd",
+        linewidth=0.2,
+        edgecolor="grey",
+        legend=True,
+        missing_kwds={"color": "lightgrey", "label": "No data"},
+    )
+    ax.set_axis_off()
+    ax.set_title(f"{section}: {value_col} by region")
+    plt.tight_layout()
+    plt.savefig(outfile, dpi=300)
+    plt.close()
+
+
+# --------------------------------------------------
+# CLI entry point
+# --------------------------------------------------
+
+def main() -> None:  # noqa: C901  (CLI, complexity ok)
+    parser = argparse.ArgumentParser(
+        description="Visualize deposit KPIs by region for two product types",
+        epilog="Example: python visualize_deposits.py data.xlsx --shape russia_regions.shp",
+    )
+    parser.add_argument("data_file", type=Path, help="Path to CSV/Excel data file")
+    parser.add_argument(
+        "--shape",
+        type=Path,
+        help="Path to Russian regions shapefile (e.g., *.shp). If omitted, maps are skipped.",
+    )
+    parser.add_argument("--outdir", type=Path, default=Path("outputs"), help="Output directory")
+
+    args = parser.parse_args()
+    args.outdir.mkdir(exist_ok=True)
+
+    df = load_data(args.data_file)
+
+    # 1–2. Bar charts
+    bar_compare(df, "sum", args.outdir / "sum_bar.png")
+    bar_compare(df, "margin", args.outdir / "margin_bar.png")
+
+    # 3. Scatter plot
+    scatter_margin_vs_sum(df, args.outdir / "scatter_margin_vs_sum.png")
+
+    # 4. Choropleths (optional)
+    if args.shape:
+        if gpd is None:
+            raise RuntimeError("Install geopandas for mapping support: pip install geopandas")
+        for section in df["section"].unique():
+            choropleth(
+                df,
+                args.shape,
+                "sum",
+                section,
+                args.outdir / f"{section}_sum_map.png",
+            )
+
+        print("Maps saved to", args.outdir)
+    else:
+        print("Bar charts and scatter saved to", args.outdir)
+
+
+if __name__ == "__main__":
+    main()
