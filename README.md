@@ -2,7 +2,8 @@
 import pandas as pd, geopandas as gpd, matplotlib.pyplot as plt, numpy as np
 from shapely.geometry import shape
 from pathlib import Path
-import json, re, unicodedata
+import json, re, unicodedata, warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 
 DATA_FILE   = "тестовый файл для проверки.xlsx"
 WORLD_FILE  = "countries.geojson"
@@ -20,12 +21,13 @@ df = df.rename(columns={
     "margin": "margin",
     "маржа": "margin",
 })
-df = df[["section", "region", "sum", "ext_rate", "ts", "margin"]].dropna(subset=["sum"])
+# только нужные столбцы
+df = df[["section", "region", "sum", "ext_rate", "margin"]].dropna(subset=["sum"])
 
 # %% 1. Координаты городов --------------------------------------------------
 CITY_COORDS = {
     "москва":          (55.7558, 37.6176),
-    "дчбо":            (69.3558, 88.1893),   # → Норильск
+    "дчбо":            (69.3558, 88.1893),   # Норильск
     "санкт-петербург": (59.9311, 30.3609),
     "краснодар":       (45.0355, 38.9753),
     "нижний новгород": (56.3269, 44.0059),
@@ -70,29 +72,33 @@ GDF_WORLD   = russia_world()
 GDF_REGIONS = russia_regions()
 
 # %% 3. Визуализация --------------------------------------------------------
-max_sum = df["sum"].max()
+max_sum = df["sum"].max()       # в тыс.руб.
 
 def bubble_map(bg: gpd.GeoDataFrame,
                dfx: pd.DataFrame,
                title: str,
                outfile: str):
     xs, ys, vals, labels = [], [], [], []
+    missing = set()
+
     for _, r in dfx.iterrows():
         city_key = norm(r["region"])
-        if city_key not in CITY_COORDS: continue
+        if city_key not in CITY_COORDS:
+            missing.add(r["region"]); continue
         lat, lon = CITY_COORDS[city_key]
         ys.append(lat); xs.append(lon); vals.append(r["sum"])
 
-        # подписи с ТС, % и margin → проценты, 2 знака
-        ts  = f"{r['ts']*100:.2f}%"
-        ex  = f"{r['ext_rate']*100:.2f}%"
-        mar = f"{r['margin']*100:.2f}%"
-        labels.append(f"{r['region']}\nТС {ts}  % {ex}  M {mar}")
+        vol_bil = r["sum"] / 1_000_000     # тыс.руб. → млрд.руб.
+        rate    = f"{r['ext_rate']*100:.2f}%"
+        marg    = f"{r['margin']*100:.2f}%"
+        labels.append(f"{r['region']}\n{vol_bil:.1f} млрд₽\nСтавка {rate}  M {marg}")
 
-    if not xs: print(f"⚠️  Нет точек для {title}"); return
+    if not xs:
+        print(f"⚠️  Нет точек для «{title}» — проверьте названия регионов.")
+        return
 
     sizes = (np.sqrt(vals)/np.sqrt(max_sum))*2200
-    cmap  = plt.cm.turbo                      # насыщенная шкала
+    cmap  = plt.cm.plasma
     normc = plt.Normalize(vmin=min(vals), vmax=max(vals))
 
     fig, ax = plt.subplots(figsize=(11,8))
@@ -101,24 +107,30 @@ def bubble_map(bg: gpd.GeoDataFrame,
                     cmap=cmap, norm=normc, alpha=0.85,
                     edgecolor="black", linewidth=0.3)
 
+    # подписи чуть ниже точки (−1°)
     for x, y, txt in zip(xs, ys, labels):
-        ax.text(x, y, txt, fontsize=6, ha="center", va="center",
+        ax.text(x, y-1, txt, fontsize=6, ha="center", va="top",
                 bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.8))
 
     ax.set_xlim(20, 190); ax.set_ylim(40, 80)
     ax.set_axis_off()
-    cbar = plt.colorbar(sc, ax=ax, shrink=0.6, pad=0.02); cbar.set_label("Объём")
+    cbar = plt.colorbar(sc, ax=ax, shrink=0.6, pad=0.02); cbar.set_label("Объём, тыс ₽")
     ax.set_title(title, fontsize=14)
     plt.tight_layout(); plt.savefig(OUTDIR/outfile, dpi=350); plt.show()
 
+    if missing:
+        print("⚠️  Для этих регионов нет координат:", ", ".join(missing))
+
 # %% 4. Строим четыре карты -------------------------------------------------
-for product in ["срочные", "накопительный счёт"]:
-    sect = df[df["section"].str.lower() == product]
+for sect_orig in df["section"].unique():
+    sect_key = norm(sect_orig)
+    sect_df  = df[df["section"].str.lower().str.strip()==sect_orig.lower().strip()]
+    title_ru = sect_orig.strip().capitalize()
 
-    bubble_map(GDF_WORLD,   sect,
-               f"{product.capitalize()} • Объём (фон World)",
-               f"{product}_world.png")
+    bubble_map(GDF_WORLD,   sect_df,
+               f"{title_ru} • Объём (фон World)",
+               f"{title_ru}_world.png")
 
-    bubble_map(GDF_REGIONS, sect,
-               f"{product.capitalize()} • Объём (фон Regions)",
-               f"{product}_regions.png")
+    bubble_map(GDF_REGIONS, sect_df,
+               f"{title_ru} • Объём (фон Regions)",
+               f"{title_ru}_regions.png")
