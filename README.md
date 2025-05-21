@@ -1,43 +1,33 @@
-# -*- coding: utf-8 -*-
-"""
-visualize_deposits.py
-=====================
-Скрипт читает Excel/CSV‑файл с колонками
+Ниже ‒ полный «скелет» ноутбука.
+Скопируйте блоки в Jupyter (или любой редактор, понимающий `# %%`), подправьте путь к файлу и запустите.
 
-    section_name | region | Сумма, тыс руб | Ставка внешняя | ТС | margin
+---
 
-и строит набор статичных png‑картинок:
+### 📒 Deposit KPI Visualization.ipynb
 
-1. Столбчатые диаграммы «Сумма» и «margin» по регионам
-   (две серии: «Срочные» и «Накопительный счёт»).
-2. Точечный график «margin vs Сумма» с цветовой группировкой по продукту.
-3. (Опционально) Хороплет‑карты для каждого продукта, если передан путь к
-   шейп‑файлу регионов РФ.
+```python
+# %% [markdown]
+# # Deposit KPI Visualization
+# *Срочные* vs *Накопительный счёт*  
+# Графики: объём, margin, scatter и (опц.) карта РФ
 
-Запуск:
-    python visualize_deposits.py data.xlsx --shape russia_regions.shp --outdir charts
-
-Папка *outdir* создаётся автоматически и будет содержать PNG‑файлы.
-
-Зависимости: pandas, matplotlib, geopandas (а также shapely, pyproj).
-"""
-
-from __future__ import annotations
-
-import argparse
-from pathlib import Path
-
+# %% 1️⃣ Импорты
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# "geopandas" и вся географическая часть импортируем лениво,
-# чтобы скрипт работал даже при отсутствии этой библиотеки,
-# если пользователю нужны только обычные графики.
+# Геокарты нужны не всегда: подключаем осторожно
 try:
-    import geopandas as gpd  # type: ignore
+    import geopandas as gpd
 except ImportError:
-    gpd = None  # noqa: N816
+    gpd = None  # карта будет пропущена
 
+# %% 2️⃣ Параметры (поменяйте пути на свои)
+DATA_FILE = "data.xlsx"           # Excel/CSV с колонками:
+                                  # section_name | region | Сумма, тыс руб | ... | margin
+SHAPE_FILE = "russia_regions.shp" # *.shp со столбцом region (можно None)
+OUTDIR     = "outputs"            # куда сохранять PNG
+
+# %% 3️⃣ Чтение и нормализация данных
 RUSSIAN_RENAME_MAP = {
     "Сумма, тыс руб": "sum",
     "Ставка внешняя": "ext_rate",
@@ -47,148 +37,90 @@ RUSSIAN_RENAME_MAP = {
     "region": "region",
 }
 
+df = (
+    pd.read_excel(DATA_FILE)        # или pd.read_csv(...)
+      .rename(columns=RUSSIAN_RENAME_MAP)
+      .loc[:, ["section", "region", "sum", "ext_rate", "ts", "margin"]]
+)
 
-def load_data(path: Path) -> pd.DataFrame:
-    """Load CSV/Excel and normalise column names to Latin."""
-    if path.suffix.lower() in {".xls", ".xlsx"}:
-        df = pd.read_excel(path)
-    else:
-        df = pd.read_csv(path, encoding="utf-8")
+df.head()
+```
 
-    df = df.rename(columns=RUSSIAN_RENAME_MAP)
-    # Оставляем только нужные колонки в фиксированном порядке
-    expected = [
-        "section",
-        "region",
-        "sum",
-        "ext_rate",
-        "ts",
-        "margin",
-    ]
-    return df[expected]
+```python
+# %% 4️⃣ Помощники для графиков
+from pathlib import Path
+Path(OUTDIR).mkdir(exist_ok=True)
 
-
-# --------------------------------------------------
-# Визуализации без карты
-# --------------------------------------------------
-
-def bar_compare(df: pd.DataFrame, value_col: str, outfile: Path) -> None:
-    """Draw side‑by‑side bar chart for two products across regions."""
+def bar_compare(df, value_col, filename):
     pivot = (
-        df.pivot_table(index="region", columns="section", values=value_col, aggfunc="sum")
-        .fillna(0)
-        .sort_values(by=df["region"].unique().tolist())
+        df.pivot_table(index="region", columns="section",
+                       values=value_col, aggfunc="sum")
+          .fillna(0)
+          .sort_index()
     )
-
     ax = pivot.plot(kind="bar", figsize=(14, 6), edgecolor="black")
-    ax.set_title(f"{value_col} by region and product")
+    ax.set_title(f"{value_col} by region")
     ax.set_ylabel(value_col)
     ax.set_xlabel("Region")
     plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
-    plt.savefig(outfile, dpi=300)
-    plt.close()
+    plt.savefig(f"{OUTDIR}/{filename}", dpi=300)
+    plt.show()
 
-
-def scatter_margin_vs_sum(df: pd.DataFrame, outfile: Path) -> None:
-    """Draw scatter for margin vs sum with product hue."""
+def scatter_margin_vs_sum(df, filename):
     fig, ax = plt.subplots(figsize=(8, 6))
     for section, grp in df.groupby("section"):
-        ax.scatter(grp["sum"], grp["margin"], label=section, s=60, alpha=0.7)
+        ax.scatter(grp["sum"], grp["margin"],
+                   label=section, s=60, alpha=0.7)
     ax.set_xlabel("Sum (thousand RUB)")
     ax.set_ylabel("Margin")
     ax.set_title("Margin vs Volume")
     ax.legend(title="Product")
     plt.tight_layout()
-    plt.savefig(outfile, dpi=300)
-    plt.close()
+    plt.savefig(f\"{OUTDIR}/{filename}\", dpi=300)
+    plt.show()
 
-
-# --------------------------------------------------
-# География (choropleth)
-# --------------------------------------------------
-
-def choropleth(
-    df: pd.DataFrame,
-    shapefile_path: Path,
-    value_col: str,
-    section: str,
-    outfile: Path,
-) -> None:
+def choropleth(df, shapefile, value_col, section, filename):
     if gpd is None:
-        raise RuntimeError("geopandas is required for choropleth maps")
-
-    gdf_regions = gpd.read_file(shapefile_path)
-
-    # Приводим строки к единому стилю, убираем пробелы
-    gdf_regions["region"] = gdf_regions["region"].str.strip()
-    data_section = df[df["section"] == section][["region", value_col]].copy()
-
-    merged = gdf_regions.merge(data_section, on="region", how="left")
-
+        print("geopandas не установлен → карта пропущена")
+        return
+    gdf = gpd.read_file(shapefile)
+    gdf["region"] = gdf["region"].str.strip()
+    data_sec = df[df.section == section][["region", value_col]]
+    merged = gdf.merge(data_sec, on="region", how="left")
     fig, ax = plt.subplots(figsize=(10, 8))
-    merged.plot(
-        column=value_col,
-        ax=ax,
-        cmap="OrRd",
-        linewidth=0.2,
-        edgecolor="grey",
-        legend=True,
-        missing_kwds={"color": "lightgrey", "label": "No data"},
-    )
+    merged.plot(column=value_col, cmap="OrRd",
+                linewidth=0.2, ax=ax, edgecolor="grey",
+                legend=True,
+                missing_kwds={"color": "lightgrey", "label": "No data"})
     ax.set_axis_off()
     ax.set_title(f"{section}: {value_col} by region")
     plt.tight_layout()
-    plt.savefig(outfile, dpi=300)
-    plt.close()
+    plt.savefig(f\"{OUTDIR}/{filename}\", dpi=300)
+    plt.show()
+```
 
+```python
+# %% 5️⃣ Столбчатые диаграммы
+bar_compare(df, "sum",    "sum_bar.png")
+bar_compare(df, "margin", "margin_bar.png")
+```
 
-# --------------------------------------------------
-# CLI entry point
-# --------------------------------------------------
+```python
+# %% 6️⃣ Scatter margin vs sum
+scatter_margin_vs_sum(df, "scatter_margin_vs_sum.png")
+```
 
-def main() -> None:  # noqa: C901  (CLI, complexity ok)
-    parser = argparse.ArgumentParser(
-        description="Visualize deposit KPIs by region for two product types",
-        epilog="Example: python visualize_deposits.py data.xlsx --shape russia_regions.shp",
-    )
-    parser.add_argument("data_file", type=Path, help="Path to CSV/Excel data file")
-    parser.add_argument(
-        "--shape",
-        type=Path,
-        help="Path to Russian regions shapefile (e.g., *.shp). If omitted, maps are skipped.",
-    )
-    parser.add_argument("--outdir", type=Path, default=Path("outputs"), help="Output directory")
+```python
+# %% 7️⃣ (Опционально) Хороплет-карты
+if SHAPE_FILE and Path(SHAPE_FILE).exists():
+    for sec in df["section"].unique():
+        choropleth(df, SHAPE_FILE, "sum", sec, f"{sec}_sum_map.png")
+else:
+    print("SHAPE_FILE не указан или не найден → карты пропущены")
+```
 
-    args = parser.parse_args()
-    args.outdir.mkdir(exist_ok=True)
+---
 
-    df = load_data(args.data_file)
-
-    # 1–2. Bar charts
-    bar_compare(df, "sum", args.outdir / "sum_bar.png")
-    bar_compare(df, "margin", args.outdir / "margin_bar.png")
-
-    # 3. Scatter plot
-    scatter_margin_vs_sum(df, args.outdir / "scatter_margin_vs_sum.png")
-
-    # 4. Choropleths (optional)
-    if args.shape:
-        if gpd is None:
-            raise RuntimeError("Install geopandas for mapping support: pip install geopandas")
-        for section in df["section"].unique():
-            choropleth(
-                df,
-                args.shape,
-                "sum",
-                section,
-                args.outdir / f"{section}_sum_map.png",
-            )
-
-        print("Maps saved to", args.outdir)
-    else:
-        print("Bar charts and scatter saved to", args.outdir)
-
-
-if __name__ == "__main__":
-    main()
+💡 Теперь у вас есть готовый ноутбук:
+*измените* `DATA_FILE` и `SHAPE_FILE`, затем выполните ячейки сверху вниз — PNG-файлы окажутся в папке `outputs/`. Если нужны новые метрики или интерактив — дайте знать!
