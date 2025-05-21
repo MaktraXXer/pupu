@@ -2,7 +2,7 @@
 import pandas as pd, geopandas as gpd, matplotlib.pyplot as plt, numpy as np
 from shapely.geometry import shape
 from pathlib import Path
-import json, re, unicodedata, textwrap
+import json, re, unicodedata
 
 DATA_FILE   = "тестовый файл для проверки.xlsx"
 WORLD_FILE  = "countries.geojson"
@@ -25,7 +25,7 @@ df = df[["section", "region", "sum", "ext_rate", "ts", "margin"]].dropna(subset=
 # %% 1. Координаты городов --------------------------------------------------
 CITY_COORDS = {
     "москва":          (55.7558, 37.6176),
-    "дчбо":            (56.0153, 92.8932),   # ✔️ смещаем в Красноярск
+    "дчбо":            (69.3558, 88.1893),   # → Норильск
     "санкт-петербург": (59.9311, 30.3609),
     "краснодар":       (45.0355, 38.9753),
     "нижний новгород": (56.3269, 44.0059),
@@ -75,21 +75,24 @@ max_sum = df["sum"].max()
 def bubble_map(bg: gpd.GeoDataFrame,
                dfx: pd.DataFrame,
                title: str,
-               outfile: str,
-               annotate: bool = True):
+               outfile: str):
     xs, ys, vals, labels = [], [], [], []
     for _, r in dfx.iterrows():
-        city_norm = norm(r["region"])
-        if city_norm not in CITY_COORDS: continue
-        lat, lon = CITY_COORDS[city_norm]
+        city_key = norm(r["region"])
+        if city_key not in CITY_COORDS: continue
+        lat, lon = CITY_COORDS[city_key]
         ys.append(lat); xs.append(lon); vals.append(r["sum"])
-        lbl = f"{r['region']}\nТС:{r['ts']}  %:{r['ext_rate']}  M:{r['margin']}"
-        labels.append(lbl)
+
+        # подписи с ТС, % и margin → проценты, 2 знака
+        ts  = f"{r['ts']*100:.2f}%"
+        ex  = f"{r['ext_rate']*100:.2f}%"
+        mar = f"{r['margin']*100:.2f}%"
+        labels.append(f"{r['region']}\nТС {ts}  % {ex}  M {mar}")
 
     if not xs: print(f"⚠️  Нет точек для {title}"); return
 
     sizes = (np.sqrt(vals)/np.sqrt(max_sum))*2200
-    cmap  = plt.cm.YlOrRd
+    cmap  = plt.cm.turbo                      # насыщенная шкала
     normc = plt.Normalize(vmin=min(vals), vmax=max(vals))
 
     fig, ax = plt.subplots(figsize=(11,8))
@@ -98,10 +101,9 @@ def bubble_map(bg: gpd.GeoDataFrame,
                     cmap=cmap, norm=normc, alpha=0.85,
                     edgecolor="black", linewidth=0.3)
 
-    if annotate:
-        for x, y, txt in zip(xs, ys, labels):
-            ax.text(x, y, txt, fontsize=6, ha="center", va="center",
-                    bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.8))
+    for x, y, txt in zip(xs, ys, labels):
+        ax.text(x, y, txt, fontsize=6, ha="center", va="center",
+                bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.8))
 
     ax.set_xlim(20, 190); ax.set_ylim(40, 80)
     ax.set_axis_off()
@@ -120,11 +122,3 @@ for product in ["срочные", "накопительный счёт"]:
     bubble_map(GDF_REGIONS, sect,
                f"{product.capitalize()} • Объём (фон Regions)",
                f"{product}_regions.png")
-
-# %% 5. (Опция) Единая карта с выносками -----------------------------------
-for product in ["срочные", "накопительный счёт"]:
-    sect = df[df["section"].str.lower() == product]
-    bubble_map(GDF_REGIONS, sect,
-               f"{product.capitalize()} • Объём + ТС/Ставка/Margin (единая)",
-               f"{product}_single.png",
-               annotate=True)
