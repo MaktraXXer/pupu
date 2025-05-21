@@ -1,8 +1,8 @@
 # %% 0. Импорт и чтение Excel ---------------------------------------------
 import pandas as pd, geopandas as gpd, matplotlib.pyplot as plt, numpy as np
-from shapely.geometry import shape, Point
+from shapely.geometry import shape
 from pathlib import Path
-import json, re, unicodedata
+import json, re, unicodedata, textwrap
 
 DATA_FILE   = "тестовый файл для проверки.xlsx"
 WORLD_FILE  = "countries.geojson"
@@ -15,13 +15,17 @@ df = df.rename(columns={
     "section_name": "section",
     "region": "region",
     "сумма, тыс руб": "sum",
+    "ставка внешняя": "ext_rate",
+    "тс": "ts",
+    "margin": "margin",
+    "маржа": "margin",
 })
-df = df[["section", "region", "sum"]].dropna(subset=["sum"])
+df = df[["section", "region", "sum", "ext_rate", "ts", "margin"]].dropna(subset=["sum"])
 
 # %% 1. Координаты городов --------------------------------------------------
 CITY_COORDS = {
     "москва":          (55.7558, 37.6176),
-    "дчбо":            (55.7558, 37.6176),
+    "дчбо":            (56.0153, 92.8932),   # ✔️ смещаем в Красноярск
     "санкт-петербург": (59.9311, 30.3609),
     "краснодар":       (45.0355, 38.9753),
     "нижний новгород": (56.3269, 44.0059),
@@ -47,61 +51,80 @@ CITY_COORDS = {
 def norm(s: str) -> str:
     return re.sub(r"[«»\"'.,]", "", unicodedata.normalize("NFKD", s).lower()).strip()
 
-# %% 2. Загрузка фонов ------------------------------------------------------
-def russia_world_gdf(path=WORLD_FILE) -> gpd.GeoDataFrame:
-    with open(path, encoding="utf-8") as f:
+# %% 2. Фоны ----------------------------------------------------------------
+def russia_world() -> gpd.GeoDataFrame:
+    with open(WORLD_FILE, encoding="utf-8") as f:
         fc = json.load(f)
     feat = next(f for f in fc["features"]
                 if (f["properties"].get("ADMIN") or
                     f["properties"].get("name")  or
                     f["properties"].get("NAME")) == "Russia")
-    geom = shape(feat["geometry"])
-    return gpd.GeoDataFrame({"geometry": [geom]}, crs="EPSG:4326")
+    return gpd.GeoDataFrame({"geometry":[shape(feat["geometry"])]}, crs="EPSG:4326")
 
-def russia_regions_gdf(path=REGION_FILE) -> gpd.GeoDataFrame:
-    gdf = gpd.read_file(path)
-    if gdf.crs is None:
-        gdf.set_crs(4326, inplace=True)
-    return gdf[["geometry"]]        # только геометрия нужна как фон
+def russia_regions() -> gpd.GeoDataFrame:
+    gdf = gpd.read_file(REGION_FILE)
+    if gdf.crs is None: gdf.set_crs(4326, inplace=True)
+    return gdf[["geometry"]]
 
-GDF_WORLD   = russia_world_gdf()
-GDF_REGIONS = russia_regions_gdf()
+GDF_WORLD   = russia_world()
+GDF_REGIONS = russia_regions()
 
-# %% 3. Функция рисования пузырей ------------------------------------------
+# %% 3. Визуализация --------------------------------------------------------
 max_sum = df["sum"].max()
 
-def bubble_map(background, section_df, title, outfile):
-    xs, ys, sz = [], [], []
-    for _, r in section_df.iterrows():
-        city = norm(r["region"])
-        if city not in CITY_COORDS: continue
-        lat, lon = CITY_COORDS[city]
-        ys.append(lat); xs.append(lon); sz.append(r["sum"])
+def bubble_map(bg: gpd.GeoDataFrame,
+               dfx: pd.DataFrame,
+               title: str,
+               outfile: str,
+               annotate: bool = True):
+    xs, ys, vals, labels = [], [], [], []
+    for _, r in dfx.iterrows():
+        city_norm = norm(r["region"])
+        if city_norm not in CITY_COORDS: continue
+        lat, lon = CITY_COORDS[city_norm]
+        ys.append(lat); xs.append(lon); vals.append(r["sum"])
+        lbl = f"{r['region']}\nТС:{r['ts']}  %:{r['ext_rate']}  M:{r['margin']}"
+        labels.append(lbl)
 
-    if not xs:
-        print(f"⚠️  Нет точек для {title}"); return
+    if not xs: print(f"⚠️  Нет точек для {title}"); return
 
-    fig, ax = plt.subplots(figsize=(10,7))
-    background.plot(ax=ax, color="#f0f0f0", edgecolor="#666", linewidth=0.4)
+    sizes = (np.sqrt(vals)/np.sqrt(max_sum))*2200
+    cmap  = plt.cm.YlOrRd
+    normc = plt.Normalize(vmin=min(vals), vmax=max(vals))
 
-    sizes = (np.sqrt(sz)/np.sqrt(max_sum))*2000
-    ax.scatter(xs, ys, s=sizes, color="#d62728", alpha=0.8, edgecolor="black")
+    fig, ax = plt.subplots(figsize=(11,8))
+    bg.plot(ax=ax, color="#f2f2f2", edgecolor="#999", linewidth=0.4)
+    sc = ax.scatter(xs, ys, s=sizes, c=vals,
+                    cmap=cmap, norm=normc, alpha=0.85,
+                    edgecolor="black", linewidth=0.3)
+
+    if annotate:
+        for x, y, txt in zip(xs, ys, labels):
+            ax.text(x, y, txt, fontsize=6, ha="center", va="center",
+                    bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.8))
 
     ax.set_xlim(20, 190); ax.set_ylim(40, 80)
     ax.set_axis_off()
-    ax.set_title(title)
-    plt.tight_layout(); plt.savefig(OUTDIR/outfile, dpi=300); plt.show()
+    cbar = plt.colorbar(sc, ax=ax, shrink=0.6, pad=0.02); cbar.set_label("Объём")
+    ax.set_title(title, fontsize=14)
+    plt.tight_layout(); plt.savefig(OUTDIR/outfile, dpi=350); plt.show()
 
-# %% 4. Построить четыре карты ---------------------------------------------
+# %% 4. Строим четыре карты -------------------------------------------------
 for product in ["срочные", "накопительный счёт"]:
     sect = df[df["section"].str.lower() == product]
 
-    bubble_map(GDF_WORLD,
-               sect,
-               f"{product.capitalize()} • объём (фон World)",
+    bubble_map(GDF_WORLD,   sect,
+               f"{product.capitalize()} • Объём (фон World)",
                f"{product}_world.png")
 
-    bubble_map(GDF_REGIONS,
-               sect,
-               f"{product.capitalize()} • объём (фон Regions)",
+    bubble_map(GDF_REGIONS, sect,
+               f"{product.capitalize()} • Объём (фон Regions)",
                f"{product}_regions.png")
+
+# %% 5. (Опция) Единая карта с выносками -----------------------------------
+for product in ["срочные", "накопительный счёт"]:
+    sect = df[df["section"].str.lower() == product]
+    bubble_map(GDF_REGIONS, sect,
+               f"{product.capitalize()} • Объём + ТС/Ставка/Margin (единая)",
+               f"{product}_single.png",
+               annotate=True)
