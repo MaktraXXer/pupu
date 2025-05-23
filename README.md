@@ -1,11 +1,13 @@
-/* ===== 0. Целевые вклады ===== */
+/* ──────────────────────────────────────────────────────
+   0. Таблица целевых вкладов
+─────────────────────────────────────────────────────── */
 DECLARE @Products TABLE (prod_name_res NVARCHAR(255) PRIMARY KEY);
 INSERT INTO @Products VALUES
 ('Надёжный'), ('Надёжный VIP'),
 ('Надёжный премиум'), ('Надёжный промо'),
 ('Надёжный старт');
 
-/* общий набор дат, чтобы не дублировать */
+/* набор дат */
 DECLARE @RepDates TABLE (d DATE PRIMARY KEY);
 INSERT INTO @RepDates VALUES
 ('2024-01-31'),('2024-02-29'),('2024-03-31'),('2024-04-30'),
@@ -14,7 +16,9 @@ INSERT INTO @RepDates VALUES
 ('2025-01-31'),('2025-02-28'),('2025-03-31'),('2025-04-30'),
 ('2025-05-20');
 
-/* ===== 1. Все рублёвые пассивы в нужных сегментах, датах и валютах ===== */
+/* ──────────────────────────────────────────────────────
+   1. «Чистая» выборка + флаг target_prod  (1 = наш вклад)
+─────────────────────────────────────────────────────── */
 WITH base_data AS (
     SELECT
         bra.cli_id,
@@ -23,9 +27,11 @@ WITH base_data AS (
         bra.SECTION_NAME,
         bra.TSEGMENTNAME,
         bra.PROD_NAME_RES,
-        bra.OUT_RUB
-    FROM  ALM.ALM.Balance_Rest_All bra  WITH (NOLOCK)
-    JOIN  @RepDates rd                 ON rd.d = bra.dt_Rep
+        bra.OUT_RUB,
+        CASE WHEN bra.PROD_NAME_RES IN (SELECT prod_name_res FROM @Products)
+             THEN 1 ELSE 0 END AS target_prod      -- ←★
+    FROM  ALM.ALM.Balance_Rest_All bra WITH (NOLOCK)
+    JOIN  @RepDates rd            ON rd.d = bra.dt_Rep
     WHERE bra.section_name  IN ('Срочные','До востребования','Накопительный счёт')
       AND bra.cur           = '810'
       AND bra.od_flag       = 1
@@ -37,37 +43,41 @@ WITH base_data AS (
       AND bra.OUT_RUB IS NOT NULL
 )
 
-/* ===== 2. Первый раз, когда клиент взял продукт из @Products ===== */
+/* ──────────────────────────────────────────────────────
+   2. Первая дата «нашего» вклада
+─────────────────────────────────────────────────────── */
 , first_touch AS (
-    SELECT  cli_id,
-            MIN(dt_Rep) AS first_dt_rep
-    FROM    base_data
-    WHERE   prod_name_res IN (SELECT prod_name_res FROM @Products)
+    SELECT cli_id,
+           MIN(dt_Rep) AS first_dt_rep
+    FROM   base_data
+    WHERE  target_prod = 1
     GROUP BY cli_id
 )
 
-/* ===== 3. Метка поколения (месяц) ===== */
+/* ──────────────────────────────────────────────────────
+   3. Месячная метка generation
+─────────────────────────────────────────────────────── */
 , generation AS (
-    SELECT  cli_id,
-            first_dt_rep,
-            FORMAT(first_dt_rep,'yyyy-MM') AS generation
+    SELECT cli_id,
+           first_dt_rep,
+           FORMAT(first_dt_rep,'yyyy-MM') AS generation
     FROM first_touch
 )
 
-/* ===== 4. Определяем, “чистый” ли клиент =====
-           (нет записей с prod_name_res вне @Products)                */
+/* ──────────────────────────────────────────────────────
+   4. Признак pure_only  (нет ни одного «чужого» вклада)
+─────────────────────────────────────────────────────── */
 , product_mix AS (
-    SELECT  bd.cli_id,
-            CASE
-                 WHEN SUM(CASE WHEN bd.prod_name_res NOT IN (SELECT prod_name_res FROM @Products)
-                                THEN 1 END) = 0
-                 THEN 1 ELSE 0
-            END AS pure_only
-    FROM base_data bd
-    GROUP BY bd.cli_id
+    SELECT  cli_id,
+            CASE WHEN SUM(CASE WHEN target_prod = 0 THEN 1 END) = 0
+                 THEN 1 ELSE 0 END AS pure_only
+    FROM base_data
+    GROUP BY cli_id
 )
 
-/* ===== 5. Соединяем всё и получаем единую витрину ===== */
+/* ──────────────────────────────────────────────────────
+   5. Финальная витрина
+─────────────────────────────────────────────────────── */
 , cte AS (
     SELECT  bd.dt_Rep,
             gen.generation,
@@ -77,18 +87,20 @@ WITH base_data AS (
             bd.PROD_NAME_RES,
             bd.con_id,
             bd.OUT_RUB
-    FROM        base_data   bd
-    INNER JOIN  generation  gen ON gen.cli_id = bd.cli_id
-    INNER JOIN  product_mix pm  ON pm.cli_id  = bd.cli_id
-    /* ►► при желании убрать остатки ДО открытия
-       добавьте условие:  AND bd.dt_Rep >= gen.first_dt_rep  */
+    FROM       base_data  bd
+    JOIN       generation gen ON gen.cli_id = bd.cli_id
+    JOIN       product_mix pm  ON pm.cli_id  = bd.cli_id
+    /* если нужно – разкомментируйте, чтобы отрезать движения ДО открытия */
+    -- AND bd.dt_Rep >= gen.first_dt_rep
 )
 
-/* ===== 6. Агрегация (общая) ===== */
+/* ──────────────────────────────────────────────────────
+   6. Агрегация
+─────────────────────────────────────────────────────── */
 SELECT
     dt_Rep,
-    generation,          -- “месяц рождения”
-    pure_only,           -- 1 = “только наши продукты”, 0 = “были и другие”
+    generation,
+    pure_only,                    -- 1 = только продукты из списка
     SECTION_NAME,
     TSEGMENTNAME,
     PROD_NAME_RES,
