@@ -1,107 +1,43 @@
-### 1 . Может ли «чужой» generation проникнуть в срез?
+DECLARE @Gen char(7) = '2024-01';   -- то же поколение
 
-Нет — при фильтре
-
-```sql
-WHERE generation = '2024-01'
-```
-
-из `step2` остаются **только** те строки, у которых
-`CONVERT(char(7), first_target_dt,120) = '2024-01'`.
-У каждого `cli_id` эта метка одна и та же, поэтому клиенты других
-поколений физически отсутствуют.
-То, что вы видите «Надёжный» в январе, а потом
-«Надёжный Промо» в феврале-марте, означает: **это тот же клиент** —
-он просто открыл новый договор (или тот же договор переобозвали).
-
-> **1.5** Первая доступная точка 2024-01-31 никакой проблемы не
-> создаёт: если договор открыт 30 января, он попадает; если 15 января —
-> смотрим остаток на 31-е; если раньше — у клиента есть депозит *до*
-> generation ⇒ `had_deposit_before = 1`.
-
----
-
-### 2 . Вывести подробные строки по одному поколению
-
-```sql
-DECLARE @Gen char(7) = '2024-01';          -- нужное поколение
-
-WITH gen_clients AS (
-    SELECT cli_id
+/* --- CTE с клиентами поколения @Gen --- */
+;WITH gen_clients AS (
+    SELECT DISTINCT cli_id
     FROM (
-        SELECT DISTINCT
-               cli_id,
-               CONVERT(char(7), MIN(CASE WHEN target_prod = 1 THEN dt_rep END)
-                                   OVER (PARTITION BY cli_id), 120) AS generation
+        SELECT cli_id,
+               CONVERT(char(7),
+                       MIN(CASE WHEN target_prod = 1 THEN dt_rep END)
+                       OVER (PARTITION BY cli_id), 120) AS generation
         FROM #bd
-        WHERE target_prod = 1
-    ) x
+    ) t
     WHERE generation = @Gen
 )
-
+/* --- договоры, где встречается >1 название продукта --- */
+, diff_prod AS (
+    SELECT  b.cli_id,
+            b.con_id,
+            COUNT(DISTINCT b.prod_name_res) AS diff_cnt
+    FROM    #bd b
+    WHERE   b.cli_id IN (SELECT cli_id FROM gen_clients)
+    GROUP BY b.cli_id, b.con_id
+    HAVING  COUNT(DISTINCT b.prod_name_res) > 1
+)
+/* --- итоговый вывод со списком названий ---------------- */
 SELECT
-    b.cli_id,
-    b.con_id,
-    b.dt_Rep,
-    b.prod_name_res,
-    b.*
-FROM   #bd b
-JOIN   gen_clients g ON g.cli_id = b.cli_id
-ORDER BY
-    b.cli_id,
-    b.con_id,
-    b.dt_Rep;
-```
-
-*Показывает всю «жизнь» клиента выбранного поколения, сортировка —
-`cli_id → con_id → dt_Rep`; легко увидеть, сменился ли продукт.*
-
----
-
-### 2.5 . Автоматическая проверка «менялся ли продукт у договора»
-
-```sql
-/* для выбранного поколения покажем договоры,
-   где за период встречается >1 prod_name_res */
-WITH gen_clients AS ( … как выше … )
-
-SELECT
-    cli_id,
-    con_id,
-    COUNT(DISTINCT prod_name_res) AS diff_products,
-    STRING_AGG(DISTINCT prod_name_res, ', ') AS products_list
-FROM   #bd
-WHERE  cli_id IN (SELECT cli_id FROM gen_clients)
-GROUP BY cli_id, con_id
-HAVING COUNT(DISTINCT prod_name_res) > 1
-ORDER BY cli_id, con_id;
-```
-
-Вы получите список «подозрительных» договоров и полный перечень их
-названий.
-
----
-
-### 3 . Можно ли «переименовать» продукт на поздний?
-
-Да:
-
-* взять для каждого `con_id` **последнее** (по `dt_rep`) ненулевое
-  `prod_name_res`;
-* обновить (или подменить в выборке) старые строки тем значением.
-
-Реализуется оконной функцией `LAST_VALUE() … OVER (PARTITION BY con_id
-ORDER BY dt_rep ROWS BETWEEN UNBOUNDED FOLLOWING AND UNBOUNDED FOLLOWING)`
-или через `FIRST_VALUE()` по убыванию даты.
-Если понадобится —- напишу точный скрипт.
-
----
-
-### Что дальше
-
-1. Запустите **проверку из п. 2.5** — увидите, действительно ли меняется
-   название договора.
-2. Если таких «прыгающих» договоров мало — это, скорее всего, ошибка
-   выгрузки/ETL. Если много — значит, банк действительно
-   переобозначает продукт; тогда можно «закрепить» последнее название,
-   как в п. 3.
+    d.cli_id,
+    d.con_id,
+    d.diff_cnt,
+    /* универсальная агрегация: STRING_AGG для 2017+, XML-хак для 2016 */
+    ISNULL(  
+        (SELECT STRING_AGG(DISTINCT b.prod_name_res, ', ')
+         FROM   #bd b
+         WHERE  b.cli_id = d.cli_id AND b.con_id = d.con_id),   -- 2017+
+        (SELECT STUFF(                                -- Fallback для 2016
+                   (SELECT DISTINCT ',' + b2.prod_name_res
+                    FROM   #bd b2
+                    WHERE  b2.cli_id = d.cli_id AND b2.con_id = d.con_id
+                    FOR XML PATH(''), TYPE).value('.','nvarchar(max)'),1,1,'')
+        )
+    ) AS products_list
+FROM diff_prod d
+ORDER BY d.cli_id, d.con_id;
