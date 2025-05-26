@@ -1,85 +1,107 @@
-/* ───────── 0. Целевые вклады ───────── */
-DECLARE @Products TABLE(prod_name_res NVARCHAR(255) PRIMARY KEY);
-INSERT INTO @Products VALUES
-('Надёжный'), ('Надёжный VIP'),
-('Надёжный премиум'), ('Надёжный промо'),
-('Надёжный старт');
+### 1 . Может ли «чужой» generation проникнуть в срез?
 
-/* ───────── 1. Читаем подходящие строки во временную таблицу ───────── */
+Нет — при фильтре
+
+```sql
+WHERE generation = '2024-01'
+```
+
+из `step2` остаются **только** те строки, у которых
+`CONVERT(char(7), first_target_dt,120) = '2024-01'`.
+У каждого `cli_id` эта метка одна и та же, поэтому клиенты других
+поколений физически отсутствуют.
+То, что вы видите «Надёжный» в январе, а потом
+«Надёжный Промо» в феврале-марте, означает: **это тот же клиент** —
+он просто открыл новый договор (или тот же договор переобозвали).
+
+> **1.5** Первая доступная точка 2024-01-31 никакой проблемы не
+> создаёт: если договор открыт 30 января, он попадает; если 15 января —
+> смотрим остаток на 31-е; если раньше — у клиента есть депозит *до*
+> generation ⇒ `had_deposit_before = 1`.
+
+---
+
+### 2 . Вывести подробные строки по одному поколению
+
+```sql
+DECLARE @Gen char(7) = '2024-01';          -- нужное поколение
+
+WITH gen_clients AS (
+    SELECT cli_id
+    FROM (
+        SELECT DISTINCT
+               cli_id,
+               CONVERT(char(7), MIN(CASE WHEN target_prod = 1 THEN dt_rep END)
+                                   OVER (PARTITION BY cli_id), 120) AS generation
+        FROM #bd
+        WHERE target_prod = 1
+    ) x
+    WHERE generation = @Gen
+)
+
+SELECT
+    b.cli_id,
+    b.con_id,
+    b.dt_Rep,
+    b.prod_name_res,
+    b.*
+FROM   #bd b
+JOIN   gen_clients g ON g.cli_id = b.cli_id
+ORDER BY
+    b.cli_id,
+    b.con_id,
+    b.dt_Rep;
+```
+
+*Показывает всю «жизнь» клиента выбранного поколения, сортировка —
+`cli_id → con_id → dt_Rep`; легко увидеть, сменился ли продукт.*
+
+---
+
+### 2.5 . Автоматическая проверка «менялся ли продукт у договора»
+
+```sql
+/* для выбранного поколения покажем договоры,
+   где за период встречается >1 prod_name_res */
+WITH gen_clients AS ( … как выше … )
+
 SELECT
     cli_id,
     con_id,
-    dt_Rep,
-    SECTION_NAME,
-    TSEGMENTNAME,
-    PROD_NAME_RES,
-    OUT_RUB,
-    CASE WHEN PROD_NAME_RES IN (SELECT prod_name_res FROM @Products)
-         THEN 1 ELSE 0 END AS target_prod
-INTO   #bd
-FROM   ALM.ALM.Balance_Rest_All WITH (NOLOCK)
-WHERE  dt_Rep BETWEEN '2024-01-01' AND '2025-05-31'
-  AND  dt_Rep IN ('2024-01-31','2024-02-29','2024-03-31','2024-04-30',
-                  '2024-05-31','2024-06-30','2024-07-31','2024-08-31',
-                  '2024-09-30','2024-10-31','2024-11-30','2024-12-31',
-                  '2025-01-31','2025-02-28','2025-03-31','2025-04-30',
-                  '2025-05-20')
-  AND  section_name  IN ('Срочные','До востребования','Накопительный счёт')
-  AND  cur           = '810'
-  AND  od_flag       = 1
-  AND  is_floatrate  = 0
-  AND  ACC_ROLE      = 'LIAB'
-  AND  AP            = 'Пассив'
-  AND  TSEGMENTNAME IN ('ДЧБО','Розничный бизнес')
-  AND  BLOCK_NAME    = 'Привлечение ФЛ'
-  AND  OUT_RUB IS NOT NULL;
+    COUNT(DISTINCT prod_name_res) AS diff_products,
+    STRING_AGG(DISTINCT prod_name_res, ', ') AS products_list
+FROM   #bd
+WHERE  cli_id IN (SELECT cli_id FROM gen_clients)
+GROUP BY cli_id, con_id
+HAVING COUNT(DISTINCT prod_name_res) > 1
+ORDER BY cli_id, con_id;
+```
 
-CREATE CLUSTERED INDEX ix_bd_cli_dt ON #bd (cli_id, dt_Rep);
+Вы получите список «подозрительных» договоров и полный перечень их
+названий.
 
-/* ───────── 2. Оконные функции — всё в один проход ───────── */
-WITH step1 AS (
-    SELECT *,
-        /* дата первого целевого вклада */
-        MIN(CASE WHEN target_prod = 1 THEN dt_Rep END)
-            OVER (PARTITION BY cli_id)                    AS first_target_dt
-    FROM #bd
-)
-, step2 AS (
-    SELECT *,
-        /* есть ли dépôt ДО generation? 1 = был */
-        CASE WHEN MAX(CASE WHEN dt_Rep < first_target_dt THEN 1 END)
-                 OVER (PARTITION BY cli_id) = 1
-             THEN 1 ELSE 0 END                            AS had_deposit_before,
+---
 
-        /* квартальная метка */
-        CONCAT(DATEPART(year , first_target_dt),
-               'Q',
-               DATEPART(quarter, first_target_dt))        AS vintage_qtr
-    FROM step1
-    WHERE first_target_dt IS NOT NULL    -- исключаем клиентов без целевого вклада
-)
+### 3 . Можно ли «переименовать» продукт на поздний?
 
-/* ───────── 3. Агрегация ───────── */
-SELECT
-    dt_Rep,
-    CONVERT(char(7), first_target_dt, 120) AS generation,   -- YYYY-MM
-    vintage_qtr,                                            -- YYYYQn
-    had_deposit_before,                                     -- 0 = «совсем новые»
-    SECTION_NAME,
-    TSEGMENTNAME,
-    PROD_NAME_RES,
-    SUM(OUT_RUB)           AS sum_OUT_RUB,
-    COUNT(DISTINCT con_id) AS count_CON_ID
-FROM step2
-GROUP BY
-    dt_Rep,
-    CONVERT(char(7), first_target_dt, 120),
-    vintage_qtr,
-    had_deposit_before,
-    SECTION_NAME,
-    TSEGMENTNAME,
-    PROD_NAME_RES
-ORDER BY
-    dt_Rep, SECTION_NAME, TSEGMENTNAME, PROD_NAME_RES;
+Да:
 
-DROP TABLE #bd;
+* взять для каждого `con_id` **последнее** (по `dt_rep`) ненулевое
+  `prod_name_res`;
+* обновить (или подменить в выборке) старые строки тем значением.
+
+Реализуется оконной функцией `LAST_VALUE() … OVER (PARTITION BY con_id
+ORDER BY dt_rep ROWS BETWEEN UNBOUNDED FOLLOWING AND UNBOUNDED FOLLOWING)`
+или через `FIRST_VALUE()` по убыванию даты.
+Если понадобится —- напишу точный скрипт.
+
+---
+
+### Что дальше
+
+1. Запустите **проверку из п. 2.5** — увидите, действительно ли меняется
+   название договора.
+2. Если таких «прыгающих» договоров мало — это, скорее всего, ошибка
+   выгрузки/ETL. Если много — значит, банк действительно
+   переобозначает продукт; тогда можно «закрепить» последнее название,
+   как в п. 3.
