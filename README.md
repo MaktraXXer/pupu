@@ -1,68 +1,65 @@
-/* ──────────────────────────────────────────────────────
-   Создать таблицу для сохранения результатов винтаж-отчёта
-   Схема: alm_test.dbo
-────────────────────────────────────────────────────── */
-IF OBJECT_ID('alm_test.dbo.fu_vintage_results', 'U') IS NOT NULL
-    DROP TABLE alm_test.dbo.fu_vintage_results;
-GO
+Ниже — полный, самодостаточный T-SQL-скрипт «от нуля до загрузки» :
 
-CREATE TABLE alm_test.dbo.fu_vintage_results
-(
-    -- ключ/дата отчётного среза
-    dt_rep             DATE            NOT NULL,
+* создаёт таблицу-приёмник **alm\_test.dbo.fu\_vintage\_results** (если её ещё нет);
+* выгружает данные из **ALM.ALM.Balance\_Rest\_All** во временную таблицу `#bd`;
+* нормализует названия **только** для вкладов из списка `@Products`
+  — берёт *самое позднее* имя по каждому `con_id`;
+* рассчитывает `generation`, `vintage_qtr`, `had_deposit_before`;
+* агрегирует метрики (`sum_out_rub`, `count_con_id`, `rate_obiem`);
+* очищает целевой диапазон дат в приёмнике и вставляет свежие данные.
 
-    -- клиент
-    cli_id             BIGINT          NOT NULL,        -- если у вас GUID или NVARCHAR → замените тип
-    generation         CHAR(7)         NOT NULL,        -- 'YYYY-MM'
-    vintage_qtr        CHAR(6)         NOT NULL,        -- 'YYYYQn'
-    had_deposit_before BIT             NOT NULL,        -- 0/1
-
-    -- бизнес-атрибуты
-    section_name       NVARCHAR(50)    NOT NULL,
-    tsegmentname       NVARCHAR(50)    NOT NULL,
-    prod_name_res      NVARCHAR(100)   NOT NULL,
-
-    -- метрики
-    sum_out_rub        DECIMAL(20,2)   NOT NULL,
-    count_con_id       INT             NOT NULL,
-    rate_obiem         DECIMAL(20,2)   NOT NULL,
-
-    -- служебное
-    load_timestamp     DATETIME2       NOT NULL
-        CONSTRAINT DF_fu_vintage_results_loadts DEFAULT (SYSUTCDATETIME()),
-
-    CONSTRAINT PK_fu_vintage_results
-        PRIMARY KEY CLUSTERED (dt_rep, cli_id, prod_name_res)
-);
-GO
-
-/* не обязательные, но полезные индексы */
-
--- по дате и поколению: удобно фильтровать по срезу и винтажу
-CREATE INDEX IX_fu_vintage_results_rep_gen
-ON alm_test.dbo.fu_vintage_results (dt_rep, generation);
-
--- по кварталу и наличию ранних депозитов (для быстрых сегментов)
-CREATE INDEX IX_fu_vintage_results_vint_had
-ON alm_test.dbo.fu_vintage_results (vintage_qtr, had_deposit_before);
-GO
-
-
-/* ─────────────────────────────────────────────────────────────
-   0. параметры расчёта: диапазон дат, который вы сейчас пишете
-──────────────────────────────────────────────────────────────*/
+```sql
+/* =======================================================================
+   0. Параметры расчёта: задайте период, который пересчитываете
+======================================================================= */
 DECLARE @DateFrom date = '2024-01-31';
 DECLARE @DateTo   date = '2025-05-20';
 
-/* ─────────────────────────────────────────────────────────────
-   1. расчёт (ваш код без изменений)
-──────────────────────────────────────────────────────────────*/
-DROP TABLE IF EXISTS #bd;
-DECLARE @Products TABLE (prod_name_res NVARCHAR(255) PRIMARY KEY);
-INSERT INTO @Products VALUES
-('Надёжный'), ('Надёжный VIP'), ('Надёжный премиум'),
-('Надёжный промо'), ('Надёжный старт');
+/* =======================================================================
+   1. Таблица-приёмник (создаётся один раз)
+======================================================================= */
+IF OBJECT_ID('alm_test.dbo.fu_vintage_results', 'U') IS NULL
+BEGIN
+    CREATE TABLE alm_test.dbo.fu_vintage_results
+    (
+        dt_rep             date          NOT NULL,
+        cli_id             bigint        NOT NULL,
+        generation         char(7)       NOT NULL,   -- 'YYYY-MM'
+        vintage_qtr        char(6)       NOT NULL,   -- 'YYYYQn'
+        had_deposit_before bit           NOT NULL,   -- 0/1
+        section_name       nvarchar(50)  NOT NULL,
+        tsegmentname       nvarchar(50)  NOT NULL,
+        prod_name_res      nvarchar(100) NOT NULL,
+        sum_out_rub        decimal(20,2) NOT NULL,
+        count_con_id       int           NOT NULL,
+        rate_obiem         decimal(20,2) NOT NULL,
+        load_timestamp     datetime2     NOT NULL
+            CONSTRAINT DF_fu_vintage_results_loadts DEFAULT (sysutcdatetime()),
+        CONSTRAINT PK_fu_vintage_results
+            PRIMARY KEY CLUSTERED (dt_rep, cli_id, prod_name_res)
+    );
 
+    CREATE INDEX IX_fu_vintage_results_rep_gen
+        ON alm_test.dbo.fu_vintage_results (dt_rep, generation);
+
+    CREATE INDEX IX_fu_vintage_results_vint_had
+        ON alm_test.dbo.fu_vintage_results (vintage_qtr, had_deposit_before);
+END
+GO
+
+/* =======================================================================
+   2. Справочник целевых вкладов «Финуслуги»
+======================================================================= */
+DROP TABLE IF EXISTS #bd;
+DECLARE @Products TABLE (prod_name_res nvarchar(255) PRIMARY KEY);
+INSERT INTO @Products VALUES
+('Надёжный'), ('Надёжный VIP'),
+('Надёжный премиум'), ('Надёжный промо'),
+('Надёжный старт');
+
+/* =======================================================================
+   3. Выгрузка во временную таблицу
+======================================================================= */
 SELECT
     cli_id,
     con_id,
@@ -92,8 +89,28 @@ WHERE dt_rep BETWEEN @DateFrom AND @DateTo
   AND block_name    = 'Привлечение ФЛ'
   AND out_rub IS NOT NULL;
 
-CREATE CLUSTERED INDEX ix_bd_cli_dt ON #bd (cli_id, dt_rep);
+CREATE CLUSTERED INDEX IX_bd_cli_dt ON #bd (con_id, dt_rep);  -- нужен для оконок
 
+/* =======================================================================
+   4. Нормализация названий: берём самое позднее имя по con_id
+======================================================================= */
+;WITH last_name AS (
+    SELECT DISTINCT
+           con_id,
+           FIRST_VALUE(prod_name_res)
+             OVER (PARTITION BY con_id ORDER BY dt_rep DESC) AS prod_latest
+    FROM #bd
+    WHERE target_prod = 1
+)
+UPDATE b
+SET    b.prod_name_res = ln.prod_latest
+FROM   #bd b
+JOIN   last_name ln ON ln.con_id = b.con_id
+WHERE  b.target_prod = 1;   -- только целевые строки правим
+
+/* =======================================================================
+   5. Расчёт generation / vintage / флагов
+======================================================================= */
 WITH step1 AS (
     SELECT *,
            MIN(CASE WHEN target_prod = 1 THEN dt_rep END)
@@ -105,10 +122,10 @@ step2 AS (
            CASE WHEN MAX(CASE WHEN dt_rep < first_target_dt THEN 1 END)
                     OVER (PARTITION BY cli_id) = 1
                 THEN 1 ELSE 0 END                         AS had_deposit_before,
-           CONCAT(DATEPART(year, first_target_dt), 'Q',
+           CONCAT(DATEPART(year, first_target_dt),'Q',
                   DATEPART(quarter, first_target_dt))     AS vintage_qtr
     FROM step1
-    WHERE first_target_dt IS NOT NULL
+    WHERE first_target_dt IS NOT NULL      -- исключаем клиентов без вкладов ФУ
 ),
 agg AS (
     SELECT
@@ -120,9 +137,9 @@ agg AS (
         section_name,
         tsegmentname,
         prod_name_res,
-        CAST(SUM(out_rub)            AS DECIMAL(20,2)) AS sum_out_rub,
+        CAST(SUM(out_rub)            AS decimal(20,2)) AS sum_out_rub,
         COUNT(DISTINCT con_id)                       AS count_con_id,
-        CAST(SUM(out_rub * rate_con) AS DECIMAL(20,2)) AS rate_obiem
+        CAST(SUM(out_rub * rate_con) AS decimal(20,2)) AS rate_obiem
     FROM step2
     GROUP BY
         dt_rep,
@@ -135,15 +152,12 @@ agg AS (
         prod_name_res
 )
 
-/* ─────────────────────────────────────────────────────────────
-   2. (опционально) очищаем диапазон перед загрузкой
-──────────────────────────────────────────────────────────────*/
+/* =======================================================================
+   6. Перезаписываем диапазон и загружаем данные
+======================================================================= */
 DELETE FROM alm_test.dbo.fu_vintage_results
 WHERE dt_rep BETWEEN @DateFrom AND @DateTo;
 
-/* ─────────────────────────────────────────────────────────────
-   3. вставляем результат
-──────────────────────────────────────────────────────────────*/
 INSERT INTO alm_test.dbo.fu_vintage_results
         (dt_rep, cli_id, generation, vintage_qtr, had_deposit_before,
          section_name, tsegmentname, prod_name_res,
@@ -154,5 +168,16 @@ SELECT
     sum_out_rub, count_con_id, rate_obiem
 FROM agg;
 
-/* ───────── 4. уборка ─────────*/
-DROP TABLE #bd;
+DROP TABLE #bd;   -- аккуратно убираем временную таблицу
+GO
+```
+
+**Проверка после загрузки**
+
+```sql
+SELECT TOP 10 * 
+FROM   alm_test.dbo.fu_vintage_results
+ORDER  BY load_timestamp DESC;
+```
+
+Скрипт можно запускать регулярно: достаточно менять `@DateFrom` / `@DateTo` — данные за этот интервал сначала удаляются, потом загружаются актуальные результаты с нормализованными названиями продуктов из «Финуслуг».
