@@ -26,9 +26,9 @@ CREATE TABLE alm_test.dbo.fu_vintage_results
     generation         char(7)       NOT NULL,
     vintage_qtr        char(6)       NOT NULL,
 
-    had_deposit_before bit           NOT NULL,   -- 1 ⇒ депозит был раньше
-    only_fu_overall    bit           NOT NULL,   -- 1 ⇒ всегда только ФУ
-    only_fu_at_generation bit        NOT NULL,   -- 1 ⇒ в месяц generation только ФУ
+    had_deposit_before      bit      NOT NULL,
+    only_fu_overall         bit      NOT NULL,
+    only_fu_at_generation   bit      NOT NULL,
 
     section_name       nvarchar(50)  NOT NULL,
     tsegmentname       nvarchar(50)  NOT NULL,
@@ -36,11 +36,10 @@ CREATE TABLE alm_test.dbo.fu_vintage_results
 
     sum_out_rub        decimal(20,2) NOT NULL,
     count_con_id       int           NOT NULL,
-
-    rate_obiem         decimal(20,2) NOT NULL,   -- Σ объём × client-rate
-    ts_obiem           decimal(20,2) NOT NULL,   -- Σ объём × ТС-rate
-    avg_rate_con       decimal(18,4) NULL,       -- взв. клиен­тская
-    avg_rate_trf       decimal(18,4) NULL,       -- взв. ТС-ставка
+    rate_obiem         decimal(20,2) NOT NULL,
+    ts_obiem           decimal(20,2) NOT NULL,
+    avg_rate_con       decimal(18,4) NULL,
+    avg_rate_trf       decimal(18,4) NULL,
 
     load_timestamp     datetime2 NOT NULL
         CONSTRAINT DF_vint_load DEFAULT (sysutcdatetime()),
@@ -50,7 +49,6 @@ CREATE TABLE alm_test.dbo.fu_vintage_results
                                section_name, tsegmentname, prod_name_res)
 );
 
-/* индексы */
 CREATE INDEX IX_fu_vint_rep_gen
     ON alm_test.dbo.fu_vintage_results (dt_rep, generation);
 
@@ -61,7 +59,6 @@ CREATE INDEX IX_fu_vint_vint_had
    2. СПИСОК ЦЕЛЕВЫХ ВКЛАДОВ
 ============================================================= */
 DROP TABLE IF EXISTS #bd;
-
 DECLARE @Products TABLE(prod_name_res nvarchar(255) PRIMARY KEY);
 INSERT INTO @Products VALUES
 ('Надёжный'), ('Надёжный VIP'),
@@ -69,22 +66,22 @@ INSERT INTO @Products VALUES
 ('Надёжный старт');
 
 /* =============================================================
-   3. ВЫГРУЗКА 17 СНИМКОВ В #bd
+   3. ВЫГРУЗКА 17 СНИМКОВ
 ============================================================= */
 SELECT
     bra.cli_id, bra.con_id, bra.dt_rep,
     bra.section_name, bra.tsegmentname,
     bra.prod_name_res, bra.out_rub,
-    bra.rate_con,            -- клиентская ставка
-    bra.rate_trf,            -- трансф. ставка
+    bra.rate_con,             -- клиентская ставка
+    bra.rate_trf,             -- трансф. ставка
     CASE WHEN bra.prod_name_res IN (SELECT prod_name_res FROM @Products)
          THEN 1 ELSE 0 END AS target_prod
 INTO  #bd
-FROM  ALM.ALM.Balance_Rest_All bra  WITH (NOLOCK)
+FROM  ALM.ALM.Balance_Rest_All bra WITH (NOLOCK)
 JOIN  @RepDates r ON r.d = bra.dt_rep
 WHERE bra.section_name IN ('Срочные','До востребования','Накопительный счёт')
   AND bra.cur = '810'  AND bra.od_flag = 1  AND bra.is_floatrate = 0
-  AND bra.acc_role = 'LIAB'  AND bra.ap   = 'Пассив'
+  AND bra.acc_role = 'LIAB' AND bra.ap = 'Пассив'
   AND bra.tsegmentname IN ('ДЧБО','Розничный бизнес')
   AND bra.block_name    = 'Привлечение ФЛ'
   AND bra.out_rub IS NOT NULL;
@@ -92,7 +89,7 @@ WHERE bra.section_name IN ('Срочные','До востребования','�
 CREATE CLUSTERED INDEX IX_bd_con_dt ON #bd (con_id, dt_rep);
 
 /* =============================================================
-   4. НОРМАЛИЗАЦИЯ НАЗВАНИЯ ПРОДУКТА (по con_id)
+   4. НОРМАЛИЗАЦИЯ НАЗВАНИЯ (последнее по con_id)
 ============================================================= */
 ;WITH last_name AS (
     SELECT DISTINCT con_id,
@@ -107,7 +104,7 @@ JOIN   last_name ln ON ln.con_id = b.con_id
 WHERE  b.target_prod = 1;
 
 /* =============================================================
-   5. CTE-цепочка: generation, флаги, средние ставки
+   5. CTE-цепочка: generation + флаги
 ============================================================= */
 WITH step1 AS (
     SELECT *,
@@ -117,23 +114,25 @@ WITH step1 AS (
 ),
 step2 AS (
     SELECT *,
-           /* 1. был ли депозит раньше? */
+           /* депозит раньше? */
            CASE WHEN MAX(CASE WHEN dt_rep < first_target_dt THEN 1 END)
-                    OVER (PARTITION BY cli_id) = 1
-                THEN 1 ELSE 0 END                           AS had_deposit_before,
+                    OVER (PARTITION BY cli_id)=1
+                THEN 1 ELSE 0 END                               AS had_deposit_before,
 
-           /* 2. клиент ВСЕГДА держит только ФУ-вклады? */
-           CASE WHEN SUM(CASE WHEN target_prod = 0 THEN 1 END)
-                    OVER (PARTITION BY cli_id) = 0
-                THEN 1 ELSE 0 END                           AS only_fu_overall,
+           /* ВСЕГДА только ФУ-вклады?            */
+           CASE WHEN SUM(CASE WHEN target_prod = 0 THEN 1 ELSE 0 END)
+                    OVER (PARTITION BY cli_id)=0
+                THEN 1 ELSE 0 END                               AS only_fu_overall,
 
-           /* 3. на дату generation держит только ФУ? */
-           CASE WHEN SUM(CASE WHEN dt_rep = first_target_dt AND target_prod = 0 THEN 1 END)
-                    OVER (PARTITION BY cli_id) = 0
-                THEN 1 ELSE 0 END                           AS only_fu_at_generation,
+           /* на generation только ФУ?             */
+           CASE WHEN SUM(CASE WHEN dt_rep = first_target_dt
+                                AND target_prod = 0
+                               THEN 1 ELSE 0 END)
+                    OVER (PARTITION BY cli_id)=0
+                THEN 1 ELSE 0 END                               AS only_fu_at_generation,
 
            CONCAT(DATEPART(year,first_target_dt),'Q',
-                  DATEPART(quarter,first_target_dt))        AS vintage_qtr
+                  DATEPART(quarter,first_target_dt))            AS vintage_qtr
     FROM step1
     WHERE first_target_dt IS NOT NULL
 ),
@@ -151,11 +150,11 @@ agg AS (
         tsegmentname,
         prod_name_res,
 
-        SUM(out_rub)                   AS sum_out_rub,
-        COUNT(DISTINCT con_id)         AS count_con_id,
+        SUM(out_rub)                       AS sum_out_rub,
+        COUNT(DISTINCT con_id)             AS count_con_id,
 
-        SUM(out_rub * rate_con)        AS rate_obiem,
-        SUM(out_rub * rate_trf)        AS ts_obiem,
+        SUM(out_rub * rate_con)            AS rate_obiem,
+        SUM(out_rub * rate_trf)            AS ts_obiem,
 
         SUM(CASE WHEN rate_con IS NOT NULL THEN out_rub END) AS vol_con,
         SUM(CASE WHEN rate_trf IS NOT NULL THEN out_rub END) AS vol_trf
@@ -167,7 +166,7 @@ agg AS (
              prod_name_res
 )
 /* =============================================================
-   6. ЗАГРУЗКА
+   6. ЗАГРУЗКА В ПРИЁМНИК
 ============================================================= */
 INSERT INTO alm_test.dbo.fu_vintage_results
         (dt_rep, cli_id, generation, vintage_qtr,
@@ -186,8 +185,8 @@ SELECT
     CASE WHEN vol_trf = 0 THEN NULL ELSE ts_obiem   / vol_trf END
 FROM agg;
 
-/* контроль: 10 последних строк */
-SELECT TOP 10 *
+/* краткий контроль */
+SELECT TOP 10 only_fu_overall, only_fu_at_generation, *
 FROM   alm_test.dbo.fu_vintage_results
 ORDER  BY load_timestamp DESC;
 
