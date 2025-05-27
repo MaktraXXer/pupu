@@ -1,56 +1,3 @@
-/* ──────────────────────────────────────────────────────
-   Создать таблицу для сохранения результатов винтаж-отчёта
-   Схема: alm_test.dbo
-────────────────────────────────────────────────────── */
-IF OBJECT_ID('alm_test.dbo.fu_vintage_results', 'U') IS NOT NULL
-    DROP TABLE alm_test.dbo.fu_vintage_results;
-GO
-
-CREATE TABLE alm_test.dbo.fu_vintage_results
-(
-    -- ключ/дата отчётного среза
-    dt_rep             DATE            NOT NULL,
-
-    -- клиент
-    cli_id             BIGINT          NOT NULL,        -- если у вас GUID или NVARCHAR → замените тип
-    generation         CHAR(7)         NOT NULL,        -- 'YYYY-MM'
-    vintage_qtr        CHAR(6)         NOT NULL,        -- 'YYYYQn'
-    had_deposit_before BIT             NOT NULL,        -- 0/1
-
-    -- бизнес-атрибуты
-    section_name       NVARCHAR(50)    NOT NULL,
-    tsegmentname       NVARCHAR(50)    NOT NULL,
-    prod_name_res      NVARCHAR(100)   NOT NULL,
-
-    -- метрики
-    sum_out_rub        DECIMAL(20,2)   NOT NULL,
-    count_con_id       INT             NOT NULL,
-    rate_obiem         DECIMAL(20,2)   NOT NULL,
-
-    -- служебное
-    load_timestamp     DATETIME2       NOT NULL
-        CONSTRAINT DF_fu_vintage_results_loadts DEFAULT (SYSUTCDATETIME()),
-
-    CONSTRAINT PK_fu_vintage_results
-        PRIMARY KEY CLUSTERED (dt_rep, cli_id, prod_name_res)
-);
-GO
-
-/* не обязательные, но полезные индексы */
-
--- по дате и поколению: удобно фильтровать по срезу и винтажу
-CREATE INDEX IX_fu_vintage_results_rep_gen
-ON alm_test.dbo.fu_vintage_results (dt_rep, generation);
-
--- по кварталу и наличию ранних депозитов (для быстрых сегментов)
-CREATE INDEX IX_fu_vintage_results_vint_had
-ON alm_test.dbo.fu_vintage_results (vintage_qtr, had_deposit_before);
-GO
-
-Я запущу этот код
-
-дальше я запущу такой код
-
 /* ───────── 0. Целевые вклады ───────── */
 DROP TABLE IF EXISTS #bd;
 DECLARE @Products TABLE (prod_name_res NVARCHAR(255) PRIMARY KEY);
@@ -71,8 +18,8 @@ SELECT
     rate_con,
     CASE WHEN prod_name_res IN (SELECT prod_name_res FROM @Products)
          THEN 1 ELSE 0 END AS target_prod
-INTO  #bd
-FROM  ALM.ALM.Balance_Rest_All WITH (NOLOCK)
+INTO #bd
+FROM ALM.ALM.Balance_Rest_All WITH (NOLOCK)
 WHERE dt_rep BETWEEN '2024-01-01' AND '2025-05-31'
   AND dt_rep IN ('2024-01-31','2024-02-29','2024-03-31','2024-04-30',
                  '2024-05-31','2024-06-30','2024-07-31','2024-08-31',
@@ -89,19 +36,35 @@ WHERE dt_rep BETWEEN '2024-01-01' AND '2025-05-31'
   AND block_name    = 'Привлечение ФЛ'
   AND out_rub IS NOT NULL;
 
-CREATE CLUSTERED INDEX ix_bd_cli_dt ON #bd (cli_id, dt_rep);
+/* индекс под нормализацию и окна */
+CREATE CLUSTERED INDEX ix_bd_con_dt ON #bd (con_id, dt_rep);
+
+/* ───────── 1.1. нормализуем имена целевых вкладов ───────── */
+;WITH last_name AS (
+    SELECT DISTINCT
+           con_id,
+           FIRST_VALUE(prod_name_res)
+             OVER (PARTITION BY con_id ORDER BY dt_rep DESC) AS prod_latest
+    FROM #bd
+    WHERE target_prod = 1
+)
+UPDATE b
+SET    b.prod_name_res = ln.prod_latest
+FROM   #bd b
+JOIN   last_name ln ON ln.con_id = b.con_id
+WHERE  b.target_prod = 1;        -- обновляем только строки из @Products
 
 /* ───────── 2. оконные функции ───────── */
 WITH step1 AS (
     SELECT *,
            MIN(CASE WHEN target_prod = 1 THEN dt_rep END)
-               OVER(PARTITION BY cli_id) AS first_target_dt
+               OVER (PARTITION BY cli_id) AS first_target_dt
     FROM #bd
 ),
 step2 AS (
     SELECT *,
            CASE WHEN MAX(CASE WHEN dt_rep < first_target_dt THEN 1 END)
-                    OVER(PARTITION BY cli_id) = 1
+                    OVER (PARTITION BY cli_id) = 1
                 THEN 1 ELSE 0 END                         AS had_deposit_before,
            CONCAT(DATEPART(year, first_target_dt), 'Q',
                   DATEPART(quarter, first_target_dt))     AS vintage_qtr
@@ -125,7 +88,7 @@ SELECT
 FROM step2
 GROUP BY
     dt_rep,
-    cli_id,                       -- ← добавили
+    cli_id,
     CONVERT(char(7), first_target_dt, 120),
     vintage_qtr,
     had_deposit_before,
