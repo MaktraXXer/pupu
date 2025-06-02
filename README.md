@@ -1,74 +1,53 @@
-/*=====================================================================
-  П А Р А М Е Т Р Ы
-=====================================================================*/
-DECLARE @rep_date  date = '2025-05-11';   -- последняя дата окна
-DECLARE @days_back int  = 6;              -- 6 дней назад + сама дата = 7 суток
+/* === Параметры ========================================================= */
+DECLARE @rep_date  date = '2025-05-11';
+DECLARE @days_back int  = 6;
 
-/*=====================================================================
-  1. Суточные остатки клиента по трём секциям
-=====================================================================*/
+/* === 1. Суточные остатки клиента ======================================= */
 ;WITH daily_cli AS (
     SELECT
         db.dt_rep,
         db.cli_id,
-
-        /* ДВС --------------------------------------------------------*/
-        SUM(CASE
-                WHEN LTRIM(RTRIM(db.section_name)) = N'До востребования'
-                     THEN db.out_rub
-            END) AS dv_rub,
-
-        /* НС ---------------------------------------------------------*/
-        SUM(CASE
-                WHEN LTRIM(RTRIM(db.section_name)) = N'Накопительный счёт'
-                     THEN db.out_rub
-            END) AS ns_rub,
-
-        /* Срочные ----------------------------------------------------*/
-        SUM(CASE
-                WHEN LTRIM(RTRIM(db.section_name)) = N'Срочные'
-                     THEN db.out_rub
-            END) AS sr_rub
+        SUM(CASE WHEN LTRIM(RTRIM(db.section_name)) = N'До востребования'
+                 THEN db.out_rub END) AS dv_rub,
+        SUM(CASE WHEN LTRIM(RTRIM(db.section_name)) = N'Накопительный счёт'
+                 THEN db.out_rub END) AS ns_rub,
+        SUM(CASE WHEN LTRIM(RTRIM(db.section_name)) = N'Срочные'
+                 THEN db.out_rub END) AS sr_rub
     FROM ALM.balance_rest_all db WITH (NOLOCK)
     WHERE db.dt_rep BETWEEN DATEADD(day,-@days_back,@rep_date) AND @rep_date
-      AND db.CUR          = '810'                     -- RUB
+      AND db.CUR          = '810'
       AND db.MAP_IS_CASH  = 1
       AND db.TSEGMENTNAME = N'Розничный бизнес'
       AND db.AP           = N'Пассив'
       AND db.BLOCK_NAME   = N'Привлечение ФЛ'
       AND LTRIM(RTRIM(db.section_name)) IN
-            (N'Срочные', N'До востребования', N'Накопительный счёт')
+          (N'Срочные', N'До востребования', N'Накопительный счёт')
     GROUP BY db.dt_rep, db.cli_id
 ),
 
-/*=====================================================================
-  2. Средний ДВС клиента за неделю  →  бакет
-=====================================================================*/
+/* === 2. Средний ДВС-остаток клиента за 7 суток → бакет ================== */
 weekly_avg AS (
-    SELECT
-        dc.cli_id,
-        AVG(ISNULL(dc.dv_rub,0)) AS avg_dv
-    FROM daily_cli dc
-    GROUP BY dc.cli_id
+    SELECT cli_id,
+           AVG(ISNULL(dv_rub,0)) AS avg_dv
+    FROM   daily_cli
+    GROUP  BY cli_id
 ),
 bucket_map AS (
     SELECT
         wa.cli_id,
         CASE
-            WHEN wa.avg_dv IS NULL OR wa.avg_dv <=      0     THEN N'0 / null'
-            WHEN wa.avg_dv <        5000                     THEN N'< 5 тыс'
-            WHEN wa.avg_dv <       10000                     THEN N'< 10 тыс'
-            WHEN wa.avg_dv <       50000                     THEN N'< 50 тыс'
-            WHEN wa.avg_dv <      150000                     THEN N'< 150 тыс'
-            WHEN wa.avg_dv <      500000                     THEN N'< 500 тыс'
-            ELSE                                                N'≥ 500 тыс'
+            WHEN wa.avg_dv <=     0       THEN N'0 / null'
+            WHEN wa.avg_dv <     5000     THEN N'< 5 тыс'
+            WHEN wa.avg_dv <    10000     THEN N'< 10 тыс'
+            WHEN wa.avg_dv <    50000     THEN N'< 50 тыс'
+            WHEN wa.avg_dv <   150000     THEN N'< 150 тыс'
+            WHEN wa.avg_dv <   500000     THEN N'< 500 тыс'
+            ELSE                              N'≥ 500 тыс'
         END AS bucket
     FROM weekly_avg wa
 ),
 
-/*=====================================================================
-  3. Суточные остатки + бакет клиента
-=====================================================================*/
+/* === 3. Суточные остатки + бакет клиента ================================= */
 daily_with_bucket AS (
     SELECT
         dc.dt_rep,
@@ -77,53 +56,45 @@ daily_with_bucket AS (
         ISNULL(dc.dv_rub,0) AS dv_rub,
         ISNULL(dc.ns_rub,0) AS ns_rub,
         ISNULL(dc.sr_rub,0) AS sr_rub
-    FROM daily_cli dc
-    JOIN bucket_map bm ON bm.cli_id = dc.cli_id
+    FROM  daily_cli dc
+    JOIN  bucket_map bm ON bm.cli_id = dc.cli_id
+),
+
+/* === 4. Суммарный объём секции в бакете за дату ========================= */
+bucket_vol AS (
+    SELECT
+        dt_rep,
+        bucket,
+        SUM(dv_rub) AS dv_vol,
+        SUM(ns_rub) AS ns_vol,
+        SUM(sr_rub) AS sr_vol
+    FROM daily_with_bucket
+    GROUP BY dt_rep, bucket
 )
 
-/*=====================================================================
-  4. Итог по бакету и дате (6 столбцов)
-=====================================================================*/
+/* === 5. Финальный вывод: объёмы и доли ================================== */
 SELECT
-    d.dt_rep,
-    d.bucket,
+    bv.dt_rep                                    AS [Дата],
+    bv.bucket                                    AS [Бакет avg(ДВС-7д)],
 
-    /* --- Накопительный счёт ---------------------------------------*/
-    COUNT(DISTINCT CASE WHEN d.ns_rub > 0 THEN d.cli_id END)                      AS cnt_ns_cli,
-    CASE
-        WHEN COUNT(DISTINCT CASE WHEN d.ns_rub > 0 THEN d.cli_id END) = 0
-             THEN 0
-        ELSE
-             SUM(CASE WHEN d.ns_rub > 0 THEN d.ns_rub END) /
-             COUNT(DISTINCT CASE WHEN d.ns_rub > 0 THEN d.cli_id END)
-    END                                                                            AS avg_ns_vol,
+    /* -------- ДВС -------- */
+    bv.dv_vol            / 1e6                           AS dv_vol_mln,
+    bv.dv_vol * 1.0 /
+        NULLIF( SUM(bv.dv_vol) OVER (PARTITION BY bv.dt_rep), 0 )   AS dv_share,
 
-    /* --- До востребования -----------------------------------------*/
-    COUNT(DISTINCT CASE WHEN d.dv_rub > 0 THEN d.cli_id END)                      AS cnt_dv_cli,
-    CASE
-        WHEN COUNT(DISTINCT CASE WHEN d.dv_rub > 0 THEN d.cli_id END) = 0
-             THEN 0
-        ELSE
-             SUM(CASE WHEN d.dv_rub > 0 THEN d.dv_rub END) /
-             COUNT(DISTINCT CASE WHEN d.dv_rub > 0 THEN d.cli_id END)
-    END                                                                            AS avg_dv_vol,
+    /* -------- НС --------- */
+    bv.ns_vol            / 1e6                           AS ns_vol_mln,
+    bv.ns_vol * 1.0 /
+        NULLIF( SUM(bv.ns_vol) OVER (PARTITION BY bv.dt_rep), 0 )   AS ns_share,
 
-    /* --- Срочные --------------------------------------------------*/
-    COUNT(DISTINCT CASE WHEN d.sr_rub > 0 THEN d.cli_id END)                      AS cnt_sr_cli,
-    CASE
-        WHEN COUNT(DISTINCT CASE WHEN d.sr_rub > 0 THEN d.cli_id END) = 0
-             THEN 0
-        ELSE
-             SUM(CASE WHEN d.sr_rub > 0 THEN d.sr_rub END) /
-             COUNT(DISTINCT CASE WHEN d.sr_rub > 0 THEN d.cli_id END)
-    END                                                                            AS avg_sr_vol
-FROM daily_with_bucket d
-GROUP BY
-    d.dt_rep,
-    d.bucket
+    /* -------- Срочные ---- */
+    bv.sr_vol            / 1e6                           AS dep_vol_mln,
+    bv.sr_vol * 1.0 /
+        NULLIF( SUM(bv.sr_vol) OVER (PARTITION BY bv.dt_rep), 0 )   AS dep_share
+FROM bucket_vol bv
 ORDER BY
-    d.dt_rep,
-    CASE d.bucket
+    bv.dt_rep,
+    CASE bv.bucket
         WHEN N'0 / null'  THEN 0
         WHEN N'< 5 тыс'   THEN 1
         WHEN N'< 10 тыс'  THEN 2
