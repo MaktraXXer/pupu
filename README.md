@@ -1,8 +1,8 @@
 /* -------------------------------------------------------------------------
-   Параметры: дата среза и глубина для «недели» (можно менять при вызове)
+   Параметры: отчётная дата и глубина «недели»
 ---------------------------------------------------------------------------*/
-DECLARE @rep_date  date = '2025-05-11';   -- актуальная отчётная дата
-DECLARE @days_back int  = 6;              -- 6 дней назад + сама дата = 7 суток
+DECLARE @rep_date  date = '2025-05-11';
+DECLARE @days_back int  = 6;   -- 6 дней + сама дата = 7 суток
 
 /* 1. Балансы клиентов на отчётную дату ------------------------------------*/
 ;WITH current_bal AS (
@@ -38,45 +38,61 @@ bucketed AS (
     FROM current_bal
 ),
 
-/* 3. Средний ДВС-остаток клиента за 7 суток -------------------------------*/
+/* 3. Средние остатки клиента за последние 7 суток -------------------------*/
 weekly_avg AS (
     SELECT
         cli_id,
-        AVG(out_rub) AS avg_dv_week
+        AVG(CASE WHEN section_name = N'До востребования'   THEN out_rub END) AS avg_dv,
+        AVG(CASE WHEN section_name = N'Накопительный счёт' THEN out_rub END) AS avg_ns,
+        AVG(CASE WHEN section_name = N'Срочные'            THEN out_rub END) AS avg_sr
     FROM ALM.balance_rest_all WITH (NOLOCK)
-    WHERE dt_rep BETWEEN DATEADD(day,-@days_back,@rep_date) AND @rep_date
+    WHERE dt_rep BETWEEN DATEADD(day,-@days_back, @rep_date) AND @rep_date
       AND MAP_IS_CASH  = 1
       AND TSEGMENTNAME = N'Розничный бизнес'
       AND AP           = N'Пассив'
       AND BLOCK_NAME   = N'Привлечение ФЛ'
-      AND section_name = N'До востребования'
+      AND section_name IN (N'Срочные', N'До востребования', N'Накопительный счёт')
     GROUP BY cli_id
 ),
 
-/* 4. Объединяем факт дня и среднюю неделю ---------------------------------*/
+/* 4. Склеиваем факт дня и недельные средние -------------------------------*/
 joined AS (
     SELECT
         b.bucket,
         b.cli_id,
+
         b.dv_rub, b.ns_rub, b.sr_rub, b.total_rub,
-        w.avg_dv_week
+
+        COALESCE(w.avg_dv,0)                       AS avg_dv,
+        COALESCE(w.avg_ns,0)                       AS avg_ns,
+        COALESCE(w.avg_sr,0)                       AS avg_sr,
+        COALESCE(w.avg_dv,0)+COALESCE(w.avg_ns,0)+
+        COALESCE(w.avg_sr,0)                       AS avg_total
     FROM bucketed   b
     LEFT JOIN weekly_avg w ON w.cli_id = b.cli_id
 )
 
-/* 5. Итоговая сводка по бакетам -------------------------------------------*/
+/* 5. Итог по бакетам + «суммы средних» ------------------------------------*/
 SELECT
     bucket                                               AS [Бакет ДВС],
     COUNT(DISTINCT cli_id)                               AS [Клиентов],
-    SUM(total_rub)   / 1e6                               AS [Сумма, млн],
-    SUM(dv_rub)      / 1e6                               AS [ДВС, млн],
-    SUM(ns_rub)      / 1e6                               AS [НС, млн],
-    SUM(sr_rub)      / 1e6                               AS [Срочные, млн],
-    AVG(avg_dv_week) / 1e6                               AS [Средний ДВС-7д, млн]
+
+    /* --- срез на дату --------------------------------------------------- */
+    SUM(total_rub) / 1e6  AS [Сумма-дата, млн],
+    SUM(dv_rub)   / 1e6   AS [ДВС-дата, млн],
+    SUM(ns_rub)   / 1e6   AS [НС-дата,  млн],
+    SUM(sr_rub)   / 1e6   AS [Вклады-дата, млн],
+
+    /* --- сумма недельных-средних --------------------------------------- */
+    SUM(avg_total) / 1e6  AS [Сумма-7д, млн],
+    SUM(avg_dv)    / 1e6  AS [ДВС-7д,   млн],
+    SUM(avg_ns)    / 1e6  AS [НС-7д,    млн],
+    SUM(avg_sr)    / 1e6  AS [Вклады-7д, млн]
+
 FROM joined
 GROUP BY bucket
 ORDER BY
-    CASE bucket                  -- фиксируем порядок вывода
+    CASE bucket
         WHEN N'0 / null'  THEN 0
         WHEN N'≤ 10 тыс'  THEN 1
         WHEN N'≤ 50 тыс'  THEN 2
