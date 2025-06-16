@@ -1,125 +1,57 @@
-Давайте убедимся, что обе части «сходятся» — иначе FK-конфликт неизбежен.
-
----
-
-## 1. Проверьте, **какие строки уже лежат** в `liq.Liq_Balance`
+Вот та самая витрина-представление, через которую удобно смотреть рассчитанные отношения «оттоки / баланс» по каждому сегменту (ЮЛ / ФЛ) и дате.
+Если ещё не создавали (или хотите пересоздать после изменений схемы) — просто выполните скрипт:
 
 ```sql
-/* Что реально есть в балансе за нужный интервал */
-SELECT  dt_rep ,
-        '['+addend_name+']' AS addend_name,   -- скобки → видно пробелы
-        balance_rub
-FROM    liq.Liq_Balance
-WHERE   dt_rep BETWEEN '2025-05-01' AND '2025-06-14'
-ORDER BY dt_rep, addend_name;
+/*======================================================================
+  ВИТРИНА liq.vw_Liq_Ratio  –  все нормативы в одном окне
+======================================================================*/
+CREATE OR ALTER VIEW liq.vw_Liq_Ratio
+AS
+SELECT
+    b.dt_rep,
+    b.addend_name,                 -- 'ЮЛ' | 'Средства ФЛ'
+
+    /* ---------- разворачиваем нормы в колонки ---------- */
+    piv.[ГВ 70]      AS Ratio_GV70,
+    piv.[ГВ 100]     AS Ratio_GV100,
+    piv.[АЛМ stress] AS Ratio_ALM_Stress
+FROM liq.Liq_Balance AS b
+/* берём нужные оттоки по той же дате + сегменту */
+OUTER APPLY (
+    SELECT *
+    FROM (
+        SELECT
+            o.normativ,
+            CAST( o.amount_sum /
+                  NULLIF(b.balance_rub,0) AS decimal(28,8) ) AS ratio
+        FROM liq.Liq_Outflow o
+        WHERE o.dt_rep      = b.dt_rep
+          AND o.addend_name = b.addend_name
+    ) AS s
+    -- превращаем строки «норматив/ratio» в колонки
+    PIVOT (
+        MAX(ratio) FOR normativ IN (
+            [ГВ 70],
+            [ГВ 100],
+            [АЛМ stress]
+        )
+    ) AS p
+) AS piv;
+GO
 ```
 
-> ‼️  Особенно посмотрите на вывод в квадратных скобках:
-> `['ЮЛ']` и `[ЮЛ  ]` — это **разные** строки, вторая «с пробелом».
-> Для FK это две разные категории, и «правильного» родителя может не оказаться.
-
----
-
-## 2. Что хотела записать `usp_SaveOutflow`
+### Как пользоваться
 
 ```sql
-DECLARE @from date = '2025-05-01', @to date = '2025-05-31';
+/* посмотреть один день */
+SELECT * 
+FROM   liq.vw_Liq_Ratio
+WHERE  dt_rep = '2025-05-13';
 
-;WITH wanted AS (
-    /* именно тот кусок, который идёт в MERGE */
-    SELECT  CAST(DT_REP AS date)                               AS dt_rep,
-            CASE WHEN LTRIM(RTRIM(ADDEND_NAME)) = N'Средства ФЛ'
-                 THEN N'Средства ФЛ'
-                 ELSE N'ЮЛ' END                                AS addend_name
-    FROM    LIQUIDITY.ratio.VW_SH_Ratio_Agg_LVL2_Fact
-    WHERE   OrganizationName = N'Банк ДОМ.РФ'
-      AND   ADDEND_TYPE      = N'Оттоки'
-      AND   ADDEND_DESCR    <> N'Аккредитивы'
-      AND   ADDEND_NAME IN (
-               N'Средства ФЛ', N'Средства ЮЛ',
-               N'Средства Ф/О в рамках станд. продуктов', N'Средства Ф/О'
-           )
-      AND   DT_REP >= @from
-      AND   DT_REP <  DATEADD(DAY,1,@to)
-    GROUP BY CAST(DT_REP AS date),
-             CASE WHEN LTRIM(RTRIM(ADDEND_NAME)) = N'Средства ФЛ'
-                  THEN N'Средства ФЛ'
-                  ELSE N'ЮЛ' END
-)
+/* или весь период */
 SELECT *
-FROM   wanted
-EXCEPT
-SELECT dt_rep, addend_name
-FROM   liq.Liq_Balance
-WHERE  dt_rep BETWEEN @from AND @to;
+FROM   liq.vw_Liq_Ratio
+ORDER BY dt_rep DESC, addend_name;
 ```
 
-Если здесь выйдет что-нибудь — именно этих «родительских» строк не хватает.
-
----
-
-## 3. Починить можно двумя путями
-
-### 3.1. **Привести строки к одному виду**
-
-Самый чистый способ – подрезать пробелы **везде** и в балансе, и в оттоках.
-
-```sql
-/* изменить (!) первичный ключ и индекс не нужно —
-   достаточно обновить сами строки */
-
-UPDATE liq.Liq_Balance
-SET    addend_name = N'ЮЛ'
-WHERE  LTRIM(RTRIM(addend_name)) = N'ЮЛ';
-
-UPDATE liq.Liq_Balance
-SET    addend_name = N'Средства ФЛ'
-WHERE  LTRIM(RTRIM(addend_name)) = N'Средства ФЛ';
-```
-
-Одновременно поправьте процедуру `liq.usp_SaveBalance`
-(добавляем `LTRIM(RTRIM())` в местах, где вписываем `addend_name`):
-
-```sql
-..., N'ЮЛ'          AS addend_name  →  , N'ЮЛ'          AS addend_name
-..., N'Средства ФЛ' AS addend_name  →  , N'Средства ФЛ' AS addend_name
---     ^ уже без пробелов, TRIM не нужен
-```
-
-А в `liq.usp_SaveOutflow_Range` уже стоит конструкция
-`CASE WHEN LTRIM(RTRIM(ADDEND_NAME)) …`, так что она пишет «правильные» категории.
-
-### 3.2. **Авто-создание пустых балансов (если допустимо)**
-
-Вставьте блок перед MERGE (тот, что я показал в предыдущем сообщении):
-
-```sql
-/* создаём недостающих «родителей» с balance_rub = NULL */
-INSERT INTO liq.Liq_Balance (dt_rep, addend_name, balance_rub)
-SELECT src.dt_rep, src.addend_name, NULL
-FROM   src
-LEFT  JOIN liq.Liq_Balance b
-       ON  b.dt_rep      = src.dt_rep
-       AND b.addend_name = src.addend_name
-WHERE  b.dt_rep IS NULL;
-```
-
-Тогда FK никогда не «падает», даже если баланс на дату будет добавлен позже.
-
----
-
-## 4. Проверяем ещё раз
-
-```sql
-EXEC liq.usp_SaveOutflow
-     @date_from = '2025-05-01',
-     @date_to   = '2025-05-31',
-     @normativ  = N'ГВ 70';
-
-SELECT * FROM liq.vw_Liq_Ratio
-WHERE  dt_rep BETWEEN '2025-05-01' AND '2025-05-31'
-ORDER BY dt_rep, addend_name;
-```
-
-Если FK-ошибка ушла — процедуры и таблицы **созданы верно**,
-а проблема была только в несовпадении строк `addend_name`.
+*Если добавятся новые нормативы* — просто допишите их названия в списке `IN (...)` внутри `PIVOT`, перезапустите скрипт `CREATE OR ALTER VIEW`, и витрина сразу начнёт показывать новые колонки.
