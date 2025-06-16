@@ -1,14 +1,17 @@
 /*======================================================================
   0.  КОНТЕКСТ И СХЕМА
 ======================================================================*/
+
+/* убеждаемся, что БД существует и сразу в неё переходим */
+IF DB_ID(N'ALM_TEST') IS NULL
+    THROW 51000, N'База ALM_TEST не найдена.', 1;
+GO
 USE ALM_TEST;
 GO
 
-/* создаём схему liq, если ещё не существует */
+/* создаём схему liq, если её нет (без указания владельца) */
 IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'liq')
-BEGIN
-    EXEC ('CREATE SCHEMA liq AUTHORIZATION dbo');
-END;
+    EXEC ('CREATE SCHEMA liq');
 GO
 
 
@@ -16,7 +19,7 @@ GO
   1.  ТАБЛИЦЫ
 ======================================================================*/
 
-/* удаляем старые версии — чтобы скрипт был идемпотентным */
+/* удаляем старые версии (если были) — скрипт идемпотентный */
 IF OBJECT_ID(N'liq.Liq_Outflow', N'U') IS NOT NULL DROP TABLE liq.Liq_Outflow;
 IF OBJECT_ID(N'liq.Liq_Balance', N'U') IS NOT NULL DROP TABLE liq.Liq_Balance;
 GO
