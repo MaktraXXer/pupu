@@ -1,100 +1,70 @@
-CREATE OR ALTER PROCEDURE liq.usp_SaveBalance
-    @dt_rep date
+CREATE OR ALTER PROCEDURE liq.usp_SaveOutflow
+    @dt_rep    date,          -- дата среза
+    @normativ  nvarchar(50)   -- 'ГВ 70', 'ГВ 100', 'АЛМ stress' …
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    /* ---------- ЮЛ: «старый ГВ» через VW_balance_rest_all ---------- */
-    ;WITH base AS (          -- 1-й CTE
+    /* ---------- 1.  оттоки из источника --------------------------- */
+    ;WITH base AS (
         SELECT
-            b.DT_REP,
-            b.CON_ID,
-            ABS(b.OUT_RUB)               AS OUT_RUB,
-            LOWER(b.ACC_ROLE)            AS acc_role,
-            cli.IS_FINANCE_LCR           AS is_finance,
-            cli.IS_SSV                   AS is_ssv,
-            cli.ISDOMRF                  AS is_domrf,
-            CASE WHEN b.PROD_ID IN (398,399,400) THEN 1 ELSE 0 END AS is_broker,
-            CASE WHEN LOWER(b.CON_TYPE) = 'loc' THEN 1 ELSE 0 END  AS is_loc,
-            CASE WHEN SUBSTRING(b.CONTO,1,3) IN ('410','411') THEN 1 ELSE 0 END AS is_government,
-            escr.CON_ID_ESCR             AS escrow_flag,
-            conto.CONTO_TYPE_ID          AS other_liab_id,
-            CASE WHEN LOWER(b.CON_TYPE) IN ('deposit','min_bal','current')
-                 THEN UPPER(b.CON_TYPE) END                    AS prod_class
-        FROM  ALM.ALM.VW_balance_rest_all                    b WITH (NOLOCK)
-        LEFT JOIN LIQUIDITY.liq.man_Client_Attr              cli
-               ON cli.CLI_ID  = b.CLI_ID
-              AND cli.SRC_SYS = '001'
-        LEFT JOIN LIQUIDITY.dwh.acc_x_escrow_rest            escr
-               ON escr.CON_ID_ESCR = b.CON_ID
-              AND escr.DT_REP      =
-                  (SELECT MAX(DT_REP)
-                   FROM LIQUIDITY.dwh.acc_x_escrow_rest
-                   WHERE DT_REP <= @dt_rep)
-        LEFT JOIN LIQUIDITY.ratio.man_Conto_For_LiquidityRatio conto
-               ON conto.CONTO = b.CONTO
-              AND @dt_rep BETWEEN conto.DT_FROM AND conto.DT_TO
-        WHERE b.DT_REP      = @dt_rep
-          AND b.OD_FLAG     = 1
-          AND b.CLI_TYPE    = 'L'
-          AND LOWER(b.CONTO_TYPE) = 'l'
-          AND ISNULL(b.CON_TYPE,'') NOT IN ('mbd','mbk','security_deal','repo')
-          AND LOWER(b.ACC_ROLE) <> 'undefined'
-    ),
-    gv_liab AS (             -- 2-й CTE
-        SELECT *
-        FROM   base
-        WHERE  acc_role IN ('liab','liab_int')
-          AND  prod_class     IS NOT NULL
-          AND  is_domrf       = 0
-          AND  is_loc         = 0
-          AND  escrow_flag   IS NULL
-          AND  is_broker      = 0
-          AND  other_liab_id IS NULL
-    ),
-    deal_sum AS (            -- 3-й CTE
-        SELECT SUM(OUT_RUB) AS OUT_RUB_PMT
-        FROM   gv_liab
-        GROUP  BY CON_ID
-    ),
-    ul_balance AS (          -- 4-й CTE
-        SELECT
-            @dt_rep           AS dt_rep,
-            N'ЮЛ'             AS addend_name,
-            SUM(OUT_RUB_PMT)  AS balance_rub
-        FROM   deal_sum
-    ),
-
-    /* ---------- ФЛ через VW_alm_balance_AGG_ALMREPORT ------------ */
-    fl_balance AS (          -- 5-й CTE (параллельно)
-        SELECT
-            @dt_rep                        AS dt_rep,
-            N'Средства ФЛ'                 AS addend_name,
-            SUM(ISNULL(sOUT_RUB,0)) * 1000 AS balance_rub
-        FROM   ALM.ALM.VW_alm_balance_AGG_ALMREPORT WITH (NOLOCK)
-        WHERE  CAST(dt_rep AS date) = @dt_rep
-          AND  AP               = N'Пассив'
-          AND  section_name IN  (N'До востребования', N'Срочные ', N'Накопительный счёт')
-          AND  block_name       = N'Привлечение ФЛ'
-          AND  TSegmentName IN  (N'ДЧБО', N'Розничный Бизнес')
+            CAST(DT_REP AS date) AS dt_rep,
+            CASE WHEN ADDEND_NAME = N'Средства ФЛ'
+                 THEN N'Средства ФЛ'
+                 ELSE N'ЮЛ' END  AS addend_name,
+            SUM(AMOUNT_RUB_MOD)  AS amount_sum
+        FROM LIQUIDITY.ratio.VW_SH_Ratio_Agg_LVL2_Fact WITH (NOLOCK)
+        WHERE OrganizationName = N'Банк ДОМ.РФ'
+          AND ADDEND_TYPE      = N'Оттоки'
+          AND ADDEND_DESCR    <> N'Аккредитивы'
+          AND ADDEND_NAME IN (
+                 N'Средства ФЛ',
+                 N'Средства ЮЛ',
+                 N'Средства Ф/О в рамках станд. продуктов',
+                 N'Средства Ф/О'
+              )
+          AND CAST(DT_REP AS date) = @dt_rep
         GROUP BY
-            CAST(dt_rep AS date)
-    ),
-    balances AS (            -- итоговый CTE
-        SELECT * FROM ul_balance
-        UNION ALL
-        SELECT * FROM fl_balance
+            CAST(DT_REP AS date),
+            CASE WHEN ADDEND_NAME = N'Средства ФЛ'
+                 THEN N'Средства ФЛ'
+                 ELSE N'ЮЛ' END
     )
 
-    /* ---------- MERGE в таблицу ---------------------------------- */
-    MERGE liq.Liq_Balance AS tgt
-    USING balances        AS src
+    /* ---------- 2.  проверяем наличие балансов -------------------- */
+    IF EXISTS (
+        SELECT 1
+        FROM   base b
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM   liq.Liq_Balance lb
+            WHERE  lb.dt_rep      = b.dt_rep
+              AND  lb.addend_name = b.addend_name
+        )
+    )
+    BEGIN
+        THROW 51000,
+              N'Сначала зафиксируйте балансы через liq.usp_SaveBalance.',
+              1;
+    END
+
+    /* ---------- 3.  MERGE в liq.Liq_Outflow ----------------------- */
+    MERGE liq.Liq_Outflow AS tgt
+    USING (
+        SELECT
+            dt_rep,
+            addend_name,
+            @normativ  AS normativ,
+            amount_sum
+        FROM base
+    ) AS src
       ON  tgt.dt_rep      = src.dt_rep
      AND  tgt.addend_name = src.addend_name
+     AND  tgt.normativ    = src.normativ
     WHEN MATCHED THEN
-         UPDATE SET balance_rub = src.balance_rub
+         UPDATE SET amount_sum = src.amount_sum
     WHEN NOT MATCHED THEN
-         INSERT (dt_rep, addend_name, balance_rub)
-         VALUES (src.dt_rep, src.addend_name, src.balance_rub);
+         INSERT (dt_rep, addend_name, normativ, amount_sum)
+         VALUES (src.dt_rep, src.addend_name, src.normativ, src.amount_sum);
 END
 GO
