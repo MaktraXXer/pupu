@@ -1,11 +1,8 @@
 /* ===================================================================
-   ПАРАМЕТРОВ НЕ НУЖНО: даты подтягиваются из самих оттоков
+   0) ОТТОКИ  – базовый набор дат + суммы
    -------------------------------------------------------------------
- =================================================================== */
-
-/* -----------------------------------------------------------
-   1) Оттоки (как были) ― берём только нужные категории
------------------------------------------------------------ */
+   (это единственный раз, когда мы лезем в VW_SH_Ratio_Agg_LVL2_Fact)
+=================================================================== */
 WITH base AS (
     SELECT
         CAST(DT_REP AS date)                         AS DT_REP,
@@ -30,124 +27,85 @@ WITH base AS (
         END
 ),
 
-/* -----------------------------------------------------------
-   2) Список дат из оттоков (чтобы ЮЛ и ФЛ считались
-      ТОЛЬКО на эти дни)
------------------------------------------------------------ */
-dt_list AS (
-    SELECT DISTINCT DT_REP FROM base
-),
-
-/* -----------------------------------------------------------
-   3) «Правильный» срез пассивов ЮЛ  (тот, который
-      мы уже собрали раньше, но теперь ― на диапазон дат)
------------------------------------------------------------ */
-ul_liab_base AS (
+/* ===================================================================
+   1) БАЛАНСЫ  – одним UNION-ом сразу ЮЛ + ФЛ
+   -------------------------------------------------------------------
+   – датами ограничиваемся «как в base» → меньше строк с трафика
+   – ЮЛ агрегируем сразу, без промежуточных выборок
+=================================================================== */
+balances AS (
     SELECT
         b.DT_REP,
-        b.CON_ID,
-        b.CLI_ID,
-        b.ACC_NO,
-        b.PROD_ID,
-        b.CON_TYPE,
-        b.CONTO,
-        b.CUR,
-        ABS(b.OUT_RUB)       AS OUT_RUB,
-        ABS(b.OUT_CUR)       AS OUT_CUR,
-        LOWER(b.ACC_ROLE)    AS acc_role,
+        b.ADDEND_NAME,
+        SUM(b.BALANCE_RUB)              AS BALANCE_RUB
+    FROM (
+        /* ---------- ЮЛ (сразу с фильтрами) ----------------------- */
+        SELECT
+            bl.DT_REP,
+            N'ЮЛ'                       AS ADDEND_NAME,
+            SUM(ABS(bl.OUT_RUB))        AS BALANCE_RUB
+        FROM   [ALM].[ALM].[VW_balance_rest_all] bl WITH (NOLOCK)
 
-        cli.IS_FINANCE_LCR   AS is_finance,
-        cli.IS_SSV           AS is_ssv,
-        cli.ISDOMRF          AS is_domrf,
+        /* --- даты только те, что есть в base -------------------- */
+        JOIN  (SELECT DISTINCT DT_REP FROM base) d
+              ON bl.DT_REP = d.DT_REP
 
-        CASE WHEN b.PROD_ID IN (398,399,400) THEN 1 ELSE 0 END             AS is_broker,
-        CASE WHEN LOWER(b.CON_TYPE) = 'loc'          THEN 1 ELSE 0 END      AS is_loc,
-        CASE WHEN SUBSTRING(b.CONTO,1,3) IN ('410','411') THEN 1 ELSE 0 END AS is_government,
+        /* --- основные фильтры «правильного» пассива ЮЛ ---------- */
+        WHERE bl.OD_FLAG          = 1                     -- активные
+          AND bl.CLI_TYPE         = 'L'                   -- юр-лица
+          AND LOWER(bl.CONTO_TYPE)= 'l'                   -- пассивы
+          AND ISNULL(bl.CON_TYPE,'') NOT IN ('mbd','mbk','security_deal','repo')
+          AND LOWER(bl.ACC_ROLE)  IN ('liab','liab_int')  -- тело + проценты
+          AND bl.PROD_ID NOT IN (398,399,400)             -- !broker
+          AND LOWER(bl.CON_TYPE) <> 'loc'                 -- !LOC
+          AND SUBSTRING(bl.CONTO,1,3) NOT IN ('410','411')-- !гос-счета
+          /* -- escrow & прочие «другие обязательства» ------------- */
+          AND NOT EXISTS (
+                  SELECT 1
+                  FROM [LIQUIDITY].[dwh].[acc_x_escrow_rest] e
+                  WHERE e.CON_ID_ESCR = bl.CON_ID
+                    AND e.DT_REP = (
+                        SELECT MAX(DT_REP)
+                        FROM [LIQUIDITY].[dwh].[acc_x_escrow_rest]
+                        WHERE DT_REP <= bl.DT_REP) )
+          AND NOT EXISTS (
+                  SELECT 1
+                  FROM [LIQUIDITY].[ratio].[man_Conto_For_LiquidityRatio] c
+                  WHERE c.CONTO = bl.CONTO
+                    AND bl.DT_REP BETWEEN c.DT_FROM AND c.DT_TO
+                    AND c.CONTO_TYPE_ID IS NOT NULL )
+        GROUP BY bl.DT_REP
 
-        escr.CON_ID_ESCR     AS escrow_flag,
-        conto.CONTO_TYPE_ID  AS other_liab_id,
+        UNION ALL
 
-        CASE WHEN LOWER(b.CON_TYPE) IN ('deposit','min_bal','current')
-             THEN UPPER(b.CON_TYPE) END                                    AS prod_class
-    FROM   [ALM].[ALM].[VW_balance_rest_all]                b  WITH (NOLOCK)
-    LEFT JOIN [LIQUIDITY].[liq].[man_Client_Attr]           cli
-           ON cli.CLI_ID  = b.CLI_ID
-          AND cli.SRC_SYS = '001'
-    LEFT JOIN [LIQUIDITY].[dwh].[acc_x_escrow_rest]         escr
-           ON escr.CON_ID_ESCR = b.CON_ID
-          AND escr.DT_REP      = (SELECT MAX(DT_REP)
-                                  FROM [LIQUIDITY].[dwh].[acc_x_escrow_rest]
-                                  WHERE DT_REP <= b.DT_REP)
-    LEFT JOIN [LIQUIDITY].[ratio].[man_Conto_For_LiquidityRatio]  conto
-           ON conto.CONTO = b.CONTO
-          AND b.DT_REP BETWEEN conto.DT_FROM AND conto.DT_TO
-    /* ---------- основные фильтры ---------- */
-    WHERE b.DT_REP IN (SELECT DT_REP FROM dt_list)   -- только нужные даты
-      AND b.OD_FLAG        = 1        -- активные
-      AND b.CLI_TYPE       = 'L'      -- ЮЛ
-      AND LOWER(b.CONTO_TYPE) = 'l'   -- пассивы
-      AND ISNULL(b.CON_TYPE,'') NOT IN ('mbd','mbk','security_deal','repo')
-      AND LOWER(b.ACC_ROLE)  <> 'undefined'
-),
-
-gv_liab AS (
-    SELECT *
-    FROM   ul_liab_base
-    WHERE  acc_role IN ('liab','liab_int')          -- тело + проценты
-      AND  prod_class IS NOT NULL
-      AND  is_domrf      = 0
-      AND  is_loc        = 0
-      AND  escrow_flag  IS NULL
-      AND  is_broker     = 0
-      AND  other_liab_id IS NULL
-),
-
-ul_bal AS (
-    SELECT
-        DT_REP,
-        SUM(OUT_RUB)           AS BALANCE_RUB,
-        N'ЮЛ'                  AS ADDEND_NAME
-    FROM   gv_liab
-    GROUP  BY DT_REP
-),
-
-/* -----------------------------------------------------------
-   4) Пассивы ФЛ (ограничены теми же датами)
------------------------------------------------------------ */
-fl_bal AS (
-    SELECT
-        CAST(dt_rep AS date)                     AS DT_REP,
-        SUM(ISNULL(sOUT_RUB, 0))*1000            AS BALANCE_RUB,
-        N'Средства ФЛ'                           AS ADDEND_NAME
-    FROM   ALM.ALM.VW_alm_balance_AGG_ALMREPORT  WITH (NOLOCK)
-    WHERE  CAST(dt_rep AS date) IN (SELECT DT_REP FROM dt_list)
-      AND  AP             = N'Пассив'
-      AND  section_name   IN ('До востребования','Срочные ','Накопительный счёт')
-      AND  block_name     = N'Привлечение ФЛ'
-      AND  TSegmentName   IN ('ДЧБО','Розничный Бизнес')
-    GROUP BY CAST(dt_rep AS date)
-),
-
-/* -----------------------------------------------------------
-   5) Объединяем баланс ЮЛ + ФЛ
------------------------------------------------------------ */
-balances AS (
-    SELECT * FROM ul_bal
-    UNION ALL
-    SELECT * FROM fl_bal
+        /* ---------- ФЛ ------------------------------------------ */
+        SELECT
+            CAST(fl.dt_rep AS date)     AS DT_REP,
+            N'Средства ФЛ'              AS ADDEND_NAME,
+            SUM(ISNULL(fl.sOUT_RUB,0))*1000 AS BALANCE_RUB
+        FROM   ALM.ALM.VW_alm_balance_AGG_ALMREPORT  fl WITH (NOLOCK)
+        JOIN  (SELECT DISTINCT DT_REP FROM base) d
+              ON CAST(fl.dt_rep AS date) = d.DT_REP
+        WHERE  fl.AP           = N'Пассив'
+          AND  fl.section_name IN ('До востребования','Срочные ','Накопительный счёт')
+          AND  fl.block_name   = N'Привлечение ФЛ'
+          AND  fl.TSegmentName IN ('ДЧБО','Розничный Бизнес')
+        GROUP BY CAST(fl.dt_rep AS date)
+    ) b
+    GROUP BY b.DT_REP, b.ADDEND_NAME
 )
 
-/* -----------------------------------------------------------
-   6) Итоговый вывод
------------------------------------------------------------ */
+/* ===================================================================
+   2) ФИНАЛ: дата / категория / оттоки / остаток / показатель «ГВ 70»
+=================================================================== */
 SELECT
-    b.DT_REP,
-    b.ADDEND_NAME,
-    b.AMOUNT_SUM,
+    base.DT_REP,
+    base.ADDEND_NAME,
+    base.AMOUNT_SUM,
     bal.BALANCE_RUB,
-    ABS(b.AMOUNT_SUM) / NULLIF(ABS(bal.BALANCE_RUB),0)  AS [ГВ 70]
-FROM   base      AS b
-LEFT  JOIN balances AS bal
-       ON  b.DT_REP      = bal.DT_REP
-       AND b.ADDEND_NAME = bal.ADDEND_NAME
-ORDER BY b.DT_REP DESC, b.ADDEND_NAME;
+    ABS(base.AMOUNT_SUM) / NULLIF(ABS(bal.BALANCE_RUB),0)  AS [ГВ 70]
+FROM   base
+LEFT  JOIN balances bal
+       ON  base.DT_REP      = bal.DT_REP
+       AND base.ADDEND_NAME = bal.ADDEND_NAME
+ORDER BY base.DT_REP DESC, base.ADDEND_NAME;
