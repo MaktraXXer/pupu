@@ -1,77 +1,120 @@
+Ниже — полный скрипт, уже «цельный»:
+
+1. берём витрину `ALM.ALM.VW_balance_rest_all`;
+2. фильтруем сделки по логике «старого ГВ»;
+3. суммируем тело + начисленные проценты внутри одной `CON_ID`;
+4. в самом конце собираем общую сумму на дату `DT_REP`.
+
+```sql
 /* -----------------------------------------------------------
    Параметры
 ----------------------------------------------------------- */
-DECLARE @dtRep DATE = '2025-06-07';      -- ← нужная отчётная дата
+DECLARE @dtRep DATE = '2025-06-07';      -- ← подставь нужную дату
 
 /* -----------------------------------------------------------
-   1. Базовый снимок юр-лиц из витрины
+   1. Базовый срез пассивов юр-лиц
 ----------------------------------------------------------- */
 WITH base AS (
     SELECT
         b.DT_REP,
         b.CON_ID,
+        b.CLI_ID,
+        b.ACC_NO,
+        b.PROD_ID,
+        b.CON_TYPE,
+        b.CONTO,
         b.CUR,
-        LOWER(b.ACC_ROLE)           AS acc_role,
-        LOWER(b.CON_TYPE)           AS con_type,
-        /* тело и начисленные % */
-        ABS(b.OUT_RUB)              AS OUT_RUB,
-        ABS(b.OUT_CUR)              AS OUT_CUR,
+        ABS(b.OUT_RUB) AS OUT_RUB,
+        ABS(b.OUT_CUR) AS OUT_CUR,
+        LOWER(b.ACC_ROLE)  AS acc_role,
 
-        /* 3 признака для исключения */
-        CASE WHEN LOWER(b.CON_TYPE) = 'loc'              THEN 1 ELSE 0 END AS is_loc,
-        CASE WHEN SUBSTRING(b.CONTO,1,3) IN ('410','411') THEN 1 ELSE 0 END AS is_vgo,
-        esc.CON_ID_ESCR                                    AS escrow_flag,
+        /* клиентские признаки */
+        cli.IS_FINANCE_LCR       AS is_finance,
+        cli.IS_SSV               AS is_ssv,
+        cli.ISDOMRF              AS is_domrf,
 
-        /* нам нужны только депозиты/НСО/текущие */
+        /* ещё фильтры */
+        CASE WHEN b.PROD_ID IN (398,399,400) THEN 1 ELSE 0 END  AS is_broker,
+        CASE WHEN LOWER(b.CON_TYPE) = 'loc'                     THEN 1 ELSE 0 END AS is_loc,
+        CASE WHEN SUBSTRING(b.CONTO,1,3) IN ('410','411')       THEN 1 ELSE 0 END AS is_government,
+        escr.CON_ID_ESCR         AS escrow_flag,
+        conto.CONTO_TYPE_ID      AS other_liab_id,
+
+        /* продуктовая корзина для ГВ */
         CASE WHEN LOWER(b.CON_TYPE) IN ('deposit','min_bal','current')
-             THEN 1 ELSE 0 END AS is_target_prod
-    FROM  [ALM].[ALM].[VW_balance_rest_all] b WITH (NOLOCK)
+             THEN UPPER(b.CON_TYPE) END                        AS prod_class
+    FROM  [ALM].[ALM].[VW_balance_rest_all]                 b  WITH (NOLOCK)
 
-    /* эскроу-признак по связке CON_ID ↔ escrow */
-    LEFT JOIN [LIQUIDITY].[dwh].[acc_x_escrow_rest] esc
-           ON esc.CON_ID_ESCR = b.CON_ID
-          AND esc.DT_REP     = (SELECT MAX(DT_REP)
-                                FROM [LIQUIDITY].[dwh].[acc_x_escrow_rest]
-                                WHERE DT_REP <= @dtRep)
+    /* признаки клиента */
+    LEFT JOIN [LIQUIDITY].[liq].[man_Client_Attr]           cli
+           ON cli.CLI_ID  = b.CLI_ID
+          AND cli.SRC_SYS = '001'
 
-    WHERE b.DT_REP     = @dtRep          -- отчётная дата
-      AND b.OD_FLAG    = 1               -- активные сделки
-      AND b.CLI_TYPE   = 'L'             -- юр-лица
-      AND LOWER(b.CONTO_TYPE) = 'l'      -- пассивы
+    /* эскроу-счета */
+    LEFT JOIN [LIQUIDITY].[dwh].[acc_x_escrow_rest]         escr
+           ON escr.CON_ID_ESCR = b.CON_ID
+          AND escr.DT_REP      = (SELECT MAX(DT_REP)
+                                  FROM [LIQUIDITY].[dwh].[acc_x_escrow_rest]
+                                  WHERE DT_REP <= @dtRep)
+
+    /* спец-счета (OTHER_LIAB_TYPE_ID) */
+    LEFT JOIN [LIQUIDITY].[ratio].[man_Conto_For_LiquidityRatio]  conto
+           ON conto.CONTO = b.CONTO
+          AND @dtRep BETWEEN conto.DT_FROM AND conto.DT_TO
+
+    WHERE b.DT_REP  = @dtRep
+      AND b.OD_FLAG = 1                     -- активные
+      AND b.CLI_TYPE = 'L'                  -- юр-лица
+      AND LOWER(b.CONTO_TYPE) = 'l'         -- пассивы
+      AND ISNULL(b.CON_TYPE,'') NOT IN ('mbd','mbk','security_deal','repo')
+      AND LOWER(b.ACC_ROLE) <> 'undefined'
 )
 
 /* -----------------------------------------------------------
-   2. «Старый ГВ» = только нужные пассивы минус 3 исключения
+   2. «Старый ГВ»: срез + нужные роли
 ----------------------------------------------------------- */
 , gv_liab AS (
     SELECT *
     FROM   base
-    WHERE  acc_role IN ('liab','liab_int')   -- тело + % сделки
-      AND  is_target_prod = 1                -- депозиты / НСО / тек. счета
-      AND  is_loc        = 0                 -- ✗ аккредитивы
-      AND  is_vgo        = 0                 -- ✗ ВГО (госорганов)
-      AND  escrow_flag  IS NULL              -- ✗ эскроу
+    WHERE  acc_role IN ('liab','liab_int')            -- тело + проценты
+      AND prod_class IS NOT NULL                      -- депозиты/НСО/текущие
+      AND (
+            (is_finance = 0 AND is_ssv = 0)           -- обычные ЮЛ
+         OR (is_finance = 1)                          -- финорганизации
+          )
+      AND is_domrf      = 0
+      AND is_loc        = 0
+      AND escrow_flag  IS NULL
+      AND is_broker     = 0
+      AND is_government = 0
+      AND other_liab_id IS NULL
 )
 
 /* -----------------------------------------------------------
-   3. Сумма сделки = тело + % (в рублях и в валюте)
+   3. Остаток сделки = тело + начисленные проценты
 ----------------------------------------------------------- */
 , deal_sum AS (
     SELECT
-        MIN(DT_REP)           AS DT_REP,
+        MIN(DT_REP)  AS DT_REP,
         CON_ID,
-        SUM(OUT_RUB)          AS OUT_RUB_PMT,
-        SUM(OUT_CUR)          AS OUT_CUR_PMT
+        SUM(OUT_RUB) AS OUT_RUB_PMT,
+        SUM(OUT_CUR) AS OUT_CUR_PMT
     FROM   gv_liab
     GROUP  BY CON_ID
 )
 
 /* -----------------------------------------------------------
-   4. Итог по дате
+   4. Итоговая сумма на дату (DT_REP)
 ----------------------------------------------------------- */
 SELECT
     DT_REP,
-    SUM(OUT_RUB_PMT) AS TOTAL_OUT_RUB_PMT,   -- рублёвый эквивалент
-    SUM(OUT_CUR_PMT) AS TOTAL_OUT_CUR_PMT    -- сумма в «родной» валюте
+    SUM(OUT_RUB_PMT) AS TOTAL_OUT_RUB_PMT,
+    SUM(OUT_CUR_PMT) AS TOTAL_OUT_CUR_PMT   -- в оригинальной валюте
 FROM   deal_sum
 GROUP  BY DT_REP;
+```
+
+> **Что в итоге получите**
+>
+> * `TOTAL_OUT_RUB_PMT` — полный рублёвый эквивалент остатков «старого ГВ» на дату `@dtRep` (тело + проценты).
+> * `TOTAL_OUT_CUR_PMT` — сумма остатков в их «родной» валюте (если нужен разрез по валютам, просто поменяйте `GROUP  BY DT_REP, CUR` в самом последнем SELECT).
