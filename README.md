@@ -1,20 +1,29 @@
 /* =============================================================
-   0. СОХРАНЯЕМ БЭКАП И СОЗДАЁМ ПРИЁМНИК С НУЛЯ
+   0. БЭКАП + ПЕРИОД + СТАТИЧНЫЙ КАЛЕНДАРЬ dt_rep
+============================================================= */
+IF OBJECT_ID('alm_test.dbo.fu_vintage_results_backup', 'U') IS NOT NULL
+    DROP TABLE alm_test.dbo.fu_vintage_results_backup;
+
+SELECT *
+INTO alm_test.dbo.fu_vintage_results_backup
+FROM alm_test.dbo.fu_vintage_results;
+
+DECLARE @DateFrom date = '2024-01-31';
+DECLARE @DateTo   date = '2025-05-20';
+
+DECLARE @RepDates TABLE (d date PRIMARY KEY);
+INSERT INTO @RepDates VALUES
+('2024-01-31'),('2024-02-29'),('2024-03-31'),('2024-04-30'),
+('2024-05-31'),('2024-06-30'),('2024-07-31'),('2024-08-31'),
+('2024-09-30'),('2024-10-31'),('2024-11-30'),('2024-12-31'),
+('2025-01-31'),('2025-02-28'),('2025-03-31'),('2025-04-30'),
+('2025-05-20');
+
+/* =============================================================
+   1. СОЗДАЁМ / ПЕРЕСОЗДАЁМ ПРИЁМНИК
 ============================================================= */
 IF OBJECT_ID('alm_test.dbo.fu_vintage_results','U') IS NOT NULL
-BEGIN
-    DECLARE @backup_name nvarchar(128) =
-        'fu_vintage_results_backup_' + CONVERT(char(8), GETDATE(), 112) + '_' + 
-        REPLACE(CONVERT(char(8), GETDATE(), 108),':','');
-
-    DECLARE @sql nvarchar(max) = '
-        SELECT * INTO alm_test.dbo.' + @backup_name + '
-        FROM alm_test.dbo.fu_vintage_results;
-        PRINT ''Сделан бэкап: ' + @backup_name + ''';
-        DROP TABLE alm_test.dbo.fu_vintage_results;';
-
-    EXEC(@sql);
-END;
+    DROP TABLE alm_test.dbo.fu_vintage_results;
 
 CREATE TABLE alm_test.dbo.fu_vintage_results
 (
@@ -37,27 +46,14 @@ CREATE TABLE alm_test.dbo.fu_vintage_results
     load_timestamp     datetime2 NOT NULL
         CONSTRAINT DF_vint_load DEFAULT (sysutcdatetime()),
     CONSTRAINT PK_fu_vint
-        PRIMARY KEY CLUSTERED (dt_rep, cli_id,
-                               section_name, tsegmentname, prod_name_res)
+        PRIMARY KEY CLUSTERED (dt_rep, cli_id, section_name, tsegmentname, prod_name_res)
 );
+
 CREATE INDEX IX_fu_vint_rep_gen
     ON alm_test.dbo.fu_vintage_results (dt_rep, generation);
+
 CREATE INDEX IX_fu_vint_vint_had
     ON alm_test.dbo.fu_vintage_results (vintage_qtr, had_deposit_before);
-
-/* =============================================================
-   1. ПЕРИОД + СТАТИЧНЫЙ КАЛЕНДАРЬ dt_rep
-============================================================= */
-DECLARE @DateFrom date = '2024-01-31';
-DECLARE @DateTo   date = '2025-05-20';
-
-DECLARE @RepDates TABLE (d date PRIMARY KEY);
-INSERT INTO @RepDates VALUES
-('2024-01-31'),('2024-02-29'),('2024-03-31'),('2024-04-30'),
-('2024-05-31'),('2024-06-30'),('2024-07-31'),('2024-08-31'),
-('2024-09-30'),('2024-10-31'),('2024-11-30'),('2024-12-31'),
-('2025-01-31'),('2025-02-28'),('2025-03-31'),('2025-04-30'),
-('2025-05-20');
 
 /* =============================================================
    2. СПИСОК ЦЕЛЕВЫХ ВКЛАДОВ
@@ -70,7 +66,7 @@ INSERT INTO @Products VALUES
 ('Надёжный старт');
 
 /* =============================================================
-   3. ВЫГРУЗКА СНИМКОВ
+   3. ВЫГРУЗКА 17 СНИМКОВ
 ============================================================= */
 SELECT
     bra.cli_id, bra.con_id, bra.dt_rep,
@@ -93,29 +89,22 @@ WHERE bra.section_name IN ('Срочные','До востребования','�
 CREATE CLUSTERED INDEX IX_bd_con_dt ON #bd (con_id, dt_rep);
 
 /* =============================================================
-   4. ОБНОВЛЕНИЕ ИМЕНИ ПРОДУКТА ПО con_id
+   4. НОРМАЛИЗАЦИЯ НАЗВАНИЯ ПРОДУКТА — ТОЛЬКО ДЛЯ ЦЕЛЕВЫХ
 ============================================================= */
 ;WITH last_name AS (
-    SELECT DISTINCT
-           con_id,
+    SELECT DISTINCT con_id,
            FIRST_VALUE(prod_name_res)
              OVER (PARTITION BY con_id ORDER BY dt_rep DESC) AS prod_latest
-    FROM #bd
+    FROM #bd WHERE target_prod = 1
 )
 UPDATE b
 SET    b.prod_name_res = ln.prod_latest
 FROM   #bd b
 JOIN   last_name ln ON ln.con_id = b.con_id
-WHERE  b.prod_name_res <> ln.prod_latest;
-
-UPDATE b
-SET    target_prod = CASE WHEN b.prod_name_res IN (SELECT prod_name_res
-                                                   FROM   @Products)
-                          THEN 1 ELSE 0 END
-FROM   #bd b;
+WHERE  b.target_prod = 1;
 
 /* =============================================================
-   5. generation + ФЛАГИ
+   5. CTE-цепочка: generation + флаги
 ============================================================= */
 WITH step1 AS (
     SELECT *,
@@ -127,17 +116,16 @@ step2 AS (
     SELECT *,
            CASE WHEN MAX(CASE WHEN dt_rep < first_target_dt THEN 1 END)
                     OVER (PARTITION BY cli_id)=1
-                THEN 1 ELSE 0 END                               AS had_deposit_before,
+                THEN 1 ELSE 0 END AS had_deposit_before,
            CASE WHEN SUM(CASE WHEN target_prod = 0 THEN 1 ELSE 0 END)
                     OVER (PARTITION BY cli_id)=0
-                THEN 1 ELSE 0 END                               AS only_fu_overall,
+                THEN 1 ELSE 0 END AS only_fu_overall,
            CASE WHEN SUM(CASE WHEN dt_rep = first_target_dt
-                                AND target_prod = 0
-                               THEN 1 ELSE 0 END)
+                                AND target_prod = 0 THEN 1 ELSE 0 END)
                     OVER (PARTITION BY cli_id)=0
-                THEN 1 ELSE 0 END                               AS only_fu_at_generation,
+                THEN 1 ELSE 0 END AS only_fu_at_generation,
            CONCAT(DATEPART(year,first_target_dt),'Q',
-                  DATEPART(quarter,first_target_dt))            AS vintage_qtr
+                  DATEPART(quarter,first_target_dt)) AS vintage_qtr
     FROM step1
     WHERE first_target_dt IS NOT NULL
 ),
@@ -167,7 +155,7 @@ agg AS (
              prod_name_res
 )
 /* =============================================================
-   6. ЗАПИСЬ В ПРИЁМНИК
+   6. ЗАГРУЗКА В ПРИЁМНИК
 ============================================================= */
 INSERT INTO alm_test.dbo.fu_vintage_results
         (dt_rep, cli_id, generation, vintage_qtr,
@@ -185,5 +173,12 @@ SELECT
     CASE WHEN vol_con = 0 THEN NULL ELSE rate_obiem / vol_con END,
     CASE WHEN vol_trf = 0 THEN NULL ELSE ts_obiem   / vol_trf END
 FROM agg;
+
+/* =============================================================
+   7. КОНТРОЛЬ + ЧИСТКА
+============================================================= */
+SELECT TOP 10 only_fu_overall, only_fu_at_generation, *
+FROM   alm_test.dbo.fu_vintage_results
+ORDER  BY load_timestamp DESC;
 
 DROP TABLE #bd;
