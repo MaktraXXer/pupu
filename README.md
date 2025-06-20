@@ -1,96 +1,104 @@
-Ниже ‒ готовые фрагменты T-SQL, которые закрывают все четыре пункта.
+Ниже — обновлённая версия скрипта «под-ключ» и пример его запуска.
+Логика та же, но теперь:
 
----
-
-## 1. Добавляем колонку «остаточная срочность» в витрину
-
-```sql
-ALTER TABLE [WORK].[GroupDepositInterestsRate]
-    ADD [RESIDUAL_MATUR] DECIMAL(38,6) NULL;   -- дни до DT_CLOSE на дату расчёта
-```
-
-> Колонка создаётся c NULL-значениями, поэтому существующие записи автоматически «заполнены» `NULL` – дополнительный `UPDATE` не нужен.
-
----
-
-## 2 – 4. Изменяем процедуру **\[WORK].\[prc\_GenerateGroupDepositInterestsRateVer1]**
-
-### 2.1 – рассчитываем остаточную срочность на уровне сделок
-
-В первом CTE/темп-таблице `#depSpreads` сразу после блока, где уже рассчитываются `BALANCE_RUB`, `MATUR`, … вставьте строку:
+* диапазон дат задаётся двумя параметрами **@DateTo** и **@DaysBack**;
+  *по умолчанию* — **@DateTo = GETDATE() – 2**, **@DaysBack = 21**;
+  это даёт окно из 21 дня, заканчивающееся позавчера;
+* процедура сама вычисляет начало диапазона и либо вставляет новые строки,
+  либо перезаписывает существующие (MERGE).
 
 ```sql
-        ,DATEDIFF(
-              DAY
-             ,CASE                                     -- дата разреза (как в calc Date)
-                  WHEN i.[i] IN (1,4,6) THEN cal.[Date]
-                  WHEN i.[i] = 2       THEN DATEADD(DAY,-(DATEPART(WEEKDAY,dep.[DT_OPEN]) - 1), dep.[DT_OPEN])
-                  WHEN i.[i] = 3       THEN DATEADD(DAY,-(DATEPART(WEEKDAY,dep.[DT_CLOSE])- 1), dep.[DT_CLOSE])
-                  WHEN i.[i] = 5       THEN DATEADD(MONTH, DATEDIFF(MONTH,0,dep.[DT_OPEN]),0)
-              END
-             ,dep.[DT_CLOSE]
-        )                                               [RESIDUAL_MATUR]   -- ← Новое поле
+/*------------------------------------------------------------------
+1.  Схема mail и итоговая таблица (создаются один раз)
+------------------------------------------------------------------*/
+IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = N'mail')
+    EXEC ('CREATE SCHEMA mail AUTHORIZATION dbo;');
+GO
+
+IF OBJECT_ID(N'mail.balance_metrics', N'U') IS NULL
+BEGIN
+    CREATE TABLE mail.balance_metrics
+    (   dt_rep        date          NOT NULL  PRIMARY KEY,     -- отчётная дата
+        out_rub_total decimal(18,2) NOT NULL,                  -- суммарный остаток
+        term_day      float         NULL,                      -- срочность (сут.)
+        rate_con      float         NULL,                      -- объём-взв. ставка
+        load_dttm     datetime2     NOT NULL DEFAULT sysutcdatetime()
+    );
+END;
+GO
+
+/*------------------------------------------------------------------
+2.  Процедура с умолчаниями: позавчера и 21 день назад
+------------------------------------------------------------------*/
+CREATE OR ALTER PROCEDURE mail.usp_fill_balance_metrics
+      @DateTo   date = NULL      -- «по какую» (включительно). NULL → GETDATE()-2
+    , @DaysBack int  = 21        -- длина окна, дней (вкл. @DateTo)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    /*--- Диапазон дат -----------------------------------------------------*/
+    IF @DateTo IS NULL
+        SET @DateTo = DATEADD(day, -2, CAST(GETDATE() AS date));
+
+    DECLARE @DateFrom date = DATEADD(day, -@DaysBack + 1, @DateTo);  -- начало
+
+    /*--- Календарь и агрегаты ---------------------------------------------*/
+    ;WITH d AS (                  -- календарь внутри диапазона
+        SELECT @DateFrom AS dt_rep
+        UNION ALL
+        SELECT DATEADD(day, 1, dt_rep)
+        FROM   d
+        WHERE  dt_rep < @DateTo
+    ),
+    src AS (                      -- расчёт показателей
+        SELECT
+              d.dt_rep
+            , SUM(t.OUT_RUB)                                           AS out_rub_total
+            , SUM(DATEDIFF(day, t.dt_rep, t.dt_close_plan) * t.OUT_RUB)
+              / NULLIF(SUM(t.OUT_RUB), 0)                              AS term_day
+            , SUM(t.rate_con * t.OUT_RUB)
+              / NULLIF(SUM(t.OUT_RUB), 0)                              AS rate_con
+        FROM       d
+        LEFT  JOIN alm.[ALM].[vw_balance_rest_all] AS t
+               ON  t.dt_rep = d.dt_rep
+               AND t.section_name = N'Срочные'
+               AND t.block_name   = N'Привлечение ФЛ'
+               AND t.od_flag      = 1
+               AND t.OUT_RUB     IS NOT NULL
+               AND t.cur          = '810'
+        GROUP BY d.dt_rep
+    )
+
+    /*--- Вставить или обновить --------------------------------------------*/
+    MERGE mail.balance_metrics AS tgt
+    USING src                  AS src
+      ON tgt.dt_rep = src.dt_rep
+    WHEN MATCHED THEN
+        UPDATE SET  tgt.out_rub_total = src.out_rub_total
+                  , tgt.term_day      = src.term_day
+                  , tgt.rate_con      = src.rate_con
+                  , tgt.load_dttm     = SYSUTCDATETIME()
+    WHEN NOT MATCHED BY TARGET THEN
+        INSERT (dt_rep, out_rub_total, term_day, rate_con)
+        VALUES (src.dt_rep, src.out_rub_total, src.term_day, src.rate_con);
+END;
+GO
 ```
 
-*(Если хотите отсечь случаи, когда дата разреза > DT\_CLOSE, оберните `DATEDIFF` во `CASE WHEN … < 0 THEN 0 END`.)*
-
-### 2.2 – агрегируем как средневзвешенное
-
-В «кубовом» объединении `#depSpreads2` добавьте колонку-агрегат рядом с остальными средневзвешенными показателями:
+### Как «запустить» процедуру
 
 ```sql
-        ,SUM([BALANCE_RUB] * [RESIDUAL_MATUR]) / SUM([BALANCE_RUB])  [RESIDUAL_MATUR]
+/* 1) Диапазон по умолчанию: позавчера и 20 дней до него */
+EXEC mail.usp_fill_balance_metrics;
+-- то есть, если сегодня 20-июн-2025,
+-- импортируются даты с 31-мая-2025 по 18-июн-2025 (21 день).
+
+/* 2) Свой диапазон — например, последние две недели,
+       закончив 15-июн-2025 включительно */
+EXEC mail.usp_fill_balance_metrics
+     @DateTo = '2025-06-15',
+     @DaysBack = 14;
 ```
 
-### 2.3 – пропускаем поле через `#t_for_transf`
-
-Колонка уже идёт в `SELECT *`, ничего менять не нужно.
-
-### 2.4 – записываем в витрину
-
-В `INSERT INTO [ALM_TEST].[WORK].[GroupDepositInterestsRate] …`
-добавьте поле в обе части списка:
-
-```sql
-    , [RESIDUAL_MATUR]
-```
-
-Полный фрагмент «шапки» вставки станет:
-
-```sql
-INSERT INTO [ALM_TEST].[WORK].[GroupDepositInterestsRate]
-SELECT  [Date]
-       ,[TYPE]
-       ,CLI_SUBTYPE
-       ,MARGIN_TYPE
-       ,TERM_GROUP
-       ,IS_OPTION
-       ,SEG_NAME
-       ,TSEGMENTNAME
-       ,Spread_KeyRate
-       ,BALANCE_RUB
-       ,[MATUR]
-       ,[RESIDUAL_MATUR]          -- ← новое
-       ,[ФОР]
-       ,[ССВ]
-       ,[ALM_OptionRate]
-       ,[ALM_Надбавка]
-       ,[MonthlyCONV_OIS]
-       ,[MonthlyCONV_TransfertRate]
-       ,[MonthlyCONV_ALM_TransfertRate]
-       ,[MonthlyCONV_TransfertRate_MOD]
-       ,[MonthlyCONV_KBD]
-       ,[MonthlyCONV_ForecastKeyRate]
-       ,[MonthlyCONV_Rate]
-       ,GETDATE()
-FROM   #t_for_transf …
-```
-
----
-
-### Итог
-
-* Таблица расширена на колонку `[RESIDUAL_MATUR]` (дни).
-* Процедура для каждой сделки считает `DT_CLOSE – Date`, после чего выводит средневзвешенное значение в витрину вместе с остальными показателями.
-
-Скрипт можно накатывать в боевую базу; откат не потребуется, так как изменения обратимы обычным `ALTER TABLE … DROP COLUMN` и возвратом старой версии процедуры.
+Процедура каждый раз **добавит новые** даты и **перезапишет** уже существующие в диапазоне — данные в `mail.balance_metrics` всегда актуальны.
