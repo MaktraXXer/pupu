@@ -1,84 +1,25 @@
-/****** Script for SelectTopNRows command from SSMS  ******/
-SELECT  [MonthEnd]
-      ,[SegmentGrouping]
-      ,[PROD_NAME]
-      ,[CurrencyGrouping]
-      ,[TermBucketGrouping]
-      ,[BalanceBucketGrouping]
-      ,[IS_OPTION]
-      ,[OpenedDeals]
-      ,[Opened_Summ_BalanceRub]
-      ,[Opened_Count_Prolong]
-      ,[Opened_Count_NewNoProlong]
-      ,[Opened_Count_1yProlong]
-      ,[Opened_Count_2yProlong]
-      ,[Opened_Count_3yProlong]
-      ,[Opened_Count_4yProlong]
-      ,[Opened_Count_5plusProlong]
-      ,[Opened_Sum_ProlongRub]
-      ,[Opened_Sum_NewNoProlong]
-      ,[Opened_Sum_1yProlong_Rub]
-      ,[Opened_Sum_2yProlong_Rub]
-      ,[Opened_Sum_3yProlong_Rub]
-      ,[Opened_Sum_4yProlong_Rub]
-      ,[Opened_Sum_5plusProlong_Rub]
-   --   ,[Opened_Dolya_ProlongRub]
-    --  ,[Opened_Dolya_ProlongSht]
-    --  ,[Opened_Dolya_1yProlongRub]
-    --  ,[Opened_Dolya_2yProlongRub]
-    --  ,[Opened_Dolya_3yProlongRub]
-    --  ,[Opened_Dolya_4yProlongRub]
-    --  ,[Opened_Dolya_5plusProlongRub]
-      ,[Opened_WeightedRate_All]
-      ,[Opened_WeightedRate_NewNoProlong]
-      ,[Opened_WeightedRate_AllProlong]
-      ,[Opened_WeightedRate_Previous]
-      ,[Opened_WeightedRate_1y]
-      ,[Opened_WeightedRate_2y]
-      ,[Opened_WeightedRate_3y]
-      ,[Opened_WeightedRate_4y]
-      ,[Opened_WeightedRate_5plus]
-      ,[ClosedDeals]
-      ,[Summ_ClosedBalanceRub]
-      ,[Summ_ClosedBalanceRub_int]
-      ,[Closed_Count_Prolong]
-      ,[Closed_Count_NewNoProlong]
-      ,[Closed_Count_1yProlong]
-      ,[Closed_Count_2yProlong]
-      ,[Closed_Count_3yProlong]
-      ,[Closed_Count_4yProlong]
-      ,[Closed_Count_5plusProlong]
-      ,[Closed_Sum_ProlongRub]
-      ,[Closed_Sum_NewNoProlong]
-      ,[Closed_Sum_1yProlong_Rub]
-      ,[Closed_Sum_2yProlong_Rub]
-      ,[Closed_Sum_3yProlong_Rub]
-      ,[Closed_Sum_4yProlong_Rub]
-      ,[Closed_Sum_5plusProlong_Rub]
-      ,[Closed_Sum_ProlongRub_int]
-      ,[Closed_Sum_NewNoProlong_int]
-      ,[Closed_Sum_1yProlong_Rub_int]
-      ,[Closed_Sum_2yProlong_Rub_int]
-      ,[Closed_Sum_3yProlong_Rub_int]
-      ,[Closed_Sum_4yProlong_Rub_int]
-      ,[Closed_Sum_5plusProlong_Rub_int]
-     -- ,[Closed_Dolya_ProlongRub]
-    --  ,[Closed_Dolya_1yProlongRub]
-    --  ,[Closed_Dolya_2yProlongRub]
-   --   ,[Closed_Dolya_3yProlongRub]
-    --  ,[Closed_Dolya_4yProlongRub]
-    --  ,[Closed_Dolya_5plusProlongRub]
-      ,[WeightedRate_Closed_Overall]
-      ,[Closed_WeightedRate_All]
-      ,[Closed_WeightedRate_NewNoProlong]
-      ,[Closed_WeightedRate_1y]
-      ,[Closed_WeightedRate_2y]
-      ,[Closed_WeightedRate_3y]
-      ,[Closed_WeightedRate_4y]
-      ,[Closed_WeightedRate_5plus]
-      ,[Closed_WeightedRate_AllProlong]
-  --    ,[Dolya_VyhodovRub]
-  FROM [ALM_TEST].[WORK].[prolongationAnalysisResult_ISOPTION]
+/* 1. Берём ТОЛЬКО дату и тип «Начало» / «Начало день ко дню»,   */
+/*    игнорируем вообще все остальные разрезы.                  */
+WITH t1 AS (
+  SELECT Date, SUM(BALANCE_RUB) AS vol1
+  FROM   liq.GroupDepositInterestsRate_dtStart
+  WHERE  TYPE = 'Начало'
+    AND  CLI_SUBTYPE IN ('ЮЛ')            -- уже агрегированная строка
+    AND  Date BETWEEN '2025-05-01' AND '2025-06-24'  -- нужный диапазон
+  GROUP  BY Date
+),
+t2 AS (
+  SELECT Date, SUM(BALANCE_RUB) AS vol2
+  FROM   WORK.GroupDepositInterestsRate_UL_matur_pdr_fo
+  WHERE  TYPE = 'Начало день ко дню'
+    AND  CLI_SUBTYPE = 'ЮЛ'
+    AND  Date BETWEEN '2025-05-01' AND '2025-06-24'
+  GROUP  BY Date
+)
+SELECT COALESCE(t1.Date,t2.Date) AS d,
+       t1.vol1, t2.vol2, t2.vol2 - t1.vol1 AS diff
+FROM   t1 FULL JOIN t2 ON t1.Date = t2.Date
+ORDER  BY d;
 
 следовательно -в экселе у меня такие поля
 
