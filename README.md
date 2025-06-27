@@ -1,3 +1,36 @@
+/*-----------------------------------------------------------------
+  Фильтрованные сделки → по каждой один INDEX SEEK в балансовой
+  витрине, выбираем TOP 1 rate_trf с MAX(DT_REP)
+-----------------------------------------------------------------*/
+WITH deals AS (      -------------------------------------------
+    SELECT  s.CON_ID,
+            s.MATUR,
+            s.DT_OPEN,
+            s.CONVENTION,
+            Nadbawka =
+                s.MonthlyCONV_ALM_TransfertRate - s.without_nadbawka
+    FROM    ALM_TEST.WORK.DepositInterestsRateSnap_upd s  WITH (NOLOCK)
+    WHERE   s.DT_OPEN BETWEEN '2025-01-01' AND '2025-06-24'
+      AND   s.IS_OPTION = 0
+      AND   s.MonthlyCONV_ALM_TransfertRate IS NOT NULL
+)
+/* …------------------------------------------------------------*/
+SELECT  d.*,
+        b.rate_trf
+FROM    deals d
+OUTER APPLY (
+        SELECT  TOP (1) br.rate_trf
+        FROM    ALM.ALM.VW_Balance_Rest_All br  WITH (NOLOCK /* +INDEX(...) */)
+        WHERE   br.CON_ID   = d.CON_ID
+          AND   br.rate_trf IS NOT NULL
+        ORDER   BY br.DT_REP DESC               -- «самый свежий»
+) b
+ORDER BY d.DT_OPEN, d.CON_ID;
+
+
+
+
+
 CREATE OR ALTER PROCEDURE mail.usp_fill_balance_metrics_by_section
       @DateTo   date = NULL
     , @DaysBack int  = 21
