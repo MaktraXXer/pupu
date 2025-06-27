@@ -1,143 +1,100 @@
-/*-----------------------------------------------------------------
-  Фильтрованные сделки → по каждой один INDEX SEEK в балансовой
-  витрине, выбираем TOP 1 rate_trf с MAX(DT_REP)
------------------------------------------------------------------*/
-WITH deals AS (      -------------------------------------------
-    SELECT  s.CON_ID,
-            s.MATUR,
-            s.DT_OPEN,
-            s.CONVENTION,
-            Nadbawka =
-                s.MonthlyCONV_ALM_TransfertRate - s.without_nadbawka
-    FROM    ALM_TEST.WORK.DepositInterestsRateSnap_upd s  WITH (NOLOCK)
-    WHERE   s.DT_OPEN BETWEEN '2025-01-01' AND '2025-06-24'
-      AND   s.IS_OPTION = 0
-      AND   s.MonthlyCONV_ALM_TransfertRate IS NOT NULL
-)
-/* …------------------------------------------------------------*/
-SELECT  d.*,
-        b.rate_trf
-FROM    deals d
-OUTER APPLY (
-        SELECT  TOP (1) br.rate_trf
-        FROM    ALM.ALM.VW_Balance_Rest_All br  WITH (NOLOCK /* +INDEX(...) */)
-        WHERE   br.CON_ID   = d.CON_ID
-          AND   br.rate_trf IS NOT NULL
-        ORDER   BY br.DT_REP DESC               -- «самый свежий»
-) b
-ORDER BY d.DT_OPEN, d.CON_ID;
+Ниже вариант, который:
 
+* **во-первых** фильтрует нужные депозиты («deals»);
+* **во-вторых** берёт **у каждой** сделки дату `DT_CLOSE – 5 дней`;
+* **в-третьих** вытягивает из огромной витрины балансов **только** те строки,
+  где `CON_ID` ∈ deals **и** `DT_REP = DT_CLOSE-5`, причём `rate_trf` не NULL.
 
-
-
-
-CREATE OR ALTER PROCEDURE mail.usp_fill_balance_metrics_by_section
-      @DateTo   date = NULL
-    , @DaysBack int  = 21
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    IF @DateTo IS NULL
-        SET @DateTo = DATEADD(day,-2,CAST(GETDATE() AS date));
-
-    DECLARE @DateFrom date = DATEADD(day,-@DaysBack+1,@DateTo);
-
-    ;WITH s AS (
-        SELECT N'Срочные' AS section_name
-        UNION ALL
-        SELECT N'Накопительный счёт'
-    ),
-    d AS (
-        SELECT @DateFrom AS dt_rep
-        UNION ALL
-        SELECT DATEADD(day,1,dt_rep) FROM d WHERE dt_rep < @DateTo
-    ),
-    ds AS (
-        SELECT d.dt_rep, s.section_name
-        FROM d CROSS JOIN s
-    ),
-    src AS (
-        SELECT
-              ds.dt_rep
-            , ds.section_name
-            , SUM(t.OUT_RUB)                                   AS out_rub_total
-            , CASE WHEN ds.section_name = N'Накопительный счёт'
-                   THEN NULL
-                   ELSE SUM(DATEDIFF(day,t.dt_rep,t.dt_close_plan)*t.OUT_RUB)
-                        / NULLIF(SUM(t.OUT_RUB),0)
-              END                                             AS term_day
-            , SUM(t.rate_con * t.OUT_RUB)
-              / NULLIF(SUM(t.OUT_RUB),0)                      AS rate_con
-        FROM       ds
-        LEFT JOIN  alm.[ALM].[vw_balance_rest_all] t
-               ON  t.dt_rep       = ds.dt_rep
-               AND t.section_name = ds.section_name
-               AND t.block_name   = N'Привлечение ФЛ'
-               AND t.od_flag      = 1
-               AND t.out_rub     IS NOT NULL
-               AND t.cur          = '810'
-        GROUP BY ds.dt_rep, ds.section_name
-    )
-
-    MERGE mail.balance_metrics_by_section AS tgt
-    USING src                              AS src
-      ON  tgt.dt_rep       = src.dt_rep
-      AND tgt.section_name = src.section_name
-    WHEN MATCHED THEN
-        UPDATE SET tgt.out_rub_total = src.out_rub_total,
-                   tgt.term_day      = src.term_day,
-                   tgt.rate_con      = src.rate_con,
-                   tgt.load_dttm     = SYSUTCDATETIME()
-    WHEN NOT MATCHED BY TARGET THEN
-        INSERT (dt_rep, section_name, out_rub_total, term_day, rate_con)
-        VALUES (src.dt_rep, src.section_name, src.out_rub_total,
-                src.term_day, src.rate_con);
-END
-GO
-
-напиши какой код создания таблицы мне требуется создать чтоб корректно работала процедура выше
-
-напиши пример запуска процедуры
-### Скрипт создания таблицы
+Так мы **один раз** читаем VW\_Balance\_Rest\_All по чёткому списку дат, а не
+делаем тысячи «TOP 1 … ORDER BY» для каждой строки.
 
 ```sql
-/*---------------------------------------------------------------
--- Таблица-приёмник для mail.usp_fill_balance_metrics_by_section
-----------------------------------------------------------------*/
-IF OBJECT_ID(N'mail.balance_metrics_by_section', 'U') IS NOT NULL
-    DROP TABLE mail.balance_metrics_by_section;
-GO
-
-CREATE TABLE mail.balance_metrics_by_section (
-      dt_rep        date           NOT NULL                 -- отчётная дата
-    , section_name  nvarchar(100)  NOT NULL                 -- «Срочные» / «Накопительный счёт»
-    , out_rub_total decimal(19,2)  NULL                     -- общий остаток, ₽
-    , term_day      numeric(18,2)  NULL                     -- средний срок (NULL для НС)
-    , rate_con      numeric(18,6)  NULL                     -- средняя ставка
-    , load_dttm     datetime2(3)   NOT NULL                 -- дата/время загрузки
-                         CONSTRAINT DF_bmbs_load_dttm
-                         DEFAULT SYSUTCDATETIME()
-    , CONSTRAINT PK_balance_metrics_by_section
-          PRIMARY KEY CLUSTERED (dt_rep, section_name)
-);
-GO
-
-/* Дополнительный индекс ускорит выборки по секции и периоду (не обязателен) */
-CREATE INDEX IX_bmbs_section_date
-    ON mail.balance_metrics_by_section (section_name, dt_rep);
-GO
+/*====================================================================
+   1. Отбираем сделки (без-опционных, открыты 01-01-2025 … 24-06-2025)
+      и у которых DT_CLOSE ≤ 24-06-2025
+====================================================================*/
+WITH deals AS (
+    SELECT
+        s.CON_ID,
+        s.MATUR,
+        s.DT_OPEN,
+        s.DT_CLOSE,
+        s.CONVENTION,
+        Nadbawka = s.MonthlyCONV_ALM_TransfertRate - s.without_nadbawka,
+        /* дата, по которой ищем баланс: DT_CLOSE – 5 дней */
+        Target_DT = DATEADD(day, -5, s.DT_CLOSE)
+    FROM ALM_TEST.WORK.DepositInterestsRateSnap_upd      s  WITH (NOLOCK)
+    WHERE s.DT_OPEN  BETWEEN '2025-01-01' AND '2025-06-24'
+      AND s.IS_OPTION = 0
+      AND s.MonthlyCONV_ALM_TransfertRate IS NOT NULL
+      AND s.DT_CLOSE <= '2025-06-24'                      -- важное новое условие
+),
+/*====================================================================
+   2. Формируем список уникальных (CON_ID, Target_DT) — чтобы
+      к балансовой витрине обращаться ровно по тем ключам, которые нужны
+====================================================================*/
+keys AS (
+    SELECT DISTINCT
+           d.CON_ID,
+           d.Target_DT
+    FROM   deals d
+),
+/*====================================================================
+   3. Забираем rate_trf из VW_Balance_Rest_All
+      — только для пар из keys, только rate_trf NOT NULL
+====================================================================*/
+rates AS (
+    SELECT
+        br.CON_ID,
+        br.DT_REP,
+        br.rate_trf
+    FROM   ALM.ALM.VW_Balance_Rest_All br  WITH (NOLOCK /* +INDEX(IX_CONID_DTREP) */)
+    JOIN   keys k
+           ON  k.CON_ID   = br.CON_ID
+           AND k.Target_DT = br.DT_REP
+    WHERE  br.rate_trf IS NOT NULL
+)
+/*====================================================================
+   4. Итог: соединяем сделки с найденными ставками (LEFT JOIN —
+      чтобы депозит не «потерялся», если ставки всё-таки нет)
+====================================================================*/
+SELECT
+    d.CON_ID,
+    d.MATUR,
+    d.DT_OPEN,
+    d.CONVENTION,
+    d.Nadbawka,
+    r.rate_trf       AS [rate_trf]          -- может быть NULL, если нет снимка
+FROM   deals d
+LEFT JOIN rates r
+       ON r.CON_ID = d.CON_ID
+      AND r.DT_REP = d.Target_DT
+ORDER BY d.DT_OPEN, d.CON_ID;
 ```
 
----
+### Почему этот вариант быстрее
 
-### Примеры вызова процедуры
+| Шаг       | Что читаем                                                                                                                              | Объём               |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
+| **keys**  | только уникальные `(CON_ID, DT_CLOSE-5)`                                                                                                | ≤ кол-ва сделок     |
+| **rates** | из огромной балансовой витрины — **только** строки, попавшие в `keys`, и сразу по точному ключу на составном индексе `(CON_ID, DT_REP)` | минимально возможно |
+| **JOIN**  | обычный `LEFT JOIN` по первичному ключу, без оконных функций                                                                            | лёгкий              |
 
-| Сценарий                                                  | Вызов                                                                                                                            | Что делает                                             |
-| --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
-| **По умолчанию** – окно 21 день, «позавчера» включительно | `sql EXEC mail.usp_fill_balance_metrics_by_section;`                                                                             | Заполнит диапазон от *GETDATE()-23* до *GETDATE()-2*   |
-| Конкретный конец периода и длина окна                     | `sql EXEC mail.usp_fill_balance_metrics_by_section <br/>     @DateTo = '2025-06-30',  -- включительно <br/>     @DaysBack = 30;` | Заполнит 30-дневное окно с 1 июня 2025 по 30 июня 2025 |
-| Только один день (например, 15 июня 2025)                 | `sql EXEC mail.usp_fill_balance_metrics_by_section <br/>     @DateTo = '2025-06-15', <br/>     @DaysBack = 1;`                   | Считает метрики ровно за 15 июня 2025                  |
+> **Индекс, который даст максимальный эффект**
+>
+> ```sql
+> CREATE INDEX IX_VW_Balance_CONID_DTREP
+>     ON ALM.ALM.VW_Balance_Rest_All ( CON_ID, DT_REP );
+> ```
+>
+> (если он уже есть — отлично; если нет — создание займёт минуты, а
+> ускорит все подобные запросы).
 
-> Процедура безопасно выполняется многократно:
-> `MERGE` обновит существующие строки и добавит недостающие.
+### Что будет, если для (CON\_ID, DT\_CLOSE-5) нет записи
+
+* В колонке **`rate_trf`** вернётся `NULL` (из-за `LEFT JOIN`);
+* депозит всё равно останется в выборке — вы сами решите, что с ним делать
+  (отфильтровать, показать как «нет ставки» и т.д.).
+
+Если нужна жёсткая фильтрация «оставить только те, где ставка нашлась» —
+замените `LEFT JOIN` на `INNER JOIN`.
