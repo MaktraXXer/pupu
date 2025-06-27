@@ -1,102 +1,45 @@
-### Скрипт-обновление WORK.vSpread\_TR\_OIS\_UL\_5d
+/*---------------------------------------------------------------
+   Договоры, открытые с 01-янв-2025 по 24-июн-2025,
+   только без-опционных (IS_OPTION = 0).
 
-(баланс — в рублях, последние 5 рабочих дат, конкретные бакеты срочности)
-
-```sql
-USE ALM_TEST;
-GO
-/*--------------------------------------------------------------
-0.  Удаляем старую версию представления, если она была
---------------------------------------------------------------*/
-IF OBJECT_ID('WORK.vSpread_TR_OIS_UL_5d', 'V') IS NOT NULL
-    DROP VIEW WORK.vSpread_TR_OIS_UL_5d;
-GO
-
-SET ANSI_NULLS ON;
-SET QUOTED_IDENTIFIER ON;
-GO
-/*--------------------------------------------------------------
-1.  Создаём новую витрину
---------------------------------------------------------------*/
-CREATE VIEW WORK.vSpread_TR_OIS_UL_5d
-AS
-/*-- 1.1  Берём нужные сделки из исходной витрины -------------------------*/
-WITH base AS (
-    SELECT
-        g.[Date],                                                                 -- дата
-        g.[Рабочий Spread_TransfertRate_x_OIS на объем и срочность]  AS Num,      -- числитель
-        g.[BALANCE_MILLION на срочность]                           AS Den,       -- знаменатель
-        g.[BALANCE_RUB]                                            AS BalanceRUB -- баланс руб.
-    FROM WORK.vGroupDepositInterestsRate_dtStart_UL_matur_pdr_fo g  WITH (NOLOCK)
-    /* фильтры ТЗ */
-    INNER JOIN ALM.info.VW_calendar cal                -- гарантия «рабочего» дня
-           ON g.[Date] = cal.[Date] AND cal.IsWorkDay = 1
-    WHERE g.[Тип клиента]      = 'ЮЛ'
-      AND g.[Сегмент бизнеса]  = 'all segment'
-      AND g.[Тип отчета]       = 'Начало день ко дню'
-      AND g.[IS_FINANCE_LCR]   = 'all FINANCE_LCR'
-      AND g.[IS_PDR]           = 'all PDR'
-      AND g.[Срочн. бакеты]   IN ( N'1', N'2-6', N'7-13', N'14-20', N'21-29' )
-),
-/*-- 1.2  Агрегация по каждой дате ----------------------------------------*/
-daily AS (
-    SELECT
-        b.[Date],
-        -- баланс за дату, рубли без округления
-        Баланс_руб           = SUM(b.BalanceRUB),
-        -- средневзв. спред (по объёму × срочности)
-        Средневзв_спред_TC_OIS = CAST(
-            SUM(b.Num) / NULLIF(SUM(b.Den),0)
-            AS DECIMAL(18,8))
-    FROM base b
-    GROUP BY b.[Date]
-),
-/*-- 1.3  Нумеруем даты от самой свежей -----------------------------------*/
-ranked AS (
-    SELECT  d.*,
-            rn = ROW_NUMBER() OVER (ORDER BY d.[Date] DESC)
-    FROM    daily d
-),
-/*-- 1.4  Оставляем пять последних рабочих дат ----------------------------*/
-last5 AS (
-    SELECT * FROM ranked WHERE rn <= 5
-),
-/*-- 1.5  5-дневные агрегаты ----------------------------------------------*/
-agg5 AS (
-    SELECT
-        Средневзв_спред_TC_OIS_5д = CAST(AVG(Средневзв_спред_TC_OIS) AS DECIMAL(18,8)),
-        Сумма_балансов_5д_руб     = SUM(Баланс_руб)
-    FROM last5
-)
-/*-- 1.6  Итоговый селект --------------------------------------------------*/
+   Сравниваем «ТС с восстановленной надбавкой» (старая витрина)
+   и «ТС AS IS» (новая витрина); выводим разницу, флаг |Δ|>3 %
+   и признак «ГГГГ-ММ» для удобной группировки по месяцам-годам.
+----------------------------------------------------------------*/
 SELECT
-    l.[Date]                                   AS [Дата],
-    l.Баланс_руб                               AS [Баланс, руб],
-    l.Средневзв_спред_TC_OIS                   AS [Средневзв. спред ТС-OIS],
-    a.Средневзв_спред_TC_OIS_5д                AS [Средневзв. спред ТС-OIS, 5д],
-    a.Сумма_балансов_5д_руб                    AS [Сумма балансов 5д, руб]
-FROM last5 l
-CROSS JOIN agg5 a;        -- одинаковое 5-дневное среднее и объём для всех 5 строк
-GO
-```
+    s.CON_ID                               AS [CON_ID],
+    s.DT_OPEN                              AS [DT_OPEN],
+    s.DT_CLOSE                             AS [DT_CLOSE],
+    s.BALANCE_RUB                          AS [BALANCE_RUB],
+    s.CONVENTION                           AS [CONVENTION],
+    s.PROD_NAME                            AS [PROD_NAME],
 
-#### Что изменилось
+    /* 2. ТС с восстановленной надбавкой */
+    s.MonthlyCONV_ALM_TransfertRate        AS [ТС с восстановленной надбавкой],
 
-| Требование                     | Реализация                                                                                         |
-| ------------------------------ | -------------------------------------------------------------------------------------------------- |
-| **1. Баланс в рублях**         | Колонка **\[Баланс, руб]** выводит `SUM([BALANCE_RUB])` — без деления на 100 000 и без округления. |
-| **2. Последние 5 рабочих дат** | `INNER JOIN ALM.info.VW_calendar` → `IsWorkDay = 1`, затем `ROW_NUMBER()` → `rn <= 5`.             |
-| **3. Только нужные бакеты**    | `WHERE [Срочн. бакеты] IN ('1','2-6','7-13','14-20','21-29')`.                                     |
+    /* 3. ТС AS IS */
+    n.MonthlyCONV_ALM_TransfertRate        AS [ТС AS IS],
 
-> **Использование**
-> Если нужен единичный результат только за самую свежую дату, выполните:
->
-> ```sql
-> SELECT TOP (1) *
-> FROM WORK.vSpread_TR_OIS_UL_5d
-> ORDER BY [Дата] DESC;
-> ```
->
-> Порядок строк в представлении не гарантирован, поэтому внешним запросом всегда добавляйте `ORDER BY [Дата]`, когда это важно.
+    /* 4. Разница (п.п.) */
+    CAST( n.MonthlyCONV_ALM_TransfertRate
+        - s.MonthlyCONV_ALM_TransfertRate  AS DECIMAL(18,8) )    AS [Δ ТС, п.п.],
 
-Сообщите, если требуется ещё что-нибудь изменить!
+    /* 5. Флаг, если |Δ| > 3 %  (0.03 = 3 п.п. при десятичной записи процентов) */
+    CASE
+        WHEN ABS(n.MonthlyCONV_ALM_TransfertRate
+               - s.MonthlyCONV_ALM_TransfertRate) > 0.03
+             THEN 1 ELSE 0
+    END                                         AS [Flag_|Δ|>3%],
+
+    /* 6. Год-месяц открытия депозита (формат YYYY-MM) */
+    CONVERT(char(7), s.DT_OPEN, 126)            AS [Месяц-Год_Открытия]
+
+FROM ALM_TEST.WORK.DepositInterestsRateSnap      s          -- «восстановл. надбавка»
+JOIN ALM_TEST.WORK.DepositInterestsRateSnap_NEW  n          -- «AS IS»
+      ON n.CON_ID = s.CON_ID                     -- 1-к-1 совпадение договоров
+
+WHERE s.DT_OPEN BETWEEN '2025-01-01' AND '2025-06-24'  -- пункт 1
+  AND s.IS_OPTION = 0                                  -- пункт 1.5
+  AND n.IS_OPTION = 0                                  -- симметричная фильтрация
+
+ORDER BY s.DT_OPEN, s.CON_ID;                          -- удобный порядок вывода
