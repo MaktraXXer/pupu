@@ -1,176 +1,166 @@
-Вот монолитный SQL-скрипт, переписанный по твоему запросу:
-🔁 **нормализация названия `prod_name_res` теперь делается по **всем** `con_id`**, не только для целевых вкладов.
+Ниже ― готовый «черновик» решения, которым можно сразу же пользоваться в тестовой базе **ALM\_TEST**.
+Я сохранил всю логику исходной витрины, но:
 
-📌 Особенности:
+* **добавил** подтягивание «эталонных» ставок из `LIQUIDITY.liq.DepositContract_Rate` (п. 1);
+* **дал возможность выбирать любую отчётную дату** `@rep_dt` (п. 2).
 
-* Оптимизировано через `FIRST_VALUE(...) OVER (...)` — **без группировок и джойнов**.
-* Производится **один проход** по `#bd` с обновлением всех `prod_name_res`.
-* Код от начала до конца — **готов к прямому запуску**.
+  > В обычном представлении параметры недоступны, поэтому я перевёл витрину в *inline* табличную функцию — одной строкой она же превращается обратно в представление по-умолчанию.
+* **создал отдельную схему** `urep_ex` в базе **ALM\_TEST** (п. 3).
+* если «эталонной» ставки нет, расчёт идёт по старому полю `t.rate_con` (п. 4).
+
+---
+
+## 1. Скрипт развёртывания в ALM\_TEST
 
 ```sql
-/* =============================================================
-   0. БЭКАП + СТАТИЧНЫЙ КАЛЕНДАРЬ dt_rep
-============================================================= */
-IF OBJECT_ID('alm_test.dbo.fu_vintage_results_backup', 'U') IS NOT NULL
-    DROP TABLE alm_test.dbo.fu_vintage_results_backup;
+/* ─────────── 0. Подготовка схемы ─────────── */
+USE ALM_TEST;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'urep_ex')
+    EXEC('CREATE SCHEMA urep_ex AUTHORIZATION dbo;');
+GO
 
-SELECT * INTO alm_test.dbo.fu_vintage_results_backup
-FROM alm_test.dbo.fu_vintage_results;
-
-DECLARE @RepDates TABLE (d date PRIMARY KEY);
-INSERT INTO @RepDates VALUES
-('2024-01-31'),('2024-02-29'),('2024-03-31'),('2024-04-30'),
-('2024-05-31'),('2024-06-30'),('2024-07-31'),('2024-08-31'),
-('2024-09-30'),('2024-10-31'),('2024-11-30'),('2024-12-31'),
-('2025-01-31'),('2025-02-28'),('2025-03-31'),('2025-04-30'),
-('2025-05-20');
-
-/* =============================================================
-   1. СОЗДАЁМ ПРИЁМНИК
-============================================================= */
-IF OBJECT_ID('alm_test.dbo.fu_vintage_results','U') IS NOT NULL
-    DROP TABLE alm_test.dbo.fu_vintage_results;
-
-CREATE TABLE alm_test.dbo.fu_vintage_results
+/* ─────────── 1. Функция с параметром отчётной даты ─────────── */
+CREATE OR ALTER FUNCTION urep_ex.fn_report_FL_NewKopilki
 (
-    dt_rep             date          NOT NULL,
-    cli_id             bigint        NOT NULL,
-    generation         char(7)       NOT NULL,
-    vintage_qtr        char(6)       NOT NULL,
-    had_deposit_before      bit      NOT NULL,
-    only_fu_overall         bit      NOT NULL,
-    only_fu_at_generation   bit      NOT NULL,
-    section_name       nvarchar(50)  NOT NULL,
-    tsegmentname       nvarchar(50)  NOT NULL,
-    prod_name_res      nvarchar(100) NOT NULL,
-    sum_out_rub        decimal(20,2) NOT NULL,
-    count_con_id       int           NOT NULL,
-    rate_obiem         decimal(20,2) NOT NULL,
-    ts_obiem           decimal(20,2) NOT NULL,
-    avg_rate_con       decimal(18,4) NULL,
-    avg_rate_trf       decimal(18,4) NULL,
-    load_timestamp     datetime2 NOT NULL
-        CONSTRAINT DF_vint_load DEFAULT (sysutcdatetime()),
-    CONSTRAINT PK_fu_vint
-        PRIMARY KEY CLUSTERED (dt_rep, cli_id, section_name, tsegmentname, prod_name_res)
-);
-
-CREATE INDEX IX_fu_vint_rep_gen ON alm_test.dbo.fu_vintage_results (dt_rep, generation);
-CREATE INDEX IX_fu_vint_vint_had ON alm_test.dbo.fu_vintage_results (vintage_qtr, had_deposit_before);
-
-/* =============================================================
-   2. ВЫГРУЗКА 17 СНИМКОВ
-============================================================= */
-DROP TABLE IF EXISTS #bd;
-
-SELECT
-    bra.cli_id, bra.con_id, bra.dt_rep,
-    bra.section_name, bra.tsegmentname,
-    bra.prod_name_res, bra.out_rub,
-    bra.rate_con,             -- клиентская ставка
-    bra.rate_trf              -- трансф. ставка
-INTO  #bd
-FROM  ALM.ALM.Balance_Rest_All bra WITH (NOLOCK)
-JOIN  @RepDates r ON r.d = bra.dt_rep
-WHERE bra.section_name IN ('Срочные','До востребования','Накопительный счёт')
-  AND bra.cur = '810'  AND bra.od_flag = 1  AND bra.is_floatrate = 0
-  AND bra.acc_role = 'LIAB' AND bra.ap = 'Пассив'
-  AND bra.tsegmentname IN ('ДЧБО','Розничный бизнес')
-  AND bra.block_name    = 'Привлечение ФЛ'
-  AND bra.out_rub IS NOT NULL;
-
-CREATE CLUSTERED INDEX IX_bd_con_dt ON #bd (con_id, dt_rep);
-
-/* =============================================================
-   3. ГЛОБАЛЬНАЯ НОРМАЛИЗАЦИЯ prod_name_res по всем con_id
-============================================================= */
-;WITH normalized AS (
-    SELECT con_id,
-           FIRST_VALUE(prod_name_res) OVER (PARTITION BY con_id ORDER BY dt_rep DESC) AS latest_name
-    FROM #bd
+    @rep_dt DATE = NULL        -- если NULL → берём max(dt_rep)
 )
-UPDATE b
-SET    b.prod_name_res = n.latest_name
-FROM   #bd b
-JOIN   normalized n ON b.con_id = n.con_id;
-
-/* =============================================================
-   4. CTE-цепочка: generation + флаги
-============================================================= */
-WITH step1 AS (
-    SELECT *,
-           MIN(dt_rep) OVER (PARTITION BY cli_id) AS first_dt
-    FROM #bd
+RETURNS TABLE
+AS
+RETURN
+/* 1.1 – фиксируем целевую rep-дату */
+WITH rep_dt AS (
+    SELECT COALESCE(@rep_dt,
+                    (SELECT MAX(dt_rep) FROM ALM.balance_rest_all_AGG)) AS dt
 ),
-step2 AS (
-    SELECT *,
-           CASE WHEN MAX(CASE WHEN dt_rep < first_dt THEN 1 END)
-                    OVER (PARTITION BY cli_id)=1
-                THEN 1 ELSE 0 END AS had_deposit_before,
-           CASE WHEN COUNT(DISTINCT prod_name_res)
-                    OVER (PARTITION BY cli_id)=1
-                THEN 1 ELSE 0 END AS only_fu_overall,
-           CASE WHEN COUNT(DISTINCT prod_name_res)
-                    OVER (PARTITION BY cli_id, dt_rep)
-                 = 1 THEN 1 ELSE 0 END AS only_fu_at_generation,
-           CONCAT(DATEPART(year,first_dt),'Q',
-                  DATEPART(quarter,first_dt)) AS vintage_qtr
-    FROM step1
-    WHERE first_dt IS NOT NULL
-),
-agg AS (
+/* 1.2 – базовые строки из vw_balance_rest_all + календарь */
+base AS (
     SELECT
-        dt_rep,
-        cli_id,
-        CONVERT(char(7), first_dt, 120) AS generation,
-        vintage_qtr,
-        had_deposit_before,
-        only_fu_overall,
-        only_fu_at_generation,
-        section_name,
-        tsegmentname,
-        prod_name_res,
-        SUM(out_rub)                       AS sum_out_rub,
-        COUNT(DISTINCT con_id)             AS count_con_id,
-        SUM(out_rub * rate_con)            AS rate_obiem,
-        SUM(out_rub * rate_trf)            AS ts_obiem,
-        SUM(CASE WHEN rate_con IS NOT NULL THEN out_rub END) AS vol_con,
-        SUM(CASE WHEN rate_trf IS NOT NULL THEN out_rub END) AS vol_trf
-    FROM step2
-    GROUP BY dt_rep, cli_id, section_name, tsegmentname,
-             CONVERT(char(7), first_dt, 120),
-             vintage_qtr, had_deposit_before,
-             only_fu_overall, only_fu_at_generation,
-             prod_name_res
+        t.SEGMENT_ID,
+        c1.date                    AS opn_dt_start,
+        c2.date                    AS opn_dt_end,
+        rdt.dt                     AS rep_dt,
+        t.con_id,
+        t.DT_OPEN,
+        t.OUT_RUB,
+        t.rate_con,                -- старая ставка
+        t.rate_trf
+    FROM  alm.info.VW_calendar            AS c1             -- начало окна
+    CROSS JOIN alm.info.VW_calendar        AS c2             -- конец окна
+    CROSS JOIN rep_dt                      AS rdt            -- выбранная rep-дата
+    JOIN  alm.ALM.vw_balance_rest_all      AS t
+          ON  t.dt_rep  = rdt.dt
+          AND t.dt_open BETWEEN c1.date AND c2.date
+          AND t.acc_role        = N'LIAB'
+          AND t.block_name      = N'Привлечение ФЛ'
+          AND t.section_name    = N'Накопительный счёт'
+          AND t.od_flag         = 1
+          AND t.OUT_RUB IS NOT NULL
+          AND ISNULL(t.is_floatrate,0) <> 1
+    WHERE c1.date BETWEEN '2020-01-01' AND GETDATE()
 )
-/* =============================================================
-   5. ЗАГРУЗКА В ПРИЁМНИК
-============================================================= */
-INSERT INTO alm_test.dbo.fu_vintage_results
-        (dt_rep, cli_id, generation, vintage_qtr,
-         had_deposit_before, only_fu_overall, only_fu_at_generation,
-         section_name, tsegmentname, prod_name_res,
-         sum_out_rub, count_con_id,
-         rate_obiem, ts_obiem,
-         avg_rate_con, avg_rate_trf)
+/* 1.3 – подцепляем «правильные» ставки */
+, joined AS (
+    SELECT  b.*,
+            r.rate AS rate_ref               -- эталон (можно заменить на нужное поле)
+    FROM    base AS b
+    /* LEFT JOIN – чтобы не терять строки, когда ставки нет */
+    LEFT JOIN LIQUIDITY.liq.DepositContract_Rate AS r
+           ON  r.con_id = b.con_id
+           /* «+1 день» для новых; иначе – сама rep-дата */
+           AND CASE WHEN b.DT_OPEN = b.rep_dt
+                    THEN DATEADD(DAY,1,b.rep_dt)
+                    ELSE b.rep_dt END
+               BETWEEN r.dt_from AND r.dt_to
+)
+/* 1.4 – агрегирование ровно как в исходной витрине + новые метрики */
 SELECT
-    dt_rep, cli_id, generation, vintage_qtr,
-    had_deposit_before, only_fu_overall, only_fu_at_generation,
-    section_name, tsegmentname, prod_name_res,
-    sum_out_rub, count_con_id,
-    rate_obiem, ts_obiem,
-    CASE WHEN vol_con = 0 THEN NULL ELSE rate_obiem / vol_con END,
-    CASE WHEN vol_trf = 0 THEN NULL ELSE ts_obiem   / vol_trf END
-FROM agg;
+    SEGMENT_ID,
+    SUM(OUT_RUB)/1e6                                       AS SUM_OUT_RUB_mln,
+    /* исходная средневзвешенная ставка */
+    SUM(OUT_RUB * rate_con)/SUM(OUT_RUB)                   AS conrate_SRVZ_orig,
+    /* ставка по тарифу (как была) */
+    SUM(OUT_RUB * rate_trf)/SUM(OUT_RUB)                   AS trf_SRVZ,
+    /* средневзвешенная по эталонным (или fallback к старой) */
+    SUM(OUT_RUB * COALESCE(rate_ref, rate_con))
+        / SUM(OUT_RUB)                                     AS conrate_SRVZ_ref,
+    rep_dt,
+    opn_dt_start,
+    opn_dt_end,
+    COUNT(*)                                               AS c,
+    /* полезная статистика: сколько строк без эталона */
+    SUM(CASE WHEN rate_ref IS NULL THEN 1 ELSE 0 END)      AS cnt_no_rate
+FROM joined
+GROUP BY SEGMENT_ID, opn_dt_start, opn_dt_end, rep_dt;
+GO
 
-/* =============================================================
-   6. КОНТРОЛЬ + УБОРКА
-============================================================= */
-SELECT TOP 10 *
-FROM   alm_test.dbo.fu_vintage_results
-ORDER  BY load_timestamp DESC;
-
-DROP TABLE #bd;
+/* ─────────── 2. Представление по-умолчанию (для «последней» даты) ─────────── */
+CREATE OR ALTER VIEW urep_ex.VW_report_FL_NewKopilki_enriched
+AS
+SELECT * FROM urep_ex.fn_report_FL_NewKopilki(NULL);
+GO
 ```
 
-📌 Если потом решишь делать нормализацию по другому критерию (например, `MAX(dt_rep)` с условиями), — можно будет быстро поправить CTE `normalized`.
+### Как использовать
+
+```sql
+/* 1) как и раньше – «последний» отчёт */
+SELECT *
+FROM ALM_TEST.urep_ex.VW_report_FL_NewKopilki_enriched
+WHERE opn_dt_start = '2025-05-01'
+  AND opn_dt_end   = '2025-06-08';
+
+/* 2) с конкретной датой отчёта */
+SELECT *
+FROM ALM_TEST.urep_ex.fn_report_FL_NewKopilki('2025-06-23')
+WHERE opn_dt_start = '2025-05-01'
+  AND opn_dt_end   = '2025-06-08';
+```
+
+---
+
+## 2. Логика джойна ставок ― пошагово
+
+| Шаг | Условие                                                                                                         | Зачем                                                                                                |
+| --- | --------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| 1.  | **`r.con_id = t.con_id`**                                                                                       | строгая связка «контракт–ставка»                                                                     |
+| 2.  | Вычисляем «момент проверки»:<br>`CASE WHEN t.dt_open = t.dt_rep THEN DATEADD(day,1,t.dt_rep) ELSE t.dt_rep END` | для контрактов, открытых в отчётный день, ставка начинает действовать со следующего календарного дня |
+| 3.  | Попадаем в интервал действия ставки:<br>`... BETWEEN r.dt_from AND r.dt_to`                                     | чтобы взять именно ту ставку, которая действовала в этот момент                                      |
+| 4.  | `LEFT JOIN`                                                                                                     | если интервала нет → поле `r.rate` = NULL, а в расчёте используется `t.rate_con` через `COALESCE`    |
+
+Таким образом:
+
+```sql
+effective_rate = COALESCE(r.rate, t.rate_con)
+```
+
+*Если в `DepositContract_Rate` хранится несколько разных полей (номинальная / эффективная и т.д.) — достаточно поменять `r.rate` на нужный столбец, остальная логика не меняется.*
+
+---
+
+## 3. Что ещё можно быстро посмотреть
+
+```sql
+/* распределение отклонений, б.п. */
+SELECT
+    SEGMENT_ID,
+    AVG(diff_bps)  AS avg_diff,
+    MAX(diff_bps)  AS max_diff,
+    COUNT(*)       AS rows_cnt
+FROM (
+    SELECT 
+        SEGMENT_ID,
+        (COALESCE(rate_ref, rate_con) - rate_con) * 10000 AS diff_bps
+    FROM ALM_TEST.urep_ex.fn_report_FL_NewKopilki('2025-06-23')
+) d
+GROUP BY SEGMENT_ID
+ORDER BY ABS(avg_diff) DESC;
+```
+
+Это сразу покажет, в каких сегментах «новые» ставки сильнее всего расходятся со старыми.
+
+---
+
+### Готово!
+
+Скрипт можно накатывать в тестовой среде; если всё ок, достаточно переместить функцию/представление в прод-базу **ALM** (или просто изменить префикс базы). Будут вопросы — пишите, скорректируем.
