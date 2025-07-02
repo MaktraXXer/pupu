@@ -49,36 +49,44 @@ grp_core AS (
     FROM base
     GROUP BY dt_rep, fu_only_overall, fu_had_deposit_before
 ),
-
 /* ===== 2. тотал по fu_only_overall (ставим 2) ===== */
 tot_fu_only AS (
     SELECT
         dt_rep,
-        2            AS fu_only_overall,
+        2 AS fu_only_overall,
         fu_had_deposit_before,
-        SUM(vol_fu)        AS vol_fu,
-        SUM(vol_non_fu)    AS vol_non_fu,
-        SUM(vol_total)     AS vol_total,
-        COUNT(DISTINCT CASE WHEN vol_fu > 0  OR vol_non_fu > 0 THEN cli_id END) AS cli_total_dummy, -- не нужен, но оставим
-        COUNT(DISTINCT CASE WHEN vol_fu        > 0 THEN cli_id END) AS cli_fu,
-        COUNT(DISTINCT CASE WHEN vol_non_fu    > 0 THEN cli_id END) AS cli_non_fu,
-        COUNT(DISTINCT cli_id)                                   AS cli_total
-    FROM (
-        /* разлагать снова base не нужно — берём набор id из grp_core */
-        SELECT dt_rep, fu_had_deposit_before, cli_id,
-               CASE WHEN prod_name_res IN (
-                     N'Надёжный', N'Надёжный VIP', N'Надёжный премиум',
-                     N'Надёжный промо', N'Надёжный старт',
-                     N'Надёжный Т2', N'Надёжный Мегафон') THEN 1 END AS mark_fu,
-               CASE WHEN prod_name_res NOT IN (
-                     N'Надёжный', N'Надёжный VIP', N'Надёжный премиум',
-                     N'Надёжный промо', N'Надёжный старт',
-                     N'Надёжный Т2', N'Надёжный Мегафон') THEN 1 END AS mark_non_fu
-        FROM base
-    ) x
+
+        SUM(CASE WHEN prod_name_res IN (
+              N'Надёжный',N'Надёжный VIP',N'Надёжный премиум',
+              N'Надёжный промо',N'Надёжный старт',
+              N'Надёжный Т2',N'Надёжный Мегафон'
+        ) THEN sum_out_rub ELSE 0 END) AS [vol_fu],
+
+        SUM(CASE WHEN prod_name_res NOT IN (
+              N'Надёжный',N'Надёжный VIP',N'Надёжный премиум',
+              N'Надёжный промо',N'Надёжный старт',
+              N'Надёжный Т2',N'Надёжный Мегафон'
+        ) THEN sum_out_rub ELSE 0 END) AS [vol_non_fu],
+
+        SUM(sum_out_rub) AS [vol_total],
+
+        COUNT(DISTINCT CASE WHEN prod_name_res IN (
+              N'Надёжный',N'Надёжный VIP',N'Надёжный премиум',
+              N'Надёжный промо',N'Надёжный старт',
+              N'Надёжный Т2',N'Надёжный Мегафон'
+        ) THEN cli_id END) AS [cli_fu],
+
+        COUNT(DISTINCT CASE WHEN prod_name_res NOT IN (
+              N'Надёжный',N'Надёжный VIP',N'Надёжный премиум',
+              N'Надёжный промо',N'Надёжный старт',
+              N'Надёжный Т2',N'Надёжный Мегафон'
+        ) THEN cli_id END) AS [cli_non_fu],
+
+        COUNT(DISTINCT cli_id) AS [cli_total]
+
+    FROM base
     GROUP BY dt_rep, fu_had_deposit_before
 ),
-
 /* ===== 3. тотал по fu_had_deposit_before (ставим 2) ===== */
 tot_had_before AS (
     SELECT
@@ -150,3 +158,5 @@ FROM union_all
 ORDER BY dt_rep,
          Категория_FU_ONLY,
          Категория_HAD_BEFORE;
+
+этот запрос сработает?
