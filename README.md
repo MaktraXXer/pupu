@@ -75,3 +75,4 @@ SELECT
     [Уникальных клиентов всего]
 FROM all_data
 ORDER BY dt_rep, [Категория клиентов];
+
