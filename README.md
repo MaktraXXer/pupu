@@ -1,19 +1,39 @@
-INSERT INTO alm_test.dbo.fu_vintage_results_ext (
-    dt_rep, cli_id, generation, vintage_qtr,
-    fu_had_deposit_before, fu_only_overall, fu_only_at_generation,
-    other_markets_had_deposit_before, other_markets_only_overall, other_markets_only_at_generation,
-    all_markets_had_deposit_before, all_markets_only_overall, all_markets_only_at_generation,
-    section_name, tsegmentname, prod_name_res,
-    sum_out_rub, count_con_id, rate_obiem, ts_obiem,
-    avg_rate_con, avg_rate_trf
-)
 SELECT
-    dt_rep, cli_id, generation, vintage_qtr,
-    fu_had_deposit_before, fu_only_overall, fu_only_at_generation,
-    other_markets_had_deposit_before, other_markets_only_overall, other_markets_only_at_generation,
-    all_markets_had_deposit_before, all_markets_only_overall, all_markets_only_at_generation,
-    section_name, tsegmentname, prod_name_res,
-    sum_out_rub, count_con_id, rate_obiem, ts_obiem,
-    CASE WHEN vol_con = 0 THEN NULL ELSE rate_obiem / vol_con END,
-    CASE WHEN vol_trf = 0 THEN NULL ELSE ts_obiem   / vol_trf END
-FROM agg;
+    dt_rep,
+    fu_only_overall,
+
+    -- Объемы
+    SUM(CASE WHEN prod_name_res IN (
+            N'Надёжный', N'Надёжный VIP', N'Надёжный премиум',
+            N'Надёжный промо', N'Надёжный старт',
+            N'Надёжный Т2', N'Надёжный Мегафон'
+        ) THEN sum_out_rub ELSE 0 END) AS sum_out_rub_fu,
+
+    SUM(CASE WHEN prod_name_res NOT IN (
+            N'Надёжный', N'Надёжный VIP', N'Надёжный премиум',
+            N'Надёжный промо', N'Надёжный старт',
+            N'Надёжный Т2', N'Надёжный Мегафон'
+        ) THEN sum_out_rub ELSE 0 END) AS sum_out_rub_non_fu,
+
+    -- Клиенты: считаем DISTINCT только если у клиента был хотя бы один вклад нужного типа
+    COUNT(DISTINCT CASE WHEN prod_name_res IN (
+            N'Надёжный', N'Надёжный VIP', N'Надёжный премиум',
+            N'Надёжный промо', N'Надёжный старт',
+            N'Надёжный Т2', N'Надёжный Мегафон'
+        ) THEN cli_id ELSE NULL END) AS cnt_clients_fu,
+
+    COUNT(DISTINCT CASE WHEN prod_name_res NOT IN (
+            N'Надёжный', N'Надёжный VIP', N'Надёжный премиум',
+            N'Надёжный промо', N'Надёжный старт',
+            N'Надёжный Т2', N'Надёжный Мегафон'
+        ) THEN cli_id ELSE NULL END) AS cnt_clients_non_fu
+
+FROM alm_test.dbo.fu_vintage_results_ext WITH (NOLOCK)
+
+GROUP BY
+    dt_rep,
+    fu_only_overall
+
+ORDER BY
+    dt_rep,
+    fu_only_overall;
