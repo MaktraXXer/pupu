@@ -1,5 +1,5 @@
 /* =============================================================
-   0. ПЕРИОД + СПИСОК ДАТ dt_rep
+   0. ДАТЫ СНИМКОВ
 ============================================================= */
 DECLARE @DateFrom date = '2024-01-31';
 DECLARE @DateTo   date = '2025-06-30';
@@ -13,44 +13,37 @@ INSERT INTO @RepDates VALUES
 ('2025-05-31'),('2025-06-30');
 
 /* =============================================================
-   1. ПРИЁМНИК (пересоздаём под расчёт)
+   1. ПРИЁМНИК (полный пересчёт)
 ============================================================= */
 IF OBJECT_ID('alm_test.dbo.fu_vintage_results_ext','U') IS NOT NULL
     DROP TABLE alm_test.dbo.fu_vintage_results_ext;
 
 CREATE TABLE alm_test.dbo.fu_vintage_results_ext (
-    dt_rep             date          NOT NULL,
-    cli_id             bigint        NOT NULL,
-    generation         char(7)       NOT NULL,
-    vintage_qtr        char(6)       NOT NULL,
+    dt_rep              date          NOT NULL,
+    cli_id              bigint        NOT NULL,
+    generation          char(7)       NOT NULL,
+    vintage_qtr         char(6)       NOT NULL,
 
-    /* --- 9 флагов --- */
-    fu_had_deposit_before            bit NOT NULL,
-    fu_only_overall                  bit NOT NULL,
-    fu_only_at_generation            bit NOT NULL,
+    had_deposit_before              bit NOT NULL,   -- общий
+    fu_only_overall                 bit NOT NULL,
+    fu_only_at_generation           bit NOT NULL,
+    other_only_overall              bit NOT NULL,
+    other_only_at_generation        bit NOT NULL,
+    all_only_overall                bit NOT NULL,
+    all_only_at_generation          bit NOT NULL,
 
-    other_markets_had_deposit_before bit NOT NULL,
-    other_markets_only_overall       bit NOT NULL,
-    other_markets_only_at_generation bit NOT NULL,
+    section_name       nvarchar(50)  NOT NULL,
+    tsegmentname       nvarchar(50)  NOT NULL,
+    prod_name_res      nvarchar(100) NOT NULL,
 
-    all_markets_had_deposit_before   bit NOT NULL,
-    all_markets_only_overall         bit NOT NULL,
-    all_markets_only_at_generation   bit NOT NULL,
+    sum_out_rub        decimal(20,2) NOT NULL,
+    count_con_id       int           NOT NULL,
+    rate_obiem         decimal(20,2) NOT NULL,
+    ts_obiem           decimal(20,2) NOT NULL,
+    avg_rate_con       decimal(18,4) NULL,
+    avg_rate_trf       decimal(18,4) NULL,
 
-    /* бизнес-атрибуты */
-    section_name     nvarchar(50)  NOT NULL,
-    tsegmentname     nvarchar(50)  NOT NULL,
-    prod_name_res    nvarchar(100) NOT NULL,
-
-    /* метрики */
-    sum_out_rub      decimal(20,2) NOT NULL,
-    count_con_id     int           NOT NULL,
-    rate_obiem       decimal(20,2) NOT NULL,
-    ts_obiem         decimal(20,2) NOT NULL,
-    avg_rate_con     decimal(18,4) NULL,
-    avg_rate_trf     decimal(18,4) NULL,
-
-    load_timestamp   datetime2 NOT NULL
+    load_timestamp     datetime2 NOT NULL
         CONSTRAINT DF_vint_ext_load DEFAULT (sysutcdatetime()),
 
     CONSTRAINT PK_fu_vint_ext
@@ -58,12 +51,6 @@ CREATE TABLE alm_test.dbo.fu_vintage_results_ext (
                                section_name, tsegmentname, prod_name_res)
 );
 GO
-
-/* индексы для удобства */
-CREATE INDEX IX_fu_vint_ext_rep_gen
-    ON alm_test.dbo.fu_vintage_results_ext (dt_rep, generation);
-CREATE INDEX IX_fu_vint_ext_vint_had
-    ON alm_test.dbo.fu_vintage_results_ext (vintage_qtr, fu_had_deposit_before);
 
 /* =============================================================
    2. СПРАВОЧНИКИ ПРОДУКТОВ
@@ -79,7 +66,7 @@ INSERT INTO @AuxProducts VALUES
 (N'ДОМа надёжно'), (N'Всё в ДОМ');
 
 /* =============================================================
-   3. ВЫГРУЗКА ДАННЫХ ВО ВРЕМЕННУЮ ТАБЛИЦУ
+   3. ЗАГРУЗКА В #bd
 ============================================================= */
 DROP TABLE IF EXISTS #bd;
 
@@ -94,7 +81,6 @@ SELECT
     bra.rate_con,
     bra.rate_trf,
 
-    /* признаки принадлежности к спискам */
     IIF(mp.prod_name_res IS NOT NULL, 1, 0) AS target_main,
     IIF(ap.prod_name_res IS NOT NULL, 1, 0) AS target_aux
 INTO #bd
@@ -112,7 +98,7 @@ WHERE bra.section_name IN (N'Срочные',N'До востребования',
 CREATE CLUSTERED INDEX IX_bd_con_dt ON #bd (con_id, dt_rep);
 
 /* =============================================================
-   4. ПЕРЕИМЕНОВАНИЕ (по последнему названию) ДЛЯ целевых СПИСКОВ
+   4. ПЕРЕИМЕНОВАНИЕ + ПЕРЕСЧЁТ ФЛАГОВ СПИСКА
 ============================================================= */
 ;WITH last_name AS (
     SELECT con_id,
@@ -121,11 +107,20 @@ CREATE CLUSTERED INDEX IX_bd_con_dt ON #bd (con_id, dt_rep);
     FROM #bd
     WHERE target_main = 1 OR target_aux = 1
 )
+/* 4.1 меняем имя */
 UPDATE b
 SET    b.prod_name_res = ln.latest_name
 FROM   #bd b
 JOIN   last_name ln ON ln.con_id = b.con_id
 WHERE  b.target_main = 1 OR b.target_aux = 1;
+
+/* 4.2 пересчитываем принадлежность */
+UPDATE b
+SET  target_main = CASE WHEN b.prod_name_res IN (SELECT prod_name_res FROM @MainProducts)
+                        THEN 1 ELSE 0 END,
+     target_aux  = CASE WHEN b.prod_name_res IN (SELECT prod_name_res FROM @AuxProducts)
+                        THEN 1 ELSE 0 END
+FROM #bd b;
 
 /* =============================================================
    5. РАСЧЁТ ФЛАГОВ
@@ -133,64 +128,44 @@ WHERE  b.target_main = 1 OR b.target_aux = 1;
 WITH step1 AS (
     SELECT *,
            MIN(CASE WHEN target_main = 1 THEN dt_rep END)
-               OVER (PARTITION BY cli_id) AS first_dt_main,
-
-           MIN(CASE WHEN target_aux  = 1 THEN dt_rep END)
-               OVER (PARTITION BY cli_id) AS first_dt_aux,
-
-           MIN(CASE WHEN target_main = 1 OR target_aux = 1 THEN dt_rep END)
-               OVER (PARTITION BY cli_id) AS first_dt_all
+               OVER (PARTITION BY cli_id) AS first_dt_main
     FROM #bd
 ),
 step2 AS (
     SELECT *,
 
-        /* --- ФУ-флаги ------------------------------------ */
-        CASE WHEN MAX(CASE WHEN dt_rep < first_dt_main THEN 1 END)
-                  OVER (PARTITION BY cli_id) = 1
-             THEN 1 ELSE 0 END                                AS fu_had_deposit_before,
+        /* --- был ли ХОТЬ ОДИН вклад ранее first_dt_main ? --- */
+        IIF( MAX(CASE WHEN dt_rep < first_dt_main THEN 1 END)
+                 OVER (PARTITION BY cli_id) = 1, 1, 0)  AS had_deposit_before,
 
-        CASE WHEN SUM(CASE WHEN target_main = 0 THEN 1 END)
-                  OVER (PARTITION BY cli_id) = 0
-             THEN 1 ELSE 0 END                                AS fu_only_overall,
+        /* --- только Main --- */
+        IIF( SUM(CASE WHEN target_main = 0 THEN 1 END)
+                 OVER (PARTITION BY cli_id) = 0, 1, 0)  AS fu_only_overall,
 
-        CASE WHEN SUM(CASE WHEN dt_rep = first_dt_main AND target_main = 0 THEN 1 END)
-                  OVER (PARTITION BY cli_id) = 0
-             THEN 1 ELSE 0 END                                AS fu_only_at_generation,
+        IIF( SUM(CASE WHEN dt_rep = first_dt_main AND target_main = 0 THEN 1 END)
+                 OVER (PARTITION BY cli_id) = 0, 1, 0)  AS fu_only_at_generation,
 
-        /* --- вспомогательные флаги ----------------------- */
-        CASE WHEN MAX(CASE WHEN dt_rep < first_dt_aux THEN 1 END)
-                  OVER (PARTITION BY cli_id) = 1
-             THEN 1 ELSE 0 END                                AS other_markets_had_deposit_before,
+        /* --- только Aux --- */
+        IIF( SUM(CASE WHEN target_aux = 0 THEN 1 END)
+                 OVER (PARTITION BY cli_id) = 0, 1, 0)  AS other_only_overall,
 
-        CASE WHEN SUM(CASE WHEN target_aux = 0 THEN 1 END)
-                  OVER (PARTITION BY cli_id) = 0
-             THEN 1 ELSE 0 END                                AS other_markets_only_overall,
+        IIF( SUM(CASE WHEN dt_rep = first_dt_main AND target_aux = 0 THEN 1 END)
+                 OVER (PARTITION BY cli_id) = 0, 1, 0)  AS other_only_at_generation,
 
-        CASE WHEN SUM(CASE WHEN dt_rep = first_dt_aux AND target_aux = 0 THEN 1 END)
-                  OVER (PARTITION BY cli_id) = 0
-             THEN 1 ELSE 0 END                                AS other_markets_only_at_generation,
+        /* --- только Main ∪ Aux --- */
+        IIF( SUM(CASE WHEN target_main = 0 AND target_aux = 0 THEN 1 END)
+                 OVER (PARTITION BY cli_id) = 0, 1, 0)  AS all_only_overall,
 
-        /* --- общий список (main+aux) --------------------- */
-        CASE WHEN MAX(CASE WHEN dt_rep < first_dt_all THEN 1 END)
-                  OVER (PARTITION BY cli_id) = 1
-             THEN 1 ELSE 0 END                                AS all_markets_had_deposit_before,
+        IIF( SUM(CASE WHEN dt_rep = first_dt_main
+                       AND target_main = 0 AND target_aux = 0 THEN 1 END)
+                 OVER (PARTITION BY cli_id) = 0, 1, 0)  AS all_only_at_generation,
 
-        CASE WHEN SUM(CASE WHEN target_main = 0 AND target_aux = 0 THEN 1 END)
-                  OVER (PARTITION BY cli_id) = 0
-             THEN 1 ELSE 0 END                                AS all_markets_only_overall,
-
-        CASE WHEN SUM(CASE WHEN dt_rep = first_dt_all
-                             AND target_main = 0 AND target_aux = 0 THEN 1 END)
-                  OVER (PARTITION BY cli_id) = 0
-             THEN 1 ELSE 0 END                                AS all_markets_only_at_generation,
-
-        /* винтаж-метки */
-        CONVERT(char(7), first_dt_main, 120)                        AS generation,
+        /* метки винтажа */
+        CONVERT(char(7), first_dt_main, 120)                  AS generation,
         CONCAT(DATEPART(year, first_dt_main),'Q',
-               DATEPART(quarter, first_dt_main))                    AS vintage_qtr
+               DATEPART(quarter, first_dt_main))              AS vintage_qtr
     FROM step1
-    WHERE first_dt_main IS NOT NULL           -- оставляем только клиентов с ФУ-вкладом
+    WHERE first_dt_main IS NOT NULL
 ),
 
 /* =============================================================
@@ -200,24 +175,26 @@ agg AS (
     SELECT
         dt_rep, cli_id, generation, vintage_qtr,
 
-        fu_had_deposit_before, fu_only_overall, fu_only_at_generation,
-        other_markets_had_deposit_before, other_markets_only_overall, other_markets_only_at_generation,
-        all_markets_had_deposit_before,   all_markets_only_overall,   all_markets_only_at_generation,
+        had_deposit_before,
+        fu_only_overall,  fu_only_at_generation,
+        other_only_overall, other_only_at_generation,
+        all_only_overall,   all_only_at_generation,
 
         section_name, tsegmentname, prod_name_res,
 
-        SUM(out_rub)                             AS sum_out_rub,
-        COUNT(DISTINCT con_id)                   AS count_con_id,
-        SUM(out_rub * rate_con)                  AS rate_obiem,
-        SUM(out_rub * rate_trf)                  AS ts_obiem,
+        SUM(out_rub)                           AS sum_out_rub,
+        COUNT(DISTINCT con_id)                 AS count_con_id,
+        SUM(out_rub * rate_con)                AS rate_obiem,
+        SUM(out_rub * rate_trf)                AS ts_obiem,
         SUM(CASE WHEN rate_con IS NOT NULL THEN out_rub END) AS vol_con,
         SUM(CASE WHEN rate_trf IS NOT NULL THEN out_rub END) AS vol_trf
     FROM step2
     GROUP BY
         dt_rep, cli_id, generation, vintage_qtr,
-        fu_had_deposit_before, fu_only_overall, fu_only_at_generation,
-        other_markets_had_deposit_before, other_markets_only_overall, other_markets_only_at_generation,
-        all_markets_had_deposit_before,   all_markets_only_overall,   all_markets_only_at_generation,
+        had_deposit_before,
+        fu_only_overall,  fu_only_at_generation,
+        other_only_overall, other_only_at_generation,
+        all_only_overall,   all_only_at_generation,
         section_name, tsegmentname, prod_name_res
 )
 
@@ -226,22 +203,24 @@ agg AS (
 ============================================================= */
 INSERT INTO alm_test.dbo.fu_vintage_results_ext (
     dt_rep, cli_id, generation, vintage_qtr,
-    fu_had_deposit_before, fu_only_overall, fu_only_at_generation,
-    other_markets_had_deposit_before, other_markets_only_overall, other_markets_only_at_generation,
-    all_markets_had_deposit_before,   all_markets_only_overall,   all_markets_only_at_generation,
+    had_deposit_before,
+    fu_only_overall,  fu_only_at_generation,
+    other_only_overall, other_only_at_generation,
+    all_only_overall,   all_only_at_generation,
     section_name, tsegmentname, prod_name_res,
     sum_out_rub, count_con_id, rate_obiem, ts_obiem,
     avg_rate_con, avg_rate_trf
 )
 SELECT
     dt_rep, cli_id, generation, vintage_qtr,
-    fu_had_deposit_before, fu_only_overall, fu_only_at_generation,
-    other_markets_had_deposit_before, other_markets_only_overall, other_markets_only_at_generation,
-    all_markets_had_deposit_before,   all_markets_only_overall,   all_markets_only_at_generation,
+    had_deposit_before,
+    fu_only_overall,  fu_only_at_generation,
+    other_only_overall, other_only_at_generation,
+    all_only_overall,   all_only_at_generation,
     section_name, tsegmentname, prod_name_res,
     sum_out_rub, count_con_id, rate_obiem, ts_obiem,
     CASE WHEN vol_con = 0 THEN NULL ELSE rate_obiem / vol_con END,
     CASE WHEN vol_trf = 0 THEN NULL ELSE ts_obiem   / vol_trf END
 FROM agg;
 
-DROP TABLE #bd;   -- уборка
+DROP TABLE #bd;   -- очистка
