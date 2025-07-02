@@ -7,7 +7,6 @@ WITH base AS (
         sum_out_rub
     FROM alm_test.dbo.fu_vintage_results_ext WITH (NOLOCK)
 ),
--- Группировка по dt_rep и fu_only_overall
 grouped AS (
     SELECT
         dt_rep,
@@ -17,50 +16,62 @@ grouped AS (
             N'Надёжный', N'Надёжный VIP', N'Надёжный премиум',
             N'Надёжный промо', N'Надёжный старт',
             N'Надёжный Т2', N'Надёжный Мегафон'
-        ) THEN sum_out_rub ELSE 0 END) AS sum_out_rub_fu,
+        ) THEN sum_out_rub ELSE 0 END) AS [Объем на ФУ, руб.],
 
         SUM(CASE WHEN prod_name_res NOT IN (
             N'Надёжный', N'Надёжный VIP', N'Надёжный премиум',
             N'Надёжный промо', N'Надёжный старт',
             N'Надёжный Т2', N'Надёжный Мегафон'
-        ) THEN sum_out_rub ELSE 0 END) AS sum_out_rub_non_fu,
+        ) THEN sum_out_rub ELSE 0 END) AS [Объем не на ФУ, руб.],
 
-        SUM(sum_out_rub) AS sum_out_rub_total,
+        SUM(sum_out_rub) AS [Объем всего, руб.],
 
         COUNT(DISTINCT CASE WHEN prod_name_res IN (
             N'Надёжный', N'Надёжный VIP', N'Надёжный премиум',
             N'Надёжный промо', N'Надёжный старт',
             N'Надёжный Т2', N'Надёжный Мегафон'
-        ) THEN cli_id END) AS cnt_clients_fu,
+        ) THEN cli_id END) AS [Уникальных клиентов на ФУ],
 
         COUNT(DISTINCT CASE WHEN prod_name_res NOT IN (
             N'Надёжный', N'Надёжный VIP', N'Надёжный премиум',
             N'Надёжный промо', N'Надёжный старт',
             N'Надёжный Т2', N'Надёжный Мегафон'
-        ) THEN cli_id END) AS cnt_clients_non_fu,
+        ) THEN cli_id END) AS [Уникальных клиентов не на ФУ],
 
-        COUNT(DISTINCT cli_id) AS cnt_clients_total
+        COUNT(DISTINCT cli_id) AS [Уникальных клиентов всего]
     FROM base
     GROUP BY dt_rep, fu_only_overall
 ),
--- Добавляем строку "итого" по всем клиентам в месяц
 totals AS (
     SELECT
         dt_rep,
         2 AS fu_only_overall,
-        SUM(sum_out_rub_fu)       AS sum_out_rub_fu,
-        SUM(sum_out_rub_non_fu)   AS sum_out_rub_non_fu,
-        SUM(sum_out_rub_total)    AS sum_out_rub_total,
-        SUM(cnt_clients_fu)       AS cnt_clients_fu,
-        SUM(cnt_clients_non_fu)   AS cnt_clients_non_fu,
-        SUM(cnt_clients_total)    AS cnt_clients_total
+        SUM([Объем на ФУ, руб.])            AS [Объем на ФУ, руб.],
+        SUM([Объем не на ФУ, руб.])         AS [Объем не на ФУ, руб.],
+        SUM([Объем всего, руб.])            AS [Объем всего, руб.],
+        SUM([Уникальных клиентов на ФУ])    AS [Уникальных клиентов на ФУ],
+        SUM([Уникальных клиентов не на ФУ]) AS [Уникальных клиентов не на ФУ],
+        SUM([Уникальных клиентов всего])    AS [Уникальных клиентов всего]
     FROM grouped
     GROUP BY dt_rep
+),
+all_data AS (
+    SELECT * FROM grouped
+    UNION ALL
+    SELECT * FROM totals
 )
--- Объединяем основной расчёт и итого
-SELECT *
-FROM grouped
-UNION ALL
-SELECT *
-FROM totals
-ORDER BY dt_rep, fu_only_overall;
+SELECT
+    dt_rep,
+    CASE fu_only_overall
+        WHEN 1 THEN N'У клиента были вклады только на ФУ'
+        WHEN 0 THEN N'У клиента были продукты Банка'
+        WHEN 2 THEN N'Тотал'
+    END AS [Категория клиентов],
+    [Объем на ФУ, руб.],
+    [Объем не на ФУ, руб.],
+    [Объем всего, руб.],
+    [Уникальных клиентов на ФУ],
+    [Уникальных клиентов не на ФУ],
+    [Уникальных клиентов всего]
+FROM all_data
+ORDER BY dt_rep, [Категория клиентов];
