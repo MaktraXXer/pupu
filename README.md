@@ -1,162 +1,247 @@
-/* ===== 0. базовая выборка ===== */
-WITH base AS (
-    SELECT
-        dt_rep,
-        cli_id,
-        fu_only_overall,
-        fu_had_deposit_before,
-        prod_name_res,
-        sum_out_rub
-    FROM alm_test.dbo.fu_vintage_results_ext WITH (NOLOCK)
-),
+/* =============================================================
+   0. ПЕРИОД + СПИСОК ДАТ dt_rep
+============================================================= */
+DECLARE @DateFrom date = '2024-01-31';
+DECLARE @DateTo   date = '2025-06-30';
 
-/* ===== 1. агрегат по полной комбинации (0/1) × (0/1) ===== */
-grp_core AS (
-    SELECT
-        dt_rep,
-        fu_only_overall,
-        fu_had_deposit_before,
+DECLARE @RepDates TABLE (d date PRIMARY KEY);
+INSERT INTO @RepDates VALUES
+('2024-01-31'),('2024-02-29'),('2024-03-31'),('2024-04-30'),
+('2024-05-31'),('2024-06-30'),('2024-07-31'),('2024-08-31'),
+('2024-09-30'),('2024-10-31'),('2024-11-30'),('2024-12-31'),
+('2025-01-31'),('2025-02-28'),('2025-03-31'),('2025-04-30'),
+('2025-05-31'),('2025-06-30');
 
-        /* объёмы */
-        SUM(CASE WHEN prod_name_res IN (
-              N'Надёжный', N'Надёжный VIP', N'Надёжный премиум',
-              N'Надёжный промо', N'Надёжный старт',
-              N'Надёжный Т2', N'Надёжный Мегафон'
-        ) THEN sum_out_rub ELSE 0 END)                           AS vol_fu,
+/* =============================================================
+   1. ПРИЁМНИК (пересоздаём под расчёт)
+============================================================= */
+IF OBJECT_ID('alm_test.dbo.fu_vintage_results_ext','U') IS NOT NULL
+    DROP TABLE alm_test.dbo.fu_vintage_results_ext;
 
-        SUM(CASE WHEN prod_name_res NOT IN (
-              N'Надёжный', N'Надёжный VIP', N'Надёжный премиум',
-              N'Надёжный промо', N'Надёжный старт',
-              N'Надёжный Т2', N'Надёжный Мегафон'
-        ) THEN sum_out_rub ELSE 0 END)                           AS vol_non_fu,
+CREATE TABLE alm_test.dbo.fu_vintage_results_ext (
+    dt_rep             date          NOT NULL,
+    cli_id             bigint        NOT NULL,
+    generation         char(7)       NOT NULL,
+    vintage_qtr        char(6)       NOT NULL,
 
-        SUM(sum_out_rub)                                         AS vol_total,
+    /* --- 9 флагов --- */
+    fu_had_deposit_before            bit NOT NULL,
+    fu_only_overall                  bit NOT NULL,
+    fu_only_at_generation            bit NOT NULL,
 
-        /* клиенты */
-        COUNT(DISTINCT CASE WHEN prod_name_res IN (
-              N'Надёжный', N'Надёжный VIP', N'Надёжный премиум',
-              N'Надёжный промо', N'Надёжный старт',
-              N'Надёжный Т2', N'Надёжный Мегафон'
-        ) THEN cli_id END)                                       AS cli_fu,
+    other_markets_had_deposit_before bit NOT NULL,
+    other_markets_only_overall       bit NOT NULL,
+    other_markets_only_at_generation bit NOT NULL,
 
-        COUNT(DISTINCT CASE WHEN prod_name_res NOT IN (
-              N'Надёжный', N'Надёжный VIP', N'Надёжный премиум',
-              N'Надёжный промо', N'Надёжный старт',
-              N'Надёжный Т2', N'Надёжный Мегафон'
-        ) THEN cli_id END)                                       AS cli_non_fu,
+    all_markets_had_deposit_before   bit NOT NULL,
+    all_markets_only_overall         bit NOT NULL,
+    all_markets_only_at_generation   bit NOT NULL,
 
-        COUNT(DISTINCT cli_id)                                   AS cli_total
-    FROM base
-    GROUP BY dt_rep, fu_only_overall, fu_had_deposit_before
-),
-/* ===== 2. тотал по fu_only_overall (ставим 2) ===== */
-tot_fu_only AS (
-    SELECT
-        dt_rep,
-        2 AS fu_only_overall,
-        fu_had_deposit_before,
+    /* бизнес-атрибуты */
+    section_name     nvarchar(50)  NOT NULL,
+    tsegmentname     nvarchar(50)  NOT NULL,
+    prod_name_res    nvarchar(100) NOT NULL,
 
-        SUM(CASE WHEN prod_name_res IN (
-              N'Надёжный',N'Надёжный VIP',N'Надёжный премиум',
-              N'Надёжный промо',N'Надёжный старт',
-              N'Надёжный Т2',N'Надёжный Мегафон'
-        ) THEN sum_out_rub ELSE 0 END) AS [vol_fu],
+    /* метрики */
+    sum_out_rub      decimal(20,2) NOT NULL,
+    count_con_id     int           NOT NULL,
+    rate_obiem       decimal(20,2) NOT NULL,
+    ts_obiem         decimal(20,2) NOT NULL,
+    avg_rate_con     decimal(18,4) NULL,
+    avg_rate_trf     decimal(18,4) NULL,
 
-        SUM(CASE WHEN prod_name_res NOT IN (
-              N'Надёжный',N'Надёжный VIP',N'Надёжный премиум',
-              N'Надёжный промо',N'Надёжный старт',
-              N'Надёжный Т2',N'Надёжный Мегафон'
-        ) THEN sum_out_rub ELSE 0 END) AS [vol_non_fu],
+    load_timestamp   datetime2 NOT NULL
+        CONSTRAINT DF_vint_ext_load DEFAULT (sysutcdatetime()),
 
-        SUM(sum_out_rub) AS [vol_total],
+    CONSTRAINT PK_fu_vint_ext
+        PRIMARY KEY CLUSTERED (dt_rep, cli_id,
+                               section_name, tsegmentname, prod_name_res)
+);
+GO
 
-        COUNT(DISTINCT CASE WHEN prod_name_res IN (
-              N'Надёжный',N'Надёжный VIP',N'Надёжный премиум',
-              N'Надёжный промо',N'Надёжный старт',
-              N'Надёжный Т2',N'Надёжный Мегафон'
-        ) THEN cli_id END) AS [cli_fu],
+/* индексы для удобства */
+CREATE INDEX IX_fu_vint_ext_rep_gen
+    ON alm_test.dbo.fu_vintage_results_ext (dt_rep, generation);
+CREATE INDEX IX_fu_vint_ext_vint_had
+    ON alm_test.dbo.fu_vintage_results_ext (vintage_qtr, fu_had_deposit_before);
 
-        COUNT(DISTINCT CASE WHEN prod_name_res NOT IN (
-              N'Надёжный',N'Надёжный VIP',N'Надёжный премиум',
-              N'Надёжный промо',N'Надёжный старт',
-              N'Надёжный Т2',N'Надёжный Мегафон'
-        ) THEN cli_id END) AS [cli_non_fu],
+/* =============================================================
+   2. СПРАВОЧНИКИ ПРОДУКТОВ
+============================================================= */
+DECLARE @MainProducts TABLE(prod_name_res nvarchar(100) PRIMARY KEY);
+INSERT INTO @MainProducts VALUES
+(N'Надёжный'), (N'Надёжный VIP'), (N'Надёжный премиум'),
+(N'Надёжный промо'), (N'Надёжный старт'),
+(N'Надёжный Т2'), (N'Надёжный Мегафон');
 
-        COUNT(DISTINCT cli_id) AS [cli_total]
+DECLARE @AuxProducts TABLE(prod_name_res nvarchar(100) PRIMARY KEY);
+INSERT INTO @AuxProducts VALUES
+(N'ДОМа надёжно'), (N'Всё в ДОМ');
 
-    FROM base
-    GROUP BY dt_rep, fu_had_deposit_before
-),
-/* ===== 3. тотал по fu_had_deposit_before (ставим 2) ===== */
-tot_had_before AS (
-    SELECT
-        dt_rep,
-        fu_only_overall,
-        2            AS fu_had_deposit_before,
-        SUM(vol_fu)     AS vol_fu,
-        SUM(vol_non_fu) AS vol_non_fu,
-        SUM(vol_total)  AS vol_total,
-        SUM(cli_fu)     AS cli_fu,
-        SUM(cli_non_fu) AS cli_non_fu,
-        SUM(cli_total)  AS cli_total
-    FROM grp_core
-    GROUP BY dt_rep, fu_only_overall
-),
+/* =============================================================
+   3. ВЫГРУЗКА ДАННЫХ ВО ВРЕМЕННУЮ ТАБЛИЦУ
+============================================================= */
+DROP TABLE IF EXISTS #bd;
 
-/* ===== 4. гран-тотал (2,2) ===== */
-tot_tot AS (
-    SELECT
-        dt_rep,
-        2 AS fu_only_overall,
-        2 AS fu_had_deposit_before,
-        SUM(vol_fu)     AS vol_fu,
-        SUM(vol_non_fu) AS vol_non_fu,
-        SUM(vol_total)  AS vol_total,
-        SUM(cli_fu)     AS cli_fu,
-        SUM(cli_non_fu) AS cli_non_fu,
-        SUM(cli_total)  AS cli_total
-    FROM grp_core
-    GROUP BY dt_rep
-)
-
-/* ===== 5. объединяем всё ===== */
-, union_all AS (
-    SELECT * FROM grp_core
-    UNION ALL
-    SELECT * FROM tot_fu_only
-    UNION ALL
-    SELECT * FROM tot_had_before
-    UNION ALL
-    SELECT * FROM tot_tot
-)
-
-/* ===== 6. человекочитаемые категории + вывод ===== */
 SELECT
-    dt_rep,
+    bra.cli_id,
+    bra.con_id,
+    bra.dt_rep,
+    bra.section_name,
+    bra.tsegmentname,
+    bra.prod_name_res,
+    bra.out_rub,
+    bra.rate_con,
+    bra.rate_trf,
 
-    CASE fu_only_overall
-        WHEN 0 THEN N'У клиента были продукты Банка'
-        WHEN 1 THEN N'У клиента были вклады только на ФУ'
-        WHEN 2 THEN N'Тотал по FU_ONLY'
-    END   AS Категория_FU_ONLY,
+    /* признаки принадлежности к спискам */
+    IIF(mp.prod_name_res IS NOT NULL, 1, 0) AS target_main,
+    IIF(ap.prod_name_res IS NOT NULL, 1, 0) AS target_aux
+INTO #bd
+FROM  ALM.ALM.Balance_Rest_All bra WITH (NOLOCK)
+JOIN  @RepDates r ON r.d = bra.dt_rep
+LEFT JOIN @MainProducts mp ON mp.prod_name_res = bra.prod_name_res
+LEFT JOIN @AuxProducts ap ON ap.prod_name_res = bra.prod_name_res
+WHERE bra.section_name IN (N'Срочные',N'До востребования',N'Накопительный счёт')
+  AND bra.cur = '810'  AND bra.od_flag = 1  AND bra.is_floatrate = 0
+  AND bra.acc_role = 'LIAB'  AND bra.ap = 'Пассив'
+  AND bra.tsegmentname IN (N'ДЧБО',N'Розничный бизнес')
+  AND bra.block_name = N'Привлечение ФЛ'
+  AND bra.out_rub IS NOT NULL;
 
-    CASE fu_had_deposit_before
-        WHEN 0 THEN N'У клиента не было продуктов Банка до открытия на ФУ'
-        WHEN 1 THEN N'У клиента были продукты Банка до открытия на ФУ'
-        WHEN 2 THEN N'Тотал по HAD_BEFORE'
-    END   AS Категория_HAD_BEFORE,
+CREATE CLUSTERED INDEX IX_bd_con_dt ON #bd (con_id, dt_rep);
 
-    vol_fu      AS [Объем на ФУ, руб.],
-    vol_non_fu  AS [Объем не на ФУ, руб.],
-    vol_total   AS [Объем всего, руб.],
+/* =============================================================
+   4. ПЕРЕИМЕНОВАНИЕ (по последнему названию) ДЛЯ целевых СПИСКОВ
+============================================================= */
+;WITH last_name AS (
+    SELECT con_id,
+           FIRST_VALUE(prod_name_res)
+             OVER (PARTITION BY con_id ORDER BY dt_rep DESC) AS latest_name
+    FROM #bd
+    WHERE target_main = 1 OR target_aux = 1
+)
+UPDATE b
+SET    b.prod_name_res = ln.latest_name
+FROM   #bd b
+JOIN   last_name ln ON ln.con_id = b.con_id
+WHERE  b.target_main = 1 OR b.target_aux = 1;
 
-    cli_fu      AS [Уникальных клиентов на ФУ],
-    cli_non_fu  AS [Уникальных клиентов не на ФУ],
-    cli_total   AS [Уникальных клиентов всего]
+/* =============================================================
+   5. РАСЧЁТ ФЛАГОВ
+============================================================= */
+WITH step1 AS (
+    SELECT *,
+           MIN(CASE WHEN target_main = 1 THEN dt_rep END)
+               OVER (PARTITION BY cli_id) AS first_dt_main,
 
-FROM union_all
-ORDER BY dt_rep,
-         Категория_FU_ONLY,
-         Категория_HAD_BEFORE;
+           MIN(CASE WHEN target_aux  = 1 THEN dt_rep END)
+               OVER (PARTITION BY cli_id) AS first_dt_aux,
 
-этот запрос сработает?
+           MIN(CASE WHEN target_main = 1 OR target_aux = 1 THEN dt_rep END)
+               OVER (PARTITION BY cli_id) AS first_dt_all
+    FROM #bd
+),
+step2 AS (
+    SELECT *,
+
+        /* --- ФУ-флаги ------------------------------------ */
+        CASE WHEN MAX(CASE WHEN dt_rep < first_dt_main THEN 1 END)
+                  OVER (PARTITION BY cli_id) = 1
+             THEN 1 ELSE 0 END                                AS fu_had_deposit_before,
+
+        CASE WHEN SUM(CASE WHEN target_main = 0 THEN 1 END)
+                  OVER (PARTITION BY cli_id) = 0
+             THEN 1 ELSE 0 END                                AS fu_only_overall,
+
+        CASE WHEN SUM(CASE WHEN dt_rep = first_dt_main AND target_main = 0 THEN 1 END)
+                  OVER (PARTITION BY cli_id) = 0
+             THEN 1 ELSE 0 END                                AS fu_only_at_generation,
+
+        /* --- вспомогательные флаги ----------------------- */
+        CASE WHEN MAX(CASE WHEN dt_rep < first_dt_aux THEN 1 END)
+                  OVER (PARTITION BY cli_id) = 1
+             THEN 1 ELSE 0 END                                AS other_markets_had_deposit_before,
+
+        CASE WHEN SUM(CASE WHEN target_aux = 0 THEN 1 END)
+                  OVER (PARTITION BY cli_id) = 0
+             THEN 1 ELSE 0 END                                AS other_markets_only_overall,
+
+        CASE WHEN SUM(CASE WHEN dt_rep = first_dt_aux AND target_aux = 0 THEN 1 END)
+                  OVER (PARTITION BY cli_id) = 0
+             THEN 1 ELSE 0 END                                AS other_markets_only_at_generation,
+
+        /* --- общий список (main+aux) --------------------- */
+        CASE WHEN MAX(CASE WHEN dt_rep < first_dt_all THEN 1 END)
+                  OVER (PARTITION BY cli_id) = 1
+             THEN 1 ELSE 0 END                                AS all_markets_had_deposit_before,
+
+        CASE WHEN SUM(CASE WHEN target_main = 0 AND target_aux = 0 THEN 1 END)
+                  OVER (PARTITION BY cli_id) = 0
+             THEN 1 ELSE 0 END                                AS all_markets_only_overall,
+
+        CASE WHEN SUM(CASE WHEN dt_rep = first_dt_all
+                             AND target_main = 0 AND target_aux = 0 THEN 1 END)
+                  OVER (PARTITION BY cli_id) = 0
+             THEN 1 ELSE 0 END                                AS all_markets_only_at_generation,
+
+        /* винтаж-метки */
+        CONVERT(char(7), first_dt_main, 120)                        AS generation,
+        CONCAT(DATEPART(year, first_dt_main),'Q',
+               DATEPART(quarter, first_dt_main))                    AS vintage_qtr
+    FROM step1
+    WHERE first_dt_main IS NOT NULL           -- оставляем только клиентов с ФУ-вкладом
+),
+
+/* =============================================================
+   6. АГРЕГАЦИЯ
+============================================================= */
+agg AS (
+    SELECT
+        dt_rep, cli_id, generation, vintage_qtr,
+
+        fu_had_deposit_before, fu_only_overall, fu_only_at_generation,
+        other_markets_had_deposit_before, other_markets_only_overall, other_markets_only_at_generation,
+        all_markets_had_deposit_before,   all_markets_only_overall,   all_markets_only_at_generation,
+
+        section_name, tsegmentname, prod_name_res,
+
+        SUM(out_rub)                             AS sum_out_rub,
+        COUNT(DISTINCT con_id)                   AS count_con_id,
+        SUM(out_rub * rate_con)                  AS rate_obiem,
+        SUM(out_rub * rate_trf)                  AS ts_obiem,
+        SUM(CASE WHEN rate_con IS NOT NULL THEN out_rub END) AS vol_con,
+        SUM(CASE WHEN rate_trf IS NOT NULL THEN out_rub END) AS vol_trf
+    FROM step2
+    GROUP BY
+        dt_rep, cli_id, generation, vintage_qtr,
+        fu_had_deposit_before, fu_only_overall, fu_only_at_generation,
+        other_markets_had_deposit_before, other_markets_only_overall, other_markets_only_at_generation,
+        all_markets_had_deposit_before,   all_markets_only_overall,   all_markets_only_at_generation,
+        section_name, tsegmentname, prod_name_res
+)
+
+/* =============================================================
+   7. ЗАПИСЬ В ПРИЁМНИК
+============================================================= */
+INSERT INTO alm_test.dbo.fu_vintage_results_ext (
+    dt_rep, cli_id, generation, vintage_qtr,
+    fu_had_deposit_before, fu_only_overall, fu_only_at_generation,
+    other_markets_had_deposit_before, other_markets_only_overall, other_markets_only_at_generation,
+    all_markets_had_deposit_before,   all_markets_only_overall,   all_markets_only_at_generation,
+    section_name, tsegmentname, prod_name_res,
+    sum_out_rub, count_con_id, rate_obiem, ts_obiem,
+    avg_rate_con, avg_rate_trf
+)
+SELECT
+    dt_rep, cli_id, generation, vintage_qtr,
+    fu_had_deposit_before, fu_only_overall, fu_only_at_generation,
+    other_markets_had_deposit_before, other_markets_only_overall, other_markets_only_at_generation,
+    all_markets_had_deposit_before,   all_markets_only_overall,   all_markets_only_at_generation,
+    section_name, tsegmentname, prod_name_res,
+    sum_out_rub, count_con_id, rate_obiem, ts_obiem,
+    CASE WHEN vol_con = 0 THEN NULL ELSE rate_obiem / vol_con END,
+    CASE WHEN vol_trf = 0 THEN NULL ELSE ts_obiem   / vol_trf END
+FROM agg;
+
+DROP TABLE #bd;   -- уборка
