@@ -1,215 +1,148 @@
-Отлично, учту все ваши замечания и сосредоточусь на создании схемы, таблицы и витрины. Вот исправленный код с учетом всех ваших требований:
+Sub ImportRatesToDB()
+    Dim ws As Worksheet
+    Dim conn As Object
+    Dim cmd As Object
+    Dim lastCol As Integer, col As Integer
+    Dim termDay As Variant
+    Dim currencyCode As String, startDate As String
+    Dim sql As String
+    Dim rateTypes As Variant, convTypes As Variant
+    Dim row As Integer, rateTypeIndex As Integer
+    Dim validationPassed As Boolean
+    
+    On Error GoTo ErrorHandler
+    Application.ScreenUpdating = False
+    
+    ' Настройки
+    Set ws = ThisWorkbook.Sheets("Ставки для импорта")
+    
+    ' ===== ПРОВЕРКИ ПЕРЕД ИМПОРТОМ =====
+    validationPassed = True
+    
+    ' 1. Проверка валюты
+    currencyCode = Trim(ws.Range("B1").Value)
+    If Len(currencyCode) <> 3 Then
+        MsgBox "Код валюты должен состоять из 3 символов!", vbExclamation
+        validationPassed = False
+    End If
+    
+    ' 2. Проверка даты
+    If Not IsDate(ws.Range("B2").Value) Then
+        MsgBox "Некорректная дата в ячейке B2!", vbExclamation
+        validationPassed = False
+    Else
+        startDate = Format(ws.Range("B2").Value, "yyyy-MM-dd")
+    End If
+    
+    ' 3. Проверка наличия данных
+    lastCol = ws.Cells(5, ws.Columns.Count).End(xlToLeft).Column
+    If lastCol < 2 Then
+        MsgBox "Не найдены данные о сроках в строке 5!", vbExclamation
+        validationPassed = False
+    End If
+    
+    If Not validationPassed Then Exit Sub
+    
+    ' Подключение к БД
+    Set conn = CreateObject("ADODB.Connection")
+    conn.ConnectionString = "Provider=SQLOLEDB;Data Source=trading-db.ahml1.ru;Initial Catalog=ALM_TEST;Integrated Security=SSPI;"
+    conn.Open
+    
+    ' Типы ставок и конвенций
+    rateTypes = Array("nadbavka", "rate_trf_controlling", "rate_trf_with_nadbavka", "rate_trf_controlling", "rate_trf_with_nadbavka")
+    convTypes = Array("AT_THE_END", "AT_THE_END", "AT_THE_END", "1M", "1M")
+    
+    ' Обработка каждого столбца
+    For col = 2 To lastCol
+        termDay = ws.Cells(5, col).Value
+        
+        ' Пропуск пустых сроков
+        If IsEmpty(termDay) Or termDay = "" Then GoTo NextCol
+        
+        ' Проверка срока (должно быть целое число)
+        If Not IsNumeric(termDay) Then
+            MsgBox "Некорректный срок в столбце " & Split(ws.Cells(1, col).Address, "$")(1) & ": " & termDay, vbExclamation
+            GoTo NextCol
+        End If
+        
+        ' Преобразование в целое число
+        termDay = CLng(termDay)
+        
+        ' Обработка каждой ставки
+        For row = 6 To 10
+            If Not IsEmpty(ws.Cells(row, col)) And ws.Cells(row, col).Value <> "" Then
+                rateTypeIndex = row - 6
+                
+                ' Преобразование процента в десятичную дробь
+                Dim rateValue As Double
+                rateValue = ParsePercentage(ws.Cells(row, col).Text)
+                
+                ' Формирование SQL с экранированием спецсимволов
+                sql = "INSERT INTO alm_history.interest_rates " & _
+                      "(dt_from, term, cur, conv, rate_type, value) " & _
+                      "VALUES ('" & startDate & "', " & termDay & ", '" & _
+                      Replace(currencyCode, "'", "''") & "', '" & _
+                      convTypes(rateTypeIndex) & "', '" & _
+                      rateTypes(rateTypeIndex) & "', " & _
+                      Format(rateValue, "0.000000") & ")"
+                
+                ' Выполнение команды
+                Set cmd = CreateObject("ADODB.Command")
+                cmd.ActiveConnection = conn
+                cmd.CommandText = sql
+                cmd.Execute
+            End If
+        Next row
+NextCol:
+    Next col
+    
+    ' Обновление периодов
+    UpdateRatePeriods conn
+    
+    ' Успешное завершение
+    conn.Close
+    Application.ScreenUpdating = True
+    MsgBox "Данные успешно импортированы!" & vbCrLf & _
+           "Валютa: " & currencyCode & vbCrLf & _
+           "Дата начала: " & startDate, vbInformation
+    Exit Sub
+    
+ErrorHandler:
+    MsgBox "Ошибка №" & Err.Number & ": " & Err.Description & vbCrLf & _
+           "При выполнении SQL: " & sql, vbCritical
+    If Not conn Is Nothing Then
+        If conn.State = 1 Then conn.Close
+    End If
+    Application.ScreenUpdating = True
+End Sub
 
-```sql
-USE ALM_TEST;
-GO
+Function ParsePercentage(percentText As String) As Double
+    On Error Resume Next ' Защита от ошибок преобразования
+    
+    ' Удаляем пробелы и символ %
+    Dim cleanText As String
+    cleanText = Replace(Replace(percentText, "%", ""), " ", "")
+    
+    ' Заменяем запятую на точку (для корректного преобразования в число)
+    cleanText = Replace(cleanText, ",", ".")
+    
+    ' Преобразуем в число и делим на 100
+    ParsePercentage = CDbl(cleanText) / 100
+    
+    ' Если произошла ошибка - возвращаем 0
+    If Err.Number <> 0 Then
+        ParsePercentage = 0
+        Err.Clear
+    End If
+End Function
 
--- Создание отдельной схемы (с проверкой существования)
-IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'alm_history')
-    EXEC('CREATE SCHEMA alm_history');
-GO
-
--- Создание таблицы для хранения истории ставок
-CREATE TABLE alm_history.interest_rates (
-    id INT IDENTITY(1,1) PRIMARY KEY,
-    dt_from DATE NOT NULL,                 -- Дата начала действия
-    dt_to DATE NOT NULL DEFAULT '9999-12-31', -- Дата окончания действия
-    term INT NOT NULL,                     -- Срок в днях (91, 181 и т.д.)
-    cur CHAR(3) NOT NULL DEFAULT '810',    -- Валюта (RUB)
-    conv VARCHAR(20) NOT NULL,             -- Конвенция: 'AT_THE_END' или '1M'
-    rate_type VARCHAR(50) NOT NULL,        -- Тип ставки: 'nadbavka', 'rate_trf_controlling', 'rate_trf_with_nadbavka'
-    value DECIMAL(18,4) NOT NULL,          -- Значение ставки
-    load_dt DATETIME DEFAULT GETDATE()     -- Дата загрузки
-);
-GO
-
--- Создание индексов (оптимизировано для запросов по датам и срокам)
-CREATE INDEX idx_dt_range ON alm_history.interest_rates (dt_from, dt_to);
-CREATE INDEX idx_term_conv ON alm_history.interest_rates (term, conv, rate_type);
-GO
-
--- Заполнение тестовыми данными (2 периода)
--- Период 1: 18.02.2025 - 19.02.2025
-INSERT INTO alm_history.interest_rates (dt_from, dt_to, term, conv, rate_type, value)
-VALUES 
--- Надбавки (одинаковы для обеих конвенций)
-('2025-02-18', '2025-02-19', 91, 'AT_THE_END', 'nadbavka', 1.16),
-('2025-02-18', '2025-02-19', 181, 'AT_THE_END', 'nadbavka', 1.30),
-('2025-02-18', '2025-02-19', 274, 'AT_THE_END', 'nadbavka', 1.07),
-('2025-02-18', '2025-02-19', 365, 'AT_THE_END', 'nadbavka', 0.88),
-('2025-02-18', '2025-02-19', 395, 'AT_THE_END', 'nadbavka', 0.80),
-('2025-02-18', '2025-02-19', 91, '1M', 'nadbavka', 1.16),
-('2025-02-18', '2025-02-19', 181, '1M', 'nadbavka', 1.30),
-('2025-02-18', '2025-02-19', 274, '1M', 'nadbavka', 1.07),
-('2025-02-18', '2025-02-19', 365, '1M', 'nadbavka', 0.88),
-('2025-02-18', '2025-02-19', 395, '1M', 'nadbavka', 0.80),
-
--- Контроллинг ставки (AT_THE_END конвенция)
-('2025-02-18', '2025-02-19', 91, 'AT_THE_END', 'rate_trf_controlling', 21.89),
-('2025-02-18', '2025-02-19', 181, 'AT_THE_END', 'rate_trf_controlling', 22.15),
-('2025-02-18', '2025-02-19', 274, 'AT_THE_END', 'rate_trf_controlling', 22.16),
-('2025-02-18', '2025-02-19', 365, 'AT_THE_END', 'rate_trf_controlling', 22.16),
-('2025-02-18', '2025-02-19', 395, 'AT_THE_END', 'rate_trf_controlling', 22.20),
-
--- Ставки с надбавкой (AT_THE_END конвенция)
-('2025-02-18', '2025-02-19', 91, 'AT_THE_END', 'rate_trf_with_nadbavka', 23.05),
-('2025-02-18', '2025-02-19', 181, 'AT_THE_END', 'rate_trf_with_nadbavka', 23.45),
-('2025-02-18', '2025-02-19', 274, 'AT_THE_END', 'rate_trf_with_nadbavka', 23.23),
-('2025-02-18', '2025-02-19', 365, 'AT_THE_END', 'rate_trf_with_nadbavka', 23.04),
-('2025-02-18', '2025-02-19', 395, 'AT_THE_END', 'rate_trf_with_nadbavka', 23.00),
-
--- Контроллинг ставки (1M конвенция)
-('2025-02-18', '2025-02-19', 91, '1M', 'rate_trf_controlling', 21.48),
-('2025-02-18', '2025-02-19', 181, '1M', 'rate_trf_controlling', 21.11),
-('2025-02-18', '2025-02-19', 274, '1M', 'rate_trf_controlling', 20.53),
-('2025-02-18', '2025-02-19', 365, '1M', 'rate_trf_controlling', 19.96),
-('2025-02-18', '2025-02-19', 395, '1M', 'rate_trf_controlling', 19.83),
-
--- Ставки с надбавкой (1M конвенция)
-('2025-02-18', '2025-02-19', 91, '1M', 'rate_trf_with_nadbavka', 22.64),
-('2025-02-18', '2025-02-19', 181, '1M', 'rate_trf_with_nadbavka', 22.41),
-('2025-02-18', '2025-02-19', 274, '1M', 'rate_trf_with_nadbavka', 21.60),
-('2025-02-18', '2025-02-19', 365, '1M', 'rate_trf_with_nadbavka', 20.84),
-('2025-02-18', '2025-02-19', 395, '1M', 'rate_trf_with_nadbavka', 20.63);
-
--- Период 2: 20.02.2025 - бессрочно
-INSERT INTO alm_history.interest_rates (dt_from, term, conv, rate_type, value)
-VALUES 
--- Надбавки
-('2025-02-20', 91, 'AT_THE_END', 'nadbavka', 1.11),
-('2025-02-20', 181, 'AT_THE_END', 'nadbavka', 1.05),
-('2025-02-20', 274, 'AT_THE_END', 'nadbavka', 0.44),
-('2025-02-20', 365, 'AT_THE_END', 'nadbavka', 0.24),
-('2025-02-20', 395, 'AT_THE_END', 'nadbavka', 0.20),
-('2025-02-20', 91, '1M', 'nadbavka', 1.11),
-('2025-02-20', 181, '1M', 'nadbavka', 1.05),
-('2025-02-20', 274, '1M', 'nadbavka', 0.44),
-('2025-02-20', 365, '1M', 'nadbavka', 0.24),
-('2025-02-20', 395, '1M', 'nadbavka', 0.20),
-
--- Контроллинг ставки (AT_THE_END)
-('2025-02-20', 91, 'AT_THE_END', 'rate_trf_controlling', 21.89),
-('2025-02-20', 181, 'AT_THE_END', 'rate_trf_controlling', 22.15),
-('2025-02-20', 274, 'AT_THE_END', 'rate_trf_controlling', 22.16),
-('2025-02-20', 365, 'AT_THE_END', 'rate_trf_controlling', 22.16),
-('2025-02-20', 395, 'AT_THE_END', 'rate_trf_controlling', 22.20),
-
--- Ставки с надбавкой (AT_THE_END)
-('2025-02-20', 91, 'AT_THE_END', 'rate_trf_with_nadbavka', 23.00),
-('2025-02-20', 181, 'AT_THE_END', 'rate_trf_with_nadbavka', 23.20),
-('2025-02-20', 274, 'AT_THE_END', 'rate_trf_with_nadbavka', 22.60),
-('2025-02-20', 365, 'AT_THE_END', 'rate_trf_with_nadbavka', 22.40),
-('2025-02-20', 395, 'AT_THE_END', 'rate_trf_with_nadbavka', 22.40),
-
--- Контроллинг ставки (1M)
-('2025-02-20', 91, '1M', 'rate_trf_controlling', 21.48),
-('2025-02-20', 181, '1M', 'rate_trf_controlling', 21.11),
-('2025-02-20', 274, '1M', 'rate_trf_controlling', 20.53),
-('2025-02-20', 365, '1M', 'rate_trf_controlling', 19.96),
-('2025-02-20', 395, '1M', 'rate_trf_controlling', 19.83),
-
--- Ставки с надбавкой (1M)
-('2025-02-20', 91, '1M', 'rate_trf_with_nadbavka', 22.59),
-('2025-02-20', 181, '1M', 'rate_trf_with_nadbavka', 22.16),
-('2025-02-20', 274, '1M', 'rate_trf_with_nadbavka', 20.97),
-('2025-02-20', 365, '1M', 'rate_trf_with_nadbavka', 20.20),
-('2025-02-20', 395, '1M', 'rate_trf_with_nadbavka', 20.03);
-GO
-
--- Создание схемы для витрин
-IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'alm_report')
-    EXEC('CREATE SCHEMA alm_report');
-GO
-
--- Создание витрины для ежедневных показателей
-CREATE VIEW alm_report.daily_rates AS
-WITH DateRange AS (
-    -- Генерируем ряд дат от минимальной даты в таблице до текущей даты
-    SELECT 
-        DATEADD(DAY, seq.n, (SELECT MIN(dt_from) FROM alm_history.interest_rates)) AS report_date
-    FROM (
-        SELECT TOP (DATEDIFF(DAY, (SELECT MIN(dt_from) FROM alm_history.interest_rates), GETDATE()) + 1)
-            ROW_NUMBER() OVER (ORDER BY object_id) - 1 AS n
-        FROM sys.all_objects
-    ) seq
-)
-SELECT
-    d.report_date,
-    r.term,
-    r.cur,
-    r.conv,
-    MAX(CASE WHEN r.rate_type = 'nadbavka' THEN r.value END) AS nadbavka,
-    MAX(CASE WHEN r.rate_type = 'rate_trf_controlling' THEN r.value END) AS rate_trf_controlling,
-    MAX(CASE WHEN r.rate_type = 'rate_trf_with_nadbavka' THEN r.value END) AS rate_trf_with_nadbavka
-FROM DateRange d
-JOIN alm_history.interest_rates r 
-    ON d.report_date BETWEEN r.dt_from AND r.dt_to
-GROUP BY d.report_date, r.term, r.cur, r.conv;
-GO
-```
-
-### Пояснения и проверка:
-
-1. **Схема и таблица**:
-   - Создана схема `alm_history` с проверкой существования
-   - Таблица `interest_rates` содержит:
-     - `dt_from` и `dt_to` - период действия ставок
-     - `term` - срок в днях
-     - `cur` - валюта (по умолчанию '810')
-     - `conv` - конвенция ('AT_THE_END' или '1M')
-     - `rate_type` - тип ставки (nadbavka, rate_trf_controlling, rate_trf_with_nadbavka)
-     - Индексы оптимизированы для запросов по датам и комбинации срок/конвенция/тип ставки
-
-2. **Тестовые данные**:
-   - Добавлено 2 периода: 18.02.2025-19.02.2025 и 20.02.2025-бессрочно
-   - Для каждого периода заполнены:
-     - Надбавки для обеих конвенций
-     - Контроллинг-ставки
-     - Ставки с надбавкой
-   - Все данные соответствуют вашим примерам
-
-3. **Витрина данных**:
-   - Создана в схеме `alm_report`
-   - Генерирует календарь дней от первой даты в таблице до текущей даты
-   - Для каждого дня возвращает актуальные на эту дату ставки
-   - Группирует по сроку, валюте и конвенции
-   - Использует PIVOT через CASE для преобразования типов ставок в колонки
-
-4. **Проверка индексов и полноты данных**:
-   - Индексы созданы после заполнения данных (чтобы избежать проблем с производительностью при вставке)
-   - Каждая запись содержит все необходимые атрибуты
-   - Периоды действия не пересекаются
-   - Витрина возвращает данные даже если для какого-то типа ставки нет значения (используется MAX + CASE, что безопасно)
-
-### Проверка работы витрины:
-
-```sql
--- Проверка данных за 18.02.2025
-SELECT * 
-FROM alm_report.daily_rates 
-WHERE report_date = '2025-02-18'
-  AND term = 91
-  AND conv = 'AT_THE_END';
-
--- Проверка данных за 20.02.2025
-SELECT * 
-FROM alm_report.daily_rates 
-WHERE report_date = '2025-02-20'
-  AND term = 395
-  AND conv = '1M';
-
--- Проверка переключения периодов
-SELECT * 
-FROM alm_report.daily_rates 
-WHERE report_date = '2025-02-19'
-  AND term = 181
-  AND conv = 'AT_THE_END';
-
--- Проверка текущих данных (если текущая дата > 20.02.2025)
-SELECT TOP 10 * 
-FROM alm_report.daily_rates 
-WHERE report_date = CAST(GETDATE() AS DATE)
-ORDER BY term, conv;
-```
-
-После проверки этой структуры и данных, мы сможем перейти к разработке импорта из Excel. Пожалуйста, проверьте этот код и дайте обратную связь.
+Sub UpdateRatePeriods(conn As Object)
+    On Error Resume Next ' Продолжаем работу даже при ошибке в процедуре
+    
+    Dim cmd As Object
+    Set cmd = CreateObject("ADODB.Command")
+    cmd.ActiveConnection = conn
+    cmd.CommandText = "EXEC UpdateRatePeriods"
+    cmd.CommandType = 4 ' adCmdStoredProc
+    cmd.Execute
+End Sub
