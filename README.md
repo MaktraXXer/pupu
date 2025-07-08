@@ -1,130 +1,32 @@
-Отлично, учту все ваши замечания и сосредоточусь на создании схемы, таблицы и витрины. Вот исправленный код с учетом всех ваших требований:
+Отлично, что витрина работает. Внесу исправления по вашим замечаниям:
 
+### 1. Обновление даты окончания на '4444-01-01'
 ```sql
-USE ALM_TEST;
+-- Обновление дефолтного значения для будущих записей
+ALTER TABLE alm_history.interest_rates
+DROP CONSTRAINT [DF__interest___dt_to__xxxx]; -- заменить xxxx на реальное имя констрейнта
+
+ALTER TABLE alm_history.interest_rates
+ADD DEFAULT '4444-01-01' FOR dt_to;
 GO
 
--- Создание отдельной схемы (с проверкой существования)
-IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'alm_history')
-    EXEC('CREATE SCHEMA alm_history');
+-- Обновление существующих записей
+UPDATE alm_history.interest_rates
+SET dt_to = '4444-01-01'
+WHERE dt_to = '9999-12-31';
+GO
+```
+
+### 2. Корректировка формата данных (проценты → десятичные дроби)
+```sql
+-- Обновление существующих данных
+UPDATE alm_history.interest_rates
+SET value = value / 100.0;
 GO
 
--- Создание таблицы для хранения истории ставок
-CREATE TABLE alm_history.interest_rates (
-    id INT IDENTITY(1,1) PRIMARY KEY,
-    dt_from DATE NOT NULL,                 -- Дата начала действия
-    dt_to DATE NOT NULL DEFAULT '9999-12-31', -- Дата окончания действия
-    term INT NOT NULL,                     -- Срок в днях (91, 181 и т.д.)
-    cur CHAR(3) NOT NULL DEFAULT '810',    -- Валюта (RUB)
-    conv VARCHAR(20) NOT NULL,             -- Конвенция: 'AT_THE_END' или '1M'
-    rate_type VARCHAR(50) NOT NULL,        -- Тип ставки: 'nadbavka', 'rate_trf_controlling', 'rate_trf_with_nadbavka'
-    value DECIMAL(18,4) NOT NULL,          -- Значение ставки
-    load_dt DATETIME DEFAULT GETDATE()     -- Дата загрузки
-);
-GO
-
--- Создание индексов (оптимизировано для запросов по датам и срокам)
-CREATE INDEX idx_dt_range ON alm_history.interest_rates (dt_from, dt_to);
-CREATE INDEX idx_term_conv ON alm_history.interest_rates (term, conv, rate_type);
-GO
-
--- Заполнение тестовыми данными (2 периода)
--- Период 1: 18.02.2025 - 19.02.2025
-INSERT INTO alm_history.interest_rates (dt_from, dt_to, term, conv, rate_type, value)
-VALUES 
--- Надбавки (одинаковы для обеих конвенций)
-('2025-02-18', '2025-02-19', 91, 'AT_THE_END', 'nadbavka', 1.16),
-('2025-02-18', '2025-02-19', 181, 'AT_THE_END', 'nadbavka', 1.30),
-('2025-02-18', '2025-02-19', 274, 'AT_THE_END', 'nadbavka', 1.07),
-('2025-02-18', '2025-02-19', 365, 'AT_THE_END', 'nadbavka', 0.88),
-('2025-02-18', '2025-02-19', 395, 'AT_THE_END', 'nadbavka', 0.80),
-('2025-02-18', '2025-02-19', 91, '1M', 'nadbavka', 1.16),
-('2025-02-18', '2025-02-19', 181, '1M', 'nadbavka', 1.30),
-('2025-02-18', '2025-02-19', 274, '1M', 'nadbavka', 1.07),
-('2025-02-18', '2025-02-19', 365, '1M', 'nadbavka', 0.88),
-('2025-02-18', '2025-02-19', 395, '1M', 'nadbavka', 0.80),
-
--- Контроллинг ставки (AT_THE_END конвенция)
-('2025-02-18', '2025-02-19', 91, 'AT_THE_END', 'rate_trf_controlling', 21.89),
-('2025-02-18', '2025-02-19', 181, 'AT_THE_END', 'rate_trf_controlling', 22.15),
-('2025-02-18', '2025-02-19', 274, 'AT_THE_END', 'rate_trf_controlling', 22.16),
-('2025-02-18', '2025-02-19', 365, 'AT_THE_END', 'rate_trf_controlling', 22.16),
-('2025-02-18', '2025-02-19', 395, 'AT_THE_END', 'rate_trf_controlling', 22.20),
-
--- Ставки с надбавкой (AT_THE_END конвенция)
-('2025-02-18', '2025-02-19', 91, 'AT_THE_END', 'rate_trf_with_nadbavka', 23.05),
-('2025-02-18', '2025-02-19', 181, 'AT_THE_END', 'rate_trf_with_nadbavka', 23.45),
-('2025-02-18', '2025-02-19', 274, 'AT_THE_END', 'rate_trf_with_nadbavka', 23.23),
-('2025-02-18', '2025-02-19', 365, 'AT_THE_END', 'rate_trf_with_nadbavka', 23.04),
-('2025-02-18', '2025-02-19', 395, 'AT_THE_END', 'rate_trf_with_nadbavka', 23.00),
-
--- Контроллинг ставки (1M конвенция)
-('2025-02-18', '2025-02-19', 91, '1M', 'rate_trf_controlling', 21.48),
-('2025-02-18', '2025-02-19', 181, '1M', 'rate_trf_controlling', 21.11),
-('2025-02-18', '2025-02-19', 274, '1M', 'rate_trf_controlling', 20.53),
-('2025-02-18', '2025-02-19', 365, '1M', 'rate_trf_controlling', 19.96),
-('2025-02-18', '2025-02-19', 395, '1M', 'rate_trf_controlling', 19.83),
-
--- Ставки с надбавкой (1M конвенция)
-('2025-02-18', '2025-02-19', 91, '1M', 'rate_trf_with_nadbavka', 22.64),
-('2025-02-18', '2025-02-19', 181, '1M', 'rate_trf_with_nadbavka', 22.41),
-('2025-02-18', '2025-02-19', 274, '1M', 'rate_trf_with_nadbavka', 21.60),
-('2025-02-18', '2025-02-19', 365, '1M', 'rate_trf_with_nadbavka', 20.84),
-('2025-02-18', '2025-02-19', 395, '1M', 'rate_trf_with_nadbavka', 20.63);
-
--- Период 2: 20.02.2025 - бессрочно
-INSERT INTO alm_history.interest_rates (dt_from, term, conv, rate_type, value)
-VALUES 
--- Надбавки
-('2025-02-20', 91, 'AT_THE_END', 'nadbavka', 1.11),
-('2025-02-20', 181, 'AT_THE_END', 'nadbavka', 1.05),
-('2025-02-20', 274, 'AT_THE_END', 'nadbavka', 0.44),
-('2025-02-20', 365, 'AT_THE_END', 'nadbavka', 0.24),
-('2025-02-20', 395, 'AT_THE_END', 'nadbavka', 0.20),
-('2025-02-20', 91, '1M', 'nadbavka', 1.11),
-('2025-02-20', 181, '1M', 'nadbavka', 1.05),
-('2025-02-20', 274, '1M', 'nadbavka', 0.44),
-('2025-02-20', 365, '1M', 'nadbavka', 0.24),
-('2025-02-20', 395, '1M', 'nadbavka', 0.20),
-
--- Контроллинг ставки (AT_THE_END)
-('2025-02-20', 91, 'AT_THE_END', 'rate_trf_controlling', 21.89),
-('2025-02-20', 181, 'AT_THE_END', 'rate_trf_controlling', 22.15),
-('2025-02-20', 274, 'AT_THE_END', 'rate_trf_controlling', 22.16),
-('2025-02-20', 365, 'AT_THE_END', 'rate_trf_controlling', 22.16),
-('2025-02-20', 395, 'AT_THE_END', 'rate_trf_controlling', 22.20),
-
--- Ставки с надбавкой (AT_THE_END)
-('2025-02-20', 91, 'AT_THE_END', 'rate_trf_with_nadbavka', 23.00),
-('2025-02-20', 181, 'AT_THE_END', 'rate_trf_with_nadbavka', 23.20),
-('2025-02-20', 274, 'AT_THE_END', 'rate_trf_with_nadbavka', 22.60),
-('2025-02-20', 365, 'AT_THE_END', 'rate_trf_with_nadbavka', 22.40),
-('2025-02-20', 395, 'AT_THE_END', 'rate_trf_with_nadbavka', 22.40),
-
--- Контроллинг ставки (1M)
-('2025-02-20', 91, '1M', 'rate_trf_controlling', 21.48),
-('2025-02-20', 181, '1M', 'rate_trf_controlling', 21.11),
-('2025-02-20', 274, '1M', 'rate_trf_controlling', 20.53),
-('2025-02-20', 365, '1M', 'rate_trf_controlling', 19.96),
-('2025-02-20', 395, '1M', 'rate_trf_controlling', 19.83),
-
--- Ставки с надбавкой (1M)
-('2025-02-20', 91, '1M', 'rate_trf_with_nadbavka', 22.59),
-('2025-02-20', 181, '1M', 'rate_trf_with_nadbavka', 22.16),
-('2025-02-20', 274, '1M', 'rate_trf_with_nadbavka', 20.97),
-('2025-02-20', 365, '1M', 'rate_trf_with_nadbavka', 20.20),
-('2025-02-20', 395, '1M', 'rate_trf_with_nadbavka', 20.03);
-GO
-
--- Создание схемы для витрин
-IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'alm_report')
-    EXEC('CREATE SCHEMA alm_report');
-GO
-
--- Создание витрины для ежедневных показателей
-CREATE VIEW alm_report.daily_rates AS
+-- Обновление дефолтного представления для проверки
+ALTER VIEW alm_report.vw_daily_rates AS
 WITH DateRange AS (
-    -- Генерируем ряд дат от минимальной даты в таблице до текущей даты
     SELECT 
         DATEADD(DAY, seq.n, (SELECT MIN(dt_from) FROM alm_history.interest_rates)) AS report_date
     FROM (
@@ -148,68 +50,100 @@ GROUP BY d.report_date, r.term, r.cur, r.conv;
 GO
 ```
 
-### Пояснения и проверка:
-
-1. **Схема и таблица**:
-   - Создана схема `alm_history` с проверкой существования
-   - Таблица `interest_rates` содержит:
-     - `dt_from` и `dt_to` - период действия ставок
-     - `term` - срок в днях
-     - `cur` - валюта (по умолчанию '810')
-     - `conv` - конвенция ('AT_THE_END' или '1M')
-     - `rate_type` - тип ставки (nadbavka, rate_trf_controlling, rate_trf_with_nadbavka)
-     - Индексы оптимизированы для запросов по датам и комбинации срок/конвенция/тип ставки
-
-2. **Тестовые данные**:
-   - Добавлено 2 периода: 18.02.2025-19.02.2025 и 20.02.2025-бессрочно
-   - Для каждого периода заполнены:
-     - Надбавки для обеих конвенций
-     - Контроллинг-ставки
-     - Ставки с надбавкой
-   - Все данные соответствуют вашим примерам
-
-3. **Витрина данных**:
-   - Создана в схеме `alm_report`
-   - Генерирует календарь дней от первой даты в таблице до текущей даты
-   - Для каждого дня возвращает актуальные на эту дату ставки
-   - Группирует по сроку, валюте и конвенции
-   - Использует PIVOT через CASE для преобразования типов ставок в колонки
-
-4. **Проверка индексов и полноты данных**:
-   - Индексы созданы после заполнения данных (чтобы избежать проблем с производительностью при вставке)
-   - Каждая запись содержит все необходимые атрибуты
-   - Периоды действия не пересекаются
-   - Витрина возвращает данные даже если для какого-то типа ставки нет значения (используется MAX + CASE, что безопасно)
-
-### Проверка работы витрины:
-
+### 3. Проверка данных после изменений
 ```sql
--- Проверка данных за 18.02.2025
-SELECT * 
-FROM alm_report.daily_rates 
+-- Проверка данных за 18.02.2025 (должны быть в десятичном формате)
+SELECT 
+    report_date,
+    term,
+    conv,
+    nadbavka,
+    rate_trf_controlling,
+    rate_trf_with_nadbavka
+FROM alm_report.vw_daily_rates
 WHERE report_date = '2025-02-18'
   AND term = 91
   AND conv = 'AT_THE_END';
-
--- Проверка данных за 20.02.2025
-SELECT * 
-FROM alm_report.daily_rates 
-WHERE report_date = '2025-02-20'
-  AND term = 395
-  AND conv = '1M';
-
--- Проверка переключения периодов
-SELECT * 
-FROM alm_report.daily_rates 
-WHERE report_date = '2025-02-19'
-  AND term = 181
-  AND conv = 'AT_THE_END';
-
--- Проверка текущих данных (если текущая дата > 20.02.2025)
-SELECT TOP 10 * 
-FROM alm_report.daily_rates 
-WHERE report_date = CAST(GETDATE() AS DATE)
-ORDER BY term, conv;
 ```
 
-После проверки этой структуры и данных, мы сможем перейти к разработке импорта из Excel. Пожалуйста, проверьте этот код и дайте обратную связь.
+**Ожидаемый результат:**
+| report_date | term | conv        | nadbavka | rate_trf_controlling | rate_trf_with_nadbavka |
+|-------------|------|-------------|----------|-----------------------|------------------------|
+| 2025-02-18  | 91   | AT_THE_END | 0.0116   | 0.2189               | 0.2305                |
+
+### 4. Адаптация под импорт из Excel
+Для корректной работы с процентными значениями из Excel:
+1. Макрос будет преобразовывать проценты в десятичные дроби
+2. Примеры значений в таблице уже приведены к корректному формату
+
+**Пример обработки в VBA:**
+```vba
+' Преобразование процентной строки в десятичное число
+Function ParsePercentage(value As String) As Double
+    Dim cleanValue As String
+    cleanValue = Replace(value, "%", "")       ' Удаляем символ %
+    cleanValue = Replace(cleanValue, ",", ".") ' Заменяем запятую на точку
+    ParsePercentage = CDbl(cleanValue) / 100   ' Конвертируем в число и делим на 100
+End Function
+
+' Пример использования в коде вставки
+value = ParsePercentage(ws.Cells(i, colIdx + 1).Value)
+```
+
+### Финализированный код создания таблицы
+```sql
+USE ALM_TEST;
+GO
+
+-- Создание схемы
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'alm_history')
+    EXEC('CREATE SCHEMA alm_history');
+GO
+
+-- Создание таблицы с корректными настройками
+CREATE TABLE alm_history.interest_rates (
+    id INT IDENTITY(1,1) PRIMARY KEY,
+    dt_from DATE NOT NULL,
+    dt_to DATE NOT NULL DEFAULT '4444-01-01',
+    term INT NOT NULL,
+    cur CHAR(3) NOT NULL DEFAULT '810',
+    conv VARCHAR(20) NOT NULL,
+    rate_type VARCHAR(50) NOT NULL,
+    value DECIMAL(18,6) NOT NULL, -- Увеличили точность для процентных ставок
+    load_dt DATETIME DEFAULT GETDATE()
+);
+GO
+
+-- Индексы
+CREATE INDEX idx_dt_range ON alm_history.interest_rates (dt_from, dt_to);
+CREATE INDEX idx_term_conv ON alm_history.interest_rates (term, conv, rate_type);
+GO
+```
+
+### Преимущества решения:
+1. **Корректное хранение процентных ставок**:
+   - Все значения хранятся в десятичном формате (0.23 вместо 23%)
+   - Увеличена точность до 6 знаков после запятой
+   - Автоматическое преобразование при импорте
+
+2. **Гибкая система периодов**:
+   - Используется '4444-01-01' как дата по умолчанию
+   - Периоды не пересекаются
+   - Легкое управление историей
+
+3. **Оптимизированная витрина**:
+   - Быстрый доступ к данным за любой день
+   - Автоматическая генерация календаря дат
+   - Корректная обработка переходов между периодами
+
+4. **Подготовка к импорту**:
+   - Структура таблицы соответствует формату Excel
+   - Процентные значения автоматически конвертируются
+   - Поддерживаются разные форматы чисел (с запятой/точкой)
+
+Для полной готовности к импорту осталось:
+1. Реализовать VBA-макрос с функцией `ParsePercentage`
+2. Настроить соединение с SQL Server
+3. Добавить обработку ошибок и логирование
+
+Готов приступить к разработке макроса импорта, как только вы подтвердите корректность обновленной структуры и витрины.
