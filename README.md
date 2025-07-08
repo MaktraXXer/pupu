@@ -139,3 +139,16 @@ Sub ClosePreviousRecord(conn As Object, newStartDate As String, termDay As Long,
 End Sub
 
 ' ... [остальные функции ParsePercentage и UpdateRatePeriods без изменений] ...
+
+
+
+
+UPDATE ir
+SET ir.dt_to = '2025-05-21'
+FROM alm_history.interest_rates ir
+WHERE ir.term = 395
+AND ir.dt_from = (
+    SELECT MAX(dt_from)
+    FROM alm_history.interest_rates
+    WHERE term = 395
+);
