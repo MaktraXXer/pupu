@@ -1,55 +1,141 @@
-Ошибка возникает из-за неправильного форматирования десятичных чисел в SQL-запросе. В вашем регионе используется запятая как десятичный разделитель, но SQL требует точку. Вот исправления:
+Option Explicit
 
-**1. Обновите функцию ParsePercentage:**
-```vba
-Function ParsePercentage(percentText As String) As Double
-    On Error GoTo ErrorHandler
-    percentText = Replace(Trim(percentText), "%", "")
-    percentText = Replace(percentText, " ", "") ' Удаляем пробелы
-    percentText = Replace(percentText, ",", ".") ' Заменяем запятую на точку
-    ParsePercentage = Val(percentText) / 100
-    Exit Function
-ErrorHandler:
-    ParsePercentage = 0
+Sub ImportRatesToDB()
+    ' ... [остальной код без изменений до основного цикла обработки данных] ...
+    
+    ' Основной цикл обработки данных
+    For col = 2 To lastCol
+        termDay = ws.Cells(5, col).Value
+        
+        ' ... [проверки срока без изменений] ...
+        
+        ' Обработка каждой ставки
+        For row = 6 To 10
+            If Not IsEmpty(ws.Cells(row, col)) And ws.Cells(row, col).Value <> "" Then
+                rateTypeIndex = row - 6
+                
+                ' Преобразуем процент в долю
+                rateValue = ParsePercentage(ws.Cells(row, col).Text)
+                Debug.Print "Обрабатываем ставку: " & rateValue
+                
+                ' ===== ИЗМЕНЕНИЕ НАЧИНАЕТСЯ ЗДЕСЬ =====
+                ' Проверяем существование записи с такой же датой начала
+                Dim existingId As Long
+                existingId = FindExistingRecord(conn, startDate, termDay, currencyCode, convTypes(rateTypeIndex), rateTypes(rateTypeIndex))
+                
+                If existingId > 0 Then
+                    ' Обновляем существующую запись
+                    UpdateExistingRecord conn, existingId, rateValue
+                Else
+                    ' Закрываем предыдущую активную запись (если есть)
+                    Call ClosePreviousRecord(conn, startDate, termDay, currencyCode, convTypes(rateTypeIndex), rateTypes(rateTypeIndex))
+                    
+                    ' Вставляем новую запись
+                    sql = "INSERT INTO alm_history.interest_rates (" & _
+                            "dt_from, term, cur, conv, rate_type, value, dt_to, load_dt)" & _
+                            " VALUES ('" & startDate & "', " & termDay & ", '" & _
+                            Replace(currencyCode, "'", "''") & "', '" & _
+                            convTypes(rateTypeIndex) & "', '" & _
+                            rateTypes(rateTypeIndex) & "', " & _
+                            Replace(Format(CDbl(rateValue), "0.000000"), ",", ".") & ", '4444-01-01', GETDATE());"
+                    
+                    Debug.Print "Запрос на вставку: " & sql
+                    
+                    ' Выполняем SQL-запрос
+                    Set cmd = CreateObject("ADODB.Command")
+                    cmd.ActiveConnection = conn
+                    cmd.CommandText = sql
+                    cmd.Execute
+                End If
+                ' ===== ИЗМЕНЕНИЕ ЗАКАНЧИВАЕТСЯ ЗДЕСЬ =====
+            End If
+        Next row
+NextCol:
+    Next col
+    
+    ' ... [остальной код без изменений] ...
+End Sub
+
+' ===== НОВЫЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
+
+' Поиск существующей записи с такой же датой начала
+Function FindExistingRecord(conn As Object, dtFrom As String, term As Long, cur As String, conv As String, rateType As String) As Long
+    Dim sql As String
+    Dim rs As Object
+    
+    FindExistingRecord = 0
+    
+    sql = "SELECT id FROM alm_history.interest_rates WHERE " & _
+          "dt_from = '" & dtFrom & "' AND " & _
+          "term = " & term & " AND " & _
+          "cur = '" & Replace(cur, "'", "''") & "' AND " & _
+          "conv = '" & conv & "' AND " & _
+          "rate_type = '" & rateType & "';"
+    
+    Set rs = CreateObject("ADODB.Recordset")
+    rs.Open sql, conn, 1, 3
+    
+    If Not rs.EOF Then
+        FindExistingRecord = rs.Fields("id").Value
+        Debug.Print "Найдена существующая запись ID: " & FindExistingRecord
+    End If
+    
+    rs.Close
+    Set rs = Nothing
 End Function
-```
 
-**2. Исправьте форматирование числа в SQL-запросе:**
-Замените строку с формированием значения ставки:
-```vba
-Format(CDbl(rateValue), "#0.000000")
-```
-на:
-```vba
-Replace(Format(CDbl(rateValue), "0.000000"), ",", ".")
-```
+' Обновление существующей записи
+Sub UpdateExistingRecord(conn As Object, recordId As Long, newValue As Double)
+    Dim sql As String
+    Dim cmd As Object
+    
+    sql = "UPDATE alm_history.interest_rates SET " & _
+          "value = " & Replace(Format(CDbl(newValue), "0.000000"), ",", ".") & ", " & _
+          "load_dt = GETDATE() " & _
+          "WHERE id = " & recordId & ";"
+    
+    Debug.Print "Запрос на обновление: " & sql
+    
+    Set cmd = CreateObject("ADODB.Command")
+    cmd.ActiveConnection = conn
+    cmd.CommandText = sql
+    cmd.Execute
+    Set cmd = Nothing
+End Sub
 
-**Итоговый исправленный блок кода:**
-```vba
-' ... предыдущий код ...
-For row = 6 To 10
-    If Not IsEmpty(ws.Cells(row, col)) And ws.Cells(row, col).Value <> "" Then
-        rateTypeIndex = row - 6
-        rateValue = ParsePercentage(ws.Cells(row, col).Text)
-        Debug.Print "Обрабатываем ставку: " & rateValue
+' Закрытие предыдущей активной записи (переименовано для ясности)
+Sub ClosePreviousRecord(conn As Object, newStartDate As String, termDay As Long, currencyCode As String, convType As String, rateType As String)
+    Dim sql As String
+    Dim rs As Object
+    Dim prevId As Long
+    Dim prevDtTo As String
+    
+    sql = "SELECT id FROM alm_history.interest_rates WHERE " & _
+           "cur='" & Replace(currencyCode, "'", "''") & "' AND " & _
+           "term=" & termDay & " AND " & _
+           "conv='" & convType & "' AND " & _
+           "rate_type='" & rateType & "' AND " & _
+           "dt_to='4444-01-01';"
+    
+    Debug.Print "Поиск активной записи для закрытия: " & sql
+    
+    Set rs = CreateObject("ADODB.Recordset")
+    rs.Open sql, conn, 1, 3
+    
+    If Not rs.EOF Then
+        prevId = rs.Fields("id").Value
+        prevDtTo = Format(DateAdd("d", -1, CDate(newStartDate)), "yyyy-MM-dd")
         
-        Call CheckAndUpdateOldRecords(conn, startDate, termDay, currencyCode, convTypes(rateTypeIndex), rateTypes(rateTypeIndex))
+        sql = "UPDATE alm_history.interest_rates SET dt_to='" & prevDtTo & "'" & _
+              " WHERE id=" & prevId & ";"
         
-        ' Исправленное форматирование числа:
-        sql = "INSERT INTO alm_history.interest_rates (" & _
-                "dt_from, term, cur, conv, rate_type, value, dt_to, load_dt)" & _
-                " VALUES ('" & startDate & "', " & termDay & ", '" & _
-                Replace(currencyCode, "'", "''") & "', '" & _
-                convTypes(rateTypeIndex) & "', '" & _
-                rateTypes(rateTypeIndex) & "', " & _
-                Replace(Format(CDbl(rateValue), "0.000000"), ",", ".") & ", '4444-01-01', GETDATE());"
+        Debug.Print "Закрытие предыдущей записи: " & sql
         
-        ' ... остальной код ...
-```
+        conn.Execute sql
+    End If
+    
+    rs.Close
+    Set rs = Nothing
+End Sub
 
-**Пояснение:**
-1. **ParsePercentage:** Теперь корректно обрабатывает числа с запятыми, заменяя их на точки перед преобразованием в число
-2. **Форматирование для SQL:** Дополнительная замена запятой на точку в отформатированном числе гарантирует правильный синтаксис SQL
-3. **Формат "0.000000":** Всегда выводит ведущий ноль (0.011600 вместо .011600), что требуется для числовых литералов в SQL
-
-После этих изменений запросы будут корректно выполняться, так как числа будут передаваться в SQL с точкой в качестве десятичного разделителя (0.011600 вместо 0,011600).
+' ... [остальные функции ParsePercentage и UpdateRatePeriods без изменений] ...
