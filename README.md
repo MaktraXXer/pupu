@@ -1,99 +1,75 @@
-/* -------------------------------------------------------------
-   Сравнение актуальной таблицы депозитов с архивом
-   за произвольный двухнедельный промежуток + две «особые» даты
-   ------------------------------------------------------------- */
-WITH base_data AS (          /* исходные записи по контрактам */
-    SELECT DISTINCT
-        dep.dt_rep,
-        dep.con_id,
-        dep.balance_rub
-    FROM LIQUIDITY.liq.DepositInterestsRate dep WITH (NOLOCK)
-    WHERE dep.cli_subtype = 'ФЛ'
-      AND dep.isfloat     <> 1
-      AND dep.cur          = 'RUR'
+/* ежедневная витрина 16-июн-2025 … 07-июл-2025 (две выборки dep)  */
+;WITH
+------------------------------------------------------------------
+-- актуальная дата отчёта ----------------------------------------
+latest_rep AS (
+    SELECT MAX(DT_REP) AS DT_REP
+    FROM  [LIQUIDITY].[liq].[DepositInterestsRate] WITH (NOLOCK)
 ),
-
-/* список календарных дат, которые нужно проверить
-   (22 дня начиная с 16-июн-2025) */
-report_dates AS (
-    SELECT TOP (22)
-           DATEADD(DAY, ROW_NUMBER() OVER (ORDER BY number) - 1,
-                   '2025-06-16') AS report_date
-    FROM master.dbo.spt_values
-    WHERE type = 'P'                         -- гарантируем набор чисел
-    ORDER BY number
-),
-
-/* остатки/выборки по контрактам на момент отчётных дат */
-saldo_data AS (
-    SELECT
-        bd.con_id,
-        s.out_rub,
-        bd.dt_rep
-    FROM base_data bd
-    LEFT JOIN LIQUIDITY.liq.DepositContract_Saldo s WITH (NOLOCK)
-           ON  bd.con_id = s.con_id
-          AND bd.dt_rep BETWEEN s.dt_from AND s.dt_to
-),
-
-/* агрегаты по каждому дню */
-stats_for_each_day AS (
-    SELECT
-        rd.report_date,
-        COUNT(bd.con_id)                                   AS cnt_con_id,
-        SUM(ISNULL(bd.balance_rub, 0))                     AS sum_balance_rub,
-        COUNT(CASE WHEN sd.out_rub IS NOT NULL THEN 1 END) AS cnt_with_out_rub,
-        COUNT(CASE WHEN sd.out_rub IS NULL  THEN 1 END)    AS cnt_without_out_rub
-    FROM report_dates rd
-    LEFT JOIN base_data bd
-           ON bd.dt_rep = rd.report_date
-    LEFT JOIN saldo_data sd
-           ON bd.con_id = sd.con_id
-          AND bd.dt_rep = sd.dt_rep
-    GROUP BY rd.report_date
-),
-
-/* две «особые» даты:
-   – 08-июл-2025
-   – последняя доступная dt_rep                                     */
-special_reports AS (
-    /* 08-июл-2025 */
-    SELECT
-        CAST('2025-07-08' AS date) AS special_dt_rep,
-        COUNT(*)                   AS cnt_con_id_20250708,
-        SUM(balance_rub)           AS sum_balance_rub_20250708,
-        NULL                       AS cnt_con_id_max_dt_rep,
-        NULL                       AS sum_balance_rub_max_dt_rep
-    FROM base_data
-    WHERE dt_rep = '2025-07-08'
-
+------------------------------------------------------------------
+-- календарь -----------------------------------------------------
+cal AS (
+    SELECT CAST('2025-06-16' AS date) AS calc_date
     UNION ALL
-
-    /* самая поздняя дата в источнике */
-    SELECT
-        (SELECT MAX(dt_rep)
-         FROM LIQUIDITY.liq.DepositInterestsRate WITH (NOLOCK)) AS special_dt_rep,
-        NULL                       AS cnt_con_id_20250708,
-        NULL                       AS sum_balance_rub_20250708,
-        COUNT(*)                   AS cnt_con_id_max_dt_rep,
-        SUM(balance_rub)           AS sum_balance_rub_max_dt_rep
-    FROM base_data
-    WHERE dt_rep = (SELECT MAX(dt_rep)
-                    FROM LIQUIDITY.liq.DepositInterestsRate WITH (NOLOCK))
+    SELECT DATEADD(day,1,calc_date)
+    FROM   cal
+    WHERE  calc_date < '2025-07-07'
+),
+------------------------------------------------------------------
+-- депозиты с нужными фильтрами ----------------------------------
+dep_filtered AS (
+    SELECT  d.CON_ID,
+            d.BALANCE_RUB,
+            CASE WHEN d.DT_REP = '2025-07-08' THEN 'REP_20250708'
+                 ELSE 'REP_LATEST' END AS rep_flag
+    FROM   [LIQUIDITY].[liq].[DepositInterestsRate] d WITH (NOLOCK)
+    CROSS  JOIN latest_rep lr            -- фиксируем latest единожды
+    WHERE  d.CLI_SUBTYPE = N'ФЛ'
+      AND  d.isfloat    <> 1
+      AND  d.CUR        =  N'RUR'
+      AND  d.DT_REP     IN ('2025-07-08', lr.DT_REP)
+),
+------------------------------------------------------------------
+-- сальдо, действующее на каждую дату ----------------------------
+saldo_on_date AS (
+    SELECT  s.CON_ID,
+            c.calc_date,
+            s.OUT_RUB
+    FROM   [LIQUIDITY].[liq].[DepositContract_Saldo] s WITH (NOLOCK)
+    JOIN   cal c
+           ON c.calc_date BETWEEN s.DT_FROM AND s.DT_TO
+),
+------------------------------------------------------------------
+-- агрегаты ------------------------------------------------------
+agg AS (
+    SELECT  c.calc_date,
+            d.rep_flag,
+            COUNT(DISTINCT d.CON_ID)                                    AS cnt_dep,
+            SUM(d.BALANCE_RUB)                                          AS sum_balance_rub,
+            SUM(ISNULL(s.OUT_RUB,0))                                    AS sum_out_rub,
+            SUM(CASE WHEN s.CON_ID IS NULL THEN 1 ELSE 0 END)           AS cnt_no_saldo
+    FROM      cal              c
+    CROSS JOIN dep_filtered     d        -- оцениваем каждый договор на каждую дату
+    LEFT JOIN saldo_on_date     s
+           ON s.CON_ID    = d.CON_ID
+          AND s.calc_date = c.calc_date
+    GROUP BY c.calc_date, d.rep_flag
 )
-
-/* итоговый вывод */
+------------------------------------------------------------------
+-- итог ----------------------------------------------------------
 SELECT
-    COALESCE(sr.special_dt_rep, sfd.report_date) AS report_date,
-    sr.cnt_con_id_20250708,
-    sr.sum_balance_rub_20250708,
-    sr.cnt_con_id_max_dt_rep,
-    sr.sum_balance_rub_max_dt_rep,
-    sfd.cnt_con_id,
-    sfd.sum_balance_rub,
-    sfd.cnt_with_out_rub,
-    sfd.cnt_without_out_rub
-FROM stats_for_each_day sfd
-FULL OUTER JOIN special_reports sr
-       ON sr.special_dt_rep = sfd.report_date
-ORDER BY COALESCE(sr.special_dt_rep, sfd.report_date);
+        a.calc_date                                                       AS report_date,
+
+        MAX(CASE WHEN rep_flag='REP_20250708' THEN cnt_dep         END)   AS cnt_dep_20250708,
+        MAX(CASE WHEN rep_flag='REP_20250708' THEN sum_balance_rub END)   AS sum_balance_rub_20250708,
+        MAX(CASE WHEN rep_flag='REP_20250708' THEN sum_out_rub     END)   AS sum_out_rub_20250708,
+        MAX(CASE WHEN rep_flag='REP_20250708' THEN cnt_no_saldo    END)   AS cnt_no_saldo_20250708,
+
+        MAX(CASE WHEN rep_flag='REP_LATEST'    THEN cnt_dep         END)  AS cnt_dep_latest,
+        MAX(CASE WHEN rep_flag='REP_LATEST'    THEN sum_balance_rub END)  AS sum_balance_rub_latest,
+        MAX(CASE WHEN rep_flag='REP_LATEST'    THEN sum_out_rub     END)  AS sum_out_rub_latest,
+        MAX(CASE WHEN rep_flag='REP_LATEST'    THEN cnt_no_saldo    END)  AS cnt_no_saldo_latest
+FROM   agg a
+GROUP BY a.calc_date
+ORDER BY a.calc_date
+OPTION (MAXRECURSION 1000, RECOMPILE);
