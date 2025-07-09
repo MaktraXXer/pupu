@@ -1,154 +1,99 @@
-Option Explicit
+/* -------------------------------------------------------------
+   Сравнение актуальной таблицы депозитов с архивом
+   за произвольный двухнедельный промежуток + две «особые» даты
+   ------------------------------------------------------------- */
+WITH base_data AS (          /* исходные записи по контрактам */
+    SELECT DISTINCT
+        dep.dt_rep,
+        dep.con_id,
+        dep.balance_rub
+    FROM LIQUIDITY.liq.DepositInterestsRate dep WITH (NOLOCK)
+    WHERE dep.cli_subtype = 'ФЛ'
+      AND dep.isfloat     <> 1
+      AND dep.cur          = 'RUR'
+),
 
-Sub ImportRatesToDB()
-    ' ... [остальной код без изменений до основного цикла обработки данных] ...
-    
-    ' Основной цикл обработки данных
-    For col = 2 To lastCol
-        termDay = ws.Cells(5, col).Value
-        
-        ' ... [проверки срока без изменений] ...
-        
-        ' Обработка каждой ставки
-        For row = 6 To 10
-            If Not IsEmpty(ws.Cells(row, col)) And ws.Cells(row, col).Value <> "" Then
-                rateTypeIndex = row - 6
-                
-                ' Преобразуем процент в долю
-                rateValue = ParsePercentage(ws.Cells(row, col).Text)
-                Debug.Print "Обрабатываем ставку: " & rateValue
-                
-                ' ===== ИЗМЕНЕНИЕ НАЧИНАЕТСЯ ЗДЕСЬ =====
-                ' Проверяем существование записи с такой же датой начала
-                Dim existingId As Long
-                existingId = FindExistingRecord(conn, startDate, termDay, currencyCode, convTypes(rateTypeIndex), rateTypes(rateTypeIndex))
-                
-                If existingId > 0 Then
-                    ' Обновляем существующую запись
-                    UpdateExistingRecord conn, existingId, rateValue
-                Else
-                    ' Закрываем предыдущую активную запись (если есть)
-                    Call ClosePreviousRecord(conn, startDate, termDay, currencyCode, convTypes(rateTypeIndex), rateTypes(rateTypeIndex))
-                    
-                    ' Вставляем новую запись
-                    sql = "INSERT INTO alm_history.interest_rates (" & _
-                            "dt_from, term, cur, conv, rate_type, value, dt_to, load_dt)" & _
-                            " VALUES ('" & startDate & "', " & termDay & ", '" & _
-                            Replace(currencyCode, "'", "''") & "', '" & _
-                            convTypes(rateTypeIndex) & "', '" & _
-                            rateTypes(rateTypeIndex) & "', " & _
-                            Replace(Format(CDbl(rateValue), "0.000000"), ",", ".") & ", '4444-01-01', GETDATE());"
-                    
-                    Debug.Print "Запрос на вставку: " & sql
-                    
-                    ' Выполняем SQL-запрос
-                    Set cmd = CreateObject("ADODB.Command")
-                    cmd.ActiveConnection = conn
-                    cmd.CommandText = sql
-                    cmd.Execute
-                End If
-                ' ===== ИЗМЕНЕНИЕ ЗАКАНЧИВАЕТСЯ ЗДЕСЬ =====
-            End If
-        Next row
-NextCol:
-    Next col
-    
-    ' ... [остальной код без изменений] ...
-End Sub
+/* список календарных дат, которые нужно проверить
+   (22 дня начиная с 16-июн-2025) */
+report_dates AS (
+    SELECT TOP (22)
+           DATEADD(DAY, ROW_NUMBER() OVER (ORDER BY number) - 1,
+                   '2025-06-16') AS report_date
+    FROM master.dbo.spt_values
+    WHERE type = 'P'                         -- гарантируем набор чисел
+    ORDER BY number
+),
 
-' ===== НОВЫЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
+/* остатки/выборки по контрактам на момент отчётных дат */
+saldo_data AS (
+    SELECT
+        bd.con_id,
+        s.out_rub,
+        bd.dt_rep
+    FROM base_data bd
+    LEFT JOIN LIQUIDITY.liq.DepositContract_Saldo s WITH (NOLOCK)
+           ON  bd.con_id = s.con_id
+          AND bd.dt_rep BETWEEN s.dt_from AND s.dt_to
+),
 
-' Поиск существующей записи с такой же датой начала
-Function FindExistingRecord(conn As Object, dtFrom As String, term As Long, cur As String, conv As String, rateType As String) As Long
-    Dim sql As String
-    Dim rs As Object
-    
-    FindExistingRecord = 0
-    
-    sql = "SELECT id FROM alm_history.interest_rates WHERE " & _
-          "dt_from = '" & dtFrom & "' AND " & _
-          "term = " & term & " AND " & _
-          "cur = '" & Replace(cur, "'", "''") & "' AND " & _
-          "conv = '" & conv & "' AND " & _
-          "rate_type = '" & rateType & "';"
-    
-    Set rs = CreateObject("ADODB.Recordset")
-    rs.Open sql, conn, 1, 3
-    
-    If Not rs.EOF Then
-        FindExistingRecord = rs.Fields("id").Value
-        Debug.Print "Найдена существующая запись ID: " & FindExistingRecord
-    End If
-    
-    rs.Close
-    Set rs = Nothing
-End Function
+/* агрегаты по каждому дню */
+stats_for_each_day AS (
+    SELECT
+        rd.report_date,
+        COUNT(bd.con_id)                                   AS cnt_con_id,
+        SUM(ISNULL(bd.balance_rub, 0))                     AS sum_balance_rub,
+        COUNT(CASE WHEN sd.out_rub IS NOT NULL THEN 1 END) AS cnt_with_out_rub,
+        COUNT(CASE WHEN sd.out_rub IS NULL  THEN 1 END)    AS cnt_without_out_rub
+    FROM report_dates rd
+    LEFT JOIN base_data bd
+           ON bd.dt_rep = rd.report_date
+    LEFT JOIN saldo_data sd
+           ON bd.con_id = sd.con_id
+          AND bd.dt_rep = sd.dt_rep
+    GROUP BY rd.report_date
+),
 
-' Обновление существующей записи
-Sub UpdateExistingRecord(conn As Object, recordId As Long, newValue As Double)
-    Dim sql As String
-    Dim cmd As Object
-    
-    sql = "UPDATE alm_history.interest_rates SET " & _
-          "value = " & Replace(Format(CDbl(newValue), "0.000000"), ",", ".") & ", " & _
-          "load_dt = GETDATE() " & _
-          "WHERE id = " & recordId & ";"
-    
-    Debug.Print "Запрос на обновление: " & sql
-    
-    Set cmd = CreateObject("ADODB.Command")
-    cmd.ActiveConnection = conn
-    cmd.CommandText = sql
-    cmd.Execute
-    Set cmd = Nothing
-End Sub
+/* две «особые» даты:
+   – 08-июл-2025
+   – последняя доступная dt_rep                                     */
+special_reports AS (
+    /* 08-июл-2025 */
+    SELECT
+        CAST('2025-07-08' AS date) AS special_dt_rep,
+        COUNT(*)                   AS cnt_con_id_20250708,
+        SUM(balance_rub)           AS sum_balance_rub_20250708,
+        NULL                       AS cnt_con_id_max_dt_rep,
+        NULL                       AS sum_balance_rub_max_dt_rep
+    FROM base_data
+    WHERE dt_rep = '2025-07-08'
 
-' Закрытие предыдущей активной записи (переименовано для ясности)
-Sub ClosePreviousRecord(conn As Object, newStartDate As String, termDay As Long, currencyCode As String, convType As String, rateType As String)
-    Dim sql As String
-    Dim rs As Object
-    Dim prevId As Long
-    Dim prevDtTo As String
-    
-    sql = "SELECT id FROM alm_history.interest_rates WHERE " & _
-           "cur='" & Replace(currencyCode, "'", "''") & "' AND " & _
-           "term=" & termDay & " AND " & _
-           "conv='" & convType & "' AND " & _
-           "rate_type='" & rateType & "' AND " & _
-           "dt_to='4444-01-01';"
-    
-    Debug.Print "Поиск активной записи для закрытия: " & sql
-    
-    Set rs = CreateObject("ADODB.Recordset")
-    rs.Open sql, conn, 1, 3
-    
-    If Not rs.EOF Then
-        prevId = rs.Fields("id").Value
-        prevDtTo = Format(DateAdd("d", -1, CDate(newStartDate)), "yyyy-MM-dd")
-        
-        sql = "UPDATE alm_history.interest_rates SET dt_to='" & prevDtTo & "'" & _
-              " WHERE id=" & prevId & ";"
-        
-        Debug.Print "Закрытие предыдущей записи: " & sql
-        
-        conn.Execute sql
-    End If
-    
-    rs.Close
-    Set rs = Nothing
-End Sub
+    UNION ALL
 
-' ... [остальные функции ParsePercentage и UpdateRatePeriods без изменений] ...
+    /* самая поздняя дата в источнике */
+    SELECT
+        (SELECT MAX(dt_rep)
+         FROM LIQUIDITY.liq.DepositInterestsRate WITH (NOLOCK)) AS special_dt_rep,
+        NULL                       AS cnt_con_id_20250708,
+        NULL                       AS sum_balance_rub_20250708,
+        COUNT(*)                   AS cnt_con_id_max_dt_rep,
+        SUM(balance_rub)           AS sum_balance_rub_max_dt_rep
+    FROM base_data
+    WHERE dt_rep = (SELECT MAX(dt_rep)
+                    FROM LIQUIDITY.liq.DepositInterestsRate WITH (NOLOCK))
+)
 
-
-
-
-UPDATE ir
-SET ir.dt_to = '2025-05-21'
-FROM alm_history.interest_rates ir
-WHERE ir.term = 395
-AND ir.dt_from = (
-    SELECT MAX(dt_from)
-    FROM alm_history.interest_rates
-    WHERE term = 395
-);
+/* итоговый вывод */
+SELECT
+    COALESCE(sr.special_dt_rep, sfd.report_date) AS report_date,
+    sr.cnt_con_id_20250708,
+    sr.sum_balance_rub_20250708,
+    sr.cnt_con_id_max_dt_rep,
+    sr.sum_balance_rub_max_dt_rep,
+    sfd.cnt_con_id,
+    sfd.sum_balance_rub,
+    sfd.cnt_with_out_rub,
+    sfd.cnt_without_out_rub
+FROM stats_for_each_day sfd
+FULL OUTER JOIN special_reports sr
+       ON sr.special_dt_rep = sfd.report_date
+ORDER BY COALESCE(sr.special_dt_rep, sfd.report_date);
