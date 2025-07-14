@@ -1,70 +1,91 @@
 import pandas as pd
 from datetime import datetime
 
-# --- assume `df_sql` already in memory (result of your pyodbc query) ---
-df = df_sql.copy()
+# ──────────────────────────────────────────────────────────────
+# 0. входной DataFrame  →  df_snap
+# ──────────────────────────────────────────────────────────────
+# dt_rep   — дата EoM-снимка
+# cli_id   — идентификатор клиента
+# prod_name_res — название депозитного продукта
 
-# 1) базовые константы и списки
-FU_PRODUCTS = [
-    'Надёжный', 'Надёжный VIP', 'Надёжный премиум',
-    'Надёжный промо', 'Надёжный старт',
-    'Надёжный Т2', 'Надёжный Мегафон'
-]
+# 1. перечень продуктов Фин-услуг (ФУ)
+fu_products = {
+    'Надёжный','Надёжный VIP','Надёжный премиум',
+    'Надёжный промо','Надёжный старт',
+    'Надёжный T2','Надёжный Мегафон'
+}
 
-CUT_OFF_MAY = pd.Timestamp('2025-05-31')
-START_2025   = pd.Timestamp('2025-01-01')
+# 2. подготовка даты
+df = df_snap.copy()
+df['dt_rep'] = pd.to_datetime(df['dt_rep'], errors='coerce')
 
-# 2) аккуратные типы
-df['CLI_ID']   = df['CLI_ID'].astype('Int64')          # целые
-df['DT_OPEN']  = pd.to_datetime(df['DT_OPEN'])
-df['DT_CLOSE'] = pd.to_datetime(df['DT_CLOSE'])
+cut_jan   = pd.Timestamp('2025-01-01')   # начало «нового» периода
+cut_may   = pd.Timestamp('2025-05-31')   # контрольный EoM-срез
 
-# 3) «кто был до 2025 г.»
-prev_cli = set(df.loc[df['DT_OPEN'] < START_2025, 'CLI_ID'].dropna().unique())
+# 3. клиенты, встречавшиеся до 01-янв-2025
+prev_cli = set(df.loc[df['dt_rep'] < cut_jan, 'cli_id'].astype('int64'))
 
-# 4) «новички‑2025» именно на ФУ
-mask_fu_2025 = (
-    df['PROD_NAME'].isin(FU_PRODUCTS) &
-    (df['DT_OPEN'] >= START_2025)
+# 4. «новые ФУ-клиенты» (их первый ФУ-вклад c 01-янв-25 по 31-мая-25)
+is_fu      = df['prod_name_res'].isin(fu_products)
+new_fu_cli = (
+    set(
+        df.loc[
+            is_fu &
+            (df['dt_rep'] >= cut_jan) &
+            (df['dt_rep'] <= cut_may),   # <-- не позже мая-25
+            'cli_id'
+        ].astype('int64')
+    )
+    - prev_cli
 )
-new_fu_cli = set(df.loc[mask_fu_2025, 'CLI_ID'].dropna().unique()) - prev_cli
 
-# 5) кто из них активен на 31‑мая‑2025
-active_mask = (
-    (df['DT_OPEN'] <= CUT_OFF_MAY) &
-    (df['DT_CLOSE'].fillna(pd.Timestamp('2100‑01‑01')) > CUT_OFF_MAY) &
-    (df['CLI_ID'].isin(new_fu_cli))
+# 5. кто из них активен на 31-мая-2025 (есть ≥1 строка в срезе)
+active_may_cli = set(
+    df.loc[
+        (df['dt_rep'] == cut_may) &
+        (df['cli_id'].isin(new_fu_cli)),
+        'cli_id'
+    ].astype('int64')
 )
-active_may_ids = set(df.loc[active_mask, 'CLI_ID'].unique())
 
-# 6) классификация остатков на 31‑мая
-act = df.loc[active_mask, ['CLI_ID', 'PROD_NAME']].copy()
-act['is_fu'] = act['PROD_NAME'].isin(FU_PRODUCTS)
+# 6. классификация портфеля на 31-мая-2025
+may_df = df.loc[
+    (df['dt_rep'] == cut_may) &
+    (df['cli_id'].isin(active_may_cli)),
+    ['cli_id', 'prod_name_res']
+].copy()
 
-has_fu     = act.groupby('CLI_ID')['is_fu'].max()         # 1 / 0
-has_non_fu = act.groupby('CLI_ID')['is_fu'].apply(lambda s: (~s).any())
+may_df['is_fu'] = may_df['prod_name_res'].isin(fu_products)
 
-only_fu     = (has_fu & ~has_non_fu).sum()
-only_bank   = (~has_fu & has_non_fu).sum()
-both_seg    = (has_fu & has_non_fu).sum()
+cli_stats = (
+    may_df.groupby('cli_id')['is_fu']
+          .agg(has_fu='any',                    # есть ли хоть 1 ФУ-вклад
+               has_nonfu=lambda s: (~s).any())  # есть ли НЕ-ФУ вклад
+)
 
-# 7) готовим итоговую таблицу
-result = pd.DataFrame({
-    'Метрика': [
-        'Новых ФУ‑клиентов (2025)', 
-        'Из них активны на 31‑мая‑2025',
-        '— только ФУ на 31‑мая',
-        '— только Банк на 31‑мая',
-        '— ФУ + Банк на 31‑мая'
-    ],
-    'Значение': [
-        len(new_fu_cli),
-        len(active_may_ids),
-        int(only_fu),
-        int(only_bank),
-        int(both_seg)
-    ]
-})
+only_fu       = cli_stats[(cli_stats['has_fu'])  & (~cli_stats['has_nonfu'])].shape[0]
+only_bank     = cli_stats[(~cli_stats['has_fu']) & (cli_stats['has_nonfu'])].shape[0]
+both_fu_bank  = cli_stats[(cli_stats['has_fu'])  & (cli_stats['has_nonfu'])].shape[0]
 
-import ace_tools as tools; tools.display_dataframe_to_user('Итоговые показатели', result)
+# 7. итоговая таблица
+res = pd.DataFrame(
+    {
+        'Метрика': [
+            'Новых ФУ-клиентов, 2025 (по 31-мая)',
+            'Активны на 31-мая-2025',
+            'Из активных: только ФУ',
+            'Из активных: только Банк',
+            'Из активных: ФУ + Банк'
+        ],
+        'Значение': [
+            len(new_fu_cli),
+            len(active_may_cli),
+            only_fu,
+            only_bank,
+            both_fu_bank
+        ]
+    }
+)
 
+import ace_tools as tools
+tools.display_dataframe_to_user("Сводка по клиентам ФУ (срез 31-мая-2025)", res)
