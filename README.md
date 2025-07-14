@@ -1,68 +1,55 @@
-USE [ALM_TEST]
-GO
-/* если витрина уже была — удаляем */
-IF OBJECT_ID('[WORK].[VW_FL_DEPO_TERM_AGGR_MEND]', 'V') IS NOT NULL
-    DROP VIEW [WORK].[VW_FL_DEPO_TERM_AGGR_MEND];
-GO
-SET ANSI_NULLS ON
-SET QUOTED_IDENTIFIER ON
-GO
-CREATE VIEW [WORK].[VW_FL_DEPO_TERM_AGGR_MEND] AS
-/* ───────── 1. календарь из 18 месяцев ───────── */
-WITH months AS (
-    SELECT CAST('2024-01-01' AS date) AS month_start
-    UNION ALL
-    SELECT DATEADD(month, 1, month_start)
-    FROM   months
-    WHERE  month_start < '2025-06-01'          -- июнь-25 — последний
+/* --------------------------  настройки  -------------------------- */
+DECLARE @cut_off_may date = '2025-05-31';   -- дата «конец мая 2025»
+
+/* список продуктов фин-услуг (Main) */
+DECLARE @MainProducts TABLE(prod_name_res nvarchar(100) PRIMARY KEY);
+INSERT INTO @MainProducts VALUES
+(N'Надёжный'),(N'Надёжный VIP'),(N'Надёжный премиум'),
+(N'Надёжный промо'),(N'Надёжный старт'),
+(N'Надёжный Т2'),(N'Надёжный Мегафон');
+
+/* ---------- 1. клиенты, которые появлялись до 2025-01-01 ---------- */
+WITH prev_cli AS (
+    SELECT DISTINCT cli_id
+    FROM   alm_test.dbo.fu_vintage_results_ext
+    WHERE  dt_rep < '2025-01-01'
 ),
-/* ───────── 2. для каждого месяца ищем «снимок» ───────── */
-month_latest AS (
-    SELECT
-        EOMONTH(month_start)             AS month_end,        -- 31.01.2024 …
-        latest.dt_rep
-    FROM   months
-    CROSS APPLY (
-        SELECT TOP (1) dt_rep                                 -- быстрый seek
-        FROM   WORK.VW_FL_DEPO_TERM_WEEK
-        WHERE  dt_rep <= EOMONTH(month_start)
-          AND  BLOCK_NAME   = 'Привлечение ФЛ'
-          AND  SECTION_NAME = 'Срочные'
-        ORDER BY dt_rep DESC                                  -- «самый поздний»
-    ) latest
-    WHERE  latest.dt_rep IS NOT NULL                          -- на случай пустых месяцев
+
+/* ---------- 2. «новички» 2025 года, пришедшие именно на ФУ ---------- */
+new_fu_cli AS (
+    SELECT DISTINCT f.cli_id
+    FROM   alm_test.dbo.fu_vintage_results_ext f
+    WHERE  f.dt_rep >= '2025-01-01'
+      AND  f.prod_name_res IN (SELECT prod_name_res FROM @MainProducts)
+      AND  NOT EXISTS (SELECT 1 FROM prev_cli p WHERE p.cli_id = f.cli_id)
 ),
-/* ───────── 3. агрегируем сумму сразу же ───────── */
-aggr AS (
-    SELECT
-        ml.month_end                    AS dt_rep,            -- 31.01.2024 …
-        CASE
-             WHEN w.termdays BETWEEN  28 AND  33 THEN  31
-             WHEN w.termdays BETWEEN  60 AND  70 THEN  61
-             WHEN w.termdays BETWEEN  85 AND 110 THEN  91
-             WHEN w.termdays BETWEEN 119 AND 140 THEN 124
-             WHEN w.termdays BETWEEN 175 AND 200 THEN 181
-             WHEN w.termdays BETWEEN 245 AND 290 THEN 274
-             WHEN w.termdays BETWEEN 340 AND 405 THEN 365
-             WHEN w.termdays BETWEEN 540 AND 621 THEN 550
-             WHEN w.termdays BETWEEN 720 AND 763 THEN 750
-             WHEN w.termdays BETWEEN 1090 AND 1140 THEN 1100
-             WHEN w.termdays BETWEEN 1450 AND 1475 THEN 1460
-             WHEN w.termdays BETWEEN 1795 AND 1830 THEN 1825
-        END                               AS term_bucket,
-        w.out_rub
-    FROM   month_latest           ml
-    JOIN   WORK.VW_FL_DEPO_TERM_WEEK w
-           ON w.dt_rep = ml.dt_rep
-          AND w.BLOCK_NAME   = 'Привлечение ФЛ'
-          AND w.SECTION_NAME = 'Срочные'
-    WHERE  EOMONTH(TRY_CONVERT(date, w.generation, 23)) = ml.month_end
+
+/* ---------- 3. кто из них живой на 31-мая-2025 ---------- */
+active_may AS (
+    SELECT DISTINCT cli_id
+    FROM   alm_test.dbo.fu_vintage_results_ext
+    WHERE  dt_rep = @cut_off_may
+      AND  cli_id IN (SELECT cli_id FROM new_fu_cli)
+),
+
+/* ---------- 4. классификация остатков на 31-мая-2025 ---------- */
+classify AS (
+    SELECT  a.cli_id,
+            MAX(CASE WHEN f.prod_name_res IN (SELECT prod_name_res FROM @MainProducts)
+                     THEN 1 END) AS has_fu,
+            MAX(CASE WHEN f.prod_name_res NOT IN (SELECT prod_name_res FROM @MainProducts)
+                     THEN 1 END) AS has_nonfu
+    FROM   active_may         a
+    JOIN   alm_test.dbo.fu_vintage_results_ext f
+           ON f.cli_id = a.cli_id
+          AND f.dt_rep = @cut_off_may
+    GROUP BY a.cli_id
 )
-/* ───────── 4. финальный результат ───────── */
+
+/* ---------- 5. итог ---------- */
 SELECT
-       dt_rep,                       -- конец месяца
-       term_bucket AS [Срок, дн.],   -- нормированный срок
-       SUM(out_rub) AS sum_out_rub   -- сумма
-FROM   aggr
-GROUP BY dt_rep, term_bucket;
-GO
+    (SELECT COUNT(*) FROM new_fu_cli)                               AS New_FU_clients_2025 ,
+    (SELECT COUNT(*) FROM active_may)                               AS Active_as_of_2025_05_31 ,
+    (SELECT COUNT(*) FROM classify WHERE has_fu     = 1 AND has_nonfu = 0) AS Only_FU_on_31_May ,
+    (SELECT COUNT(*) FROM classify WHERE has_fu     = 0 AND has_nonfu = 1) AS Only_Bank_on_31_May ,
+    (SELECT COUNT(*) FROM classify WHERE has_fu     = 1 AND has_nonfu = 1) AS Both_FU_and_Bank_on_31_May ;
