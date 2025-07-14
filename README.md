@@ -1,77 +1,73 @@
-/* ────────────────────────────────────────────────────────── *
-   0.  Константы и мини-справочник продуктов фин-услуг
- * ────────────────────────────────────────────────────────── */
-DECLARE @cut_off_may date = '2025-05-31';
+import pandas as pd
+from datetime import datetime
 
-DECLARE @MainProducts TABLE(prod_name_res nvarchar(100) PRIMARY KEY);
-INSERT INTO @MainProducts VALUES
-(N'Надёжный'), (N'Надёжный VIP'), (N'Надёжный премиум'),
-(N'Надёжный промо'), (N'Надёжный старт'),
-(N'Надёжный Т2'), (N'Надёжный Мегафон');
+# ───────────────────────────────────────────
+#  Assume `df_sql` is already in memory
+# ───────────────────────────────────────────
 
-/* ────────────────────────────────────────────────────────── *
-   1.  «Старые» клиенты – имели депозит (любой) до 2025-01-01
- * ────────────────────────────────────────────────────────── */
-WITH prev_cli AS (
-    SELECT DISTINCT cli_id
-    FROM   LIQUIDITY.liq.DepositContract_all WITH (NOLOCK)
-    WHERE  cli_short_name = N'ФЛ'
-      AND  seg_name       = N'Розничный бизнес'
-      AND  dt_open        < '2025-01-01'
-),
+# 1. Список ФУ‑продуктов
+fu_products = {
+    'Надёжный', 'Надёжный VIP', 'Надёжный премиум',
+    'Надёжный промо', 'Надёжный старт',
+    'Надёжный Т2', 'Надёжный Мегафон'
+}
 
-/* ────────────────────────────────────────────────────────── *
-   2.  «Новые ФУ-клиенты 2025» – впервые открыли ФУ-депозит в 2025 г.
- * ────────────────────────────────────────────────────────── */
-new_fu_cli AS (
-    SELECT DISTINCT d.cli_id
-    FROM   LIQUIDITY.liq.DepositContract_all d WITH (NOLOCK)
-    JOIN   @MainProducts mp ON mp.prod_name_res = d.prod_name
-    WHERE  d.cli_short_name = N'ФЛ'
-      AND  d.seg_name       = N'Розничный бизнес'
-      AND  d.dt_open       >= '2025-01-01'
-      AND  NOT EXISTS (SELECT 1 FROM prev_cli p WHERE p.cli_id = d.cli_id)
-),
+# 2. Подготовка дат
+df = df_sql.copy()
 
-/* ────────────────────────────────────────────────────────── *
-   3.  Кто из них «жив» на 31-мая-2025
-   * активным считаем договор, у которого
-       – дата открытия ≤ 31-мая
-       – дата закрытия (dt_close) либо пуста, либо > 31-мая
- * ────────────────────────────────────────────────────────── */
-active_may AS (
-    SELECT DISTINCT d.cli_id
-    FROM   LIQUIDITY.liq.DepositContract_all d WITH (NOLOCK)
-    WHERE  d.cli_id IN (SELECT cli_id FROM new_fu_cli)
-      AND  d.dt_open  <= @cut_off_may
-      AND  (d.dt_close IS NULL OR d.dt_close > @cut_off_may)
-),
+for col in ['DT_OPEN', 'DT_CLOSE']:
+    df[col] = pd.to_datetime(df[col], errors='coerce')
 
-/* ────────────────────────────────────────────────────────── *
-   4.  Классифицируем «живых» клиентов по наличию
-       – хотя бы 1 ФУ-депозита
-       – хотя бы 1 НЕ-ФУ-депозита
- * ────────────────────────────────────────────────────────── */
-classify AS (
-    SELECT  a.cli_id,
-            MAX(CASE WHEN mp2.prod_name_res IS NOT NULL THEN 1 ELSE 0 END) AS has_fu,
-            MAX(CASE WHEN mp2.prod_name_res IS     NULL THEN 1 ELSE 0 END) AS has_nonfu
-    FROM   active_may                    a
-    JOIN   LIQUIDITY.liq.DepositContract_all d WITH (NOLOCK)
-           ON d.cli_id = a.cli_id
-          AND d.dt_open <= @cut_off_may
-          AND (d.dt_close IS NULL OR d.dt_close > @cut_off_may)
-    LEFT  JOIN @MainProducts mp2
-           ON mp2.prod_name_res = d.prod_name
-    GROUP BY a.cli_id
+# 3. Клиенты, у которых ДЕПОЗИТ был до 2025‑01‑01
+cut_2025 = pd.Timestamp('2025-01-01')
+prev_cli = set(df.loc[df['DT_OPEN'] < cut_2025, 'CLI_ID'].astype('int64'))
+
+# 4. «Новые ФУ‑клиенты» 2025 г.
+is_fu = df['PROD_NAME'].isin(fu_products)
+new_fu_df  = df[is_fu & (df['DT_OPEN'] >= cut_2025)]
+new_fu_cli = set(new_fu_df['CLI_ID'].astype('int64')) - prev_cli
+
+# 5. Кто из них активен на 31‑мая‑2025
+ref_date = pd.Timestamp('2025-05-31')
+active_mask = (
+    df['CLI_ID'].isin(new_fu_cli) &
+    (df['DT_OPEN'] <= ref_date) &
+    (df['DT_CLOSE'].isna() | (df['DT_CLOSE'] > ref_date))
+)
+active_df = df[active_mask].copy()
+
+# 6. Классификация активных
+active_df['is_fu'] = active_df['PROD_NAME'].isin(fu_products)
+
+cli_stats = (
+    active_df
+    .groupby('CLI_ID')['is_fu']
+    .agg(has_fu='any',  # хотя бы 1 ФУ
+         all_fu='all')  # все депозиты ‑ ФУ
 )
 
-/* ────────────────────────────────────────────────────────── *
-   5.  Итоговая панель
- * ────────────────────────────────────────────────────────── */
-SELECT
-    (SELECT COUNT(*) FROM new_fu_cli)                                         AS New_FU_clients_2025 ,
-    (SELECT COUNT(*) FROM active_may)                                         AS Active_as_of_2025_05_31 ,
-    (SELECT COUNT(*) FROM classify WHERE has_fu = 1 AND has_nonfu = 0)        AS Only_FU_on_31_May ,
-    (SELECT COUNT(*) FROM classify WHERE has_fu = 0 AND has_nonfu = 1)        AS Only_Bank_on_31_May ,
-    (SELECT COUNT(*) FROM classify WHERE has_fu = 1 AND has_nonfu = 1)        AS Both_FU_and_Bank_on_31_May ;
+only_fu      = cli_stats[cli_stats['all_fu']].shape[0]
+only_bank    = cli_stats[~cli_stats['has_fu']].shape[0]
+both_fu_bank = cli_stats[(cli_stats['has_fu']) & (~cli_stats['all_fu'])].shape[0]
+
+# 7. Итоговые цифры
+res = pd.DataFrame(
+    {
+        'Метрика': [
+            'Новых ФУ‑клиентов, 2025',
+            'Активны на 31‑мая‑2025',
+            'Из активных: только ФУ',
+            'Из активных: только Банк',
+            'Из активных: ФУ + Банк'
+        ],
+        'Значение': [
+            len(new_fu_cli),
+            cli_stats.shape[0],
+            only_fu,
+            only_bank,
+            both_fu_bank
+        ]
+    }
+)
+
+import ace_tools as tools; tools.display_dataframe_to_user("Сводка по клиентам ФУ", res)
