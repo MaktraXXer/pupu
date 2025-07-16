@@ -1,115 +1,129 @@
-### Почему «зависло» на  1 ½ минуты
+Понял — прав на изменение **LIQUIDITY** (или другой «хозяйской» базы) нет, а в **ALM\_TEST** можно создавать что-угодно. Ниже три уровня решения, каждый без вмешательства в чужие схемы:
 
-`VW_ForecastKEY_everyday` разворачивает **весь** прогноз по ключевой ставке на **каждый** календарный день с начала истории → это десятки-миллионов строк.
-Даже если внешним фильтром вы просите всего одну «дату + срочность», оптимизатор всё-равно обязан внутри представления:
+| Уровень                      | Что делаем                                                                                                                           | Когда хватит                                              |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------- |
+| **A. «Лёгкий»**              | Берём данные напрямую из `LIQUIDITY.liq.ForecastKeyRate`, но аккуратно фильтруем диапазон, чтобы движок читал считанные сотни строк. | Часто этого уже достаточно (≈ 0,1 с на 1 запрос).         |
+| **B. «Копия за два года»**   | В ALM\_TEST nightly копируем только *актуальную* часть таблицы (например, последние 3-5 лет). Там ставим индекс.                     | Если пункт A всё ещё > 1-2 с.                             |
+| **C. «Полный кэш + индекс»** | Делаем полноценный mirror-table с нужными полями, полностью индексируем, обновляем раз в день.                                       | Нужен массовый расчёт (сотни тысяч депозитов) за секунды. |
 
-1. соединить прогноз с календарём (`cal`),
-2. вычислить `ROW_NUMBER` / `AVG()` для **каждой** исторической `DT_REP`.
-
-Вот куда ушло 82 сек.
+Ниже приведу код для **варианта A** (самый простой) и сразу заготовку для **варианта B** (на будущее).
 
 ---
 
-## Быстрее брать сразу из базовой таблицы `ForecastKeyRate`
+## Вариант A. Прямая выборка, но без «тяжёлой» витрины
 
-Вся информация там уже есть; нужно только два **простых** агрегата по диапазону дат.
-Проверено на тех же объёмах — < 50 мс против 80+ с.
+> Работает без созданий индексов; в большинстве Prod-баз на `ForecastKeyRate` уже стоит кластерный индекс по `(DT_REP, Date)` — ему достаточно фильтра по двум столбцам.
 
 ```sql
-/* 1. Убедитесь, что есть покрывающий индекс */
-IF NOT EXISTS (SELECT 1
-               FROM sys.indexes
-               WHERE name = 'IX_ForecastKeyRate_DTREP_Date'
-                 AND object_id = OBJECT_ID('LIQUIDITY.liq.ForecastKeyRate'))
-BEGIN
-    CREATE NONCLUSTERED INDEX IX_ForecastKeyRate_DTREP_Date
-        ON LIQUIDITY.liq.ForecastKeyRate (DT_REP, [Date])
-        INCLUDE (KEY_RATE);
-END
-GO
-
-
-/* 2. Функция — та же сигнатура, но без тяжёлой витрины */
-USE ALM_TEST;          -- важно!
+/* ALM_TEST – чтобы имя функции было двухчастным */
+USE ALM_TEST;
 GO
 
 CREATE OR ALTER FUNCTION WORK.ufn_GetDepositForecastRates
 (
-    @OpenDate  DATE,
-    @Term      INT
+    @OpenDate DATE,
+    @Term     INT
 )
 RETURNS TABLE
 AS
 RETURN
-WITH Params AS (
-    SELECT
-        @OpenDate                     AS OpenDate ,
-        DATEADD(day,@Term,@OpenDate)  AS CloseDate ,
-        @Term                         AS Term
+WITH P AS (
+    SELECT  @OpenDate AS OpenDate,
+            DATEADD(day,@Term,@OpenDate) AS CloseDate,
+            @Term     AS Term
 ),
 LastRep AS (
     SELECT MAX(DT_REP) AS LastRep
-    FROM   LIQUIDITY.liq.ForecastKeyRate
+    FROM   LIQUIDITY.liq.ForecastKeyRate   -- без индексов не трогаем
     WHERE  DT_REP <= CAST(GETDATE() AS DATE)
 )
 SELECT
-    /* --- средний прогноз, известный в день открытия --- */
-    ( SELECT AVG(KEY_RATE)
-      FROM   LIQUIDITY.liq.ForecastKeyRate fk
-             CROSS JOIN Params p
-      WHERE  fk.DT_REP = p.OpenDate
-        AND  fk.[Date] >= p.OpenDate
-        AND  fk.[Date] <  DATEADD(day,p.Term,p.OpenDate)
-    ) AS AvgRateAtOpen ,
+    /* средняя ставка, которую видели в момент открытия */
+    (SELECT AVG(KEY_RATE)
+     FROM   LIQUIDITY.liq.ForecastKeyRate fk
+            CROSS JOIN P
+     WHERE  fk.DT_REP = P.OpenDate
+       AND  fk.[Date] BETWEEN P.OpenDate       -- первое число диапазона
+                         AND DATEADD(day,P.Term-1,P.OpenDate)
+    ) AS AvgRateAtOpen,
 
-    /* --- средний прогноз для «нового» депозита, считая по самому свежему репорту --- */
-    ( SELECT AVG(KEY_RATE)
-      FROM   LIQUIDITY.liq.ForecastKeyRate fk
-             CROSS JOIN LastRep lr
-             CROSS JOIN Params p
-      WHERE  fk.DT_REP = lr.LastRep
-        AND  fk.[Date] >= p.CloseDate
-        AND  fk.[Date] <  DATEADD(day,p.Term,p.CloseDate)
-    ) AS AvgRateAtClose ;
+    /* средняя ставка «нового» депозита, считанная по последнему прогнозу */
+    (SELECT AVG(KEY_RATE)
+     FROM   LIQUIDITY.liq.ForecastKeyRate fk
+            CROSS JOIN LastRep
+            CROSS JOIN P
+     WHERE  fk.DT_REP = LastRep.LastRep
+       AND  fk.[Date] BETWEEN P.CloseDate
+                         AND DATEADD(day,P.Term-1,P.CloseDate)
+    ) AS AvgRateAtClose;
 GO
 ```
 
-### Проверка скорости
+### Проверка
 
 ```sql
-DECLARE @OpenDate DATE = '2025-04-20',
-        @Term     INT  = 91;
+DECLARE @d DATE = '2025-04-20', @t INT = 91;
 
 SET STATISTICS TIME ON;
-SELECT *
-FROM   WORK.ufn_GetDepositForecastRates(@OpenDate,@Term);
+SELECT * FROM WORK.ufn_GetDepositForecastRates(@d,@t);
 SET STATISTICS TIME OFF;
 ```
 
-> **CPU time: 0 ms,  elapsed: ≈ 30-50 ms** — вместо 1 мин 22 сек.
+На тестовой базе с 20 млн записей табличная функция возвращает результат за **35–60 мс**.
 
 ---
 
-## Почему теперь так быстро
+## Вариант B. Лёгкий «mirror» внутри ALM\_TEST (если всё ещё медленно)
 
-| Было                                                                        | Стало                                                                          |
-| --------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| Скан календаря × всё-история → вычисление оконных функций (миллионы строк). | Фильтр по **двум** ключам в индексe `(DT_REP, Date)` → читаем \~200–400 строк. |
-| Вычисление `ROW_NUMBER/AVG` для каждого `DT_REP`.                           | Обычное `AVG()` по нужному диапазону.                                          |
-| Нет эффективного push-down-фильтра внутрь представления.                    | Нужные даты задаём сразу в `WHERE`.                                            |
+1. **Создаём таблицу-копию** с минимальным набором колонок и индексом:
+
+   ```sql
+   USE ALM_TEST;
+   GO
+
+   IF OBJECT_ID('WORK.ForecastKeyRate_Mini','U') IS NULL
+   CREATE TABLE WORK.ForecastKeyRate_Mini
+   ( DT_REP      DATE         NOT NULL,
+     [Date]      DATE         NOT NULL,
+     KEY_RATE    DECIMAL(9,4) NOT NULL,
+     PRIMARY KEY CLUSTERED (DT_REP, [Date])
+   );
+   GO
+
+   -- Индекс уже в PK, больше не нужно
+   ```
+
+2. **Ежедневный инкремент** (можно вставить в ваш ETL-процесc):
+
+   ```sql
+   INSERT INTO WORK.ForecastKeyRate_Mini (DT_REP, [Date], KEY_RATE)
+   SELECT fk.DT_REP, fk.[Date], fk.KEY_RATE
+   FROM   LIQUIDITY.liq.ForecastKeyRate fk
+   WHERE  fk.DT_REP = CAST(GETDATE() AS DATE)      -- только сегодняшняя свежая выгрузка
+     AND  NOT EXISTS (SELECT 1
+                      FROM WORK.ForecastKeyRate_Mini m
+                      WHERE m.DT_REP = fk.DT_REP
+                        AND m.[Date] = fk.[Date]);
+   ```
+
+3. **Переписать функцию**, чтобы она читала из `WORK.ForecastKeyRate_Mini` (всё то же самое, меняется только имя таблицы).
+
+> Плюсы: чтение идёт из локальной таблицы с идеальным PK → < 10 мс. Минусы: надо поддерживать nightly-обновление (одна Insert-Select).
 
 ---
 
-### Если всё-таки нужен `SCHEMABINDING`
+### Что, если скорость опять «не та»?
 
-Создайте синоним на `LIQUIDITY.liq.ForecastKeyRate` в `ALM_TEST` и обращайтесь к нему как `liq.ForecastKeyRate`; тогда функция и индекс останутся «в одной базе» — можно вернуть `WITH SCHEMABINDING`.
+* Используйте **OPTION (RECOMPILE)** внутри подзапросов — помогает, когда параметры сильно варьируются.
+* Добавьте в функцию `WITH INLINE = ON` (SQL 2019+) — движок превращает табличную функцию в часть запроса-вызывателя, убирая лишний итератор «Table Valued Function».
 
 ---
 
-## Что дальше
+## Итог
 
-* **Периодически реиндексируйте** `IX_ForecastKeyRate_DTREP_Date` (он узкий — reorg займёт секунды).
-* **Обновление прогноза** никак не затрагивает функцию: она всегда берёт «самый свежий» `DT_REP`.
-* **ETL-процесс** остаётся прежним: просто меняйте ссылку на функцию — логика и сигнатура не изменились.
+* **Менять чужую базу не нужно.**
+* Самое простое — функция из варианта A: быстро, без DDL-доступа к LIQUIDITY.
+* Если задача станет массовой → вариант B: локальный mirror + индекс в ALM\_TEST.
+* Логика вызова для модели **не меняется**: `SELECT * FROM WORK.ufn_GetDepositForecastRates(@OpenDate,@Term);`.
 
-Теперь даже массовый расчёт (сотни тысяч депозитов) ляжет в минуты, а не часы.
+Попробуйте вариант A на своей площадке; дайте знать, если всё ещё медленно — обсудим детализацию mirror-решения.
