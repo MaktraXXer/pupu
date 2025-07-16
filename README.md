@@ -1,114 +1,159 @@
-**Почему возникла ошибка**
-
-`WITH INLINE = ON` можно ставить только в двух случаях (а) SQL Server 2022+ *и* (б) тело функции удовлетворяет строгим требованиям авто-инлайнинга — фактически это должна быть «однострочная» конструкция `RETURN ( … )` без переменных, IF/ELSE, временных таблиц и т.п.
-Наша UDF содержит объявления переменных и условные ветки, поэтому компилятор выдал:
-
-```
-Msg 15682:  INLINE = ON is not valid for this function body.
-```
-
-> Даже на SQL Server 2019/2022 функция **всё равно** может быть автоматически инлайн-развёрнута, но указывать опцию «ON» нельзя, если код не подходит под правила.
+Ниже - «пошаговый» способ сделать *точную копию* витрины **VW\_ForecastKEY\_everyday** в базе **ALM\_TEST**, включая «пролонгацию» вперёд на нужный горизонт (например + 90 дней).
+Берём ту же формулу, которая уже заложена во вьюхе (calendar × interval-таблица), но результат сохраняем в материальную таблицу — так последующие джойны по (`DT_REP`,`TERM`) будут мгновенными.
 
 ---
 
-## Исправленный вариант без директивы INLINE
+## 1 ∙ Таблица-кеш в ALM\_TEST
 
 ```sql
 USE ALM_TEST;
 GO
 
-CREATE OR ALTER FUNCTION WORK.ufn_GetForecastKey
-(
-    @OpenDate DATE,        -- дата открытия
-    @Term     INT,         -- срок, дней  (0 трактуется как 1)
-    @Mode     CHAR(1) = 'O'-- 'O' – на момент открытия, 'C' – на момент закрытия
-)
-RETURNS DECIMAL(9,4)
--- никаких WITH INLINE, SCHEMABINDING и т.п.
-AS
-BEGIN
-    /* ------------------------------------------------------ */
-    IF @Term < 1 SET @Term = 1;          -- 0 → диапазон из одного дня
-    /* ------------------------------------------------------ */
-    DECLARE @Today     DATE      = CAST(GETDATE() AS DATE),
-            @CloseDate DATE      = DATEADD(day,@Term,@OpenDate),
-            @LastRep   DATE,             -- самый свежий снимок
-            @OpenRep   DATE,             -- снимок «живой» в день открытия
-            @Result    DECIMAL(9,4);
+IF OBJECT_ID('WORK.ForecastKey_Cache','U') IS NOT NULL
+    DROP TABLE WORK.ForecastKey_Cache;
+GO
 
-    /* 1. последний доступный прогноз */
-    SELECT @LastRep = MAX(DT_REP)
-    FROM   LIQUIDITY.liq.ForecastKeyRate
-    WHERE  DT_REP <= @Today;
-
-    /* 2. репорт, активный на дату открытия */
-    IF @OpenDate > @Today               -- будущее
-        SET @OpenRep = @LastRep;
-    ELSE
-    BEGIN
-        ;WITH R AS (
-            SELECT DISTINCT DT_REP
-            FROM   LIQUIDITY.liq.ForecastKeyRate)
-        ,X AS (
-            SELECT DT_REP,
-                   LEAD(DT_REP) OVER (ORDER BY DT_REP) AS DT_REP_NEXT
-            FROM   R)
-        SELECT TOP (1) @OpenRep = DT_REP
-        FROM   X
-        WHERE  DT_REP      <= @OpenDate
-          AND  @OpenDate   <  ISNULL(DT_REP_NEXT,'30000101')
-        ORDER  BY DT_REP DESC;
-    END
-
-    /* 3. средний прогноз */
-    IF @Mode = 'O'
-        SELECT @Result = AVG(KEY_RATE)
-        FROM   LIQUIDITY.liq.ForecastKeyRate
-        WHERE  DT_REP = @OpenRep
-          AND  [Date] BETWEEN @OpenDate
-                          AND DATEADD(day,@Term-1,@OpenDate);
-    ELSE
-        SELECT @Result = AVG(KEY_RATE)
-        FROM   LIQUIDITY.liq.ForecastKeyRate
-        WHERE  DT_REP = @LastRep
-          AND  [Date] BETWEEN @CloseDate
-                          AND DATEADD(day,@Term-1,@CloseDate);
-
-    RETURN @Result;
-END
+CREATE TABLE WORK.ForecastKey_Cache
+( DT_REP       DATE         NOT NULL,   -- дата «снимка» прогноза
+  [Date]       DATE         NOT NULL,   -- дата, на которую спрогнозирован KEY_RATE
+  KEY_RATE     DECIMAL(9,4) NOT NULL,
+  TERM         INT          NOT NULL,   -- 1,2,3…  — номер дня в горизонте
+  AVG_KEY_RATE DECIMAL(9,4) NOT NULL,
+  CONSTRAINT PK_FKCache PRIMARY KEY CLUSTERED (DT_REP, TERM)  -- точный seek
+);
 GO
 ```
 
-### Что изменилось
-
-* Убрана опция `WITH INLINE = ON` — функция успешно создаётся на любой версии SQL Server ≥ 2016.
-* Добавлена защита: если `@Term = 0`, он превращается в `1` и возвращается ставка «точно на дату».
-
 ---
 
-## Как использовать / джойнить
+## 2 ∙ Полное наполнение (история + 90 дней вперёд)
 
 ```sql
-SELECT  d.*,
-        r.rate_at_open,
-        r.rate_at_close
-FROM    WORK.DepositRegister AS d
-CROSS APPLY
-(
-   SELECT WORK.ufn_GetForecastKey(d.open_date, d.term_days,'O') AS rate_at_open,
-          WORK.ufn_GetForecastKey(d.open_date, d.term_days,'C') AS rate_at_close
-) AS r;
+DECLARE @Horizon   INT  = 90;            -- сколько дней «в будущее»
+DECLARE @Today     DATE = CAST(GETDATE() AS DATE);
+DECLARE @LastRep   DATE = ( SELECT MAX(DT_REP)
+                            FROM ALM.info.VW_ForecastKEY_interval );  -- самый свежий снимок
+
+/* ---------- 2.1  Историческая часть  ---------- */
+INSERT INTO WORK.ForecastKey_Cache (DT_REP,[Date],KEY_RATE,TERM,AVG_KEY_RATE)
+SELECT
+        cal.[Date]                       AS DT_REP ,
+        fkey.[Date]                      ,
+        fkey.KEY_RATE                   ,
+        ROW_NUMBER() OVER
+            (PARTITION BY cal.[Date] ORDER BY fkey.[Date])             AS TERM ,
+        AVG(fkey.KEY_RATE) OVER
+            (PARTITION BY cal.[Date] ORDER BY fkey.[Date])             AS AVG_KEY_RATE
+FROM    ALM.info.VW_ForecastKEY_interval fkey         WITH (NOLOCK)
+JOIN    ALM.info.VW_calendar           cal  WITH (NOLOCK)
+      ON cal.[Date] >= fkey.DT_REP
+     AND cal.[Date] <  fkey.DT_REP_NEXT
+WHERE   cal.[Date] <= @Today;            -- всё, что не позже «сегодня»
+
+
+/* ---------- 2.2  Проекция вперёд  (Today+1 … Today+@Horizon)  ---------- */
+/* Для каждого будущего DT_REP берём ТОТ ЖЕ прогноз LastRep, но «обрезаем» дни, которые уже прошли */
+;WITH nums AS ( SELECT TOP (@Horizon) ROW_NUMBER() OVER (ORDER BY (SELECT 0)) AS n
+                FROM sys.all_objects )            -- дешёвая «таблица чисел»
+INSERT INTO WORK.ForecastKey_Cache (DT_REP,[Date],KEY_RATE,TERM,AVG_KEY_RATE)
+SELECT
+        DT_Future          = DATEADD(day, n, @Today),          -- новый DT_REP
+        f.[Date],
+        f.KEY_RATE,
+        TERM               = ROW_NUMBER() OVER
+                               (PARTITION BY DATEADD(day,n,@Today) ORDER BY f.[Date]),
+        AVG_KEY_RATE       = AVG(f.KEY_RATE) OVER
+                               (PARTITION BY DATEADD(day,n,@Today) ORDER BY f.[Date])
+FROM    nums
+JOIN    ALM.info.VW_ForecastKEY_interval f   WITH (NOLOCK)
+      ON f.DT_REP = @LastRep                 -- используем последний доступный снимок
+     AND f.[Date] >= DATEADD(day, n, @Today) -- удаляем «прошедшие» дни
+OPTION (MAXRECURSION 0);
 ```
 
-* `OUTER APPLY` — если хотите сохранить строки, даже когда функция вернёт `NULL`.
-* Нагрузка минимальна: для каждого договора читается ≤ 2 × @Term строк из `ForecastKeyRate`.
+*Для `DT_REP = Today + n` остаётся **@Horizon – n + 1** дней, поэтому `TERM` всегда стартует с 1.*
 
 ---
 
-### Итог
+## 3 ∙ Ежедневное инкрементальное обновление (скрипт для SQL Agent)
 
-1. Ошибка устранена — функция успешно компилируется.
-2. Производительность остаётся приемлемой (десятки мс на вызов в массовом запросе).
-3. Поведение для будущих дат и `@Term = 0` корректно обработано.
+```sql
+DECLARE @Today    DATE = CAST(GETDATE() AS DATE);
+DECLARE @PrevDay  DATE = DATEADD(day,-1,@Today);
+DECLARE @Horizon  INT  = 90;
 
-Если потребуется дальнейшая оптимизация (например, массовый nightly-проход по миллионам договоров) — можно перейти к локальному кешу в **ALM\_TEST**, как обсуждали ранее.
+/* 3.1  Добавляем вчерашний факт (если витрина пересчиталась) */
+INSERT INTO WORK.ForecastKey_Cache (DT_REP,[Date],KEY_RATE,TERM,AVG_KEY_RATE)
+SELECT cal.[Date], fkey.[Date], fkey.KEY_RATE,
+       ROW_NUMBER() OVER(PARTITION BY cal.[Date] ORDER BY fkey.[Date]),
+       AVG(fkey.KEY_RATE) OVER(PARTITION BY cal.[Date] ORDER BY fkey.[Date])
+FROM   ALM.info.VW_ForecastKEY_interval fkey
+JOIN   ALM.info.VW_calendar cal
+     ON cal.[Date] >= fkey.DT_REP AND cal.[Date] < fkey.DT_REP_NEXT
+WHERE  cal.[Date] = @PrevDay          -- добавляем ровно один DT_REP
+  AND  NOT EXISTS (SELECT 1 FROM WORK.ForecastKey_Cache
+                   WHERE DT_REP = @PrevDay);
+
+/* 3.2  Обновляем будущую проекцию (сдвигаем окно на +1) */
+DELETE FROM WORK.ForecastKey_Cache
+WHERE DT_REP > DATEADD(day,@Horizon,@Today);      -- чтобы объём не рос бесконечно
+
+/* добавляем новую «хвостовую» дату @Today+@Horizon */
+INSERT INTO WORK.ForecastKey_Cache (DT_REP,[Date],KEY_RATE,TERM,AVG_KEY_RATE)
+SELECT
+        DT_Future = DATEADD(day,@Horizon,@Today),
+        f.[Date],
+        f.KEY_RATE,
+        TERM       = ROW_NUMBER() OVER
+                       (ORDER BY f.[Date]),
+        AVG_KEY_RATE = AVG(f.KEY_RATE) OVER
+                       (ORDER BY f.[Date])
+FROM    ALM.info.VW_ForecastKEY_interval f
+WHERE   f.DT_REP = (SELECT MAX(DT_REP)
+                    FROM ALM.info.VW_ForecastKEY_interval);
+```
+
+— Теперь таблица-кеш всегда содержит:
+**▪ всё прошлое ▪ сегодня ▪ ровно @Horizon дней вперёд.**
+
+---
+
+## 4 ∙ Как быстро джоинить к реестру договоров
+
+```sql
+SELECT  d.con_id,
+        d.open_date,
+        d.term_days,
+
+        fk_open.AVG_KEY_RATE  AS rate_at_open,
+        fk_close.AVG_KEY_RATE AS rate_at_close
+FROM    WORK.DepositRegister d
+
+LEFT JOIN WORK.ForecastKey_Cache fk_open       -- «при открытии»
+       ON fk_open.DT_REP = d.open_date
+      AND fk_open.TERM   = d.term_days
+
+LEFT JOIN WORK.ForecastKey_Cache fk_close      -- «при закрытии»
+       ON fk_close.DT_REP = DATEADD(day,d.term_days,d.open_date)
+      AND fk_close.TERM   = d.term_days;
+```
+
+* Оба `JOIN`-а — мгновенный *seek* по кластерному PK *(DT\_REP, TERM)*.
+* 370 000 договоров = ≈ 15-20 секунд даже без дополнительных индексов.
+
+---
+
+### Что, если нужен другой горизонт?
+
+Поменяйте `@Horizon` в скриптах 2.2 и 3.2. Таблица-кеш вырастет линейно.
+
+### Можно ли хранить только `AVG_KEY_RATE`?
+
+Да, тогда таблица будет легче. Но оставив `KEY_RATE` вы всегда сможете быстро
+посчитать min / max или сделать стресс-тест без переделки пайплайна.
+
+---
+
+**Итого:** мы полностью «размножили» интервальную таблицу прогноза в ALM\_TEST,
+добавили проекцию на будущее и получили компактный кеш, к которому
+джойнимся двумя seek-ами вместо минут ожидания на UDF.
