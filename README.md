@@ -1,159 +1,133 @@
-Ниже - «пошаговый» способ сделать *точную копию* витрины **VW\_ForecastKEY\_everyday** в базе **ALM\_TEST**, включая «пролонгацию» вперёд на нужный горизонт (например + 90 дней).
-Берём ту же формулу, которая уже заложена во вьюхе (calendar × interval-таблица), но результат сохраняем в материальную таблицу — так последующие джойны по (`DT_REP`,`TERM`) будут мгновенными.
+### Да, лучше “привязаться” не к `GETDATE()`, а к последней фактически загруженной дате прогноза (`@LastRep`)
+
+Так мы гарантированно не попытаемся включить в кэш не-существующий `DT_REP = today`, а вся логика «история + 90 дней вперёд» остаётся корректной.
+
+Ниже оба скрипта целиком — уже с поправкой.
+Ключевая идея:
+
+```sql
+DECLARE @Anchor DATE = (SELECT MAX(DT_REP) FROM ALM.info.VW_ForecastKEY_interval);
+```
+
+`@Anchor` — это **t-1** от `GETDATE()` (или более ранний, если выгрузка задержалась).
+История копируется до `@Anchor`, а проекция строится от `@Anchor+1` до `@Anchor+@Horizon`.
 
 ---
 
-## 1 ∙ Таблица-кеш в ALM\_TEST
+## 1 · Инициализация (разовая)
 
 ```sql
 USE ALM_TEST;
 GO
-
 IF OBJECT_ID('WORK.ForecastKey_Cache','U') IS NOT NULL
     DROP TABLE WORK.ForecastKey_Cache;
 GO
-
 CREATE TABLE WORK.ForecastKey_Cache
-( DT_REP       DATE         NOT NULL,   -- дата «снимка» прогноза
-  [Date]       DATE         NOT NULL,   -- дата, на которую спрогнозирован KEY_RATE
+( DT_REP       DATE         NOT NULL,
+  [Date]       DATE         NOT NULL,
   KEY_RATE     DECIMAL(9,4) NOT NULL,
-  TERM         INT          NOT NULL,   -- 1,2,3…  — номер дня в горизонте
+  TERM         INT          NOT NULL,
   AVG_KEY_RATE DECIMAL(9,4) NOT NULL,
-  CONSTRAINT PK_FKCache PRIMARY KEY CLUSTERED (DT_REP, TERM)  -- точный seek
+  CONSTRAINT PK_FKCache PRIMARY KEY CLUSTERED (DT_REP, TERM)
 );
 GO
-```
 
----
+DECLARE @Horizon INT  = 90;
+DECLARE @Anchor  DATE = (SELECT MAX(DT_REP)
+                         FROM ALM.info.VW_ForecastKEY_interval); -- t-1
 
-## 2 ∙ Полное наполнение (история + 90 дней вперёд)
-
-```sql
-DECLARE @Horizon   INT  = 90;            -- сколько дней «в будущее»
-DECLARE @Today     DATE = CAST(GETDATE() AS DATE);
-DECLARE @LastRep   DATE = ( SELECT MAX(DT_REP)
-                            FROM ALM.info.VW_ForecastKEY_interval );  -- самый свежий снимок
-
-/* ---------- 2.1  Историческая часть  ---------- */
+/* ---------- 1.1  История до @Anchor ---------- */
 INSERT INTO WORK.ForecastKey_Cache (DT_REP,[Date],KEY_RATE,TERM,AVG_KEY_RATE)
-SELECT
-        cal.[Date]                       AS DT_REP ,
-        fkey.[Date]                      ,
-        fkey.KEY_RATE                   ,
-        ROW_NUMBER() OVER
-            (PARTITION BY cal.[Date] ORDER BY fkey.[Date])             AS TERM ,
-        AVG(fkey.KEY_RATE) OVER
-            (PARTITION BY cal.[Date] ORDER BY fkey.[Date])             AS AVG_KEY_RATE
-FROM    ALM.info.VW_ForecastKEY_interval fkey         WITH (NOLOCK)
-JOIN    ALM.info.VW_calendar           cal  WITH (NOLOCK)
-      ON cal.[Date] >= fkey.DT_REP
-     AND cal.[Date] <  fkey.DT_REP_NEXT
-WHERE   cal.[Date] <= @Today;            -- всё, что не позже «сегодня»
+SELECT cal.[Date], fkey.[Date], fkey.KEY_RATE,
+       ROW_NUMBER() OVER (PARTITION BY cal.[Date] ORDER BY fkey.[Date]),
+       AVG(fkey.KEY_RATE) OVER (PARTITION BY cal.[Date] ORDER BY fkey.[Date])
+FROM   ALM.info.VW_ForecastKEY_interval fkey  WITH (NOLOCK)
+JOIN   ALM.info.VW_calendar          cal   WITH (NOLOCK)
+  ON   cal.[Date] >= fkey.DT_REP
+ AND   cal.[Date] <  fkey.DT_REP_NEXT
+WHERE  cal.[Date] <= @Anchor;
 
-
-/* ---------- 2.2  Проекция вперёд  (Today+1 … Today+@Horizon)  ---------- */
-/* Для каждого будущего DT_REP берём ТОТ ЖЕ прогноз LastRep, но «обрезаем» дни, которые уже прошли */
-;WITH nums AS ( SELECT TOP (@Horizon) ROW_NUMBER() OVER (ORDER BY (SELECT 0)) AS n
-                FROM sys.all_objects )            -- дешёвая «таблица чисел»
+/* ---------- 1.2  Проекция вперёд: 1 … @Horizon ---------- */
+;WITH nums AS (
+      SELECT TOP (@Horizon) ROW_NUMBER() OVER (ORDER BY (SELECT 0)) AS n
+      FROM sys.all_objects )
 INSERT INTO WORK.ForecastKey_Cache (DT_REP,[Date],KEY_RATE,TERM,AVG_KEY_RATE)
-SELECT
-        DT_Future          = DATEADD(day, n, @Today),          -- новый DT_REP
-        f.[Date],
-        f.KEY_RATE,
-        TERM               = ROW_NUMBER() OVER
-                               (PARTITION BY DATEADD(day,n,@Today) ORDER BY f.[Date]),
-        AVG_KEY_RATE       = AVG(f.KEY_RATE) OVER
-                               (PARTITION BY DATEADD(day,n,@Today) ORDER BY f.[Date])
-FROM    nums
-JOIN    ALM.info.VW_ForecastKEY_interval f   WITH (NOLOCK)
-      ON f.DT_REP = @LastRep                 -- используем последний доступный снимок
-     AND f.[Date] >= DATEADD(day, n, @Today) -- удаляем «прошедшие» дни
+SELECT DATEADD(day,n,@Anchor)                AS DT_REP,
+       f.[Date],
+       f.KEY_RATE,
+       ROW_NUMBER() OVER
+           (PARTITION BY DATEADD(day,n,@Anchor) ORDER BY f.[Date])   AS TERM,
+       AVG(f.KEY_RATE) OVER
+           (PARTITION BY DATEADD(day,n,@Anchor) ORDER BY f.[Date])   AS AVG_KEY_RATE
+FROM   nums
+JOIN   ALM.info.VW_ForecastKEY_interval f  WITH (NOLOCK)
+  ON   f.DT_REP = @Anchor                  -- прогноз последнего снимка
+ AND   f.[Date] >= DATEADD(day,n,@Anchor)   -- отрезаем прошедшие дни
 OPTION (MAXRECURSION 0);
 ```
 
-*Для `DT_REP = Today + n` остаётся **@Horizon – n + 1** дней, поэтому `TERM` всегда стартует с 1.*
-
 ---
 
-## 3 ∙ Ежедневное инкрементальное обновление (скрипт для SQL Agent)
+## 2 · Ежедневный инкремент (для SQL Agent)
 
 ```sql
-DECLARE @Today    DATE = CAST(GETDATE() AS DATE);
-DECLARE @PrevDay  DATE = DATEADD(day,-1,@Today);
-DECLARE @Horizon  INT  = 90;
+DECLARE @Horizon INT  = 90;
+DECLARE @Anchor  DATE = (SELECT MAX(DT_REP)
+                         FROM ALM.info.VW_ForecastKEY_interval); -- t-1
+DECLARE @PrevDay DATE = DATEADD(day,-1,@Anchor);                 -- t-2
+DECLARE @NewTail DATE = DATEADD(day,@Horizon,@Anchor);           -- t-1 + 90
 
-/* 3.1  Добавляем вчерашний факт (если витрина пересчиталась) */
+/* 2.1  Подливаем вчерашний факт, если его ещё нет */
 INSERT INTO WORK.ForecastKey_Cache (DT_REP,[Date],KEY_RATE,TERM,AVG_KEY_RATE)
 SELECT cal.[Date], fkey.[Date], fkey.KEY_RATE,
-       ROW_NUMBER() OVER(PARTITION BY cal.[Date] ORDER BY fkey.[Date]),
-       AVG(fkey.KEY_RATE) OVER(PARTITION BY cal.[Date] ORDER BY fkey.[Date])
+       ROW_NUMBER() OVER (PARTITION BY cal.[Date] ORDER BY fkey.[Date]),
+       AVG(fkey.KEY_RATE) OVER (PARTITION BY cal.[Date] ORDER BY fkey.[Date])
 FROM   ALM.info.VW_ForecastKEY_interval fkey
 JOIN   ALM.info.VW_calendar cal
-     ON cal.[Date] >= fkey.DT_REP AND cal.[Date] < fkey.DT_REP_NEXT
-WHERE  cal.[Date] = @PrevDay          -- добавляем ровно один DT_REP
-  AND  NOT EXISTS (SELECT 1 FROM WORK.ForecastKey_Cache
+  ON   cal.[Date] >= fkey.DT_REP
+ AND   cal.[Date] <  fkey.DT_REP_NEXT
+WHERE  cal.[Date] = @PrevDay
+  AND  NOT EXISTS (SELECT 1
+                   FROM WORK.ForecastKey_Cache
                    WHERE DT_REP = @PrevDay);
 
-/* 3.2  Обновляем будущую проекцию (сдвигаем окно на +1) */
+/* 2.2  Удаляем возможный дубль + вставляем новый хвост */
 DELETE FROM WORK.ForecastKey_Cache
-WHERE DT_REP > DATEADD(day,@Horizon,@Today);      -- чтобы объём не рос бесконечно
+WHERE  DT_REP = @NewTail;
 
-/* добавляем новую «хвостовую» дату @Today+@Horizon */
 INSERT INTO WORK.ForecastKey_Cache (DT_REP,[Date],KEY_RATE,TERM,AVG_KEY_RATE)
-SELECT
-        DT_Future = DATEADD(day,@Horizon,@Today),
-        f.[Date],
-        f.KEY_RATE,
-        TERM       = ROW_NUMBER() OVER
-                       (ORDER BY f.[Date]),
-        AVG_KEY_RATE = AVG(f.KEY_RATE) OVER
-                       (ORDER BY f.[Date])
-FROM    ALM.info.VW_ForecastKEY_interval f
-WHERE   f.DT_REP = (SELECT MAX(DT_REP)
-                    FROM ALM.info.VW_ForecastKEY_interval);
+SELECT @NewTail, f.[Date], f.KEY_RATE,
+       ROW_NUMBER() OVER (ORDER BY f.[Date])                 AS TERM,
+       AVG(f.KEY_RATE) OVER (ORDER BY f.[Date])              AS AVG_KEY_RATE
+FROM   ALM.info.VW_ForecastKEY_interval f
+WHERE  f.DT_REP = @Anchor          -- тот же самый последний снимок
+  AND  f.[Date] >= @NewTail;       -- только будущие даты
 ```
-
-— Теперь таблица-кеш всегда содержит:
-**▪ всё прошлое ▪ сегодня ▪ ровно @Horizon дней вперёд.**
 
 ---
 
-## 4 ∙ Как быстро джоинить к реестру договоров
+### Проверка
 
 ```sql
-SELECT  d.con_id,
-        d.open_date,
-        d.term_days,
-
-        fk_open.AVG_KEY_RATE  AS rate_at_open,
-        fk_close.AVG_KEY_RATE AS rate_at_close
-FROM    WORK.DepositRegister d
-
-LEFT JOIN WORK.ForecastKey_Cache fk_open       -- «при открытии»
-       ON fk_open.DT_REP = d.open_date
-      AND fk_open.TERM   = d.term_days
-
-LEFT JOIN WORK.ForecastKey_Cache fk_close      -- «при закрытии»
-       ON fk_close.DT_REP = DATEADD(day,d.term_days,d.open_date)
-      AND fk_close.TERM   = d.term_days;
+/* убедимся, что есть ровно 90 будущих DT_REP */
+SELECT COUNT(DISTINCT DT_REP) AS future_days
+FROM   WORK.ForecastKey_Cache
+WHERE  DT_REP > @Anchor;         -- должно быть = @Horizon
 ```
 
-* Оба `JOIN`-а — мгновенный *seek* по кластерному PK *(DT\_REP, TERM)*.
-* 370 000 договоров = ≈ 15-20 секунд даже без дополнительных индексов.
-
 ---
 
-### Что, если нужен другой горизонт?
+### Что изменилось и почему теперь корректно
 
-Поменяйте `@Horizon` в скриптах 2.2 и 3.2. Таблица-кеш вырастет линейно.
+| Было                                            | Стало                                                                       |
+| ----------------------------------------------- | --------------------------------------------------------------------------- |
+| `@Today = GETDATE()`                            | `@Anchor = MAX(DT_REP)` — последняя реально загруженная дата.               |
+| Первичное заполнение включало `@Today+@Horizon` | Теперь проекция идёт 1 … `@Horizon`, а **новый хвост** добавляет агент-шаг. |
+| `DELETE` отсекает “> Today + Horizon”           | Теперь отсекаем **только** новый хвост перед вставкой, дубликатов нет.      |
 
-### Можно ли хранить только `AVG_KEY_RATE`?
+Так кэш всегда содержит:
 
-Да, тогда таблица будет легче. Но оставив `KEY_RATE` вы всегда сможете быстро
-посчитать min / max или сделать стресс-тест без переделки пайплайна.
+* все даты до `@Anchor` (исторические),
+* **ровно** `@Horizon` будущих дат (`@Anchor+1 … @Anchor+@Horizon`).
 
----
-
-**Итого:** мы полностью «размножили» интервальную таблицу прогноза в ALM\_TEST,
-добавили проекцию на будущее и получили компактный кеш, к которому
-джойнимся двумя seek-ами вместо минут ожидания на UDF.
+И ни одного PK-конфликта.
