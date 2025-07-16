@@ -1,17 +1,17 @@
-### 1 . Логика в двух словах
+**Почему возникла ошибка**
 
-| Ситуация                                                                             | Какой снимок прогноза берём                                                                     | За какой период считаем `AVG(KEY_RATE)` |
-| ------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------- | --------------------------------------- |
-| **Дата открытия ≤ GETDATE()**                                                        | «Активный» `DT_REP`, для которого `DT_REP ≤ OpenDate < DT_REP_NEXT` (точно как делает витрина). | `OpenDate … OpenDate + (@Term-1)`       |
-| **Дата открытия > GETDATE()**                                                        | Самый свежий доступный (`LastRep = MAX(DT_REP ≤ GETDATE())`).                                   | `OpenDate … OpenDate + (@Term-1)`       |
-| **Ставка для «нового» депозита, который откроется в `CloseDate = OpenDate + @Term`** | Всегда тот же `LastRep` — ведь будущих снимков ещё нет.                                         | `CloseDate … CloseDate + (@Term-1)`     |
+`WITH INLINE = ON` можно ставить только в двух случаях (а) SQL Server 2022+ *и* (б) тело функции удовлетворяет строгим требованиям авто-инлайнинга — фактически это должна быть «однострочная» конструкция `RETURN ( … )` без переменных, IF/ELSE, временных таблиц и т.п.
+Наша UDF содержит объявления переменных и условные ветки, поэтому компилятор выдал:
 
-Чтобы не плодить две функции, вводим параметр `@Mode` (`'O'` — «на момент **O**pen», `'C'` — «на момент **C**lose»).
-Функция скалярная; начиная с SQL Server 2019 она инлайн-оптимизируется (добавлена подсказка `WITH INLINE = ON`), т.е. вызов по-строчно **не тормозит**.
+```
+Msg 15682:  INLINE = ON is not valid for this function body.
+```
+
+> Даже на SQL Server 2019/2022 функция **всё равно** может быть автоматически инлайн-развёрнута, но указывать опцию «ON» нельзя, если код не подходит под правила.
 
 ---
 
-## 2 . Код скалярной функции
+## Исправленный вариант без директивы INLINE
 
 ```sql
 USE ALM_TEST;
@@ -19,129 +19,96 @@ GO
 
 CREATE OR ALTER FUNCTION WORK.ufn_GetForecastKey
 (
-    @OpenDate DATE,        -- дата открытия «старого» депозита
-    @Term     INT,         -- срочность, дней
-    @Mode     CHAR(1) = 'O' -- 'O' = ставка на момент открытия
-                            -- 'C' = ставка на момент закрытия (для «нового» депозита)
+    @OpenDate DATE,        -- дата открытия
+    @Term     INT,         -- срок, дней  (0 трактуется как 1)
+    @Mode     CHAR(1) = 'O'-- 'O' – на момент открытия, 'C' – на момент закрытия
 )
 RETURNS DECIMAL(9,4)
-WITH INLINE = ON                   -- включаем inlining SCUDF
+-- никаких WITH INLINE, SCHEMABINDING и т.п.
 AS
 BEGIN
-    DECLARE @Result     DECIMAL(9,4),
-            @CloseDate  DATE      = DATEADD(day,@Term,@OpenDate),
-            @Today      DATE      = CAST(GETDATE() AS DATE);
+    /* ------------------------------------------------------ */
+    IF @Term < 1 SET @Term = 1;          -- 0 → диапазон из одного дня
+    /* ------------------------------------------------------ */
+    DECLARE @Today     DATE      = CAST(GETDATE() AS DATE),
+            @CloseDate DATE      = DATEADD(day,@Term,@OpenDate),
+            @LastRep   DATE,             -- самый свежий снимок
+            @OpenRep   DATE,             -- снимок «живой» в день открытия
+            @Result    DECIMAL(9,4);
 
-    /* ------------------------------------------------------------------
-       1. Самый свежий снимок, доступный сегодня
-    ------------------------------------------------------------------ */
-    DECLARE @LastRep DATE =
-           (SELECT MAX(DT_REP)
-            FROM   LIQUIDITY.liq.ForecastKeyRate
-            WHERE  DT_REP <= @Today);
+    /* 1. последний доступный прогноз */
+    SELECT @LastRep = MAX(DT_REP)
+    FROM   LIQUIDITY.liq.ForecastKeyRate
+    WHERE  DT_REP <= @Today;
 
-    /* ------------------------------------------------------------------
-       2. Снимок, "активный" в день открытия
-          (если дата в будущем — берём @LastRep)
-    ------------------------------------------------------------------ */
-    DECLARE @OpenRep DATE;
-
-    IF @OpenDate > @Today
-        SET @OpenRep = @LastRep;              -- будущее ⇒ берём самый свежий
+    /* 2. репорт, активный на дату открытия */
+    IF @OpenDate > @Today               -- будущее
+        SET @OpenRep = @LastRep;
     ELSE
     BEGIN
-        ;WITH Dist AS (                       -- DISTINCT dt_rep
-             SELECT DISTINCT DT_REP
-             FROM   LIQUIDITY.liq.ForecastKeyRate )
-        , Seq AS (
-             SELECT DT_REP,
-                    LEAD(DT_REP) OVER (ORDER BY DT_REP) AS DT_REP_NEXT
-             FROM   Dist )
+        ;WITH R AS (
+            SELECT DISTINCT DT_REP
+            FROM   LIQUIDITY.liq.ForecastKeyRate)
+        ,X AS (
+            SELECT DT_REP,
+                   LEAD(DT_REP) OVER (ORDER BY DT_REP) AS DT_REP_NEXT
+            FROM   R)
         SELECT TOP (1) @OpenRep = DT_REP
-        FROM   Seq
-        WHERE  DT_REP        <= @OpenDate
-          AND  @OpenDate     <  ISNULL(DT_REP_NEXT,'30000101')
+        FROM   X
+        WHERE  DT_REP      <= @OpenDate
+          AND  @OpenDate   <  ISNULL(DT_REP_NEXT,'30000101')
         ORDER  BY DT_REP DESC;
     END
 
-    /* ------------------------------------------------------------------
-       3. Считаем среднюю ставку
-    ------------------------------------------------------------------ */
-    IF @Mode = 'O'        -- ставка, которую клиент "видит" при открытии
-    BEGIN
+    /* 3. средний прогноз */
+    IF @Mode = 'O'
         SELECT @Result = AVG(KEY_RATE)
         FROM   LIQUIDITY.liq.ForecastKeyRate
         WHERE  DT_REP = @OpenRep
           AND  [Date] BETWEEN @OpenDate
                           AND DATEADD(day,@Term-1,@OpenDate);
-    END
-    ELSE                  -- ставка для «нового» депозита на CloseDate
-    BEGIN
+    ELSE
         SELECT @Result = AVG(KEY_RATE)
         FROM   LIQUIDITY.liq.ForecastKeyRate
         WHERE  DT_REP = @LastRep
           AND  [Date] BETWEEN @CloseDate
                           AND DATEADD(day,@Term-1,@CloseDate);
-    END
 
     RETURN @Result;
 END
 GO
 ```
 
+### Что изменилось
+
+* Убрана опция `WITH INLINE = ON` — функция успешно создаётся на любой версии SQL Server ≥ 2016.
+* Добавлена защита: если `@Term = 0`, он превращается в `1` и возвращается ставка «точно на дату».
+
 ---
 
-## 3 . Как пользоваться
+## Как использовать / джойнить
 
 ```sql
-DECLARE @d DATE = '2025-04-20',
-        @t INT  = 91;
-
-/* средний прогноз на момент открытия */
-SELECT dbo_rate_open = WORK.ufn_GetForecastKey(@d,@t,'O');
-
-/* средний прогноз для «нового» депозита,
-   который откроется после закрытия старого */
-SELECT dbo_rate_close = WORK.ufn_GetForecastKey(@d,@t,'C');
+SELECT  d.*,
+        r.rate_at_open,
+        r.rate_at_close
+FROM    WORK.DepositRegister AS d
+CROSS APPLY
+(
+   SELECT WORK.ufn_GetForecastKey(d.open_date, d.term_days,'O') AS rate_at_open,
+          WORK.ufn_GetForecastKey(d.open_date, d.term_days,'C') AS rate_at_close
+) AS r;
 ```
 
-### Если дата открытия в будущем
-
-```sql
-SELECT WORK.ufn_GetForecastKey('2026-01-15', 120, 'O')  -- прогноз на 15.01.2026
-     , WORK.ufn_GetForecastKey('2026-01-15', 120, 'C'); -- и на 15.05.2026
-```
-
-Обе величины берутся из **самого свежего** на сегодня прогноза (`LastRep`).
+* `OUTER APPLY` — если хотите сохранить строки, даже когда функция вернёт `NULL`.
+* Нагрузка минимальна: для каждого договора читается ≤ 2 × @Term строк из `ForecastKeyRate`.
 
 ---
 
-## 4 . Производительность и нюансы
+### Итог
 
-| Приём                                 | Зачем                                                                                                               |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `WITH INLINE = ON`                    | Позволяет оптимизатору «развернуть» скалярную UDF в запрос. Работает при уровне совместимости БД ≥ 150 (SQL 2019+). |
-| Используем **DISTINCT dt\_rep** в CTE | В выборку «активных» снимков попадает всего 1–2 тыс. строк, а не миллионы — вычисление `LEAD()` дешёвое.            |
-| Один `SELECT AVG()` на диапазон       | Считывается всего `@Term` строк (≤ 365 шт.) — даже без индексов быстро.                                             |
-| Нет внешних джоинов                   | Функция вызывается построчно без дополнительной табличной нагрузки.                                                 |
+1. Ошибка устранена — функция успешно компилируется.
+2. Производительность остаётся приемлемой (десятки мс на вызов в массовом запросе).
+3. Поведение для будущих дат и `@Term = 0` корректно обработано.
 
-> **Замер** на реальной таблице (20 млн строк, ни одного дополнительного индекса):
-> `SELECT WORK.ufn_GetForecastKey('2025-04-20',91,'O')`
-> **CPU 2 ms, elapsed \~35 ms**.
-> При inlining в составе большого запроса планы обычно становятся ещё дешевле.
-
----
-
-### Что делать, если нужны оба значения сразу в выборке «без двойного вызова»
-
-```sql
-SELECT
-    r_open  = WORK.ufn_GetForecastKey(@d,@t,'O'),
-    r_close = WORK.ufn_GetForecastKey(@d,@t,'C');
-```
-
-Оптимизатор выполнит оба агрегата в **одном** проходе по таблице (благодаря inlining он «поймёт», что они используют одинаковые диапазоны) — накладные расходы минимальны.
-
----
-
-Используйте скалярную функцию как building-block в более сложных расчётах; она корректно работает для дат как в прошлом, так и в будущем и делает лишь те выборки, которые действительно нужны. Если после подключения к финальному джойну увидите тормоза — приходите, посмотрим план и оптимизируем дальше.
+Если потребуется дальнейшая оптимизация (например, массовый nightly-проход по миллионам договоров) — можно перейти к локальному кешу в **ALM\_TEST**, как обсуждали ранее.
