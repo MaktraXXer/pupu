@@ -1,87 +1,81 @@
-/* ===== параметры периода ========================================== */
-DECLARE @DateFrom date = '2025‑05‑01',
-        @DateTo   date = '2025‑07‑01';
+Ниже — корректный скрипт «с нуля»:
 
-/* ===== 1. Срочные (все валюты) ==================================== */
-WITH term AS (
-    SELECT  t.dt_rep,
-            t.out_rub,
-            /* эквивалентная рублёвая ставка */
-            t.rate_con * t.out_cur / NULLIF(t.out_rub,0) AS rate_rub
-    FROM    alm.ALM.vw_balance_rest_all t
-    WHERE   t.dt_rep BETWEEN @DateFrom AND @DateTo
-      AND   t.section_name =  N'Срочные'
-      AND   t.block_name   =  N'Привлечение ФЛ'
-      AND   t.od_flag      = 1            -- действующие
-),
+* **историю** берём напрямую из готовой витрины `VW_ForecastKEY_everyday` (там всё уже разложено правильно);
+* **проекцию вперёд** строим на базе последнего доступного `DT_REP`, но
+  обязательно сохраняем условие `f.[Date] >= DT_REP` — иначе появляются
+  лишние строки и «растёт» `TERM`.
 
-/* ===== 2. НС + ДВС: та же логика, что в usp_fill_balance_metrics_savings */
-bal0 AS (
-    SELECT  t.dt_rep, t.dt_open, t.con_id,
-            t.out_cur,
-            t.out_rub,
-            t.rate_con          AS rate_balance,
-            t.rate_con_src,
-            r.rate              AS rate_liq
-    FROM    alm.ALM.vw_balance_rest_all t
-    LEFT    JOIN LIQUIDITY.liq.DepositContract_Rate r
-             ON  r.con_id = t.con_id
-             AND CASE WHEN t.dt_open = t.dt_rep
-                      THEN DATEADD(day,1,t.dt_rep)     -- «нулевой» день ULTRA
-                      ELSE t.dt_rep
-                 END BETWEEN r.dt_from AND r.dt_to
-    WHERE   t.dt_rep BETWEEN @DateFrom AND @DateTo
-      AND   t.section_name IN (N'Накопительный счёт', N'До востребования')
-      AND   t.block_name   =  N'Привлечение ФЛ'
-      AND   t.od_flag      = 1
-),
-bal_pos AS (
-    SELECT *, MIN(CASE WHEN rate_balance>0
-                        AND rate_con_src=N'счет ультра,вручную'
-                       THEN rate_balance END)
-                 OVER (PARTITION BY con_id
-                       ORDER BY dt_rep
-                       ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) AS rate_pos
-    FROM   bal0
-),
-rate_calc AS (
-    SELECT *, CASE
-        WHEN rate_liq IS NULL
-             THEN CASE WHEN rate_balance<0
-                       THEN COALESCE(rate_pos, rate_balance)
-                       ELSE rate_balance END
-        WHEN rate_liq<0  AND rate_balance>0  THEN rate_balance
-        WHEN rate_liq<0  AND rate_balance<0  THEN COALESCE(rate_pos, rate_balance)
-        WHEN rate_liq>=0 AND rate_balance>=0 THEN rate_liq
-        WHEN rate_liq>0  AND rate_balance<0  THEN rate_liq
-        ELSE rate_liq
-    END AS rate_use
-    FROM bal_pos
-),
-sav_dem AS (
-    SELECT dt_rep,
-           out_rub,
-           /* переводим ставку в рубли */ 
-           rate_use * out_cur / NULLIF(out_rub,0) AS rate_rub
-    FROM   rate_calc
-),
+```sql
+/*------------------------------------------------------------------
+  0.   параметры
+------------------------------------------------------------------*/
+USE ALM_TEST;
+GO
 
-/* ===== 3. Собираем всё и агрегируем ================================ */
-all_rows AS (
-    SELECT dt_rep, out_rub, rate_rub FROM term
-    UNION ALL
-    SELECT dt_rep, out_rub, rate_rub FROM sav_dem
-),
-aggr AS (
-    SELECT dt_rep,
-           SUM(out_rub)                             AS out_rub_total,
-           SUM(rate_rub*out_rub)/NULLIF(SUM(out_rub),0) AS rate_wavg
-    FROM   all_rows
-    GROUP BY dt_rep
-)
-SELECT dt_rep,
-       out_rub_total,
-       rate_wavg
-FROM   aggr
-ORDER  BY dt_rep;
+DECLARE
+    @Anchor    date = (SELECT MAX(DT_REP)                    -- t-1
+                       FROM  ALM.info.VW_ForecastKEY_interval),
+    @Horizon   int  = 145;                                   -- дней вперёд
 
+/*------------------------------------------------------------------
+  1.   кэш-таблица
+------------------------------------------------------------------*/
+IF OBJECT_ID('WORK.ForecastKey_Cache','U') IS NOT NULL
+    DROP TABLE WORK.ForecastKey_Cache;
+GO
+
+CREATE TABLE WORK.ForecastKey_Cache
+( DT_REP       date         NOT NULL,
+  [Date]       date         NOT NULL,
+  KEY_RATE     decimal(9,4) NOT NULL,
+  TERM         int          NOT NULL,
+  AVG_KEY_RATE decimal(9,4) NOT NULL,
+  CONSTRAINT PK_FKCache PRIMARY KEY CLUSTERED (DT_REP, TERM)
+);
+GO
+
+/*------------------------------------------------------------------
+  2.   История  — просто копия витрины (до @Anchor)
+------------------------------------------------------------------*/
+INSERT INTO WORK.ForecastKey_Cache (DT_REP,[Date],KEY_RATE,TERM,AVG_KEY_RATE)
+SELECT DT_REP, [Date], KEY_RATE, TERM, AVG_KEY_RATE
+FROM   ALM.info.VW_ForecastKEY_everyday  WITH (NOLOCK)
+WHERE  DT_REP <= @Anchor;
+
+/*------------------------------------------------------------------
+  3.   Проекция вперёд: @Anchor+1 … @Anchor+@Horizon
+------------------------------------------------------------------*/
+;WITH nums AS (SELECT TOP (@Horizon) ROW_NUMBER() OVER (ORDER BY (SELECT 0)) AS n
+               FROM sys.all_objects)
+INSERT INTO WORK.ForecastKey_Cache (DT_REP,[Date],KEY_RATE,TERM,AVG_KEY_RATE)
+SELECT
+        DT_Future       = DATEADD(day,n,@Anchor),        -- новый DT_REP
+        f.[Date],
+        f.KEY_RATE,
+        TERM            = ROW_NUMBER() OVER
+                            (PARTITION BY DATEADD(day,n,@Anchor) ORDER BY f.[Date]),
+        AVG_KEY_RATE    = AVG(f.KEY_RATE) OVER
+                            (PARTITION BY DATEADD(day,n,@Anchor) ORDER BY f.[Date])
+FROM    nums
+JOIN    ALM.info.VW_ForecastKEY_interval f  WITH (NOLOCK)
+      ON f.DT_REP = @Anchor                 -- прогноз последнего снимка
+     AND f.[Date] >= DATEADD(day,n,@Anchor) -- ключ всегда ≥ DT_REP
+OPTION (MAXRECURSION 0);
+```
+
+### Что изменилось
+
+| было                                                                                 | стало                                                                                                                    |
+| ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| Историю собирали «самодельным» join’ом и пропускали условие `f.[Date] >= cal.[Date]` | Берём строки **как есть** из витрины — никаких лишних дат, `TERM` начинается с 1.                                        |
+| В проекции не фильтровали по `f.[Date] >= новому DT_REP`                             | Фильтр добавлен, поэтому в каждом будущем снимке остаётся только «хвост» прогноза, и `AVG_KEY_RATE` считается правильно. |
+
+Проверьте теперь:
+
+```sql
+SELECT TOP 10 *
+FROM   WORK.ForecastKey_Cache
+WHERE  DT_REP = '2025-07-14';
+```
+
+должно начинаться с `TERM = 1`, `AVG_KEY_RATE = KEY_RATE` и **никаких** дат до 14-07-2025.
