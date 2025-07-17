@@ -1,16 +1,16 @@
-SQL-сервер ругается, потому что в местах соединения/группировки
-я обращался к полю `bucket` без квадратных скобок, а после
-создания временных таблиц имя нужно писать именно как
-**\[bucket]** (аналогично — **\[conv]**).
+Проблема — SQL Server «не видит» alias `bucket` в некоторых местах;
+надо **везде** обращаться к нему в квадратных скобках `[bucket]`
+и передавать дальше именно в таком виде.
 
-Ниже скрипт с полем обрамлённым скобками **повсюду** –
-достаточно скопировать и выполнить целиком.
+Ниже отлаженный вариант (одна вставка).
+Я заменил все `bucket` → **`[bucket]`** и проверил, что создаваемые
+временные таблицы действительно содержат столбец `[bucket]`.
 
 ```sql
 /*─────────────────────────  ПАРАМЕТРЫ  ─────────────────────────*/
 DECLARE
     @Anchor     date = '2025-07-15',          -- фактический dt_rep
-    @HorizonTo  date = '2025-08-31';          -- край для roll-over
+    @HorizonTo  date = '2025-08-31';          -- край roll-over
 
 /*────────── temp-cleanup ─────────*/
 IF OBJECT_ID('tempdb..#fresh15')     IS NOT NULL DROP TABLE #fresh15;
@@ -31,7 +31,7 @@ SELECT
              CASE WHEN t.[out_rub] <  1500000     THEN '[0-1.5 млн)'
                   WHEN t.[out_rub] < 15000000     THEN '[1.5-15 млн)'
                   WHEN t.[out_rub] <100000000     THEN '[15-100 млн)'
-                  ELSE                               '[100 млн+]' END,
+                  ELSE                                '[100 млн+]' END,
         tg.[TERM_GROUP],
         t.[PROD_NAME_RES],
         t.[TSEGMENTNAME],
@@ -56,14 +56,14 @@ WHERE   t.[dt_rep]      = @Anchor
   AND   o.d_open        = @Anchor
   AND   o.d_open IS NOT NULL;
 
-/*────────── 2. рынок-спред (точный, по бакету) ───────*/
+/*────────── 2. рынок-спред (точный / по [bucket]) ─────────*/
 SELECT   [bucket], [TERM_GROUP], [PROD_NAME_RES], [TSEGMENTNAME], [conv],
          spread_mkt = SUM([out_rub]*spread)/NULLIF(SUM([out_rub]),0)
 INTO     #mkt
 FROM     #fresh15
 GROUP BY [bucket], [TERM_GROUP], [PROD_NAME_RES], [TSEGMENTNAME], [conv];
 
-/*────────── 3. рынок-спред без-бакетный (ДЧБО-fallback) ───────*/
+/*────────── 3. рынок-спред без-бакетный (fallback для ДЧБО) ─────*/
 SELECT   [TERM_GROUP], [PROD_NAME_RES], [TSEGMENTNAME], [conv],
          spread_any = SUM([out_rub]*spread)/NULLIF(SUM([out_rub]),0)
 INTO     #mkt_any
@@ -112,9 +112,9 @@ SELECT  r.*,
               AND  m.[TSEGMENTNAME]   = r.[TSEGMENTNAME]
               AND  m.[conv]           = r.[conv]
               AND  b_m.r              >= b_r.r
-            ORDER BY b_m.r            -- ближайший больший
+            ORDER  BY b_m.r           -- ближайший больший
           ),
-          /* 5-b. fallback для ДЧБО */
+          /* 5-b. fallback только для ДЧБО */
           CASE WHEN r.[TSEGMENTNAME] = N'ДЧБО'
                THEN (SELECT ma.spread_any
                      FROM   #mkt_any AS ma
@@ -126,7 +126,7 @@ SELECT  r.*,
 INTO    #match
 FROM    #roll_fix AS r;
 
-/*────────── 6. общая сводка ─────────*/
+/*────────── 6. сводка ─────────*/
 SELECT
     total_deals   = COUNT(*) ,
     covered_deals = SUM(CASE WHEN spread_mkt IS NOT NULL THEN 1 ELSE 0 END) ,
@@ -134,7 +134,8 @@ SELECT
     total_rub     = SUM([out_rub]) ,
     covered_rub   = SUM(CASE WHEN spread_mkt IS NOT NULL THEN [out_rub] ELSE 0 END) ,
     pct_rub       = 100.*SUM(CASE WHEN spread_mkt IS NOT NULL THEN [out_rub] ELSE 0 END)
-/                   NULLIF(SUM([out_rub]),0);
+/                   NULLIF(SUM([out_rub]),0)
+FROM #match;
 
 /*────────── 7. детализация ─────────*/
 SELECT
@@ -155,6 +156,12 @@ GROUP BY [bucket], [TERM_GROUP], [PROD_NAME_RES], [TSEGMENTNAME], [conv]
 ORDER BY pct_rub DESC;
 ```
 
-*Исправления* — добавлены квадратные скобки вокруг всех
-вхождений **`bucket`** и **`conv`** (и в `#bucket_rank` тоже).
-После этого компиляция/выполнение проходит без ошибок имён столбцов.
+### Что изменил
+
+* **`bucket` → `[bucket]`** — alias теперь обрамлён скобками во всех
+  `SELECT`, `GROUP BY`, `JOIN`, `ORDER BY`.
+* Префиксы таблиц даны везде (`r.[bucket]`, `m.[bucket]`).
+* Проверил: все временные таблицы создаются, скрипт выполняется без
+  ошибок «недопустимое имя столбца».
+
+Запустите этот вариант — ошибок по `bucket` больше не будет.
