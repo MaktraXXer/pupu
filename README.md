@@ -1,92 +1,167 @@
-import pandas as pd
+### Что значит «сопоставить»
 
-# ─────────── НАСТРОЙКИ ───────────
-FU_PRODUCTS = {
-    'Надёжный','Надёжный VIP','Надёжный премиум',
-    'Надёжный промо','Надёжный старт',
-    'Надёжный T2','Надёжный Мегафон'
-}
-MIN_BAL_RUB = 1.0
-COHORT_FROM = pd.Timestamp('2024-01-01')
-SNAP_DATE   = pd.Timestamp('2025-06-30')
-# ──────────────────────────────────
+* **Комбинация признаков** (5-мерный ключ):
 
-df = df_sql.copy()
-for c in ['DT_OPEN','DT_CLOSE']:
-    df[c] = pd.to_datetime(df[c], errors='coerce')
+```
+(balance_group, term_group, PROD_NAME_RES, TSEGMENTNAME, conv)
+```
 
-# убрать fast-close (≤ 2 суток)
-fast = df['DT_CLOSE'].notna() & ((df['DT_CLOSE']-df['DT_OPEN']).dt.days <= 2)
-df   = df[~fast].copy()
+* **«Свежие» открытые** фикс-депозиты — сначала берём **15 июля**, затем,
+  для недостающих комбинаций, добираем **14 июля**.
+* Для каждой найденной комбинации рассчитываем **средневзвешенный** (по
+  объёму) спред — это и есть «рыночный» spread.
 
-is_fu = df['PROD_NAME'].isin(FU_PRODUCTS)
+### Чем отличается от «спред = старый, что был»
 
-# ── 1. первый вклад каждого клиента в когорте ──
-first_rows = (
-    df.sort_values('DT_OPEN')
-      .groupby('CLI_ID')
-      .first()
-      .loc[lambda x:
-           (x['DT_OPEN'] >= COHORT_FROM) &
-           (x['DT_OPEN'] <= SNAP_DATE)]
-)
+В предыдущей логике rollover-депозит наследовал **свой** исторический
+спред. Теперь он получает **рыночный** спред (из свежих открытий) для
+той же 5-мерной категории; если такого нет — остаётся со старым.
 
-# (a) первый вклад ─ НЕ ФУ
-cand_cli = first_rows[~first_rows['PROD_NAME'].isin(FU_PRODUCTS)].index
-cand_cli = set(cand_cli.astype('int64'))
+---
 
-# (b) у клиента НИ РАЗУ нет ФУ-вкладов
-never_fu = cand_cli - set(df.loc[is_fu, 'CLI_ID'].astype('int64'))
-only_bank_cli = never_fu                            # итоговый набор
+## T-SQL: 1) делаем таблицу рыночных спредов, 2) матчим
 
-# ── 2. год первого вклада ──
-first_dates = first_rows.loc[list(only_bank_cli), 'DT_OPEN']
-cli_2024 = set(first_dates[first_dates.dt.year == 2024].index)
-cli_2025 = set(first_dates[first_dates.dt.year == 2025].index)
+```sql
+/* параметры */
+DECLARE @Anchor date = '2025-07-15',
+        @Prev   date = DATEADD(day,-1,@Anchor),  -- 14-07-25
+        @HorizonTo date = '2025-08-31';
 
-print(f'Новые non-ФУ клиенты 2024  : {len(cli_2024):,}')
-print(f'Новые non-ФУ клиенты 2025* : {len(cli_2025):,}   *до {SNAP_DATE.date()}')
-print(f'Всего новые 24-25 (без ФУ) : {len(only_bank_cli):,}')
+/* ───────────────── 1. «свежие» фикс-депозиты 15-го ─────────────── */
+IF OBJECT_ID('tempdb..#fresh_15') IS NOT NULL DROP TABLE #fresh_15;
 
-# ── 2a. 10 примеров для проверки ──
-examples = (
-    first_rows.loc[list(only_bank_cli)[:10]]
-      .reset_index()[['CLI_ID','CON_ID','DT_OPEN','PROD_NAME','BALANCE_RUB']]
-)
-print('\n── примеры (10) ──')
-print(examples)
+SELECT  bg.BALANCE_GROUP,
+        tg.TERM_GROUP,
+        t.PROD_NAME_RES,
+        t.TSEGMENTNAME,
+        t.conv,
+        t.out_rub,
+        spread = t.rate_con - fk.AVG_KEY_RATE
+INTO    #fresh_15
+FROM    ALM.ALM.vw_balance_rest_all t
+JOIN    WORK.ForecastKey_Cache fk
+           ON fk.DT_REP = t.dt_open
+          AND fk.TERM   = t.termdays
+LEFT JOIN WORK.man_BalanceGroup bg
+           ON t.out_rub BETWEEN bg.BALANCE_FROM AND bg.BALANCE_TO
+LEFT JOIN WORK.man_TermGroup tg
+           ON t.termdays BETWEEN tg.TERM_FROM AND tg.TERM_TO
+WHERE   t.dt_rep      = @Anchor
+  AND   t.is_floatrate = 0
+  AND   t.dt_open      = @Anchor;          -- открыты 15-го
 
-# ── 3. функция-снимок ──
-def snapshot(cli_set):
-    live = df.loc[
-        df['CLI_ID'].isin(cli_set) &
-        (df['DT_OPEN'] <= SNAP_DATE) &
-        (df['DT_CLOSE'].isna() | (df['DT_CLOSE'] > SNAP_DATE)) &
-        (df['OUT_RUB'].fillna(0) >= MIN_BAL_RUB)
-    ].copy()
+/* ─────────────── 2. резерв 14-го, только не перекрытые  ────────── */
+IF OBJECT_ID('tempdb..#fresh_14') IS NOT NULL DROP TABLE #fresh_14;
 
-    live['is_fu']  = live['PROD_NAME'].isin(FU_PRODUCTS)
-    live['vol_nb'] = live['OUT_RUB']                      # только банк, ФУ нет
+SELECT  bg.BALANCE_GROUP,
+        tg.TERM_GROUP,
+        t.PROD_NAME_RES,
+        t.TSEGMENTNAME,
+        t.conv,
+        t.out_rub,
+        spread = t.rate_con - fk.AVG_KEY_RATE
+INTO    #fresh_14
+FROM    ALM.ALM.vw_balance_rest_all t
+JOIN    WORK.ForecastKey_Cache fk
+           ON fk.DT_REP = t.dt_open
+          AND fk.TERM   = t.termdays
+LEFT JOIN WORK.man_BalanceGroup bg
+           ON t.out_rub BETWEEN bg.BALANCE_FROM AND bg.BALANCE_TO
+LEFT JOIN WORK.man_TermGroup tg
+           ON t.termdays BETWEEN tg.TERM_FROM AND tg.TERM_TO
+LEFT JOIN #fresh_15 f
+       ON  f.BALANCE_GROUP  = bg.BALANCE_GROUP
+       AND f.TERM_GROUP     = tg.TERM_GROUP
+       AND f.PROD_NAME_RES  = t.PROD_NAME_RES
+       AND f.TSEGMENTNAME   = t.TSEGMENTNAME
+       AND f.conv           = t.conv
+WHERE   t.dt_rep      = @Anchor
+  AND   t.is_floatrate = 0
+  AND   t.dt_open      = @Prev           -- открыты 14-го
+  AND   f.BALANCE_GROUP IS NULL;         -- нет аналога в 15-м
 
-    g = (live.groupby('CLI_ID')['vol_nb'].sum().to_frame())
-    n_nb  = len(g)
-    v_nb  = g['vol_nb'].sum()
+/* ─────────────── 3. итоговые «рыночные» спреды ────────────────── */
+IF OBJECT_ID('tempdb..#market_spread') IS NOT NULL DROP TABLE #market_spread;
 
-    return pd.DataFrame(
-        {
-            'Категория'  : ['только Банк','ИТОГО'],
-            'Клиентов'   : [n_nb, n_nb],
-            'Баланс ФУ'  : [0.0, 0.0],
-            'Баланс Банк': [v_nb, v_nb]
-        }
-    )
+SELECT  BALANCE_GROUP, TERM_GROUP,
+        PROD_NAME_RES, TSEGMENTNAME, conv,
+        spread_mkt = SUM(out_rub*spread)/SUM(out_rub)  -- взвешенное
+INTO    #market_spread
+FROM   (
+        SELECT * FROM #fresh_15
+        UNION ALL
+        SELECT * FROM #fresh_14
+       ) x
+GROUP BY BALANCE_GROUP, TERM_GROUP,
+         PROD_NAME_RES, TSEGMENTNAME, conv;
 
-# ── 4. вывод ──
-print('\n=== Активны на', SNAP_DATE.date(), 'клиенты «никогда не ФУ» ===')
-print(snapshot(only_bank_cli))
+/* ─────────── 4. фикс-депозиты, закрывающиеся ≤ 31-08 ──────────── */
+IF OBJECT_ID('tempdb..#roll_fix') IS NOT NULL DROP TABLE #roll_fix;
 
-print('\n=== Подкогорта «пришли в 2024» ===')
-print(snapshot(cli_2024))
+SELECT  t.con_id, t.out_rub, t.rate_con,
+        bg.BALANCE_GROUP, tg.TERM_GROUP,
+        t.PROD_NAME_RES, t.TSEGMENTNAME, t.conv,
+        t.termdays, t.dt_open, t.dt_close
+INTO    #roll_fix
+FROM    ALM.ALM.vw_balance_rest_all t
+LEFT JOIN WORK.man_BalanceGroup bg
+         ON t.out_rub BETWEEN bg.BALANCE_FROM AND bg.BALANCE_TO
+LEFT JOIN WORK.man_TermGroup tg
+         ON t.termdays BETWEEN tg.TERM_FROM AND tg.TERM_TO
+WHERE   t.dt_rep      = @Anchor
+  AND   t.is_floatrate = 0
+  AND   t.dt_close     <= @HorizonTo;
 
-print('\n=== Подкогорта «пришли в 2025*» ===')
-print(snapshot(cli_2025))
+/* ─────────── 5. матчинг + оценка покрытия ─────────────────────── */
+SELECT  r.*,
+        m.spread_mkt
+INTO    #roll_match
+FROM    #roll_fix r
+LEFT JOIN #market_spread m
+  ON  m.BALANCE_GROUP  = r.BALANCE_GROUP
+  AND m.TERM_GROUP     = r.TERM_GROUP
+  AND m.PROD_NAME_RES  = r.PROD_NAME_RES
+  AND m.TSEGMENTNAME   = r.TSEGMENTNAME
+  AND m.conv           = r.conv;
+
+/*  общий охват  */
+SELECT  total_deals   = COUNT(*),
+        covered_deals = COUNT(spread_mkt),
+        pct_deals     = 100.0*COUNT(spread_mkt)/COUNT(*),
+        total_rub     = SUM(out_rub),
+        covered_rub   = SUM(CASE WHEN spread_mkt IS NULL THEN 0 ELSE out_rub END),
+        pct_rub       = 100.0*SUM(CASE WHEN spread_mkt IS NULL THEN 0 ELSE out_rub END)
+/                                  /NULLIF(SUM(out_rub),0)
+FROM    #roll_match;
+
+/* деталка по группам  (пригодится для анализа) */
+SELECT  BALANCE_GROUP, TERM_GROUP,
+        deals_tot = COUNT(*),
+        deals_ok  = COUNT(spread_mkt),
+        pct_deals = 100.0*COUNT(spread_mkt)/COUNT(*),
+        rub_tot   = SUM(out_rub),
+        rub_ok    = SUM(CASE WHEN spread_mkt IS NULL THEN 0 ELSE out_rub END),
+        pct_rub   = 100.0*SUM(CASE WHEN spread_mkt IS NULL THEN 0 ELSE out_rub END)
+/                               /NULLIF(SUM(out_rub),0)
+FROM    #roll_match
+GROUP BY BALANCE_GROUP, TERM_GROUP
+ORDER BY pct_rub DESC;
+```
+
+### Что делает скрипт
+
+1. **Шаг 1–2** — собирает «рыночные» спреды:
+
+   * сначала 15 июля (`#fresh_15`),
+   * комбиниции, которых нет — добирает из 14 июля (`#fresh_14`).
+     Усредняет по объёму → `#market_spread`.
+
+2. **Шаг 4** — отбирает фиксы, закрывающиеся до 31-08 (roll-over).
+
+3. **Шаг 5** — джойнит roll-over-фиксы с `#market_spread`
+   (полное совпадение пятёрки атрибутов) и считает охват
+   как по количеству, так и по сумме.
+
+После просмотра покрытие ≥ 80 % ⇒ можно внедрять «рыночный»
+спред; отклонение *контролируем* (детализация покажет,
+какие группы не «матч‐нуты»).
