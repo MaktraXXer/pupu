@@ -15,7 +15,7 @@ df = df_sql.copy()
 for c in ['DT_OPEN','DT_CLOSE']:
     df[c] = pd.to_datetime(df[c], errors='coerce')
 
-# fast-close ≤ 2 сут убираем
+# fast-close ≤ 2 сут удаляем
 fast = df['DT_CLOSE'].notna() & ((df['DT_CLOSE']-df['DT_OPEN']).dt.days <= 2)
 df   = df[~fast].copy()
 
@@ -28,92 +28,55 @@ first_rows = (df.sort_values('DT_OPEN')
 
 first_rows = first_rows.loc[
       (first_rows['DT_OPEN'] >= COHORT_FROM) &
-      (first_rows['DT_OPEN'] <= SNAP_DATE) &
-      (~first_rows['PROD_NAME'].isin(FU_PRODUCTS))          # ← НЕ-ФУ
+      (first_rows['DT_OPEN'] <= SNAP_DATE)
 ]
 
-bank_first_cli = set(first_rows.index.astype('int64'))
+# (a) у клиента НИ ОДНОГО ФУ-вклада
+cli_with_fu = set(df.loc[is_fu, 'CLI_ID'].astype('int64'))
+only_bank_cli = set(first_rows.index.astype('int64')) - cli_with_fu
 
-# ── 2. среди них оставляем тех, у кого ПОЗЖЕ есть ≥1 ФУ-вклад ──
-fu_later = (df.loc[ is_fu & df['CLI_ID'].isin(bank_first_cli)]
-              .groupby('CLI_ID')['DT_OPEN']
-              .min()                               # дата первого ФУ
-              .dropna())
+# ── 2. под-когорты по году первого вклада ──
+first_dates = first_rows.loc[only_bank_cli, 'DT_OPEN']
+cli_2024 = set(first_dates[first_dates.dt.year==2024].index)
+cli_2025 = set(first_dates[first_dates.dt.year==2025].index)
 
-bank_then_fu_cli = set(fu_later.index.astype('int64'))
+print(f'Новые «только Банк» 2024  : {len(cli_2024):,}')
+print(f'Новые «только Банк» 2025* : {len(cli_2025):,}   *до {SNAP_DATE.date()}')
+print(f'Всего новые 24-25         : {len(only_bank_cli):,}')
 
-# ── 3. год ПЕРВОГО ФУ-вклада (он второй по порядку) ──
-first_fu_dates = fu_later                              # Series CLI_ID→date
-cli_2024 = set(first_fu_dates[first_fu_dates.dt.year==2024].index)
-cli_2025 = set(first_fu_dates[first_fu_dates.dt.year==2025].index)
-
-print(f'Новые ФУ-клиенты 2024  : {len(cli_2024):,}')
-print(f'Новые ФУ-клиенты 2025* : {len(cli_2025):,}   *до {SNAP_DATE.date()}')
-print(f'Всего новые 24-25      : {len(bank_then_fu_cli):,}')
-
-# ── 3a. 10 примеров (1-й Банк → 1-й ФУ) ──
-examples = []
-for cid in list(bank_then_fu_cli)[:10]:
-    rows = df[df['CLI_ID']==cid].sort_values('DT_OPEN')
-    r_bank = rows[~rows['PROD_NAME'].isin(FU_PRODUCTS)].iloc[0]   # 1-й (банк)
-    r_fu   = rows[ rows['PROD_NAME'].isin(FU_PRODUCTS)].iloc[0]   # 1-й ФУ
-    examples.append({
-        'CLI_ID'       : cid,
-        'Bank_CON_ID'  : int(r_bank['CON_ID']),
-        'Bank_date'    : r_bank['DT_OPEN'].date(),
-        'Bank_prod'    : r_bank['PROD_NAME'],
-        'Bank_bal'     : r_bank['BALANCE_RUB'],
-        'FU_CON_ID'    : int(r_fu['CON_ID']),
-        'FU_date'      : r_fu['DT_OPEN'].date(),
-        'FU_prod'      : r_fu['PROD_NAME'],
-        'FU_bal'       : r_fu['BALANCE_RUB'],
-    })
+# ── 2a. 10 примеров для проверки ──
+examples = (
+    first_rows.loc[list(only_bank_cli)[:10]]
+      .reset_index()[['CLI_ID','CON_ID','DT_OPEN','PROD_NAME','BALANCE_RUB']]
+)
+examples.columns = ['CLI_ID','CON_ID','Date_open','Prod_name','Balance_RUB']
 print('\n── 10 примеров ──')
-print(pd.DataFrame(examples))
+print(examples)
 
-# ── 4. функция-снимок (тот же формат) ──
+# ── 3. функция-снимок ──
 def snapshot(cli_set):
     live = df.loc[
           df['CLI_ID'].isin(list(cli_set)) &
           (df['DT_OPEN'] <= SNAP_DATE) &
           (df['DT_CLOSE'].isna() | (df['DT_CLOSE'] > SNAP_DATE)) &
           (df['OUT_RUB'].fillna(0) >= MIN_BAL_RUB)
-    ].copy()
+    ]
 
-    live['is_fu']  = live['PROD_NAME'].isin(FU_PRODUCTS)
-    live['vol_fu'] = live['OUT_RUB'].where(live['is_fu'], 0)
-    live['vol_nb'] = live['OUT_RUB'].where(~live['is_fu'],0)
-
-    g = (live.groupby('CLI_ID')
-               .agg(vol_fu=('vol_fu','sum'),
-                    vol_nb=('vol_nb','sum')))
-    g['has_fu'] = g['vol_fu']>0
-    g['has_nb'] = g['vol_nb']>0
-
-    only_fu = g[ g['has_fu'] & ~g['has_nb']]
-    only_nb = g[~g['has_fu'] &  g['has_nb']]
-    both    = g[ g['has_fu'] &  g['has_nb']]
-
-    def _tot(df_): return len(df_), df_['vol_fu'].sum(), df_['vol_nb'].sum()
-    n_fu,  v_fu,  _         = _tot(only_fu)
-    n_nb,          v_nb     = len(only_nb), only_nb['vol_nb'].sum()
-    n_both, v_fu_b, v_nb_b  = _tot(both)
-
+    vol_bank = live['OUT_RUB'].sum()
     return pd.DataFrame(
         {
-            'Категория'   : ['только ФУ','только Банк','ФУ + Банк','ИТОГО'],
-            'Клиентов'    : [n_fu, n_nb, n_both, len(g)],
-            'Баланс ФУ'   : [v_fu,       0,   v_fu_b, v_fu+v_fu_b],
-            'Баланс Банк' : [0,       v_nb,   v_nb_b, v_nb+v_nb_b]
+            'Категория'    : ['только Банк','ИТОГО'],
+            'Клиентов'     : [len(cli_set), len(cli_set)],
+            'Баланс Банк'  : [vol_bank, vol_bank]
         }
     )
 
-# ── 5. вывод (тот же блок print-ов) ──
+# ── 4. вывод ──
 print('\n=== Активны на', SNAP_DATE.date(), 'ВСЯ когорта (24-25) ===')
-print(snapshot(bank_then_fu_cli))
+print(snapshot(only_bank_cli))
 
-print('\n=== Подкогорта «пришли в 2024 (банк→ФУ)» ===')
+print('\n=== Подкогорта «новые 2024 (только Банк)» ===')
 print(snapshot(cli_2024))
 
-print('\n=== Подкогорта «пришли в 2025* (банк→ФУ)» ===')
+print('\n=== Подкогорта «новые 2025* (только Банк)» ===')
 print(snapshot(cli_2025))
