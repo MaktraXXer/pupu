@@ -1,200 +1,147 @@
-Ниже — корректный скрипт «с нуля»:
+Ниже ‒ полный скрипт (v. FIX) — всё, что было в «старом» коде **осталось в том же формате**
+(одинаковые имена переменных, те же print-блоки), но
 
-* **историю** берём напрямую из готовой витрины `VW_ForecastKEY_everyday` (там всё уже разложено правильно);
-* **проекцию вперёд** строим на базе последнего доступного `DT_REP`, но
-  обязательно сохраняем условие `f.[Date] >= DT_REP` — иначе появляются
-  лишние строки и «растёт» `TERM`.
+* фильтр «новый клиент 2024-25» теперь берёт **оба** условия
+  `>= COHORT_FROM` **и** `<= SNAP_DATE` (раньше второе затирало первое);
+* добавлена логика «первый вклад - ФУ, позже есть ≥ 1 non-ФУ»;
+* выводится витрина из 10 CLI\_ID с первым ФУ-вкладом и первым non-ФУ.
 
-```sql
-/*------------------------------------------------------------------
-  0.   параметры
-------------------------------------------------------------------*/
-USE ALM_TEST;
-GO
+```python
+import pandas as pd
 
-DECLARE
-    @Anchor    date = (SELECT MAX(DT_REP)                    -- t-1
-                       FROM  ALM.info.VW_ForecastKEY_interval),
-    @Horizon   int  = 145;                                   -- дней вперёд
+# ─────────── НАСТРОЙКИ ───────────
+FU_PRODUCTS = {
+    'Надёжный','Надёжный VIP','Надёжный премиум',
+    'Надёжный промо','Надёжный старт',
+    'Надёжный T2','Надёжный Мегафон'
+}
+MIN_BAL_RUB = 1.0                                  # «живой» остаток
+COHORT_FROM = pd.Timestamp('2024-01-01')           # новые ≥ этой даты
+SNAP_DATE   = pd.Timestamp('2025-06-30')           # дата снимка
+# ──────────────────────────────────
 
-/*------------------------------------------------------------------
-  1.   кэш-таблица
-------------------------------------------------------------------*/
-IF OBJECT_ID('WORK.ForecastKey_Cache','U') IS NOT NULL
-    DROP TABLE WORK.ForecastKey_Cache;
-GO
+df = df_sql.copy()
+for c in ['DT_OPEN', 'DT_CLOSE']:
+    df[c] = pd.to_datetime(df[c], errors='coerce')
 
-CREATE TABLE WORK.ForecastKey_Cache
-( DT_REP       date         NOT NULL,
-  [Date]       date         NOT NULL,
-  KEY_RATE     decimal(9,4) NOT NULL,
-  TERM         int          NOT NULL,
-  AVG_KEY_RATE decimal(9,4) NOT NULL,
-  CONSTRAINT PK_FKCache PRIMARY KEY CLUSTERED (DT_REP, TERM)
-);
-GO
+# fast-close (≤ 2 суток) вычёркиваем
+fast = df['DT_CLOSE'].notna() & ((df['DT_CLOSE'] - df['DT_OPEN']).dt.days <= 2)
+df   = df[~fast].copy()
 
-/*------------------------------------------------------------------
-  2.   История  — просто копия витрины (до @Anchor)
-------------------------------------------------------------------*/
-INSERT INTO WORK.ForecastKey_Cache (DT_REP,[Date],KEY_RATE,TERM,AVG_KEY_RATE)
-SELECT DT_REP, [Date], KEY_RATE, TERM, AVG_KEY_RATE
-FROM   ALM.info.VW_ForecastKEY_everyday  WITH (NOLOCK)
-WHERE  DT_REP <= @Anchor;
+is_fu = df['PROD_NAME'].isin(FU_PRODUCTS)
 
-/*------------------------------------------------------------------
-  3.   Проекция вперёд: @Anchor+1 … @Anchor+@Horizon
-------------------------------------------------------------------*/
-;WITH nums AS (SELECT TOP (@Horizon) ROW_NUMBER() OVER (ORDER BY (SELECT 0)) AS n
-               FROM sys.all_objects)
-INSERT INTO WORK.ForecastKey_Cache (DT_REP,[Date],KEY_RATE,TERM,AVG_KEY_RATE)
-SELECT
-        DT_Future       = DATEADD(day,n,@Anchor),        -- новый DT_REP
-        f.[Date],
-        f.KEY_RATE,
-        TERM            = ROW_NUMBER() OVER
-                            (PARTITION BY DATEADD(day,n,@Anchor) ORDER BY f.[Date]),
-        AVG_KEY_RATE    = AVG(f.KEY_RATE) OVER
-                            (PARTITION BY DATEADD(day,n,@Anchor) ORDER BY f.[Date])
-FROM    nums
-JOIN    ALM.info.VW_ForecastKEY_interval f  WITH (NOLOCK)
-      ON f.DT_REP = @Anchor                 -- прогноз последнего снимка
-     AND f.[Date] >= DATEADD(day,n,@Anchor) -- ключ всегда ≥ DT_REP
-OPTION (MAXRECURSION 0);
+# ───────────────────────────────────────
+# 1. новые клиенты 24-25: первый вклад ∈ [COHORT_FROM ; SNAP_DATE]
+# ───────────────────────────────────────
+first_open = df.groupby('CLI_ID')['DT_OPEN'].min()
+
+new_cli_raw = first_open[
+    (first_open >= COHORT_FROM) & (first_open <= SNAP_DATE)
+]           # ← оба условия одновременно!
+
+# 2. первый вклад клиента ОБЯЗАТЕЛЬНО из ФУ-списка
+first_rows = (
+    df.sort_values('DT_OPEN')
+      .groupby('CLI_ID')
+      .first()
+      .loc[new_cli_raw.index]
+)
+fu_first_cli = set(
+    first_rows[first_rows['PROD_NAME'].isin(FU_PRODUCTS)].index.astype('int64')
+)
+
+# 3. у этих клиентов ПОЗЖЕ есть ≥ 1 вклад НЕ из ФУ
+nonfu_exists = (
+    df.loc[(~is_fu) & df['CLI_ID'].isin(fu_first_cli)]
+      .groupby('CLI_ID')['DT_OPEN']
+      .min()
+      .notna()
+)
+fu_first_then_bank_cli = set(nonfu_exists[nonfu_exists].index.astype('int64'))
+
+# 4. год «первого ФУ» (он же самый первый вклад)
+first_fu_dates = first_rows.loc[fu_first_then_bank_cli, 'DT_OPEN']
+cli_2024 = set(first_fu_dates[first_fu_dates.dt.year == 2024].index)
+cli_2025 = set(first_fu_dates[first_fu_dates.dt.year == 2025].index)
+
+print(f'Новые ФУ-клиенты 2024  : {len(cli_2024):,}')
+print(f'Новые ФУ-клиенты 2025* : {len(cli_2025):,}   *до {SNAP_DATE.date()}')
+print(f'Всего новые 24-25      : {len(fu_first_then_bank_cli):,}')
+
+# ───────────────────────────────────────
+# 5. 10 примеров: первый ФУ  ➜  первый non-ФУ
+# ───────────────────────────────────────
+examples = []
+for cid in list(fu_first_then_bank_cli)[:10]:
+    rows = df[df['CLI_ID'] == cid].sort_values('DT_OPEN')
+    r_fu  = rows[rows['PROD_NAME'].isin(FU_PRODUCTS)].iloc[0]
+    r_nb  = rows[~rows['PROD_NAME'].isin(FU_PRODUCTS)].iloc[0]
+    examples.append({
+        'CLI_ID'      : cid,
+        'FU_CON_ID'   : int(r_fu['CON_ID']),
+        'FU_date'     : r_fu['DT_OPEN'].date(),
+        'FU_prod'     : r_fu['PROD_NAME'],
+        'FU_bal'      : r_fu['BALANCE_RUB'],
+        'Bank_CON_ID' : int(r_nb['CON_ID']),
+        'Bank_date'   : r_nb['DT_OPEN'].date(),
+        'Bank_prod'   : r_nb['PROD_NAME'],
+        'Bank_bal'    : r_nb['BALANCE_RUB'],
+    })
+
+print('\n── 10 примеров (первый ФУ → первый non-ФУ) ──')
+print(pd.DataFrame(examples))
+
+# ───────────────────────────────────────
+# 6. функция-снимок в прежнем формате
+# ───────────────────────────────────────
+def snapshot(cli_ids):
+    live = df.loc[
+        df['CLI_ID'].isin(cli_ids) &
+        (df['DT_OPEN']  <= SNAP_DATE) &
+        (df['DT_CLOSE'].isna() | (df['DT_CLOSE'] > SNAP_DATE)) &
+        (df['OUT_RUB'].fillna(0) >= MIN_BAL_RUB)
+    ].copy()
+
+    live['is_fu']  = live['PROD_NAME'].isin(FU_PRODUCTS)
+    live['vol_fu'] = live['OUT_RUB'].where(live['is_fu'], 0)
+    live['vol_nb'] = live['OUT_RUB'].where(~live['is_fu'], 0)
+
+    g = (live.groupby('CLI_ID')
+               .agg(vol_fu=('vol_fu', 'sum'),
+                    vol_nb=('vol_nb', 'sum')))
+    g['has_fu'] = g['vol_fu'] > 0
+    g['has_nb'] = g['vol_nb'] > 0
+
+    only_fu = g[ g['has_fu'] & ~g['has_nb']]
+    only_nb = g[~g['has_fu'] &  g['has_nb']]
+    both    = g[ g['has_fu'] &  g['has_nb']]
+
+    def _tot(df_): return len(df_), df_['vol_fu'].sum(), df_['vol_nb'].sum()
+    n_fu,  v_fu,  _        = _tot(only_fu)
+    n_nb,          v_nb    = len(only_nb), only_nb['vol_nb'].sum()
+    n_both, v_fu_b, v_nb_b = _tot(both)
+
+    return pd.DataFrame(
+        {
+            'Категория'  : ['только ФУ','только Банк','ФУ + Банк','ИТОГО'],
+            'Клиентов'   : [n_fu, n_nb, n_both, len(g)],
+            'Баланс ФУ'  : [v_fu,   0,     v_fu_b, v_fu + v_fu_b],
+            'Баланс Банк': [0,     v_nb,   v_nb_b, v_nb + v_nb_b],
+        }
+    )
+
+# ───────────────────────────────────────
+# 7. вывод ‒ формат НЕ изменился
+# ───────────────────────────────────────
+print('\n=== Активны на', SNAP_DATE.date(), 'ВСЯ когорта (24-25) ===')
+print(snapshot(fu_first_then_bank_cli))
+
+print('\n=== Подкогорта «пришли в 2024» ===')
+print(snapshot(cli_2024))
+
+print('\n=== Подкогорта «пришли в 2025*» ===')
+print(snapshot(cli_2025))
 ```
 
-### Что изменилось
-
-| было                                                                                 | стало                                                                                                                    |
-| ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| Историю собирали «самодельным» join’ом и пропускали условие `f.[Date] >= cal.[Date]` | Берём строки **как есть** из витрины — никаких лишних дат, `TERM` начинается с 1.                                        |
-| В проекции не фильтровали по `f.[Date] >= новому DT_REP`                             | Фильтр добавлен, поэтому в каждом будущем снимке остаётся только «хвост» прогноза, и `AVG_KEY_RATE` считается правильно. |
-
-Проверьте теперь:
-
-```sql
-SELECT TOP 10 *
-FROM   WORK.ForecastKey_Cache
-WHERE  DT_REP = '2025-07-14';
-```
-
-должно начинаться с `TERM = 1`, `AVG_KEY_RATE = KEY_RATE` и **никаких** дат до 14-07-2025.
-
-
-```sql
-/* ▀▀  ПАРАМЕТРЫ  ▀▀ */
-USE ALM_TEST;
-GO
-DECLARE @Anchor    date = '2025-07-14',      -- последний факт
-        @HorizonTo date = '2025-08-31';      -- конец прогноза
-/* ▀▀  КАЛЕНДАРЬ  ▀▀ */
-IF OBJECT_ID('tempdb..#cal') IS NOT NULL DROP TABLE #cal;
-SELECT d=@Anchor INTO #cal;
-WHILE (SELECT MAX(d) FROM #cal)<@HorizonTo
-    INSERT #cal SELECT DATEADD(day,1,MAX(d)) FROM #cal;
-/* ▀▀  SPOT-KEY  ▀▀ */
-IF OBJECT_ID('tempdb..#key_spot') IS NOT NULL DROP TABLE #key_spot;
-SELECT fc.DT_REP,fc.KEY_RATE
-INTO   #key_spot
-FROM   WORK.ForecastKey_Cache fc
-JOIN   #cal c ON c.d=fc.DT_REP
-WHERE  fc.TERM=1;
-/* ▀▀  БАЗА + СПРЕДЫ  ▀▀ */
-IF OBJECT_ID('tempdb..#base') IS NOT NULL DROP TABLE #base;
-SELECT  t.con_id,t.out_rub,t.rate_con,t.is_floatrate,
-        t.termdays,t.dt_open,t.dt_close,
-        spread_float = CASE WHEN t.is_floatrate=1
-                            THEN t.rate_con-ks.KEY_RATE END,
-        spread_fix   = CASE WHEN t.is_floatrate=0
-                            THEN t.rate_con-fk_open.AVG_KEY_RATE END
-INTO    #base
-FROM    ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
-JOIN    #key_spot ks                ON ks.DT_REP=@Anchor
-LEFT JOIN WORK.ForecastKey_Cache fk_open
-       ON fk_open.DT_REP=t.dt_open AND fk_open.TERM=t.termdays
-WHERE   t.dt_rep=@Anchor
-  AND   t.section_name=N'Срочные'
-  AND   t.block_name  =N'Привлечение ФЛ'
-  AND   t.od_flag=1  AND t.cur='810' AND t.out_rub IS NOT NULL;
-/* ▀▀  ROLL-OVER  ▀▀ */
-IF OBJECT_ID('tempdb..#rolls') IS NOT NULL DROP TABLE #rolls;
-;WITH seq AS(
-    SELECT con_id,out_rub,is_floatrate,termdays,
-           spread_float,spread_fix,
-           dt_open, n=0
-    FROM   #base
-    UNION ALL
-    SELECT  s.con_id,s.out_rub,s.is_floatrate,s.termdays,
-            s.spread_float,s.spread_fix,
-            DATEADD(day,s.termdays,s.dt_open),n+1
-    FROM   seq s
-    WHERE  DATEADD(day,s.termdays,s.dt_open)<=@HorizonTo)
-SELECT  con_id,out_rub,is_floatrate,termdays,
-        dt_open,
-        dt_close=DATEADD(day,termdays,dt_open),
-        spread_float,spread_fix
-INTO   #rolls
-FROM   seq OPTION (MAXRECURSION 0);
-/* ▀▀  КОНТРАКТЫ ▀▀ */
-IF OBJECT_ID('tempdb..#work') IS NOT NULL DROP TABLE #work;
-SELECT * INTO #work FROM #rolls;
-/* ▀▀  ПОСУТОЧНО  ▀▀ */
-IF OBJECT_ID('tempdb..#daily') IS NOT NULL DROP TABLE #daily;
-SELECT c.d AS dt_rep,
-       w.con_id,w.out_rub,
-       rate_con = CASE
-                    WHEN w.is_floatrate=1
-                         THEN ks.KEY_RATE+w.spread_float
-                    ELSE ISNULL(fko.AVG_KEY_RATE+w.spread_fix,w.spread_fix)
-                  END
-INTO   #daily
-FROM   #cal c
-JOIN   #work w
-  ON   c.d BETWEEN w.dt_open AND DATEADD(day,-1,w.dt_close)
-LEFT  JOIN #key_spot ks
-       ON ks.DT_REP=c.d
-LEFT  JOIN WORK.ForecastKey_Cache fko
-       ON fko.DT_REP=w.dt_open AND fko.TERM=w.termdays;
-/* ▀▀  ЦЕЛЕВЫЕ ТАБЛИЦЫ  ▀▀ */
-IF OBJECT_ID('WORK.Forecast_BalanceDaily','U') IS NULL
-    CREATE TABLE WORK.Forecast_BalanceDaily
-    (dt_rep DATE PRIMARY KEY,
-     out_rub_total DECIMAL(20,2),
-     rate_con DECIMAL(9,4));
-ELSE TRUNCATE TABLE WORK.Forecast_BalanceDaily;
-
-IF OBJECT_ID('WORK.Forecast_BalanceDeals','U') IS NULL
-    CREATE TABLE WORK.Forecast_BalanceDeals
-    (dt_rep DATE,
-     con_id BIGINT,
-     out_rub DECIMAL(20,2),
-     rate_con DECIMAL(9,4),
-     CONSTRAINT PK_FBD PRIMARY KEY(dt_rep,con_id));
-ELSE TRUNCATE TABLE WORK.Forecast_BalanceDeals;
-/* ▀▀  АГРЕГАТ  ▀▀ */
-INSERT INTO WORK.Forecast_BalanceDaily(dt_rep,out_rub_total,rate_con)
-SELECT  dt_rep,
-        SUM(out_rub),
-        SUM(out_rub*rate_con)/SUM(out_rub)
-FROM    #daily
-GROUP BY dt_rep;
-/* ▀▀  ДЕТАЛКА  ▀▀ */
-INSERT INTO WORK.Forecast_BalanceDeals(dt_rep,con_id,out_rub,rate_con)
-SELECT dt_rep,con_id,out_rub,rate_con
-FROM   #daily;
-```
-
-**Копируйте целиком** — скрипт:
-
-1. заново наполняет `ForecastKey_Cache` (исправленная логика уже у вас);
-2. каждый запуск «с нуля» очищает (`TRUNCATE`) итоговые таблицы
-   `WORK.Forecast_BalanceDaily` и `WORK.Forecast_BalanceDeals`;
-3. формирует посуточные ставки (float: `KEY_RATE+спред`, fix: `AVG_KEY_RATE+спред`),
-   roll-over’ы и сохраняет:
-
-| таблица                         | содержимое                                                    |
-| ------------------------------- | ------------------------------------------------------------- |
-| **WORK.Forecast\_BalanceDaily** | `dt_rep`, суммарный объём, средневзвешенная ставка            |
-| **WORK.Forecast\_BalanceDeals** | только те сделки, ставка которых меняется (float + roll-over) |
-
-Выполнение ≤ 1 минуты на портфель порядка 400 тыс. договоров.
+*Изменить даты когорт / среза по-прежнему можно, подправив только
+`COHORT_FROM` и `SNAP_DATE`; остальной код трогать не нужно.*
