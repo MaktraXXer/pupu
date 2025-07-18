@@ -1,21 +1,34 @@
-/*───────────────────── 9. Roll-over с применением spread_final */
-IF OBJECT_ID('tempdb..#rolls') IS NOT NULL DROP TABLE #rolls;
-;WITH seq AS (
-    SELECT con_id, out_rub, is_floatrate, termdays,
-           spread_float, spread_fix, dt_open, n = 0
-    FROM   #base
-    UNION ALL
-    SELECT s.con_id, s.out_rub, s.is_floatrate, s.termdays,
-           s.spread_float, s.spread_fix, DATEADD(day, s.termdays, s.dt_open), n + 1
-    FROM   seq s
-    WHERE  DATEADD(day, s.termdays, s.dt_open) <= @HorizonTo
+WITH base AS (
+    SELECT 
+        c.cli_id,
+        c.con_id,
+        c.dt_open,
+        s.out_rub,
+        t.con_rate AS rate_balance
+    FROM dds.contract c
+    JOIN dds.con_rate t
+      ON c.con_id = t.con_id 
+     AND DATE '2025-07-16' BETWEEN t.dt_from AND t.dt_to
+    JOIN dds.con_saldo s
+      ON c.con_id = s.con_id 
+     AND DATE '2025-07-16' BETWEEN s.dt_from AND s.dt_to
+    WHERE c.prod_id = 654
+),
+flag_july_ns AS (
+    SELECT DISTINCT c.cli_id,
+           1 AS has_july_ns
+    FROM dds.contract c
+    WHERE c.prod_id = 654
+      AND c.dt_open BETWEEN DATE '2025-07-01' AND DATE '2025-07-31'
 )
-SELECT s.con_id, s.out_rub, s.is_floatrate, s.termdays,
-       s.dt_open,
-       dt_close = DATEADD(day, s.termdays, s.dt_open),
-       s.spread_float,
-       spread_fix = ISNULL(fs.spread_final, s.spread_fix)
-INTO   #rolls
-FROM   seq s
-LEFT   JOIN #fix_spread fs ON fs.con_id = s.con_id
-OPTION (MAXRECURSION 0);
+SELECT 
+    b.cli_id,
+    b.con_id,
+    b.dt_open,
+    b.out_rub,
+    b.rate_balance,
+    NVL(f.has_july_ns, 0) AS has_july_ns
+FROM base b
+LEFT JOIN flag_july_ns f
+       ON b.cli_id = f.cli_id
+ORDER BY b.cli_id, b.dt_open;
