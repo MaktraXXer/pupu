@@ -1,141 +1,46 @@
-Ошибка заключается в некорректном применении нового спреда к **исходным сделкам** вместо **перевёрнутых версий**. В текущей реализации:
+/*───────────────────── 8-NEW. База баланса (dedup) ───────────────────*/
+IF OBJECT_ID('tempdb..#base') IS NOT NULL DROP TABLE #base;
 
-1. Для исходных сделок (n=0) происходит замена фактического спреда на рыночный (`spread_final`)
-2. Это приводит к пересчёту ставок по текущим сделкам на якорную дату
-3. Результат - искажение остатка на старте прогноза
-
-**Исправление:** Замену спреда нужно применять ТОЛЬКО к перевёрнутым копиям сделок (n >= 1). Фактические условия исходных сделок должны сохраняться.
-
-### Критические изменения
-Изменён блок `#rolls` (шаг 9):
-
-```sql
-/*───────────────────── 9. Roll-over с применением spread_final (ИСПРАВЛЕНО) ───────────────────*/
-IF OBJECT_ID('tempdb..#rolls') IS NOT NULL DROP TABLE #rolls;
-;WITH seq AS (
-    SELECT 
-        con_id, out_rub, is_floatrate, termdays,
-        spread_float, spread_fix, dt_open, 
-        n = 0  -- Исходная сделка
-    FROM #base
-    UNION ALL
-    SELECT 
-        s.con_id, s.out_rub, s.is_floatrate, s.termdays,
-        s.spread_float, s.spread_fix, 
-        DATEADD(day, s.termdays, s.dt_open), -- Дата переворота
-        n + 1
-    FROM seq s
-    WHERE DATEADD(day, s.termdays, s.dt_open) <= @HorizonTo
+;WITH src AS (
+    SELECT  t.con_id,
+            t.out_rub,
+            t.rate_con,
+            t.is_floatrate,
+            t.termdays,
+            TRY_CAST(t.DT_OPEN  AS date) AS dt_open,
+            TRY_CAST(t.DT_CLOSE AS date) AS dt_close,
+            /* номер строки внутри договора:
+               1 — самая свежая (поздняя) дата открытия */
+            ROW_NUMBER() OVER (PARTITION BY t.con_id
+                               ORDER BY TRY_CAST(t.DT_OPEN AS date) DESC,
+                                        t.rate_con DESC)            AS rn
+    FROM   ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
+    WHERE  t.dt_rep       = @Anchor
+      AND  t.section_name = N'Срочные'
+      AND  t.block_name   = N'Привлечение ФЛ'
+      AND  t.od_flag      = 1
+      AND  t.cur          = '810'
+      AND  t.out_rub      > 0
 )
-SELECT 
-    s.con_id,
-    s.out_rub,
-    s.is_floatrate,
-    s.termdays,
-    s.dt_open,
-    dt_close = DATEADD(day, s.termdays, s.dt_open),
-    s.spread_float,
-    spread_fix = 
-        CASE 
-            -- Для ПЕРЕВЁРНУТЫХ сделок: используем новый спред
-            WHEN s.n >= 1 THEN ISNULL(fs.spread_final, s.spread_fix) 
-            -- Для ИСХОДНЫХ сделок: оставляем фактический спред
-            ELSE s.spread_fix 
-        END  
-INTO #rolls
-FROM seq s
-LEFT JOIN #fix_spread fs ON fs.con_id = s.con_id
-OPTION (MAXRECURSION 0);
-```
-
-### Пояснение изменений
-1. **Сохраняем номер итерации `n`** в CTE `seq`:
-   - `n = 0`: Исходная сделка (факт)
-   - `n >= 1`: Перевёрнутые копии
-
-2. **Условная замена спреда**:
-   ```sql
-   CASE 
-       WHEN s.n >= 1 THEN ISNULL(fs.spread_final, s.spread_fix)  -- Новый спред для перевёрнутых
-       ELSE s.spread_fix  -- Фактический спред для исходных
-   END
-   ```
-
-3. **Гарантируется**:
-   - На якорную дату (`@Anchor`) все сделки используют фактические параметры
-   - Перевёрнутые версии получают актуальные рыночные спреды
-
-### Полный исправленный скрипт
-Все остальные блоки остаются без изменений. Убедитесь, что в вашем скрипте заменён ТОЛЬКО указанный фрагмент.
-
-```sql
-/* ... предыдущие шаги 1-8 без изменений ... */
-
-/*───────────────────── 9. Roll-over с применением spread_final (ИСПРАВЛЕНО) ───────────────────*/
-IF OBJECT_ID('tempdb..#rolls') IS NOT NULL DROP TABLE #rolls;
-;WITH seq AS (
-    SELECT 
-        con_id, out_rub, is_floatrate, termdays,
-        spread_float, spread_fix, dt_open, 
-        n = 0  -- Исходная сделка
-    FROM #base
-    UNION ALL
-    SELECT 
-        s.con_id, s.out_rub, s.is_floatrate, s.termdays,
-        s.spread_float, s.spread_fix, 
-        DATEADD(day, s.termdays, s.dt_open), -- Дата переворота
-        n + 1
-    FROM seq s
-    WHERE DATEADD(day, s.termdays, s.dt_open) <= @HorizonTo
-)
-SELECT 
-    s.con_id,
-    s.out_rub,
-    s.is_floatrate,
-    s.termdays,
-    s.dt_open,
-    dt_close = DATEADD(day, s.termdays, s.dt_open),
-    s.spread_float,
-    spread_fix = 
-        CASE 
-            -- Для ПЕРЕВЁРНУТЫХ сделок: используем новый спред
-            WHEN s.n >= 1 THEN ISNULL(fs.spread_final, s.spread_fix) 
-            -- Для ИСХОДНЫХ сделок: оставляем фактический спред
-            ELSE s.spread_fix 
-        END  
-INTO #rolls
-FROM seq s
-LEFT JOIN #fix_spread fs ON fs.con_id = s.con_id
-OPTION (MAXRECURSION 0);
-
-/* ... шаги 10-11 без изменений ... */
-```
-
-### Проверка результата
-После исправления на якорной дате (`2025-07-16`) вы должны получить идентичные значения:
-```sql
-SELECT 
-    dt_rep,
-    out_rub_total = FORMAT(SUM(out_rub_total), 'N0'),
-    rate_con
-FROM (
-    SELECT dt_rep, out_rub_total, rate_con 
-    FROM WORK.Forecast_BalanceDaily_v2  -- Исправленная модель
-    WHERE dt_rep = '2025-07-16'
-    UNION ALL
-    SELECT dt_rep, out_rub_total, rate_con 
-    FROM WORK.Forecast_BalanceDaily     -- Базовая модель
-    WHERE dt_rep = '2025-07-16'
-) t
-GROUP BY dt_rep, rate_con;
-```
-
-Ожидаемый вывод:
-```
-dt_rep       | out_rub_total | rate_con
--------------|---------------|---------
-2025-07-16  | 364,319,748,223.17 | 0.2021
-```
+/* ── оставляем rn = 1, тем самым убираем все дубликаты по con_id ── */
+SELECT  s.con_id,
+        s.out_rub,
+        s.rate_con,
+        s.is_floatrate,
+        s.termdays,
+        s.dt_open,
+        s.dt_close,
+        spread_float = CASE WHEN s.is_floatrate = 1
+                            THEN s.rate_con - ks.KEY_RATE END,
+        spread_fix   = CASE WHEN s.is_floatrate = 0
+                            THEN s.rate_con - fk_open.AVG_KEY_RATE END
+INTO    #base
+FROM    src                    s
+JOIN    #key_spot              ks  ON ks.DT_REP = @Anchor
+LEFT JOIN WORK.ForecastKey_Cache fk_open
+       ON fk_open.DT_REP = s.dt_open
+      AND fk_open.TERM   = s.termdays
+WHERE   s.rn = 1;   -- ← единственная строка по договору
 
 
 USE ALM_TEST;
