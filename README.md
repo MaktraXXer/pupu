@@ -10,6 +10,12 @@
 /*====================================================================
   1. Таблица  mail.balance_metrics_dvs
   ===================================================================*/
+Верно — в строках для `data_scope` и `load_dttm` я «потерял» имена столбцов. Ниже -- исправленная версия DDL (можно просто выполнить `DROP TABLE mail.balance_metrics_dvs;` если вы уже пытались создать, затем этот скрипт).
+
+```sql
+/*====================================================================
+  1. Таблица  mail.balance_metrics_dvs  (исправлено)
+  ===================================================================*/
 USE [ALM_TEST];
 GO
 
@@ -18,12 +24,12 @@ SET QUOTED_IDENTIFIER ON;
 GO
 
 CREATE TABLE [mail].[balance_metrics_dvs](
-    [dt_rep]       [date]            NOT NULL,
-        NOT NULL,
-    [out_rub_total] [decimal](19,2)   NULL,
-    [term_day]     [numeric](18,2)   NULL,
-    [rate_con]     [numeric](18,6)   NULL,
-        NOT NULL,
+    [dt_rep]        [date]          NOT NULL,
+      NOT NULL,
+    [out_rub_total] [decimal](19,2) NULL,
+    [term_day]      [numeric](18,2) NULL,
+    [rate_con]      [numeric](18,6) NULL,
+      NOT NULL,
     CONSTRAINT [PK_balance_metrics_dvs] 
         PRIMARY KEY CLUSTERED (dt_rep, data_scope)
 ) ON [PRIMARY];
@@ -33,6 +39,10 @@ ALTER TABLE [mail].[balance_metrics_dvs]  WITH NOCHECK
     ADD CONSTRAINT [DF_bmdvs_load_dttm] 
         DEFAULT (SYSUTCDATETIME()) FOR [load_dttm];
 GO
+```
+
+Теперь столбцы объявлены корректно, и скрипт создаётся без ошибок.
+
 ```
 
 ```sql
