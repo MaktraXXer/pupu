@@ -1,18 +1,9 @@
-CREATE TABLE [mail].[balance_metrics_dvs] (
-    [dt_rep]        date          NOT NULL,          -- дата среза
-    [data_scope]    nvarchar(10)  NOT NULL,          -- ← сегмент: 'портфель' | 'новые'
-    [out_rub_total] decimal(19,2) NULL,
-    [term_day]      numeric(18,2) NULL,
-    [rate_con]      numeric(18,6) NULL,
-    [load_dttm]     datetime2(3)  NOT NULL,
-    CONSTRAINT PK_balance_metrics_dvs PRIMARY KEY CLUSTERED (dt_rep, data_scope)
-);
-ALTER TABLE mail.balance_metrics_dvs
-ADD CONSTRAINT CK_bmdvs_data_scope
-    CHECK (data_scope IN (N'портфель', N'новые'));
+Ниже — обновлённая версия процедуры **mail.usp\_fill\_balance\_metrics\_dvs**.
+Изменение только в шаге 3: если *оба* значения ставки на дату (`rate_liq` и `rate_balance`) равны NULL, подставляем первое ненулевое значение ставки с *следующего дня* по тому же договору (`rate_liq_next` или, если её нет, `rate_balance_next`). Все остальные правила остаются без изменений.
 
+```sql
 /*====================================================================
-  2. Процедура  mail.usp_fill_balance_metrics_dvs
+  Процедура  mail.usp_fill_balance_metrics_dvs  — версия с fallback
   ===================================================================*/
 USE [ALM_TEST];
 GO
@@ -55,46 +46,55 @@ BEGIN
     FROM alm.ALM.vw_balance_rest_all  AS t
     LEFT JOIN LIQUIDITY.liq.DepositContract_Rate  r
            ON r.con_id = t.con_id
-          AND CASE WHEN t.dt_open = t.dt_rep 
-                   THEN DATEADD(day, 1, t.dt_rep)   -- первый «нулевой» день ULTRA
-                   ELSE t.dt_rep 
-              END 
-              BETWEEN r.dt_from AND r.dt_to
+          AND CASE WHEN t.dt_open = t.dt_rep
+                   THEN DATEADD(day, 1, t.dt_rep)
+                   ELSE t.dt_rep
+              END BETWEEN r.dt_from AND r.dt_to
     WHERE t.dt_rep      BETWEEN @DateFromWide AND @DateToWide
-      AND t.section_name = N'До востребования'      -- *** отличие ***
+      AND t.section_name = N'До востребования'   -- *** отличие от накопительных ***
       AND t.block_name   = N'Привлечение ФЛ'
       AND t.od_flag      = 1
       AND t.cur          = '810';
 
-    /* оптимальный доступ внутри оконных функций */
     CREATE CLUSTERED INDEX IX_bal ON #bal(con_id, dt_rep);
 
 /* --------------------------------------------------------------
-3. Расчёт итоговой ставки без плавающих ULTRA-правил
+3. Расчёт итоговой ставки
+   — добавлен fallback: если обе ставки NULL, берем значение со следующего дня
 ----------------------------------------------------------------*/
     ;WITH bal_filtered AS (
-        SELECT * 
-        FROM #bal 
+        SELECT *
+        FROM #bal
         WHERE dt_rep BETWEEN @DateFrom AND @DateTo
+    ),
+    bal_enriched AS (          -- добавляем «следующий день» по договору
+        SELECT *,
+               LEAD(rate_balance) OVER (PARTITION BY con_id ORDER BY dt_rep) AS rate_balance_next,
+               LEAD(rate_liq)     OVER (PARTITION BY con_id ORDER BY dt_rep) AS rate_liq_next
+        FROM bal_filtered
     ),
     rate_calc AS (
         SELECT *,
-               CASE 
-                   /* r отсутствует */
+               CASE
+                   /* --- новый пункт: обе ставки NULL, берём из следующего дня --- */
+                   WHEN rate_liq IS NULL AND rate_balance IS NULL
+                        THEN COALESCE(rate_liq_next, rate_balance_next)
+
+                   /* r отсутствует, но t есть */
                    WHEN rate_liq IS NULL                          THEN rate_balance
 
-                   /* (1) r<0, t>0 */
+                   /* (1) r<0 , t>0 */
                    WHEN rate_liq < 0  AND rate_balance > 0       THEN rate_balance
 
-                   /* (3) r≥0, t≥0 */
+                   /* (3) r≥0 , t≥0 */
                    WHEN rate_liq >= 0 AND rate_balance >= 0      THEN rate_liq
 
-                   /* (4) r>0, t<0 */
+                   /* (4) r>0 , t<0 */
                    WHEN rate_liq > 0  AND rate_balance < 0       THEN rate_liq
 
                    ELSE rate_balance
                END AS rate_use
-        FROM bal_filtered
+        FROM bal_enriched
     ),
 
 /* --------------------------------------------------------------
@@ -124,7 +124,7 @@ BEGIN
                DATEADD(day, ROW_NUMBER() OVER (ORDER BY (SELECT 0)) - 1, @DateFrom) AS dt_rep
         FROM master..spt_values
     ),
-    scopes AS (SELECT 'портфель' AS data_scope UNION ALL SELECT 'новые'),
+    scopes AS (SELECT N'портфель' AS data_scope UNION ALL SELECT N'новые'),
     frame AS (SELECT c.dt_rep, s.data_scope FROM cal c CROSS JOIN scopes s),
     src AS (
         SELECT
@@ -134,8 +134,8 @@ BEGIN
             NULL                                        AS term_day,
             COALESCE(a.rate_con,    n.rate_con)        AS rate_con
         FROM frame f
-        LEFT JOIN aggr_all a ON a.dt_rep = f.dt_rep AND f.data_scope = 'портфель'
-        LEFT JOIN aggr_new n ON n.dt_rep = f.dt_rep AND f.data_scope = 'новые'
+        LEFT JOIN aggr_all a ON a.dt_rep = f.dt_rep AND f.data_scope = N'портфель'
+        LEFT JOIN aggr_new n ON n.dt_rep = f.dt_rep AND f.data_scope = N'новые'
     )
 
 /* --------------------------------------------------------------
@@ -157,9 +157,8 @@ END;
 GO
 ```
 
-> **Что изменилось по сравнению с «накопительным счётом»**
+> **Логика fallback**
 >
-> * Источник выборки переключён на `'До востребования'`.
-> * Окно `rate_pos` и все проверки, завязанные на `rate_con_src = 'счет ультра,вручную'`, удалены; расчёт `rate_use` теперь проще и не содержит fallback-к логике плавающих ULTRA-ставок.
-
-Скрипты готовы к запуску в той же базе **ALM\_TEST**.
+> * Для каждой строки ищется ставка того же договора (**con\_id**) на **следующий календарный день** (`LEAD(...) OVER (PARTITION BY con_id ORDER BY dt_rep)`).
+> * Если и `rate_liq`, и `rate_balance` равны `NULL`, то в `rate_use` берётся `rate_liq_next`; если и она `NULL`, то `rate_balance_next`.
+> * Если следующей строки по договору нет, либо там тоже `NULL`, `rate_use` остаётся `NULL`.
