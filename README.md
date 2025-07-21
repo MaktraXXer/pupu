@@ -1,39 +1,15 @@
-/*====================================================================
-  Таблица  mail.balance_metrics_dvs
-  ===================================================================*/
-USE [ALM_TEST];
-GO
-
-SET ANSI_NULLS ON;
-SET QUOTED_IDENTIFIER ON;
-GO
-
 CREATE TABLE [mail].[balance_metrics_dvs] (
-    [dt_rep]        [date]          NOT NULL,
-      NOT NULL,
-    [out_rub_total] [decimal](19,2) NULL,
-    [term_day]      [numeric](18,2) NULL,
-    [rate_con]      [numeric](18,6) NULL,
-      NOT NULL,
-    CONSTRAINT [PK_balance_metrics_dvs]
-        PRIMARY KEY CLUSTERED (
-            [dt_rep] ASC,
-            [data_scope] ASC
-        ) WITH (
-            PAD_INDEX = OFF,
-            STATISTICS_NORECOMPUTE = OFF,
-            IGNORE_DUP_KEY = OFF,
-            ALLOW_ROW_LOCKS = ON,
-            ALLOW_PAGE_LOCKS = ON,
-            OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF
-        ) ON [PRIMARY]
-) ON [PRIMARY];
-GO
-
-ALTER TABLE [mail].[balance_metrics_dvs]  WITH NOCHECK
-ADD CONSTRAINT [DF_bmdvs_load_dttm]
-    DEFAULT (SYSUTCDATETIME()) FOR [load_dttm];
-GO
+    [dt_rep]        date          NOT NULL,          -- дата среза
+    [data_scope]    nvarchar(10)  NOT NULL,          -- ← сегмент: 'портфель' | 'новые'
+    [out_rub_total] decimal(19,2) NULL,
+    [term_day]      numeric(18,2) NULL,
+    [rate_con]      numeric(18,6) NULL,
+    [load_dttm]     datetime2(3)  NOT NULL,
+    CONSTRAINT PK_balance_metrics_dvs PRIMARY KEY CLUSTERED (dt_rep, data_scope)
+);
+ALTER TABLE mail.balance_metrics_dvs
+ADD CONSTRAINT CK_bmdvs_data_scope
+    CHECK (data_scope IN (N'портфель', N'новые'));
 
 /*====================================================================
   2. Процедура  mail.usp_fill_balance_metrics_dvs
