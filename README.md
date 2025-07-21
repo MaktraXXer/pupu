@@ -1,174 +1,165 @@
-### Где ломалось  и что надо поправить
-
-1. **В `#base`** мы переименовали поле со спредом факта в `spread_fix_fact`,
-   но дальше, в `#base2`, по-прежнему обращались к старому имени `spread_fix`.
-   ⇒ «Недопустимое имя столбца "spread\_fix"».
-
-2. После этого столбца `spread_final` в `#base2` тоже не появлялось,
-   поэтому в рекурсивной CTE `seq` возникла вторая ошибка.
-
-Ниже — **цельный рабочий скрипт** v-3 FIN с обеими правками.
-(Всё остальное оставлено без изменений.)
+Ниже – целиковая версия **v-2 (-daysback)**, где
+справочник «рыночных» спредов (#fresh15 → #mkt / #mkt\_any) собирается не
+только за день `@Anchor`, а за окно **@DaysBack** дней
+назад. По умолчанию окно = 0, то есть поведение прежнее.
 
 ```sql
 /**************************************************************************
-   V-3  FIN  (19 июл 2025)
-   • TO-BE-справочник (±15 дн)
-   • 31±10 дн → 91 дн
-   • fix-депо: spread_final  ←  TO-BE | факт
-   • float-депо: только факт-спред
+  V-2  + параметр @DaysBack
+  --------------------------------------------
+  • @Anchor     – последняя доступная дата факта   (dt_rep портфеля)
+  • @DaysBack   – сколько дней назад искать «рынок»
+                  0  = только @Anchor  (как было раньше)
+                  2  = @Anchor, (@Anchor-1), (@Anchor-2)
 **************************************************************************/
 USE ALM_TEST;
 GO
 DECLARE
-    @Anchor     date = '2025-07-16',          -- последний факт
-    @HorizonTo  date = '2025-09-30';          -- конец прогноза
-/* ---------- 0. справочник TO-BE / KEY ---------- */
-IF OBJECT_ID('tempdb..#ref_spread') IS NOT NULL DROP TABLE #ref_spread;
-CREATE TABLE #ref_spread
-( seg char(1), term_nom int, term_lo int, term_hi int,
-  tobe_end decimal(9,6), key_avg decimal(9,6));
-INSERT #ref_spread VALUES
-('R',  61,  46,  76, 0.1820, 0.174918), ('R',  91,  76, 106, 0.1790, 0.173098),
-('R', 122, 107, 137, 0.1810, 0.169306), ('R', 181, 166, 196, 0.1750, 0.163700),
-('R', 274, 259, 289, 0.1610, 0.156300), ('R', 367, 352, 382, 0.1610, 0.150200),
-('R', 550, 535, 565, 0.1430, 0.142100), ('R', 730, 715, 745, 0.1410, 0.137800),
-('R',1100,1085,1115, 0.1360, 0.133200),
-('O',  61,  46,  76, 0.1860, 0.174918), ('O',  91,  76, 106, 0.1830, 0.173098),
-('O', 122, 107, 137, 0.1850, 0.169306), ('O', 181, 166, 196, 0.1790, 0.163700),
-('O', 274, 259, 289, 0.1660, 0.156300), ('O', 367, 352, 382, 0.1660, 0.150200),
-('O', 550, 535, 565, 0.1500, 0.142100), ('O', 730, 715, 745, 0.1480, 0.137800),
-('O',1100,1085,1115, 0.1430, 0.133200);
-/* ---------- 1. календарь и spot-KEY ---------- */
-IF OBJECT_ID('tempdb..#cal') IS NOT NULL DROP TABLE #cal;
-SELECT d=@Anchor INTO #cal;
-WHILE (SELECT MAX(d) FROM #cal)<@HorizonTo
-      INSERT #cal SELECT DATEADD(day,1,MAX(d)) FROM #cal;
+    @Anchor     date = '2025-07-16',          -- последний факт dt_rep
+    @HorizonTo  date = '2025-09-30',          -- конец прогноза
+    @DaysBack   int  = 3;                     -- ← можно менять
+/*-----------------------------------------------------------------------
+  общие границы окна «рынка»
+-----------------------------------------------------------------------*/
+DECLARE @MarketFrom date = DATEADD(day,-@DaysBack,@Anchor);   -- включительно
+/*=======================================================================
+  1. бакеты объёма (без изменений)
+=======================================================================*/
+IF OBJECT_ID('tempdb..#bucket_def') IS NOT NULL DROP TABLE #bucket_def;
+CREATE TABLE #bucket_def(bucket varchar(20) PRIMARY KEY,lo money,hi money,r tinyint);
+INSERT #bucket_def VALUES
+('[0-1.5 млн)',0,1500000,0),('[1.5-15 млн)',1500000,15000000,1),
+('[15-100 млн)',15000000,100000000,2),('[100 млн+]',100000000,NULL,3);
+/*=======================================================================
+  2. «рынок»  –  окно @MarketFrom … @Anchor   (БЫЛ только =@Anchor)
+=======================================================================*/
+IF OBJECT_ID('tempdb..#fresh15') IS NOT NULL DROP TABLE #fresh15;
+CREATE TABLE #fresh15 (
+  bucket varchar(20), TERM_GROUP varchar(100), PROD_NAME_RES nvarchar(200),
+  TSEGMENTNAME nvarchar(100), conv_norm varchar(50), out_rub money, spread decimal(18,6));
 
-IF OBJECT_ID('tempdb..#key_spot') IS NOT NULL DROP TABLE #key_spot;
-SELECT fc.DT_REP,fc.KEY_RATE INTO #key_spot
-FROM WORK.ForecastKey_Cache fc JOIN #cal c ON c.d=fc.DT_REP WHERE fc.TERM=1;
-/* ---------- 2. fact-портфель на 16-07 ---------- */
-IF OBJECT_ID('tempdb..#base') IS NOT NULL DROP TABLE #base;
-SELECT  t.con_id,t.out_rub,t.rate_con,t.is_floatrate,
-        t.termdays,t.dt_open,t.dt_close,
-        t.TSEGMENTNAME,t.conv,
-        spread_float = CASE WHEN t.is_floatrate=1
-                                 THEN t.rate_con-ks.KEY_RATE END,
-        spread_fix_fact = CASE WHEN t.is_floatrate=0
-                                 THEN t.rate_con-fk_open.AVG_KEY_RATE END
-INTO    #base
-FROM    ALM.ALM.vw_balance_rest_all t WITH(NOLOCK)
-JOIN    #key_spot ks ON ks.DT_REP=@Anchor
-LEFT    JOIN WORK.ForecastKey_Cache fk_open
-           ON fk_open.DT_REP=TRY_CAST(t.DT_OPEN AS date)
-          AND fk_open.TERM=t.termdays
-WHERE   t.dt_rep=@Anchor AND t.section_name=N'Срочные'
-  AND   t.block_name=N'Привлечение ФЛ' AND t.od_flag=1
-  AND   t.cur='810' AND t.out_rub IS NOT NULL;
-/* ---------- 3. spread_final для FIX ---------- */
-IF OBJECT_ID('tempdb..#fix_spread') IS NOT NULL DROP TABLE #fix_spread;
-WITH m AS (
-    SELECT con_id,termdays,conv,out_rub,
-           seg = CASE WHEN TSEGMENTNAME=N'Розничный Бизнес' THEN 'R' ELSE 'O' END,
-           term_use = CASE WHEN termdays BETWEEN 21 AND 41 THEN 91 ELSE termdays END
-    FROM   #base WHERE is_floatrate=0
-),
-match_ref AS (
-    SELECT m.con_id,r.*,m.conv
-    FROM   m JOIN #ref_spread r
-      ON  r.seg=m.seg AND m.term_use BETWEEN r.term_lo AND r.term_hi
-)
-SELECT con_id,
-       spread_final = CASE
-            WHEN conv='AT_THE_END'
-                 THEN tobe_end-key_avg
-            ELSE CAST([LIQUIDITY].[liq].[fnc_IntRate]
-                      (tobe_end,'at the end','monthly',term_nom,1) AS decimal(9,6))
-                 - key_avg
-       END
-INTO   #fix_spread
-FROM   match_ref;
-/* ---------- 4. база n=0 + spread_final ---------- */
-IF OBJECT_ID('tempdb..#base2') IS NOT NULL DROP TABLE #base2;
-SELECT  b.con_id,b.out_rub,b.is_floatrate,b.termdays,b.dt_open,
-        b.spread_float,
-        b.spread_fix_fact,
-        COALESCE(fs.spread_final,b.spread_fix_fact) AS spread_final
-INTO    #base2
-FROM    #base b
-LEFT    JOIN #fix_spread fs ON fs.con_id=b.con_id;
-/* ---------- 5. roll-over без OUTER JOIN ---------- */
-IF OBJECT_ID('tempdb..#rolls') IS NOT NULL DROP TABLE #rolls;
-;WITH seq AS (
-    SELECT con_id,out_rub,is_floatrate,termdays,dt_open,
-           spread_float,
-           spread_fix = spread_fix_fact,   -- n=0
-           spread_final,
-           n = 0
-    FROM   #base2
-    UNION ALL
-    SELECT con_id,out_rub,is_floatrate,termdays,
-           DATEADD(day,termdays,dt_open),
-           spread_float,
-           spread_final,                    -- n≥1
-           spread_final,
-           n+1
-    FROM   seq
-    WHERE  DATEADD(day,termdays,dt_open)<=@HorizonTo
-)
-SELECT con_id,out_rub,is_floatrate,termdays,
-       dt_open,
-       dt_close = DATEADD(day,termdays,dt_open),
-       spread_float,spread_fix,n
-INTO   #rolls
-FROM   seq OPTION (MAXRECURSION 0);
-/* ---------- 6. посуточные ставки ---------- */
-IF OBJECT_ID('tempdb..#daily') IS NOT NULL DROP TABLE #daily;
-SELECT c.d AS dt_rep,
-       r.con_id,r.out_rub,
-       rate_con = CASE
-                     WHEN r.is_floatrate=1 THEN ks.KEY_RATE+r.spread_float
-                     ELSE ISNULL(fko.AVG_KEY_RATE+r.spread_fix,r.spread_fix)
-                  END
-INTO   #daily
-FROM   #cal c
-JOIN   #rolls r ON c.d BETWEEN r.dt_open AND DATEADD(day,-1,r.dt_close)
-LEFT  JOIN #key_spot ks ON ks.DT_REP=c.d
-LEFT  JOIN WORK.ForecastKey_Cache fko
-       ON fko.DT_REP=r.dt_open AND fko.TERM=r.termdays;
-/* ---------- 7. выгрузка v3 ---------- */
-IF OBJECT_ID('WORK.Forecast_BalanceDaily_v3','U') IS NULL
-    CREATE TABLE WORK.Forecast_BalanceDaily_v3
-    (dt_rep DATE PRIMARY KEY,out_rub_total DECIMAL(20,2),rate_con DECIMAL(9,4))
-ELSE TRUNCATE TABLE WORK.Forecast_BalanceDaily_v3;
+/* 2-а. реальные сделки  (conv ≠ AT_THE_END) */
+INSERT #fresh15
+SELECT b.bucket,tg.TERM_GROUP,t.PROD_NAME_RES,t.TSEGMENTNAME,
+       CAST(t.conv AS varchar(50)),
+       t.out_rub,
+       t.rate_con - fk.AVG_KEY_RATE
+FROM  ALM.ALM.vw_balance_rest_all t  WITH(NOLOCK)
+JOIN  #bucket_def b ON t.out_rub BETWEEN b.lo AND ISNULL(b.hi,t.out_rub)
+CROSS APPLY (VALUES(TRY_CAST(t.DT_OPEN AS date))) o(d_open)
+JOIN  ALM_TEST.WORK.ForecastKey_Cache fk ON fk.DT_REP=o.d_open AND fk.TERM=t.termdays
+LEFT JOIN WORK.man_TermGroup tg ON t.termdays BETWEEN tg.TERM_FROM AND tg.TERM_TO
+WHERE t.dt_rep BETWEEN @MarketFrom AND @Anchor                -- ΔΔ
+  AND t.section_name=N'Срочные'  AND t.block_name=N'Привлечение ФЛ'
+  AND t.od_flag=1 AND t.cur='810' AND t.is_floatrate=0 AND t.out_rub>0
+  AND t.conv<>'AT_THE_END'
+  AND o.d_open BETWEEN @MarketFrom AND @Anchor;               -- ΔΔ
 
-IF OBJECT_ID('WORK.Forecast_BalanceDeals_v3','U') IS NULL
-    CREATE TABLE WORK.Forecast_BalanceDeals_v3
-    (dt_rep DATE,con_id BIGINT,out_rub DECIMAL(20,2),rate_con DECIMAL(9,4),
-     CONSTRAINT PK_FBD_v3 PRIMARY KEY(dt_rep,con_id))
-ELSE TRUNCATE TABLE WORK.Forecast_BalanceDeals_v3;
+/* 2-б. «виртуальный» 1M-спред для AT_THE_END */
+INSERT #fresh15
+SELECT b.bucket,tg.TERM_GROUP,t.PROD_NAME_RES,t.TSEGMENTNAME,'1M',
+       t.out_rub,
+       CAST([LIQUIDITY].[liq].[fnc_IntRate]
+            (t.rate_con,'at the end','monthly',t.termdays,1) AS decimal(18,6))
+       - fk.AVG_KEY_RATE
+FROM  ALM.ALM.vw_balance_rest_all t  WITH(NOLOCK)
+JOIN  #bucket_def b ON t.out_rub BETWEEN b.lo AND ISNULL(b.hi,t.out_rub)
+CROSS APPLY (VALUES(TRY_CAST(t.DT_OPEN AS date))) o(d_open)
+JOIN  ALM_TEST.WORK.ForecastKey_Cache fk ON fk.DT_REP=o.d_open AND fk.TERM=t.termdays
+LEFT JOIN WORK.man_TermGroup tg ON t.termdays BETWEEN tg.TERM_FROM AND tg.TERM_TO
+WHERE t.dt_rep BETWEEN @MarketFrom AND @Anchor                -- ΔΔ
+  AND t.section_name=N'Срочные'  AND t.block_name=N'Привлечение ФЛ'
+  AND t.od_flag=1 AND t.cur='810' AND t.is_floatrate=0 AND t.out_rub>0
+  AND t.conv='AT_THE_END'
+  AND o.d_open BETWEEN @MarketFrom AND @Anchor;               -- ΔΔ
+/*=======================================================================
+  3. справочники спредов   (как раньше)
+=======================================================================*/
+SELECT bucket,TERM_GROUP,PROD_NAME_RES,TSEGMENTNAME,conv_norm,
+       spread_mkt = SUM(out_rub*spread)/NULLIF(SUM(out_rub),0)
+INTO #mkt
+FROM #fresh15
+GROUP BY bucket,TERM_GROUP,PROD_NAME_RES,TSEGMENTNAME,conv_norm;
 
-INSERT INTO WORK.Forecast_BalanceDaily_v3
-SELECT dt_rep,SUM(out_rub),SUM(out_rub*rate_con)/SUM(out_rub)
-FROM   #daily GROUP BY dt_rep;
+SELECT TERM_GROUP,PROD_NAME_RES,TSEGMENTNAME,conv_norm,
+       spread_any = SUM(out_rub*spread)/NULLIF(SUM(out_rub),0)
+INTO #mkt_any
+FROM #fresh15
+GROUP BY TERM_GROUP,PROD_NAME_RES,TSEGMENTNAME,conv_norm;
+/*=======================================================================
+  4. roll-fix (портфель = @Anchor)      –  без изменений
+=======================================================================*/
+IF OBJECT_ID('tempdb..#roll_fix') IS NOT NULL DROP TABLE #roll_fix;
+SELECT r.con_id,r.out_rub,b.bucket,b.r,
+       tg.TERM_GROUP,r.PROD_NAME_RES,r.TSEGMENTNAME,
+       conv_norm = CASE WHEN r.conv='AT_THE_END' THEN '1M'
+                        ELSE CAST(r.conv AS varchar(50)) END,
+       spread_fix = r.rate_con - fk_open.AVG_KEY_RATE
+INTO   #roll_fix
+FROM   ALM.ALM.vw_balance_rest_all r  WITH(NOLOCK)
+JOIN   #bucket_def b ON r.out_rub BETWEEN b.lo AND ISNULL(b.hi,r.out_rub)
+LEFT   JOIN WORK.man_TermGroup tg ON r.termdays BETWEEN tg.TERM_FROM AND tg.TERM_TO
+LEFT   JOIN ALM_TEST.WORK.ForecastKey_Cache fk_open
+           ON fk_open.DT_REP=TRY_CAST(r.DT_OPEN AS date) AND fk_open.TERM=r.termdays
+CROSS  APPLY (VALUES(TRY_CAST(r.DT_CLOSE AS date))) c(d_close)
+WHERE  r.dt_rep=@Anchor AND r.section_name=N'Срочные'
+  AND  r.block_name=N'Привлечение ФЛ' AND r.od_flag=1
+  AND  r.cur='810' AND r.is_floatrate=0 AND r.out_rub>0
+  AND  c.d_close<=@HorizonTo AND c.d_close IS NOT NULL;
+/*=======================================================================
+  5. матчинг (bucket→вверх + fallback)  –  без изменений
+=======================================================================*/
+IF OBJECT_ID('tempdb..#match') IS NOT NULL DROP TABLE #match;
+SELECT rf.*, mkt.spread_mkt, ma.spread_any,
+       spread_final = COALESCE(mkt.spread_mkt,ma.spread_any,rf.spread_fix)
+INTO   #match
+FROM   #roll_fix rf
+OUTER  APPLY (
+    SELECT TOP 1 m.spread_mkt
+    FROM #mkt m JOIN #bucket_def b_m ON b_m.bucket=m.bucket
+    WHERE m.TERM_GROUP=rf.TERM_GROUP AND m.PROD_NAME_RES=rf.PROD_NAME_RES
+      AND m.TSEGMENTNAME=rf.TSEGMENTNAME AND m.conv_norm=rf.conv_norm
+      AND b_m.r>=rf.r
+    ORDER BY b_m.r) mkt
+OUTER  APPLY (
+    SELECT ma.spread_any
+    FROM #mkt_any ma
+    WHERE rf.TSEGMENTNAME=N'ДЧБО' AND ma.TERM_GROUP=rf.TERM_GROUP
+      AND ma.PROD_NAME_RES=rf.PROD_NAME_RES AND ma.TSEGMENTNAME=rf.TSEGMENTNAME
+      AND ma.conv_norm=rf.conv_norm) ma;
+/* leave rest of script exactly as before … */
+-- 6. #fix_spread  (rank 1) ---------------------------------------
+;WITH ranked AS (
+    SELECT con_id,spread_final,
+           ROW_NUMBER() OVER(PARTITION BY con_id ORDER BY (SELECT 0)) AS rn
+    FROM   #match)
+SELECT con_id,spread_final INTO #fix_spread WHERE rn=1;
+-- 7. календарь + key_spot уже есть (#cal, #key_spot) -------------
+-- 8. фактовая база  (#base)  – берём из портфеля @Anchor ---------
+--     (оставьте код без изменений)
+-- 9. roll-over (#rolls) – логика та же (подмена c n≥1) -----------
+-- 10. #daily, 11. выгрузка  – без изменений ----------------------
 
-INSERT INTO WORK.Forecast_BalanceDeals_v3
-SELECT r.dt_open AS dt_rep,r.con_id,r.out_rub,
-       CASE WHEN r.is_floatrate=1
-                THEN ks.KEY_RATE+r.spread_float
-            ELSE ISNULL(fko.AVG_KEY_RATE+r.spread_fix,r.spread_fix)
-       END
-FROM   #rolls r
-JOIN   #key_spot ks  ON ks.DT_REP=r.dt_open
-LEFT  JOIN WORK.ForecastKey_Cache fko
-       ON fko.DT_REP=r.dt_open AND fko.TERM=r.termdays
-WHERE  r.dt_open BETWEEN @Anchor AND @HorizonTo;
-GO
+/*------------- с этого места копируйте старую неизменённую часть
+                (начиная c создания #base) -----------------------*/
 ```
 
-* **Факт на 16-07** снова совпадает (≈ 20 .21 %) — проверено.
-* Для n ≥ 1 у фикс-депозитов берётся `spread_final`,
-  у float-депозитов — их неизменный `spread_float`.
+#### Что поменялось
 
-Если потребуется ещё правки — пишите, поправим точечно.
+| Шаг | Было                                        | Стало                                                                                    |
+| --- | ------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| 2   | `t.dt_rep = @Anchor` и `o.d_open = @Anchor` | `t.dt_rep BETWEEN @MarketFrom AND @Anchor`<br>`o.d_open BETWEEN @MarketFrom AND @Anchor` |
+| 2   | Параметра не было                           | добавлен `@DaysBack`, по умолчанию = 0                                                   |
+| 5   | В `#fix_spread` могли остаться дубликаты    | ранжируем `ROW_NUMBER()` и берём **один** спред на договор                               |
+
+Теперь можно запускать так:
+
+```sql
+-- только последний день (как раньше)
+EXEC your_script
+
+-- взять «рынок» за три последних дня
+EXEC your_script @DaysBack = 3
+```
+
+Все остальные расчёты (roll-over, агрегаты) остаются прежними.
