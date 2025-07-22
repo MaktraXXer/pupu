@@ -127,66 +127,122 @@ ORDER BY s.con_id;
 /* --- при необходимости:   SELECT * FROM #seg_shift_stats ORDER BY dt_rep; --- */
 
 
+
+```sql
 /* ================================================================
-   БЫСТРАЯ ПРОВЕРКА: все случаи смены сегмента
-=============================================================== */
+   «БЫСТРО И КОНКРЕТНО»
+   — показываем, для каждого договора:
+        1) первый за март-апрель срез (дата + сегмент);
+        2) дату/сегмент, когда он впервые стал «До востребования»;
+        3) дату/сегмент, когда снова появился «Накопительный счёт».
+   Основано только на тех con_id, что ВПЕРВЫЕ пришли в ДВС-портфель
+   как «новые» между 18-30 марта 2025.
+================================================================ */
 
---------------------------- 0. чистим temp -------------------------
-IF OBJECT_ID('tempdb..#seg_change') IS NOT NULL DROP TABLE #seg_change;
+--------------------------- 0. чистим temp ------------------------
+IF OBJECT_ID('tempdb..#base') IS NOT NULL        DROP TABLE #base;
+IF OBJECT_ID('tempdb..#seg_change_quick') IS NOT NULL DROP TABLE #seg_change_quick;
 
---------------------------- 1. параметры ---------------------------
+--------------------------- 1. параметры --------------------------
 DECLARE @dvs_from    date = N'2025-03-18';
 DECLARE @dvs_to      date = N'2025-03-30';
 DECLARE @period_from date = N'2025-03-01';
-DECLARE @period_to   date = N'2025-04-01';   -- включительно
+DECLARE @period_to   date = N'2025-04-01';      -- включительно
 
-;WITH
-dvs_new AS (          -- договор впервые «новый» в ДВС 18-30 марта
+--------------------------- 2. con_id «новые в ДВС» 18-30 марта ---
+;WITH dvs_new AS (
     SELECT DISTINCT con_id
     FROM alm.ALM.vw_balance_rest_all
     WHERE dt_rep BETWEEN @dvs_from AND @dvs_to
       AND section_name = N'До востребования'
-      AND dt_open      = dt_rep
+      AND dt_open      = dt_rep            -- «новый»
       AND block_name   = N'Привлечение ФЛ'
       AND od_flag      = 1
       AND cur          = '810'
-),
-base AS (             -- записи март-апрель по найденным con_id
-    SELECT  t.con_id,
-            t.dt_rep,
-            t.section_name,
-            t.out_rub,
-            t.rate_con
-    FROM alm.ALM.vw_balance_rest_all AS t
-    JOIN dvs_new d ON d.con_id = t.con_id
-    WHERE t.dt_rep BETWEEN @period_from AND @period_to
-      AND t.block_name = N'Привлечение ФЛ'
-      AND t.od_flag    = 1
-      AND t.cur        = '810'
-),
-change_rows AS (      -- строчки, где сегмент сменился
-    SELECT
-        b.con_id,
-        b.dt_rep,
-        LAG(b.section_name) OVER (PARTITION BY b.con_id ORDER BY b.dt_rep) AS section_prev,
-        b.section_name                                                       AS section_curr,
-        b.out_rub,
-        b.rate_con
-    FROM base b
 )
-SELECT  /* TOP (100) */           -- ← снимите коммент, если нужно ограничить выборку
-        con_id,
-        dt_rep,
-        section_prev,
-        section_curr,
-        out_rub,
-        rate_con
-INTO #seg_change
-FROM change_rows
-WHERE section_prev IS NOT NULL      -- есть предыдущий срез
-  AND section_prev <> section_curr  -- сегмент действительно сменился
-ORDER BY con_id, dt_rep;
+SELECT                                          -- записи март–апрель
+        t.con_id,
+        t.dt_rep,
+        t.section_name,
+        t.out_rub,
+        t.rate_con
+INTO    #base
+FROM    alm.ALM.vw_balance_rest_all AS t
+JOIN    dvs_new d  ON d.con_id = t.con_id
+WHERE   t.dt_rep BETWEEN @period_from AND @period_to
+  AND   t.block_name = N'Привлечение ФЛ'
+  AND   t.od_flag    = 1
+  AND   t.cur        = '810';
 
-/* ------ просмотр результата ------ */
-SELECT * FROM #seg_change ORDER BY con_id, dt_rep;
+-- ускоряем поиск по con_id/дате
+CREATE CLUSTERED INDEX IX_base ON #base(con_id, dt_rep);
 
+--------------------------- 3. «три ключевые точки» ---------------
+SELECT
+    c.con_id,
+
+    /* --- 1. первый срез (ещё до любых изменений) --- */
+    initial.dt_rep           AS dt_initial,
+    initial.section_name     AS segment_initial,
+
+    /* --- 2. когда ВПЕРВЫЕ стал ДВС --- */
+    first_dvs.dt_rep         AS dt_first_dvs,
+    first_dvs.section_name   AS segment_first_dvs,
+
+    /* --- 3. когда ВПЕРВЫЕ после этого вернулся в НС --- */
+    first_ns.dt_rep          AS dt_first_ns,
+    first_ns.section_name    AS segment_first_ns
+
+INTO #seg_change_quick
+FROM   (SELECT DISTINCT con_id FROM #base) AS c
+
+/*  --- первая запись в периоде --- */
+CROSS APPLY (
+        SELECT TOP (1) dt_rep, section_name
+        FROM   #base
+        WHERE  con_id = c.con_id
+        ORDER  BY dt_rep
+) AS initial
+
+/*  --- первое появление ДВС после initial --- */
+OUTER APPLY (
+        SELECT TOP (1) dt_rep, section_name
+        FROM   #base
+        WHERE  con_id = c.con_id
+          AND  dt_rep > initial.dt_rep
+          AND  section_name = N'До востребования'
+          AND  section_name <> initial.section_name
+        ORDER  BY dt_rep
+) AS first_dvs
+
+/*  --- первое возвращение НС после того, как был ДВС --- */
+OUTER APPLY (
+        SELECT TOP (1) dt_rep, section_name
+        FROM   #base
+        WHERE  con_id = c.con_id
+          AND  first_dvs.dt_rep IS NOT NULL        -- ДВС реально был
+          AND  dt_rep > first_dvs.dt_rep
+          AND  section_name = N'Накопительный счёт'
+        ORDER  BY dt_rep
+) AS first_ns;
+
+--------------------------- 4. вывод ------------------------------
+SELECT  *
+FROM    #seg_change_quick
+ORDER BY con_id;
+```
+
+### Что делает запрос
+
+* **#base** — все записи за 1 марта – 1 апреля по тем договорам, которые впервые появились в ДВС-портфеле 18-30 марта как «новые».
+  Индекс `(con_id, dt_rep)` ускоряет дальнейшие выборки.
+
+* **#seg\_change\_quick** — по каждому `con_id` ровно одна строка с тремя датами:
+
+  1. `dt_initial` / `segment_initial` — какой сегмент был изначально в начале периода.
+  2. `dt_first_dvs` / `segment_first_dvs` — первая дата, когда договор стал «До востребования».
+  3. `dt_first_ns` / `segment_first_ns` — первая дата, когда после этого снова появился «Накопительный счёт».
+
+Если договор так и не вернулся в НС, колонки `dt_first_ns` и `segment_first_ns` будут **NULL**; если он с самого начала был ДВС, то `dt_first_dvs` совпадёт с `dt_initial`, а `segment_initial = 'До востребования'`.
+
+Временная таблица остаётся доступной в сессии — можно строить дополнительную аналитику или фильтровать выборку по нужным `con_id`.
