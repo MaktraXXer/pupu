@@ -125,3 +125,68 @@ LEFT JOIN alm.ALM.vw_balance_rest_all b
 ORDER BY s.con_id;
 
 /* --- при необходимости:   SELECT * FROM #seg_shift_stats ORDER BY dt_rep; --- */
+
+
+/* ================================================================
+   БЫСТРАЯ ПРОВЕРКА: все случаи смены сегмента
+=============================================================== */
+
+--------------------------- 0. чистим temp -------------------------
+IF OBJECT_ID('tempdb..#seg_change') IS NOT NULL DROP TABLE #seg_change;
+
+--------------------------- 1. параметры ---------------------------
+DECLARE @dvs_from    date = N'2025-03-18';
+DECLARE @dvs_to      date = N'2025-03-30';
+DECLARE @period_from date = N'2025-03-01';
+DECLARE @period_to   date = N'2025-04-01';   -- включительно
+
+;WITH
+dvs_new AS (          -- договор впервые «новый» в ДВС 18-30 марта
+    SELECT DISTINCT con_id
+    FROM alm.ALM.vw_balance_rest_all
+    WHERE dt_rep BETWEEN @dvs_from AND @dvs_to
+      AND section_name = N'До востребования'
+      AND dt_open      = dt_rep
+      AND block_name   = N'Привлечение ФЛ'
+      AND od_flag      = 1
+      AND cur          = '810'
+),
+base AS (             -- записи март-апрель по найденным con_id
+    SELECT  t.con_id,
+            t.dt_rep,
+            t.section_name,
+            t.out_rub,
+            t.rate_con
+    FROM alm.ALM.vw_balance_rest_all AS t
+    JOIN dvs_new d ON d.con_id = t.con_id
+    WHERE t.dt_rep BETWEEN @period_from AND @period_to
+      AND t.block_name = N'Привлечение ФЛ'
+      AND t.od_flag    = 1
+      AND t.cur        = '810'
+),
+change_rows AS (      -- строчки, где сегмент сменился
+    SELECT
+        b.con_id,
+        b.dt_rep,
+        LAG(b.section_name) OVER (PARTITION BY b.con_id ORDER BY b.dt_rep) AS section_prev,
+        b.section_name                                                       AS section_curr,
+        b.out_rub,
+        b.rate_con
+    FROM base b
+)
+SELECT  /* TOP (100) */           -- ← снимите коммент, если нужно ограничить выборку
+        con_id,
+        dt_rep,
+        section_prev,
+        section_curr,
+        out_rub,
+        rate_con
+INTO #seg_change
+FROM change_rows
+WHERE section_prev IS NOT NULL      -- есть предыдущий срез
+  AND section_prev <> section_curr  -- сегмент действительно сменился
+ORDER BY con_id, dt_rep;
+
+/* ------ просмотр результата ------ */
+SELECT * FROM #seg_change ORDER BY con_id, dt_rep;
+
