@@ -1,3 +1,35 @@
+/*--------------------------------------------------------------------
+  0. опорные даты и таблица-чисел
+--------------------------------------------------------------------*/
+DECLARE @AnchorFact   date,
+        @FirstScen    date = '2025-07-28',
+        @ScenCutOff   date = '2026-08-16',
+        @LastSnapDate date;
+
+SELECT @AnchorFact = MAX(DT_REP)
+FROM   ALM.info.VW_ForecastKEY_interval;
+
+SET @LastSnapDate = DATEADD(day, @HorizonDays, @AnchorFact);
+
+/* явное описание временной таблицы --------------- */
+IF OBJECT_ID('tempdb..#nums') IS NOT NULL DROP TABLE #nums;
+CREATE TABLE #nums(                 -- метаданные известны компилятору
+    n int   NOT NULL PRIMARY KEY,   -- порядковый номер
+    d date  NOT NULL                -- соответствующая календарная дата
+);
+
+/* заполняем #nums один раз на диапазон 2000-01-01 … 2030-12-31 */
+;WITH seq AS (
+    SELECT TOP (DATEDIFF(day,'2000-01-01','2030-12-31') + 1)
+           n = ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1
+    FROM   sys.all_objects a
+    CROSS  JOIN sys.all_objects b
+)
+INSERT INTO #nums(n, d)
+SELECT n, DATEADD(day, n, '2000-01-01')
+FROM   seq;
+
+
 ### Что сломалось
 
 * В `CREATE PROCEDURE` во **внутреннем `DECLARE`** я ссылался на переменные,
