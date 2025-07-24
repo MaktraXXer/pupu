@@ -42,7 +42,7 @@ DECLARE @KeySpot decimal(9,4) =
            AND  DT_REP    = @Anchor);      -- должна быть!
 
 /*------------------------------------------------------------------
-  портфель t-1  (только нужные поля) 
+  портфель t-1  (добавили stub-колонку spread_final)
 ------------------------------------------------------------------*/
 IF OBJECT_ID('tempdb..#base','U') IS NOT NULL DROP TABLE #base;
 
@@ -54,25 +54,28 @@ SELECT  t.con_id,
         t.dt_open,
         t.TSEGMENTNAME,
         t.conv,
+
         /* плавающий: спрэд = ставка – spot */
         spread_float    = CASE WHEN t.is_floatrate = 1
                                THEN t.rate_con - @KeySpot END,
-        /* фикс-факт: ставка – средний ключ открытия  */
+
+        /* фикс-факт: ставка – средний ключ открытия */
         spread_fix_fact = CASE WHEN t.is_floatrate = 0
-                               THEN t.rate_con - kc.AVG_KEY_RATE END
+                               THEN t.rate_con - kc.AVG_KEY_RATE END,
+
+        spread_final    = CAST(NULL AS decimal(9,6))   -- ← ЗАГЛУШКА
 INTO    #base
 FROM    ALM.ALM.vw_balance_rest_all     t  WITH (NOLOCK)
 LEFT    JOIN WORK.ForecastKey_Cache_Scen kc
            ON kc.SCENARIO = @Scenario
           AND kc.DT_REP   = t.dt_open
           AND kc.TERM     = t.termdays
-WHERE   t.dt_rep        = @Anchor
-  AND   t.section_name  = N'Срочные'
-  AND   t.block_name    = N'Привлечение ФЛ'
-  AND   t.od_flag       = 1
-  AND   t.cur           = '810'
-  AND   t.out_rub      IS NOT NULL;
-
+WHERE   t.dt_rep       = @Anchor
+  AND   t.section_name = N'Срочные'
+  AND   t.block_name   = N'Привлечение ФЛ'
+  AND   t.od_flag      = 1
+  AND   t.cur          = '810'
+  AND   t.out_rub     IS NOT NULL;
 /*------------------------------------------------------------------
   “to-be” ставка и окончательный фикс-спрэд
 ------------------------------------------------------------------*/
