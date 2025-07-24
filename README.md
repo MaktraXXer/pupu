@@ -120,32 +120,46 @@ BEGIN
       AND   t.od_flag=1 AND t.cur='810' AND t.out_rub IS NOT NULL;
 
     /* -------- 3. spread_final для FIX ----------------------------- */
-    IF OBJECT_ID('tempdb..#fix_spread','U') IS NOT NULL DROP TABLE #fix_spread;
-    WITH m AS (
-        SELECT con_id,termdays,conv,out_rub,
-               seg = IIF(TSEGMENTNAME=N'Розничный Бизнес','R','O')
-        FROM   #base WHERE is_floatrate=0
-    ),
-    match_ref AS (
-        SELECT m.con_id,r.*,m.conv
-        FROM   m
-        JOIN   WORK.TOBE_Rates r
-               ON r.variant=@Variant
-              AND r.seg     =m.seg
-              AND m.termdays BETWEEN r.tenor_lo AND r.tenor_hi
-    )
-    SELECT con_id,
-           spread_final = CASE
-               WHEN conv='AT_THE_END'
-                    THEN r.rate_O - r.diff_RO - r.rate_O + r.diff_RO /* 0 – placeholder */
-               ELSE CAST(LIQUIDITY.liq.fnc_IntRate(
-                          r.rate_O,'at the end','monthly',r.tenor_nom,1)
-                         AS decimal(9,6))
-                    - r.rate_O
-           END
-    INTO   #fix_spread
-    FROM   match_ref r;  -- r.rate_O – ставка O; diff_RO – разница
-
+/* --- Фрагмент процедуры: блок #fix_spread  --- */
+IF OBJECT_ID('tempdb..#fix_spread','U') IS NOT NULL DROP TABLE #fix_spread;
+WITH m AS (
+    SELECT con_id, termdays, conv, out_rub,
+           seg = IIF(TSEGMENTNAME=N'Розничный Бизнес','R','O')
+    FROM   #base
+    WHERE  is_floatrate = 0
+),
+match_ref AS (                -- подбираем строку TO-BE по диапазону
+    SELECT m.*, r.rate_O, r.diff_RO, r.tenor_nom
+    FROM   m
+    JOIN   WORK.TOBE_Rates r
+           ON  r.variant   = @Variant
+           AND m.termdays BETWEEN r.tenor_lo AND r.tenor_hi
+)
+SELECT  con_id,
+        spread_final = CASE
+             /* ставка-база: O  или  (O-diff_RO) для розницы */
+             WHEN conv = 'AT_THE_END' THEN
+                  (CASE WHEN seg='R' THEN rate_O - diff_RO ELSE rate_O END)
+                  - key_avg        -- key_avg возьмём чуть ниже
+             ELSE
+                  CAST(LIQUIDITY.liq.fnc_IntRate(
+                             (CASE WHEN seg='R'
+                                   THEN rate_O - diff_RO
+                                   ELSE rate_O END),
+                             'at the end','monthly',tenor_nom,1)
+                       AS decimal(9,6))
+                  - key_avg
+        END
+INTO    #fix_spread
+FROM   match_ref
+/* средний ключ на дату открытия (из нужного сценария) */
+CROSS  APPLY (
+        SELECT key_avg = kc.AVG_KEY_RATE
+        FROM   WORK.ForecastKey_Cache_Scen kc
+        WHERE  kc.SCENARIO=@Scenario
+          AND  kc.DT_REP = @Anchor      -- дата открытия = @Anchor
+          AND  kc.TERM   = termdays
+     ) kavg;
     /* -------- 4. roll-over-цепочки ------------------------------- */
     IF OBJECT_ID('tempdb..#rolls','U') IS NOT NULL DROP TABLE #rolls;
     ;WITH seq AS (
