@@ -1,202 +1,213 @@
-#### что нужно получить
+Ниже ― «чистый» T-SQL-процедура **без динамического SQL**, которая собирает
+кэш ключевой ставки *одновременно* для любого числа сценариев.
+У вас будет **одна** таблица-приёмник
+`WORK.ForecastKey_Cache_Scen`, а сценарий отличается полем `SCENARIO`.
 
-* **Две независимые «кэширующие» таблицы**
-  `WORK.ForecastKey_Cache_S1` - для сценария 1
-  `WORK.ForecastKey_Cache_S2` - для сценария 2
-
-* В них:
-
-| диапазон `DT_REP`               | откуда берётся KEY\_RATE                                                             |
-| ------------------------------- | ------------------------------------------------------------------------------------ |
-| **< 2025-07-01**                | полностью из истории (`VW_ForecastKEY_everyday`)                                     |
-| **2025-07-01 … @AnchorFact**    | фактический прогноз, уже лежащий в базе                                              |
-| **@AnchorFact+1 … @HorizonEnd** | ключ по сценарию: значение меняется только в даты заседаний, между ними - «держится» |
-
-* `TERM` и `AVG_KEY_RATE` пересчитываются **так же, как в вашем исходном кэше**
-  (т.е. для каждого `DT_REP` «хвост» прогноза начинается с `TERM = 1`,
-  а `AVG_KEY_RATE` — среднее от 1-го срока до текущего).
-
----
-
-## 1 — каркас: задаём сценарии
+### 1. подготавливаем сценарии (разово)
 
 ```sql
-/* ─── СЦЕНАРИИ КЛЮЧЕВОЙ СТАВКИ: что меняется и когда ─── */
-IF OBJECT_ID('tempdb..#scenario_rate') IS NOT NULL DROP TABLE #scenario_rate;
-CREATE TABLE #scenario_rate
-( scenario tinyint,  -- 1 или 2
-  change_dt date,   -- дата заседания ЦБ
-  key_rate  decimal(9,4) );
+/* -------------------------------------------------------------------
+   список заседаний ЦБ и ставки «после заседания»
+   – добавляйте сюда N-й сценарий простым INSERT-ом
+------------------------------------------------------------------- */
+IF OBJECT_ID('WORK.KeyRate_Scenarios','U') IS NULL
+    CREATE TABLE WORK.KeyRate_Scenarios
+    ( SCENARIO   tinyint   NOT NULL,
+      change_dt  date      NOT NULL,
+      key_rate   decimal(9,4) NOT NULL,
+      CONSTRAINT PK_KeyRateScen PRIMARY KEY (SCENARIO,change_dt) );
+
+TRUNCATE TABLE WORK.KeyRate_Scenarios;
 
 /* сценарий 1 */
-INSERT #scenario_rate VALUES
+INSERT WORK.KeyRate_Scenarios VALUES
 (1,'2025-07-28',0.1800),(1,'2025-09-15',0.1600),
 (1,'2025-10-27',0.1470),(1,'2025-12-22',0.1470),
 (1,'2026-02-16',0.1259),(1,'2026-03-23',0.1259),
 (1,'2026-05-18',0.1259),(1,'2026-06-22',0.1259);
 
 /* сценарий 2 */
-INSERT #scenario_rate VALUES
+INSERT WORK.KeyRate_Scenarios VALUES
 (2,'2025-07-28',0.1700),(2,'2025-09-15',0.1600),
 (2,'2025-10-27',0.1470),(2,'2025-12-22',0.1470),
 (2,'2026-02-16',0.1259),(2,'2026-03-23',0.1259),
 (2,'2026-05-18',0.1259),(2,'2026-06-22',0.1259);
 ```
 
-> **Если нужно новый сценарий** — просто добавьте строки
-> `INSERT #scenario_rate VALUES (3,'2025-08-31',0.1750)…`
+### 2. таблица-кэш, общая для всех сценариев
 
----
+```sql
+IF OBJECT_ID('WORK.ForecastKey_Cache_Scen','U') IS NULL
+CREATE TABLE WORK.ForecastKey_Cache_Scen
+( SCENARIO     tinyint     NOT NULL,
+  DT_REP       date        NOT NULL,
+  [Date]       date        NOT NULL,
+  KEY_RATE     decimal(9,4)NOT NULL,
+  TERM         int         NOT NULL,
+  AVG_KEY_RATE decimal(9,4)NOT NULL,
+  CONSTRAINT PK_FKCacheScen PRIMARY KEY (SCENARIO,DT_REP,TERM) );
+GO
+```
 
-## 2 — один скрипт, который собирает нужный кэш
+### 3. универсальная процедура-построитель
 
 ```sql
 /***********************************************************************
-  proc dbo.usp_BuildKeyCacheScenario
-    @Scenario tinyint        -- 1 / 2 / …
-    ,@Horizon int = 200      -- сколько дней вперёд считаем
+  dbo.usp_BuildKeyCache
+    @Scenario      – номер сценария (1,2,…)
+    @HistoryCut    – от какой даты хранить историю (по-умолч. '2025-07-01')
+    @HorizonDays   – сколько дней после последнего факта держим хвост
 ***********************************************************************/
-IF OBJECT_ID('dbo.usp_BuildKeyCacheScenario','P') IS NOT NULL
-    DROP PROCEDURE dbo.usp_BuildKeyCacheScenario;
+IF OBJECT_ID('dbo.usp_BuildKeyCache','P') IS NOT NULL
+    DROP PROCEDURE dbo.usp_BuildKeyCache;
 GO
-CREATE PROCEDURE dbo.usp_BuildKeyCacheScenario
-      @Scenario tinyint
-    , @Horizon  int = 200
+CREATE PROCEDURE dbo.usp_BuildKeyCache
+      @Scenario      tinyint,
+      @HistoryCut    date       = '2025-07-01',
+      @HorizonDays   int        = 200
 AS
 SET NOCOUNT ON;
 
-/* ---- исходные даты ---- */
-DECLARE @AnchorFact date = (SELECT MAX(DT_REP)          -- t-1
-                            FROM  ALM.info.VW_ForecastKEY_interval),
-        @HistoryCut date = '2025-07-01',                -- где «обрываем» историю
-        @HorizonEnd date = DATEADD(day,@Horizon,@AnchorFact);
+/* последний факт-прогноз из витрины interval */
+DECLARE @AnchorFact date = (SELECT MAX(DT_REP)
+                            FROM  ALM.info.VW_ForecastKEY_interval);
 
-/* ---- 0. Timeline всех нужных дат и ставок ---- */
-IF OBJECT_ID('tempdb..#timeline') IS NOT NULL DROP TABLE #timeline;
+/* куда дорастить прогноз */
+DECLARE @HorizonEnd date = DATEADD(day,@HorizonDays,@AnchorFact);
+
+/* ---- 0. календарь нужного диапазона ---- */
+IF OBJECT_ID('tempdb..#cal') IS NOT NULL DROP TABLE #cal;
 WITH d AS (
-    SELECT DATEADD(day,0,@HistoryCut) AS d
+    SELECT d = @HistoryCut
     UNION ALL
-    SELECT DATEADD(day,1,d) FROM d WHERE d < @HorizonEnd )
-SELECT  d.d                                  AS [Date],
-        /* историческую часть берём из витрины,
-           будущее — по сценарию                                   */
-        key_rate = COALESCE(h.key_rate,
-                            /* «последняя» ставка сценария ≤ текущей даты */
-                            ( SELECT TOP 1 s.key_rate
-                              FROM   #scenario_rate s
-                              WHERE  s.scenario = @Scenario
-                                AND  s.change_dt <= d.d
-                              ORDER  BY s.change_dt DESC ))
-INTO    #timeline
-FROM    d
-LEFT    JOIN ALM.info.VW_ForecastKEY_interval h
-           ON h.DT_REP = @AnchorFact AND h.[Date] = d.d
-OPTION (MAXRECURSION 32767);   -- нужно, если горизонт > 32767
+    SELECT DATEADD(day,1,d) FROM d WHERE d < @HorizonEnd)
+SELECT d INTO #cal OPTION (MAXRECURSION 32767);
 
-/* ---- 1. заготовка дат DT_REP, для которых сделаем «снимок» ---- */
-IF OBJECT_ID('tempdb..#dt_rep') IS NOT NULL DROP TABLE #dt_rep;
-WITH a AS (
-    /* история до AnchorFact ― как в everyday-витрине */
-    SELECT DISTINCT DT_REP
-    FROM   ALM.info.VW_ForecastKEY_everyday
-    WHERE  DT_REP <  @AnchorFact
+/* ---- 1. базовый (фактический) прогноз, привязанный к AnchorFact ---- */
+IF OBJECT_ID('tempdb..#base_fore') IS NOT NULL DROP TABLE #base_fore;
+SELECT f.[Date], f.KEY_RATE
+INTO   #base_fore
+FROM   ALM.info.VW_ForecastKEY_interval f
+WHERE  f.DT_REP = @AnchorFact;
 
-    UNION ALL
-    /* плюс будущие dt_rep от (AnchorFact+1) до HorizonEnd */
-    SELECT DATEADD(day,v.n,@AnchorFact)
-    FROM  (SELECT TOP (DATEDIFF(day,0,@HorizonEnd)) ROW_NUMBER() OVER(ORDER BY (SELECT 0))-1 AS n
-           FROM master..spt_values) v
-    WHERE v.n BETWEEN 1 AND @Horizon
+/* ---- 2. сценарная кривая: «держим» ставку до следующего заседания ---- */
+IF OBJECT_ID('tempdb..#scen_rate') IS NOT NULL DROP TABLE #scen_rate;
+WITH s AS (
+      SELECT s.change_dt,
+             s.key_rate,
+             nxt = LEAD(s.change_dt) OVER (ORDER BY s.change_dt)
+      FROM   WORK.KeyRate_Scenarios s
+      WHERE  s.SCENARIO = @Scenario
+),
+d AS (
+      SELECT change_dt AS d, key_rate FROM s
+      UNION ALL
+      SELECT DATEADD(day,1,d), key_rate
+      FROM   d
+      WHERE  d < (SELECT MAX(nxt)-1 FROM s WHERE nxt IS NOT NULL)
 )
+SELECT d AS [Date], key_rate
+INTO   #scen_rate
+FROM   d OPTION (MAXRECURSION 32767);
+
+/* ---- 3. итоговая временная шкала ---- */
+IF OBJECT_ID('tempdb..#timeline') IS NOT NULL DROP TABLE #timeline;
+SELECT  c.d                                   AS [Date],
+        /* приоритеты:
+           1) история до AnchorFact
+           2) сценарий (если попадает в диапазон его дат)
+           3) базовый прогноз                                         */
+        KEY_RATE = COALESCE(h.KEY_RATE,
+                            s.key_rate,
+                            b.KEY_RATE)
+INTO    #timeline
+FROM    #cal               c
+LEFT    JOIN ALM.info.VW_ForecastKEY_everyday h
+           ON h.DT_REP = c.d
+LEFT    JOIN #scen_rate s
+           ON s.[Date] = c.d           -- только заявленные сценарные дни
+LEFT    JOIN #base_fore  b
+           ON b.[Date] = c.d;
+
+/* ---- 4. даты DT_REP, для которых делаем снимок ---- */
+IF OBJECT_ID('tempdb..#dt_rep') IS NOT NULL DROP TABLE #dt_rep;
+WITH all_rep AS (
+      SELECT DISTINCT DT_REP
+      FROM   ALM.info.VW_ForecastKEY_everyday
+      WHERE  DT_REP <  @AnchorFact
+
+      UNION ALL
+      SELECT DATEADD(day,n,@AnchorFact)
+      FROM   ( SELECT TOP (@HorizonDays)
+                     ROW_NUMBER() OVER (ORDER BY (SELECT 0))-1 AS n
+               FROM master..spt_values ) v )
 SELECT * INTO #dt_rep;
 
-/* ---- 2. собираем финальный кэш ---- */
-DECLARE @tblName sysname = CONCAT('WORK.ForecastKey_Cache_S',@Scenario);
+/* ---- 5. удаляем старую версию сценария и пишем новую ---- */
+DELETE FROM WORK.ForecastKey_Cache_Scen
+WHERE  SCENARIO = @Scenario;
 
-EXEC('
-IF OBJECT_ID('''+@tblName+''',''U'') IS NOT NULL DROP TABLE '+@tblName+';
-CREATE TABLE '+@tblName+'
-( DT_REP date NOT NULL,
-  [Date] date NOT NULL,
-  KEY_RATE decimal(9,4) NOT NULL,
-  TERM int NOT NULL,
-  AVG_KEY_RATE decimal(9,4) NOT NULL,
-  CONSTRAINT PK_'+@tblName+' PRIMARY KEY CLUSTERED (DT_REP,TERM) );');
-
-/* 2-а. история (< AnchorFact) — как есть */
-INSERT '+@tblName+'
-SELECT DT_REP,[Date],KEY_RATE,TERM,AVG_KEY_RATE
-FROM   ALM.info.VW_ForecastKEY_everyday
-WHERE  DT_REP < @AnchorFact
-  AND  DT_REP >= @HistoryCut;
-
-/* 2-б. снимки от AnchorFact и дальше */
-INSERT '+@tblName+'
-SELECT  r.DT_REP,
+INSERT WORK.ForecastKey_Cache_Scen
+SELECT  @Scenario                 AS SCENARIO,
+        r.DT_REP,
         t.[Date],
-        t.key_rate,
+        t.KEY_RATE,
         TERM = ROW_NUMBER() OVER (PARTITION BY r.DT_REP ORDER BY t.[Date]),
-        AVG_KEY_RATE = AVG(t.key_rate) OVER (PARTITION BY r.DT_REP ORDER BY t.[Date])
+        AVG_KEY_RATE = AVG(t.KEY_RATE) OVER
+                         (PARTITION BY r.DT_REP ORDER BY t.[Date])
 FROM    #dt_rep  r
-JOIN    #timeline t
-      ON t.[Date] >= r.DT_REP
-WHERE   r.DT_REP >= @AnchorFact;');
+JOIN    #timeline t ON t.[Date] >= r.DT_REP
+WHERE   r.DT_REP >= @HistoryCut;
 GO
 ```
 
-*Вызываем так:*
+### 4. вызываем
 
 ```sql
-EXEC dbo.usp_BuildKeyCacheScenario @Scenario = 1;  -- сделает WORK.ForecastKey_Cache_S1
-EXEC dbo.usp_BuildKeyCacheScenario @Scenario = 2;  -- сделает WORK.ForecastKey_Cache_S2
+/* пересобрать сценарий 1 и 2 */
+EXEC dbo.usp_BuildKeyCache @Scenario = 1, @HorizonDays = 200;
+EXEC dbo.usp_BuildKeyCache @Scenario = 2, @HorizonDays = 200;
 ```
-
-> **Если горизонт нужен другой** — добавьте `,@Horizon = 300` при вызове.
 
 ---
 
-## 3 — как подключить в ваши три методики
+## 5. как подключить к вашим трём расчётам
 
-* В каждом калькуляторе ставок **замените** строку
-
-```sql
-FROM   WORK.ForecastKey_Cache fc   -- было
-```
-
-на
+*Замените только источник ключевой ставки*:
 
 ```sql
-FROM   WORK.ForecastKey_Cache_S1 fc   -- или _S2
+FROM WORK.ForecastKey_Cache_Scen fc   -- вместо WORK.ForecastKey_Cache
+WHERE fc.SCENARIO = 1                 -- (или 2)
 ```
 
-* Больше менять ничего не нужно: структура таблицы полностью та же,
-  `TERM` начинается с 1, `AVG_KEY_RATE` корректный.
+Всё остальное – без изменений: поля (`DT_REP`,`Date`,`KEY_RATE`,`TERM`,
+`AVG_KEY_RATE`) те же, `TERM` всегда начинается с 1,
+`AVG_KEY_RATE` считается «скользящим» точно как раньше.
 
 ---
 
-### Проверка себя
+### проверка
 
 ```sql
-/* убедимся, что TERM и AVG_KEY_RATE идут правильно */
+/* TERM начинается с 1 и среднее = KEY_RATE на первой дате */
 SELECT TOP 10 *
-FROM   WORK.ForecastKey_Cache_S1
-WHERE  DT_REP = '2025-07-29';
+FROM   WORK.ForecastKey_Cache_Scen
+WHERE  SCENARIO = 1
+  AND  DT_REP   = '2025-07-29';
 
-/* сравним сценарии между собой */
-SELECT  a.[Date],
-        s1 = s1.KEY_RATE,
-        s2 = s2.KEY_RATE
-FROM    WORK.ForecastKey_Cache_S1 s1
-JOIN    WORK.ForecastKey_Cache_S2 s2
-          ON s2.DT_REP = s1.DT_REP AND s2.[Date] = s1.[Date]
-WHERE   s1.DT_REP = '2025-07-29'
+/* сценарии действительно различаются только в нужных окнах */
+SELECT  t.Date, s1.KEY_RATE AS S1, s2.KEY_RATE AS S2
+FROM    WORK.ForecastKey_Cache_Scen s1
+JOIN    WORK.ForecastKey_Cache_Scen s2
+          ON s2.DT_REP = s1.DT_REP
+         AND s2.Date   = s1.Date
+WHERE   s1.SCENARIO = 1
+  AND   s2.SCENARIO = 2
+  AND   s1.DT_REP   = '2025-07-29'
   AND   s1.KEY_RATE <> s2.KEY_RATE;
 ```
 
-*В диапазоне 28-07 – 14-09-2025 вы увидите разницу: 18 % против 17 %.*
-Все остальные даты совпадут, что и требовалось.
+После 17 августа 2026 ставки обоих сценариев снова совпадут с базовым прогнозом из `VW_ForecastKEY_interval`, потому что за пределами списка заседаний кривая «проваливается» в оригинальный прогноз.
 
----
-
-> В итоге у вас есть **универсальный генератор кэша**.
-> Хотите новую траекторию ключевой ставки — добавляете сценарий в `#scenario_rate` и вызываете процедуру с нужным id.
+Теперь кэш собирается статическим SQL, легко
+расширяется новыми сценариями и подключается к любой из ваших трёх методик одной строкой.
