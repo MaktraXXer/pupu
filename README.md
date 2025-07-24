@@ -1,5 +1,5 @@
 import pandas as pd
-
+ mR3[ypulczafnastia
 # ─────────── НАСТРОЙКИ ───────────
 FU_PRODUCTS = {
     'Надёжный','Надёжный VIP','Надёжный премиум',
