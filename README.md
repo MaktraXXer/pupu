@@ -1,3 +1,140 @@
+/***********************************************************************
+  dbo.usp_BuildKeyCache   –  версия 2025-07-24 fix
+***********************************************************************/
+IF OBJECT_ID('dbo.usp_BuildKeyCache','P') IS NOT NULL
+    DROP PROCEDURE dbo.usp_BuildKeyCache;
+GO
+CREATE PROCEDURE dbo.usp_BuildKeyCache
+      @Scenario      tinyint,
+      @HistoryCut    date       = '2025-07-01',
+      @HorizonDays   int        = 200
+AS
+SET NOCOUNT ON;
+
+/* последний факт-прогноз */
+DECLARE @AnchorFact  date = (SELECT MAX(DT_REP)
+                             FROM  ALM.info.VW_ForecastKEY_interval);
+DECLARE @HorizonEnd  date = DATEADD(day,@HorizonDays,@AnchorFact);
+
+/* ------------------------------------------------------------------ */
+/* 0. календарь с @HistoryCut по @HorizonEnd                           */
+/* ------------------------------------------------------------------ */
+IF OBJECT_ID('tempdb..#cal') IS NOT NULL DROP TABLE #cal;
+;WITH cal_src AS (
+        SELECT d = @HistoryCut
+        UNION ALL
+        SELECT DATEADD(day,1,cal_src.d)
+        FROM   cal_src
+        WHERE  cal_src.d < @HorizonEnd )
+SELECT d INTO #cal FROM cal_src OPTION (MAXRECURSION 32767);
+
+/* ------------------------------------------------------------------ */
+/* 1. базовый прогноз (витрина interval, снимок @AnchorFact)           */
+/* ------------------------------------------------------------------ */
+IF OBJECT_ID('tempdb..#base_fore') IS NOT NULL DROP TABLE #base_fore;
+SELECT f.[Date], f.KEY_RATE
+INTO   #base_fore
+FROM   ALM.info.VW_ForecastKEY_interval f
+WHERE  f.DT_REP = @AnchorFact;
+
+/* ------------------------------------------------------------------ */
+/* 2. разворачиваем сценарную кривую                                   */
+/* ------------------------------------------------------------------ */
+DECLARE @LastScenDate date =
+       ( SELECT MAX(change_dt)
+         FROM   WORK.KeyRate_Scenarios
+         WHERE  SCENARIO = @Scenario );
+
+IF OBJECT_ID('tempdb..#scen_rate') IS NOT NULL DROP TABLE #scen_rate;
+
+WITH s AS (
+    SELECT change_dt ,
+           key_rate ,
+           nxt = LEAD(change_dt) OVER (ORDER BY change_dt)
+    FROM   WORK.KeyRate_Scenarios
+    WHERE  SCENARIO = @Scenario
+),
+expand AS (
+    -- первая строка каждого интервала
+    SELECT s.change_dt AS d,
+           s.key_rate,
+           s.nxt
+    FROM   s
+    UNION ALL
+    -- все даты до дня «-1» перед следующим заседанием
+    SELECT DATEADD(day,1,expand.d) ,
+           expand.key_rate ,
+           expand.nxt
+    FROM   expand
+    WHERE  expand.d < DATEADD(day,-1,expand.nxt)
+)
+SELECT d AS [Date] ,
+       key_rate
+INTO   #scen_rate
+FROM   expand
+UNION ALL                                  -- хвост после последнего заседания
+SELECT d , key_rate
+FROM   #cal  c
+CROSS  APPLY (SELECT key_rate
+              FROM   WORK.KeyRate_Scenarios
+              WHERE  SCENARIO = @Scenario
+                AND  change_dt = @LastScenDate) k
+WHERE  c.d >  @LastScenDate
+OPTION (MAXRECURSION 32767);
+
+/* ------------------------------------------------------------------ */
+/* 3. итоговая временная шкала                                         */
+/* ------------------------------------------------------------------ */
+IF OBJECT_ID('tempdb..#timeline') IS NOT NULL DROP TABLE #timeline;
+SELECT  c.d                                 AS [Date],
+        KEY_RATE = COALESCE(h.KEY_RATE,      -- история
+                            s.key_rate,      -- сценарий
+                            b.KEY_RATE)      -- базовый прогноз
+INTO    #timeline
+FROM    #cal         c
+LEFT JOIN ALM.info.VW_ForecastKEY_everyday h
+       ON h.DT_REP = c.d
+LEFT JOIN #scen_rate s
+       ON s.[Date] = c.d
+LEFT JOIN #base_fore b
+       ON b.[Date] = c.d;
+
+/* ------------------------------------------------------------------ */
+/* 4. список DT_REP, для которых делаем снимок                         */
+/* ------------------------------------------------------------------ */
+IF OBJECT_ID('tempdb..#dt_rep') IS NOT NULL DROP TABLE #dt_rep;
+WITH all_rep AS (
+      SELECT DISTINCT DT_REP
+      FROM   ALM.info.VW_ForecastKEY_everyday
+      WHERE  DT_REP <  @AnchorFact
+
+      UNION ALL
+      SELECT DATEADD(day,n,@AnchorFact)
+      FROM   ( SELECT TOP (@HorizonDays)
+                     ROW_NUMBER() OVER (ORDER BY (SELECT 0))-1 AS n
+               FROM master..spt_values ) v )
+SELECT * INTO #dt_rep;
+
+/* ------------------------------------------------------------------ */
+/* 5. сохраняем в кэш                                                  */
+/* ------------------------------------------------------------------ */
+DELETE FROM WORK.ForecastKey_Cache_Scen
+WHERE  SCENARIO = @Scenario;
+
+INSERT WORK.ForecastKey_Cache_Scen
+SELECT  @Scenario                       AS SCENARIO,
+        r.DT_REP,
+        t.[Date],
+        t.KEY_RATE,
+        TERM = ROW_NUMBER() OVER (PARTITION BY r.DT_REP ORDER BY t.[Date]),
+        AVG_KEY_RATE = AVG(t.KEY_RATE) OVER
+                         (PARTITION BY r.DT_REP ORDER BY t.[Date])
+FROM    #dt_rep  r
+JOIN    #timeline t ON t.[Date] >= r.DT_REP
+WHERE   r.DT_REP >= @HistoryCut;
+GO
+
+
 Ниже ― «чистый» T-SQL-процедура **без динамического SQL**, которая собирает
 кэш ключевой ставки *одновременно* для любого числа сценариев.
 У вас будет **одна** таблица-приёмник
