@@ -1,185 +1,202 @@
+#### что нужно получить
 
+* **Две независимые «кэширующие» таблицы**
+  `WORK.ForecastKey_Cache_S1` - для сценария 1
+  `WORK.ForecastKey_Cache_S2` - для сценария 2
 
+* В них:
 
-помнишь мой код для расчета спредов?
-где был справочник
-вот код
-### Где ломалось  и что надо поправить
+| диапазон `DT_REP`               | откуда берётся KEY\_RATE                                                             |
+| ------------------------------- | ------------------------------------------------------------------------------------ |
+| **< 2025-07-01**                | полностью из истории (`VW_ForecastKEY_everyday`)                                     |
+| **2025-07-01 … @AnchorFact**    | фактический прогноз, уже лежащий в базе                                              |
+| **@AnchorFact+1 … @HorizonEnd** | ключ по сценарию: значение меняется только в даты заседаний, между ними - «держится» |
 
-1. **В `#base`** мы переименовали поле со спредом факта в `spread_fix_fact`,
-   но дальше, в `#base2`, по-прежнему обращались к старому имени `spread_fix`.
-   ⇒ «Недопустимое имя столбца "spread\_fix"».
+* `TERM` и `AVG_KEY_RATE` пересчитываются **так же, как в вашем исходном кэше**
+  (т.е. для каждого `DT_REP` «хвост» прогноза начинается с `TERM = 1`,
+  а `AVG_KEY_RATE` — среднее от 1-го срока до текущего).
 
-2. После этого столбца `spread_final` в `#base2` тоже не появлялось,
-   поэтому в рекурсивной CTE `seq` возникла вторая ошибка.
+---
 
-Ниже — **цельный рабочий скрипт** v-3 FIN с обеими правками.
-(Всё остальное оставлено без изменений.)
+## 1 — каркас: задаём сценарии
 
 ```sql
-/**************************************************************************
-   V-3  FIN  (19 июл 2025)
-   • TO-BE-справочник (±15 дн)
-   • 31±10 дн → 91 дн
-   • fix-депо: spread_final  ←  TO-BE | факт
-   • float-депо: только факт-спред
-**************************************************************************/
-USE ALM_TEST;
+/* ─── СЦЕНАРИИ КЛЮЧЕВОЙ СТАВКИ: что меняется и когда ─── */
+IF OBJECT_ID('tempdb..#scenario_rate') IS NOT NULL DROP TABLE #scenario_rate;
+CREATE TABLE #scenario_rate
+( scenario tinyint,  -- 1 или 2
+  change_dt date,   -- дата заседания ЦБ
+  key_rate  decimal(9,4) );
+
+/* сценарий 1 */
+INSERT #scenario_rate VALUES
+(1,'2025-07-28',0.1800),(1,'2025-09-15',0.1600),
+(1,'2025-10-27',0.1470),(1,'2025-12-22',0.1470),
+(1,'2026-02-16',0.1259),(1,'2026-03-23',0.1259),
+(1,'2026-05-18',0.1259),(1,'2026-06-22',0.1259);
+
+/* сценарий 2 */
+INSERT #scenario_rate VALUES
+(2,'2025-07-28',0.1700),(2,'2025-09-15',0.1600),
+(2,'2025-10-27',0.1470),(2,'2025-12-22',0.1470),
+(2,'2026-02-16',0.1259),(2,'2026-03-23',0.1259),
+(2,'2026-05-18',0.1259),(2,'2026-06-22',0.1259);
+```
+
+> **Если нужно новый сценарий** — просто добавьте строки
+> `INSERT #scenario_rate VALUES (3,'2025-08-31',0.1750)…`
+
+---
+
+## 2 — один скрипт, который собирает нужный кэш
+
+```sql
+/***********************************************************************
+  proc dbo.usp_BuildKeyCacheScenario
+    @Scenario tinyint        -- 1 / 2 / …
+    ,@Horizon int = 200      -- сколько дней вперёд считаем
+***********************************************************************/
+IF OBJECT_ID('dbo.usp_BuildKeyCacheScenario','P') IS NOT NULL
+    DROP PROCEDURE dbo.usp_BuildKeyCacheScenario;
 GO
-DECLARE
-    @Anchor     date = '2025-07-16',          -- последний факт
-    @HorizonTo  date = '2025-09-30';          -- конец прогноза
-/* ---------- 0. справочник TO-BE / KEY ---------- */
-IF OBJECT_ID('tempdb..#ref_spread') IS NOT NULL DROP TABLE #ref_spread;
-CREATE TABLE #ref_spread
-( seg char(1), term_nom int, term_lo int, term_hi int,
-  tobe_end decimal(9,6), key_avg decimal(9,6));
-INSERT #ref_spread VALUES
-('R',  61,  46,  76, 0.1820, 0.174918), ('R',  91,  76, 106, 0.1790, 0.173098),
-('R', 122, 107, 137, 0.1810, 0.169306), ('R', 181, 166, 196, 0.1750, 0.163700),
-('R', 274, 259, 289, 0.1610, 0.156300), ('R', 367, 352, 382, 0.1610, 0.150200),
-('R', 550, 535, 565, 0.1430, 0.142100), ('R', 730, 715, 745, 0.1410, 0.137800),
-('R',1100,1085,1115, 0.1360, 0.133200),
-('O',  61,  46,  76, 0.1860, 0.174918), ('O',  91,  76, 106, 0.1830, 0.173098),
-('O', 122, 107, 137, 0.1850, 0.169306), ('O', 181, 166, 196, 0.1790, 0.163700),
-('O', 274, 259, 289, 0.1660, 0.156300), ('O', 367, 352, 382, 0.1660, 0.150200),
-('O', 550, 535, 565, 0.1500, 0.142100), ('O', 730, 715, 745, 0.1480, 0.137800),
-('O',1100,1085,1115, 0.1430, 0.133200);
-/* ---------- 1. календарь и spot-KEY ---------- */
-IF OBJECT_ID('tempdb..#cal') IS NOT NULL DROP TABLE #cal;
-SELECT d=@Anchor INTO #cal;
-WHILE (SELECT MAX(d) FROM #cal)<@HorizonTo
-      INSERT #cal SELECT DATEADD(day,1,MAX(d)) FROM #cal;
+CREATE PROCEDURE dbo.usp_BuildKeyCacheScenario
+      @Scenario tinyint
+    , @Horizon  int = 200
+AS
+SET NOCOUNT ON;
 
-IF OBJECT_ID('tempdb..#key_spot') IS NOT NULL DROP TABLE #key_spot;
-SELECT fc.DT_REP,fc.KEY_RATE INTO #key_spot
-FROM WORK.ForecastKey_Cache fc JOIN #cal c ON c.d=fc.DT_REP WHERE fc.TERM=1;
-/* ---------- 2. fact-портфель на 16-07 ---------- */
-IF OBJECT_ID('tempdb..#base') IS NOT NULL DROP TABLE #base;
-SELECT  t.con_id,t.out_rub,t.rate_con,t.is_floatrate,
-        t.termdays,t.dt_open,t.dt_close,
-        t.TSEGMENTNAME,t.conv,
-        spread_float = CASE WHEN t.is_floatrate=1
-                                 THEN t.rate_con-ks.KEY_RATE END,
-        spread_fix_fact = CASE WHEN t.is_floatrate=0
-                                 THEN t.rate_con-fk_open.AVG_KEY_RATE END
-INTO    #base
-FROM    ALM.ALM.vw_balance_rest_all t WITH(NOLOCK)
-JOIN    #key_spot ks ON ks.DT_REP=@Anchor
-LEFT    JOIN WORK.ForecastKey_Cache fk_open
-           ON fk_open.DT_REP=TRY_CAST(t.DT_OPEN AS date)
-          AND fk_open.TERM=t.termdays
-WHERE   t.dt_rep=@Anchor AND t.section_name=N'Срочные'
-  AND   t.block_name=N'Привлечение ФЛ' AND t.od_flag=1
-  AND   t.cur='810' AND t.out_rub IS NOT NULL;
-/* ---------- 3. spread_final для FIX ---------- */
-IF OBJECT_ID('tempdb..#fix_spread') IS NOT NULL DROP TABLE #fix_spread;
-WITH m AS (
-    SELECT con_id,termdays,conv,out_rub,
-           seg = CASE WHEN TSEGMENTNAME=N'Розничный Бизнес' THEN 'R' ELSE 'O' END,
-           term_use = CASE WHEN termdays BETWEEN 21 AND 41 THEN 91 ELSE termdays END
-    FROM   #base WHERE is_floatrate=0
-),
-match_ref AS (
-    SELECT m.con_id,r.*,m.conv
-    FROM   m JOIN #ref_spread r
-      ON  r.seg=m.seg AND m.term_use BETWEEN r.term_lo AND r.term_hi
-)
-SELECT con_id,
-       spread_final = CASE
-            WHEN conv='AT_THE_END'
-                 THEN tobe_end-key_avg
-            ELSE CAST([LIQUIDITY].[liq].[fnc_IntRate]
-                      (tobe_end,'at the end','monthly',term_nom,1) AS decimal(9,6))
-                 - key_avg
-       END
-INTO   #fix_spread
-FROM   match_ref;
-/* ---------- 4. база n=0 + spread_final ---------- */
-IF OBJECT_ID('tempdb..#base2') IS NOT NULL DROP TABLE #base2;
-SELECT  b.con_id,b.out_rub,b.is_floatrate,b.termdays,b.dt_open,
-        b.spread_float,
-        b.spread_fix_fact,
-        COALESCE(fs.spread_final,b.spread_fix_fact) AS spread_final
-INTO    #base2
-FROM    #base b
-LEFT    JOIN #fix_spread fs ON fs.con_id=b.con_id;
-/* ---------- 5. roll-over без OUTER JOIN ---------- */
-IF OBJECT_ID('tempdb..#rolls') IS NOT NULL DROP TABLE #rolls;
-;WITH seq AS (
-    SELECT con_id,out_rub,is_floatrate,termdays,dt_open,
-           spread_float,
-           spread_fix = spread_fix_fact,   -- n=0
-           spread_final,
-           n = 0
-    FROM   #base2
+/* ---- исходные даты ---- */
+DECLARE @AnchorFact date = (SELECT MAX(DT_REP)          -- t-1
+                            FROM  ALM.info.VW_ForecastKEY_interval),
+        @HistoryCut date = '2025-07-01',                -- где «обрываем» историю
+        @HorizonEnd date = DATEADD(day,@Horizon,@AnchorFact);
+
+/* ---- 0. Timeline всех нужных дат и ставок ---- */
+IF OBJECT_ID('tempdb..#timeline') IS NOT NULL DROP TABLE #timeline;
+WITH d AS (
+    SELECT DATEADD(day,0,@HistoryCut) AS d
     UNION ALL
-    SELECT con_id,out_rub,is_floatrate,termdays,
-           DATEADD(day,termdays,dt_open),
-           spread_float,
-           spread_final,                    -- n≥1
-           spread_final,
-           n+1
-    FROM   seq
-    WHERE  DATEADD(day,termdays,dt_open)<=@HorizonTo
+    SELECT DATEADD(day,1,d) FROM d WHERE d < @HorizonEnd )
+SELECT  d.d                                  AS [Date],
+        /* историческую часть берём из витрины,
+           будущее — по сценарию                                   */
+        key_rate = COALESCE(h.key_rate,
+                            /* «последняя» ставка сценария ≤ текущей даты */
+                            ( SELECT TOP 1 s.key_rate
+                              FROM   #scenario_rate s
+                              WHERE  s.scenario = @Scenario
+                                AND  s.change_dt <= d.d
+                              ORDER  BY s.change_dt DESC ))
+INTO    #timeline
+FROM    d
+LEFT    JOIN ALM.info.VW_ForecastKEY_interval h
+           ON h.DT_REP = @AnchorFact AND h.[Date] = d.d
+OPTION (MAXRECURSION 32767);   -- нужно, если горизонт > 32767
+
+/* ---- 1. заготовка дат DT_REP, для которых сделаем «снимок» ---- */
+IF OBJECT_ID('tempdb..#dt_rep') IS NOT NULL DROP TABLE #dt_rep;
+WITH a AS (
+    /* история до AnchorFact ― как в everyday-витрине */
+    SELECT DISTINCT DT_REP
+    FROM   ALM.info.VW_ForecastKEY_everyday
+    WHERE  DT_REP <  @AnchorFact
+
+    UNION ALL
+    /* плюс будущие dt_rep от (AnchorFact+1) до HorizonEnd */
+    SELECT DATEADD(day,v.n,@AnchorFact)
+    FROM  (SELECT TOP (DATEDIFF(day,0,@HorizonEnd)) ROW_NUMBER() OVER(ORDER BY (SELECT 0))-1 AS n
+           FROM master..spt_values) v
+    WHERE v.n BETWEEN 1 AND @Horizon
 )
-SELECT con_id,out_rub,is_floatrate,termdays,
-       dt_open,
-       dt_close = DATEADD(day,termdays,dt_open),
-       spread_float,spread_fix,n
-INTO   #rolls
-FROM   seq OPTION (MAXRECURSION 0);
-/* ---------- 6. посуточные ставки ---------- */
-IF OBJECT_ID('tempdb..#daily') IS NOT NULL DROP TABLE #daily;
-SELECT c.d AS dt_rep,
-       r.con_id,r.out_rub,
-       rate_con = CASE
-                     WHEN r.is_floatrate=1 THEN ks.KEY_RATE+r.spread_float
-                     ELSE ISNULL(fko.AVG_KEY_RATE+r.spread_fix,r.spread_fix)
-                  END
-INTO   #daily
-FROM   #cal c
-JOIN   #rolls r ON c.d BETWEEN r.dt_open AND DATEADD(day,-1,r.dt_close)
-LEFT  JOIN #key_spot ks ON ks.DT_REP=c.d
-LEFT  JOIN WORK.ForecastKey_Cache fko
-       ON fko.DT_REP=r.dt_open AND fko.TERM=r.termdays;
-/* ---------- 7. выгрузка v3 ---------- */
-IF OBJECT_ID('WORK.Forecast_BalanceDaily_v3','U') IS NULL
-    CREATE TABLE WORK.Forecast_BalanceDaily_v3
-    (dt_rep DATE PRIMARY KEY,out_rub_total DECIMAL(20,2),rate_con DECIMAL(9,4))
-ELSE TRUNCATE TABLE WORK.Forecast_BalanceDaily_v3;
+SELECT * INTO #dt_rep;
 
-IF OBJECT_ID('WORK.Forecast_BalanceDeals_v3','U') IS NULL
-    CREATE TABLE WORK.Forecast_BalanceDeals_v3
-    (dt_rep DATE,con_id BIGINT,out_rub DECIMAL(20,2),rate_con DECIMAL(9,4),
-     CONSTRAINT PK_FBD_v3 PRIMARY KEY(dt_rep,con_id))
-ELSE TRUNCATE TABLE WORK.Forecast_BalanceDeals_v3;
+/* ---- 2. собираем финальный кэш ---- */
+DECLARE @tblName sysname = CONCAT('WORK.ForecastKey_Cache_S',@Scenario);
 
-INSERT INTO WORK.Forecast_BalanceDaily_v3
-SELECT dt_rep,SUM(out_rub),SUM(out_rub*rate_con)/SUM(out_rub)
-FROM   #daily GROUP BY dt_rep;
+EXEC('
+IF OBJECT_ID('''+@tblName+''',''U'') IS NOT NULL DROP TABLE '+@tblName+';
+CREATE TABLE '+@tblName+'
+( DT_REP date NOT NULL,
+  [Date] date NOT NULL,
+  KEY_RATE decimal(9,4) NOT NULL,
+  TERM int NOT NULL,
+  AVG_KEY_RATE decimal(9,4) NOT NULL,
+  CONSTRAINT PK_'+@tblName+' PRIMARY KEY CLUSTERED (DT_REP,TERM) );');
 
-вот новый справочник
-РОЗНИЦА
-Срок	TO BE	Средний прогнозный ключ сейчас
-61	18.20%	17.33%
-91	17.90%	17.18%
-122	18.10%	16.83%
-181	17.50%	16.36%
-274	16.10%	15.48%
-367	16.10%	14.84%
-550	14.30%	14.08%
-730	14.10%	13.70%
-1100	13.60%	13.20%
+/* 2-а. история (< AnchorFact) — как есть */
+INSERT '+@tblName+'
+SELECT DT_REP,[Date],KEY_RATE,TERM,AVG_KEY_RATE
+FROM   ALM.info.VW_ForecastKEY_everyday
+WHERE  DT_REP < @AnchorFact
+  AND  DT_REP >= @HistoryCut;
 
-ДЧБО	
-Срок	TO BE	Средний прогнозный ключ сейчас
-61	18,60%	17.33%
-91	18,30%	17.18%
-122	18,50%	16.83%
-181	17,90%	16.36%
-274	16,60%	15.48%
-367	16,60%	14.84%
-550	15,00%	14.08%
-730	14,80%	13.70%
-1100	14,30%	13.20%
+/* 2-б. снимки от AnchorFact и дальше */
+INSERT '+@tblName+'
+SELECT  r.DT_REP,
+        t.[Date],
+        t.key_rate,
+        TERM = ROW_NUMBER() OVER (PARTITION BY r.DT_REP ORDER BY t.[Date]),
+        AVG_KEY_RATE = AVG(t.key_rate) OVER (PARTITION BY r.DT_REP ORDER BY t.[Date])
+FROM    #dt_rep  r
+JOIN    #timeline t
+      ON t.[Date] >= r.DT_REP
+WHERE   r.DT_REP >= @AnchorFact;');
+GO
+```
+
+*Вызываем так:*
+
+```sql
+EXEC dbo.usp_BuildKeyCacheScenario @Scenario = 1;  -- сделает WORK.ForecastKey_Cache_S1
+EXEC dbo.usp_BuildKeyCacheScenario @Scenario = 2;  -- сделает WORK.ForecastKey_Cache_S2
+```
+
+> **Если горизонт нужен другой** — добавьте `,@Horizon = 300` при вызове.
+
+---
+
+## 3 — как подключить в ваши три методики
+
+* В каждом калькуляторе ставок **замените** строку
+
+```sql
+FROM   WORK.ForecastKey_Cache fc   -- было
+```
+
+на
+
+```sql
+FROM   WORK.ForecastKey_Cache_S1 fc   -- или _S2
+```
+
+* Больше менять ничего не нужно: структура таблицы полностью та же,
+  `TERM` начинается с 1, `AVG_KEY_RATE` корректный.
+
+---
+
+### Проверка себя
+
+```sql
+/* убедимся, что TERM и AVG_KEY_RATE идут правильно */
+SELECT TOP 10 *
+FROM   WORK.ForecastKey_Cache_S1
+WHERE  DT_REP = '2025-07-29';
+
+/* сравним сценарии между собой */
+SELECT  a.[Date],
+        s1 = s1.KEY_RATE,
+        s2 = s2.KEY_RATE
+FROM    WORK.ForecastKey_Cache_S1 s1
+JOIN    WORK.ForecastKey_Cache_S2 s2
+          ON s2.DT_REP = s1.DT_REP AND s2.[Date] = s1.[Date]
+WHERE   s1.DT_REP = '2025-07-29'
+  AND   s1.KEY_RATE <> s2.KEY_RATE;
+```
+
+*В диапазоне 28-07 – 14-09-2025 вы увидите разницу: 18 % против 17 %.*
+Все остальные даты совпадут, что и требовалось.
+
+---
+
+> В итоге у вас есть **универсальный генератор кэша**.
+> Хотите новую траекторию ключевой ставки — добавляете сценарий в `#scenario_rate` и вызываете процедуру с нужным id.
