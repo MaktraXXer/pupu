@@ -22,7 +22,7 @@ df = df[~bad_fast].copy()
 df['is_fu'] = df['PROD_NAME'].isin(FU_PRODUCTS)
 df['month_open'] = df['DT_OPEN'].dt.to_period('M')
 
-# === Определение новых клиентов ФУ ===
+# === Определение первого вклада клиента ===
 first = (
     df.sort_values('DT_OPEN')
       .groupby('CLI_ID')
@@ -31,12 +31,12 @@ first = (
       .loc[
          lambda x:
          (x['DT_OPEN'] >= START_DATE) &
-         (x['DT_OPEN'] <= END_DATE) &
-         (x['PROD_NAME'].isin(FU_PRODUCTS))
+         (x['DT_OPEN'] <= END_DATE)
       ]
 )
 
 first['month'] = first['DT_OPEN'].dt.to_period('M')
+first['group'] = first['PROD_NAME'].apply(lambda x: 'ФУ' if x in FU_PRODUCTS else 'Банк')
 
 # === Перебор по месяцам ===
 months = pd.period_range('2024-01', '2025-06', freq='M')
@@ -45,35 +45,49 @@ rows = []
 for m in months:
     month_end = m.end_time.normalize()
 
-    # новые клиенты ФУ, открывшие первый вклад в этом месяце
+    # новые клиенты этого месяца (все)
     cohort = first.loc[first['month'] == m]
-    cli_ids = set(cohort['CLI_ID'])
-
-    if not cli_ids:
-        rows.append([month_end.strftime('%d.%m.%Y'), 0, 0.0])
+    if cohort.empty:
+        rows.append([month_end.strftime('%d.%m.%Y'), 0, 0.0, 0, 0.0])
         continue
 
-    # берём только вклады этих клиентов, открытые в этом же месяце, живые на конец месяца
+    # разделение
+    cohort_fu    = cohort.loc[cohort['group'] == 'ФУ']
+    cohort_bank  = cohort.loc[cohort['group'] == 'Банк']
+
+    ids_fu   = set(cohort_fu['CLI_ID'])
+    ids_bank = set(cohort_bank['CLI_ID'])
+
+    # только те вклады, что открыты в этом месяце и живы на конец месяца
     df_m = df[
-        df['CLI_ID'].isin(cli_ids) &
-        (df['month_open'] == m) &
+        df['month_open'] == m &
         (df['DT_OPEN'] <= month_end) &
         ((df['DT_CLOSE'].isna()) | (df['DT_CLOSE'] > month_end)) &
         (df['BALANCE_RUB'].fillna(0) >= MIN_BAL_RUB)
     ].copy()
 
-    vol = df_m['BALANCE_RUB'].sum()
-    rows.append([month_end.strftime('%d.%m.%Y'), len(cli_ids), vol])
+    vol_fu   = df_m[df_m['CLI_ID'].isin(ids_fu)]['BALANCE_RUB'].sum()
+    vol_bank = df_m[df_m['CLI_ID'].isin(ids_bank)]['BALANCE_RUB'].sum()
+
+    rows.append([
+        month_end.strftime('%d.%m.%Y'),
+        len(ids_fu),
+        vol_fu,
+        len(ids_bank),
+        vol_bank
+    ])
 
 # === Таблица результатов ===
 res_df = pd.DataFrame(rows, columns=[
     'Месяц',
     'Новый клиент с ФУ',
-    'Портфель новых клиентов с ФУ'
+    'Портфель новых клиентов с ФУ',
+    'Новый клиент Банка',
+    'Портфель новых клиентов банка'
 ])
 res_df.set_index('Месяц', inplace=True)
 
-# === Финальный вывод — строки: метрики, столбцы: месяцы ===
+# === Финальный вид (твой формат) ===
 final = res_df.T
 final.columns.name = None
 print(final)
