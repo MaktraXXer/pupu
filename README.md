@@ -1,98 +1,66 @@
-import pandas as pd
+Ниже — полностью готовый фрагмент, который можно просто вставить вместо старого блока «INPUT: TO-BE-O RATES …» в вашем скрипте.
+	•	Ставки для клиентов О (УЧК) взяты из вашей таблицы 17 .80 % … 13 .80 % и заведены в долях (0.1780 … 0.1380).
+	•	Δ(O-R) — тот же набор 0 .50 % … 0 .70 % (тоже в долях).
+	•	Я оставил один единственный набор ставок X – потому что вы написали, что он «един для каждого сценария».
+	•	Если позже понадобится ещё один набор – просто продублируйте строки, сменив set_cd, например, на Y.
+	•	Новый Anchor – 26 июля 2025 г. (последний факт в балансе).
+	•	Если у вас изменилась и конечная дата прогноза – поправьте переменную @HorizonTo аналогично.
 
-# === Настройки ===
-FU_PRODUCTS = {
-    'Надёжный','Надёжный VIP','Надёжный премиум',
-    'Надёжный промо','Надёжный старт',
-    'Надёжный T2','Надёжный Мегафон'
-}
-MIN_BAL_RUB = 1.0
-SNAP_DATE   = pd.Timestamp('2025-06-30')
-CUTOFF_DATE = pd.Timestamp('2024-01-01')  # старые клиенты до этой даты
+/*----------------------------------------------------------------------  
+  ПАРАМЕТРЫ ВЫЧИСЛЕНИЯ  
+----------------------------------------------------------------------*/
+DECLARE @Anchor    date = '2025-07-26',    -- последний факт
+        @HorizonTo date = '2025-12-31';    -- конец прогноза
 
-# === Данные ===
-df = df_sql.copy()
-for c in ['DT_OPEN', 'DT_CLOSE']:
-    df[c] = pd.to_datetime(df[c], errors='coerce')
+/*----------------------------------------------------------------------  
+  INPUT:  TO-BE-O RATES  (набор X)  + Δ(O-R) по каждому сроку  
+----------------------------------------------------------------------*/
+IF OBJECT_ID('tempdb..#to_be_O') IS NOT NULL DROP TABLE #to_be_O;
+IF OBJECT_ID('tempdb..#delta_R') IS NOT NULL DROP TABLE #delta_R;
+IF OBJECT_ID('tempdb..#cases'  ) IS NOT NULL DROP TABLE #cases;
 
-# Удаляем "быстрые" вклады и бессрочные
-fast = df['DT_CLOSE'].notna() & ((df['DT_CLOSE'] - df['DT_OPEN']).dt.days <= 2)
-df = df[~fast].copy()
+/* один набор – одна строка (ставка O-клиента в долях) */
+CREATE TABLE #to_be_O
+( set_cd   char(1),         -- X  (можно добавить A/B, если понадобится)
+  term_nom int,             -- 61, 91, 122, …
+  o_rate   decimal(9,4) );  -- 17 % = 0.1700
 
-# Флаг ФУ
-df['is_fu'] = df['PROD_NAME'].isin(FU_PRODUCTS)
+/* ----- набор X : УЧК ставки 17.80 % … 13.80 % ----- */
+INSERT #to_be_O VALUES
+('X',  61 ,0.1780), ('X',  91 ,0.1780), ('X', 122 ,0.1720),
+('X', 181 ,0.1660), ('X', 274 ,0.1600), ('X', 365 ,0.1560),
+('X', 548 ,0.1450), ('X', 730 ,0.1430), ('X',1100 ,0.1380);
 
-# 1. Определяем "старых" клиентов — первый вклад ДО 2024
-first_all = (
-    df.sort_values('DT_OPEN')
-      .groupby('CLI_ID')
-      .first()
-)
-old_cli = set(first_all.loc[first_all['DT_OPEN'] < CUTOFF_DATE].index.astype('int64'))
+/* Δ(O-R) — одинаков для всех наборов */
+CREATE TABLE #delta_R
+( term_nom int PRIMARY KEY,
+  delta_ro decimal(9,4) );
 
-# 2. Среди них — те, кто с 2024-01-01 открылся на ФУ
-fu_later = (df.loc[
-    df['is_fu'] & 
-    df['CLI_ID'].isin(old_cli) &
-    (df['DT_OPEN'] >= CUTOFF_DATE) &
-    (df['DT_OPEN'] <= SNAP_DATE)
-].groupby('CLI_ID')['DT_OPEN'].min())
+INSERT #delta_R VALUES
+( 61 ,0.0050), ( 91 ,0.0040), (122 ,0.0060),
+(181 ,0.0040), (274 ,0.0040), (365 ,0.0020),
+(548 ,0.0070), (730 ,0.0070), (1100,0.0070);
 
-# 3. Группировка по годам открытия на ФУ
-cli_2024 = set(fu_later[fu_later.dt.year == 2024].index)
-cli_2025 = set(fu_later[fu_later.dt.year == 2025].index)
-old_to_fu = set(fu_later.index)
+/* кейсы: <сценарий><набор> — 1X и 2X */
+CREATE TABLE #cases
+( case_cd varchar(5) PRIMARY KEY,
+  scen    tinyint,   -- 1 или 2
+  set_cd  char(1) ); -- всегда X в текущей конфигурации
 
-# 4. Заголовки
-def headline(t, ids):
-    ages = first_all.loc[list(ids), 'age']
-    print(f'{t:<33}: {len(ids):,}  {round(ages.mean())}  {(ages>=50).mean():.2f}')
+INSERT #cases VALUES
+('1X',1,'X'),
+('2X',2,'X');
 
-print()
-headline('Старые → ФУ 2024',  cli_2024)
-headline('Старые → ФУ 2025',  cli_2025)
-headline('Всего старые 24-25 (на ФУ)', old_to_fu)
-print(f'{"":<33}  *по откр. на ФУ до {SNAP_DATE.date()}')
+Куда вставлять
+	1.	В вашем большом скрипте найдите старый блок:
 
-# 5. Snapshot-функция
-def snapshot(ids):
-    live = df.loc[
-        df['CLI_ID'].isin(ids) &
-        (df['DT_OPEN'] <= SNAP_DATE) &
-        (df['DT_CLOSE'].isna() | (df['DT_CLOSE'] > SNAP_DATE)) &
-        (df['OUT_RUB'].fillna(0) >= MIN_BAL_RUB)
-    ].copy()
+/*----------------------------------------------------------------------  
+  INPUT:  TO-BE-O RATES  (два набора — A и B)  + Δ(O-R) …  
+----------------------------------------------------------------------*/
 
-    live['vol_fu'] = live['OUT_RUB'].where(live['is_fu'], 0)
-    live['vol_nb'] = live['OUT_RUB'].where(~live['is_fu'], 0)
+	2.	Замените целиком на код выше (от «ПАРАМЕТРЫ ВЫЧИСЛЕНИЯ» до окончания вставок в #cases).
+	3.	Никакие другие части скрипта менять не нужно:
+	•	Блок 2.3, который строит #ref, уже использует поля set_cd и delta_ro – всё подхватится автоматически.
+	•	Все проценты задания в долях (0 .1780, а не 17 .80) – скрипт ниже работает в тех же единицах, так что дополнительных делений / умножений не требуется.
 
-    g = (live.groupby('CLI_ID')
-              .agg(vol_fu=('vol_fu','sum'),
-                   vol_nb=('vol_nb','sum'))
-         .join(first_all[['age']], how='left'))
-    g['AGE50'] = (g['age'] >= 50).astype(int)
-
-    def agg(mask):
-        sub = g[mask]
-        return (len(sub), sub['vol_fu'].sum(), sub['vol_nb'].sum(),
-                round(sub['age'].mean()) if len(sub) else 0,
-                sub['AGE50'].mean() if len(sub) else 0)
-
-    rows = [agg((g['vol_fu'] > 0) & (g['vol_nb'] == 0)),
-            agg((g['vol_fu'] == 0) & (g['vol_nb'] > 0)),
-            agg((g['vol_fu'] > 0) & (g['vol_nb'] > 0))]
-    rows.append(agg(slice(None)))
-
-    return pd.DataFrame(rows,
-        columns=['Клиентов','Баланс ФУ','Баланс Банк','Avg_age','Share50'],
-        index=['только ФУ','только Банк','ФУ + Банк','ИТОГО'])
-
-# 6. Вывод
-print('\n=== Активны на', SNAP_DATE.date(), 'ВСЯ когорта (старые → ФУ в 24–25) ===')
-print(snapshot(old_to_fu))
-
-print('\n=== Подкогорта «старые → ФУ в 2024» ===')
-print(snapshot(cli_2024))
-
-print('\n=== Подкогорта «старые → ФУ в 2025» ===')
-print(snapshot(cli_2025))
+После замены выполните весь скрипт – в таблице WORK.Forecast_BalanceDaily_cases появятся результаты для кейсов 1X и 2X, рассчитанные на новом прогнозном ключе и с новыми спредами.
