@@ -1,73 +1,118 @@
-/* Данные: ALM.ALM.VW_Balance_Rest_All  ****************************/
-/* Условия:
-   – в выборке только BLOCK_NAME='Привлечение ФЛ' и SECTION_NAME='Срочные'
-   – для каждого месяца берём САМЫЙ ПОЗДНИЙ dt_rep (конец месяца)
-   – учитываем лишь те вклады, у которых DT_OPEN_fact попадает в ТОТ ЖЕ месяц
-      (EOMONTH(DT_OPEN_fact) = конец месяца снимка)
-   – агрегируем: dt_rep, корзинка срока → SUM(out_rub)
-*/
+Вот готовое Python-решение:
 
-;WITH  /* 1. маленький календарь из 13 месяцев */
-months AS (
-    SELECT CAST('2023-01-01' AS date) AS month_start
-    UNION ALL
-    SELECT DATEADD(month, 1, month_start)
-    FROM   months
-    WHERE  month_start < '2024-01-01'          -- последним будет янв-24
-),
+⸻
 
-/* 2. выбираем «снимок» – самый поздний dt_rep в пределах месяца */
-month_latest AS (
-    SELECT
-        EOMONTH(m.month_start)         AS month_end,   -- 31.01.2023, 28.02.2023…
-        latest.dt_rep
-    FROM   months m
-    CROSS APPLY (
-        SELECT TOP (1) dt_rep
-        FROM   ALM.ALM.VW_Balance_Rest_All
-        WHERE  dt_rep BETWEEN m.month_start AND EOMONTH(m.month_start)
-          AND  BLOCK_NAME   = 'Привлечение ФЛ'
-          AND  SECTION_NAME = 'Срочные'
-        ORDER BY dt_rep DESC               -- самый поздний в месяце
-    ) latest
-    WHERE latest.dt_rep IS NOT NULL        -- если в месяце нет снимка – пропускаем
-),
+🔹 Шаг 1: Выгрузка из Oracle по дате
 
-/* 3. основной набор строк по найденным dt_rep */
-base AS (
-    SELECT
-        ml.month_end             AS dt_rep,         -- конец месяца
-        /* корзинка срока */
-        CASE
-            WHEN w.termdays BETWEEN  28 AND  33 THEN  31
-            WHEN w.termdays BETWEEN  60 AND  70 THEN  61
-            WHEN w.termdays BETWEEN  85 AND 110 THEN  91
-            WHEN w.termdays BETWEEN 119 AND 140 THEN 124
-            WHEN w.termdays BETWEEN 175 AND 200 THEN 181
-            WHEN w.termdays BETWEEN 245 AND 290 THEN 274
-            WHEN w.termdays BETWEEN 340 AND 405 THEN 365
-            WHEN w.termdays BETWEEN 540 AND 621 THEN 550
-            WHEN w.termdays BETWEEN 720 AND 763 THEN 750
-            WHEN w.termdays BETWEEN 1090 AND 1140 THEN 1100
-            WHEN w.termdays BETWEEN 1450 AND 1475 THEN 1460
-            WHEN w.termdays BETWEEN 1795 AND 1830 THEN 1825
-            ELSE w.termdays                    -- если срок вне сетки
-        END                       AS term_bucket,
-        w.out_rub
-    FROM   month_latest ml
-    JOIN   ALM.ALM.VW_Balance_Rest_All w
-           ON w.dt_rep = ml.dt_rep
-          AND w.BLOCK_NAME   = 'Привлечение ФЛ'
-          AND w.SECTION_NAME = 'Срочные'
-    /* учитываем только депозиты, открытые в том же месяце */
-    WHERE  EOMONTH(w.DT_OPEN_fact) = ml.month_end
-)
+import pandas as pd
+import oracledb
+from itertools import islice
+from datetime import date
 
-/* 4. итоговая агрегация */
-SELECT
-       dt_rep,                      -- 31.01.2023, 28.02.2023, …, 31.01.2024
-       term_bucket  AS [Срок, дн.], -- 31, 61, 91, …
-       SUM(out_rub) AS sum_out_rub
-FROM   base
-GROUP BY dt_rep, term_bucket
-ORDER  BY dt_rep, term_bucket;
+# ─── Параметры подключения ───
+ORA_USER = 'makhmudov_mark[TREASURY]'
+ORA_PASS = 'Mmakhmudov_mark#1488'
+ORA_DSN  = 'udwh-db-pr-01/udwh'
+
+# ─── Дата оценки ───
+REP_DT = date(2025, 7, 27)  # ← можно менять
+
+def chunked(iterable, size=100):
+    it = iter(iterable)
+    while chunk := list(islice(it, size)):
+        yield chunk
+
+def fetch_base_data(rep_dt, connection):
+    sql = f"""
+        SELECT 
+            c.cli_id,
+            c.con_id,
+            c.dt_open,
+            s.out_rub,
+            r.con_rate AS rate_balance
+        FROM dds.contract c
+        JOIN dds.con_saldo s
+            ON c.con_id = s.con_id 
+           AND DATE '{rep_dt}' BETWEEN s.dt_from AND s.dt_to
+        JOIN dds.con_rate r
+            ON c.con_id = r.con_id 
+           AND DATE '{rep_dt}' BETWEEN r.dt_from AND r.dt_to
+        WHERE c.prod_id = 654
+    """
+    return pd.read_sql(sql, connection)
+
+with oracledb.connect(user=ORA_USER, password=ORA_PASS, dsn=ORA_DSN) as conn:
+    df_sql = fetch_base_data(REP_DT, conn)
+
+print(f"Выгружено строк: {len(df_sql):,}")
+
+
+⸻
+
+🔹 Шаг 2: Классификация и агрегация клиентов в Pandas
+
+# ─── Обработка ───
+df = df_sql.copy()
+df['dt_open'] = pd.to_datetime(df['dt_open'])
+
+# 1. Флаг промо-счёта
+df['is_promo'] = (
+    ((df['dt_open'].dt.month.isin([5,6,7])) & (df['dt_open'].dt.year == 2025)) |
+    (df['rate_balance'] > 10)
+).astype(int)
+
+# 2. Группируем по клиенту: какие типы счетов есть
+flags = df.groupby('cli_id')['is_promo'].agg(
+    has_promo=lambda x: (x == 1).any(),
+    has_non_promo=lambda x: (x == 0).any()
+).reset_index()
+
+def classify_client(row):
+    if row.has_promo and row.has_non_promo:
+        return 'both'
+    elif row.has_promo:
+        return 'only_promo'
+    elif row.has_non_promo:
+        return 'only_base'
+    return 'unknown'
+
+flags['client_type'] = flags.apply(classify_client, axis=1)
+
+# 3. Соединяем обратно
+df = df.merge(flags[['cli_id', 'client_type']], on='cli_id', how='left')
+
+# 4. Агрегация
+agg = df.groupby('client_type').agg(
+    num_clients=('cli_id', 'nunique'),
+    volume_base=('out_rub', lambda x: x[df['is_promo'] == 0].sum()),
+    volume_promo=('out_rub', lambda x: x[df['is_promo'] == 1].sum()),
+    avg_rate_base=('rate_balance', lambda x: (
+        (df.loc[df['is_promo'] == 0, 'rate_balance'] * df.loc[df['is_promo'] == 0, 'out_rub']).sum() /
+        df.loc[df['is_promo'] == 0, 'out_rub'].sum()
+        if df.loc[df['is_promo'] == 0, 'out_rub'].sum() > 0 else None
+    )),
+    avg_rate_promo=('rate_balance', lambda x: (
+        (df.loc[df['is_promo'] == 1, 'rate_balance'] * df.loc[df['is_promo'] == 1, 'out_rub']).sum() /
+        df.loc[df['is_promo'] == 1, 'out_rub'].sum()
+        if df.loc[df['is_promo'] == 1, 'out_rub'].sum() > 0 else None
+    ))
+).reset_index()
+
+import numpy as np
+agg = agg.replace({np.nan: None})
+agg
+
+
+⸻
+
+🔹 Что ты получишь
+
+client_type	num_clients	volume_base	volume_promo	avg_rate_base	avg_rate_promo
+only_base	x	y	0	r1	None
+only_promo	a	0	c	None	r2
+both	d	e	f	r3	r4
+
+
+⸻
+
+Хочешь сохранить результат в Excel / CSV? Я могу добавить строку agg.to_excel("...", index=False).
