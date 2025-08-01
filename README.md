@@ -1,8 +1,40 @@
-Отлично, вот решение в два этапа:
+with h as(SELECT distinct t.cli_id
+FROM alm.ALM.vw_balance_rest_all t WITH (NOLOCK)
+LEFT JOIN [LIQUIDITY].[liq].[DepositContract_Saldo] saldo WITH (NOLOCK)
+       ON t.con_id = saldo.con_id
+      AND '2025-07-29' BETWEEN saldo.DT_FROM AND saldo.DT_TO
+      AND ISNULL(saldo.OUT_RUB, 0) > 0
+WHERE t.dt_rep = '2025-06-30'
+  AND t.section_name = N'Срочные'
+  AND t.is_floatrate = 0
+  AND t.block_name = N'Привлечение ФЛ'
+  AND t.od_flag = 1
+  AND t.cur = '810'
+  AND t.OUT_RUB IS NOT NULL
+  AND saldo.con_id IS NULL  -- нет сальдо на 29 июля → вклад закрыт
+  )
+  SELECT * FROM ALM.[ehd].[VW_transfers_FL_det] with (nolock)
+   WHERE dt_rep BETWEEN '2025-07-01' AND '2025-07-31' and cli_id in (select * from h)
 
-⸻
+   формат поменялся,мне по сути для айди этих клиентов нужно:
+   1) из alm.ALM.vw_balance_rest_all не просто уникальные айди клиентов, но и 
+   а) вывести сумму всех out_RUB что там встречаются
+   б) вывести и сохранить (в удобном формате массив и это в ячейку?) список con_id по которым известна информация.
 
-🔹 ЭТАП 1: Выгрузка данных из Oracle в Pandas
+Зачем нужен пункт Б -смотри на самом деле мне нужно вывести значения из совсем другой базы данных 
+
+SELECT *
+FROM dds.contract
+это вообще другая база данных!
+и в ней при этом есть con_id и con_no 
+мне нужно сохранить в строчку con_no либо как 1 элемент либо несколько в строчку
+
+и мне придется в пайтоне джоинить ее, при этом меня все-еще интересует чтоб по итогу я вывел   SELECT * FROM ALM.[ehd].[VW_transfers_FL_det] with (nolock)
+   WHERE dt_rep BETWEEN '2025-07-01' AND '2025-07-31' and cli_id in (select * from h)
+   только еще добавил бы поля с номерами счетов клиентов (con_no)
+
+Запросы к Базе данных с con_no:
+делается в рамках такого кода
 
 import pandas as pd
 import oracledb
@@ -44,75 +76,96 @@ def fetch_contract_data(rep_dt):
 df = fetch_contract_data(REP_DT)
 print(f'Выгружено: {len(df):,} строк')
 
+И ПОТРЕБУЕТ оттебя чтоб ты четко по нужным con_id выгружал, вот пример похожего кода
+# ──────────────────────────────── Oracle ───────────────────────────────
+ORA_USER = 'makhmudov_mark[TREASURY]'
+ORA_PASS = 'Mmakhmudov_mark#1488'
+ORA_DSN  = 'udwh-db-pr-01/udwh'
+REP_DT   = '2025-07-10'
 
-⸻
+con_ids = df_sql['con_id'].dropna().astype(int).unique().tolist()
 
-🔹 ЭТАП 2: Расчёт аналитики в Pandas
+def chunked(iterable, size=100):
+    it = iter(iterable)
+    while chunk := list(islice(it, size)):
+        yield chunk
 
-# ─── Добавляем флаги ───
-df['is_promo'] = (
-    ((df['dt_open'].dt.month.isin([5,6,7])) & (df['dt_open'].dt.year == 2025)) |
-    (df['rate_balance'] > 10)
-).astype(int)
+def fetch_chunk(ids, connection):
+    ids_str = ','.join(str(i) for i in ids)               # безопасно: только числа
+    sql = f"""
+        SELECT dca.*
+        FROM   dds.con_rate dca
+        WHERE  dca.con_id IN ({ids_str})
+          AND  date'{REP_DT}'
+               BETWEEN dca.DT_FROM AND dca.DT_TO
+    """
+    return pd.read_sql(sql, connection)
 
-df['is_base'] = (df['is_promo'] == 0).astype(int)
+with oracledb.connect(user=ORA_USER, password=ORA_PASS, dsn=ORA_DSN) as conn:
+    df_chunks = [fetch_chunk(chunk, conn) for chunk in chunked(con_ids, 100)]
+    df_ora = pd.concat(df_chunks, ignore_index=True)
 
-# ─── Тип клиента: only_base / only_promo / both ───
-grouped = df.groupby('cli_id').agg({
-    'is_promo': 'max',
-    'is_base': 'max'
-}).reset_index()
-
-def classify(row):
-    if row['is_promo'] and row['is_base']:
-        return 'both'
-    elif row['is_promo']:
-        return 'only_promo'
-    elif row['is_base']:
-        return 'only_base'
-    return 'unknown'
-
-grouped['client_type'] = grouped.apply(classify, axis=1)
-df = df.merge(grouped[['cli_id', 'client_type']], on='cli_id', how='left')
-
-# ─── Расчёт итоговой таблицы ───
-def weighted_avg(x):
-    return (x['rate_balance'] * x['out_rub']).sum() / x['out_rub'].sum()
-
-summary = df.groupby('client_type').agg(
-    num_clients=('cli_id', 'nunique'),
-    volume_base=('out_rub', lambda x: x[df.loc[x.index, 'is_base'] == 1].sum()),
-    volume_promo=('out_rub', lambda x: x[df.loc[x.index, 'is_promo'] == 1].sum()),
-    avg_rate_base=('rate_balance', lambda x: weighted_avg(df.loc[x.index & (df['is_base'] == 1)])),
-    avg_rate_promo=('rate_balance', lambda x: weighted_avg(df.loc[x.index & (df['is_promo'] == 1)]))
-).reset_index()
-
-print(summary)
+print(f'Oracle: {len(df_ora):,} строк')
 
 
-⸻
 
-🔹 ДОПОЛНИТЕЛЬНО: Разбивка по месяцам открытия
+при этом братик посмотри еще как сами переводы и другие штуки вытащить:
+import pyodbc
+import pandas as pd
+import oracledb
+from textwrap import dedent
+from itertools import islice
 
-df['month_open'] = df['dt_open'].dt.to_period('M').astype(str)
+# ──────────────────────────────── MSSQL ────────────────────────────────
+REP_DT   = '2025-07-10'
+DATE_FR  = '2025-04-01'
+DATE_TO  = '2025-04-30'
+INCL_FLT = 0
 
-monthly = df.groupby(['month_open', 'is_promo']).agg(
-    volume=('out_rub', 'sum'),
-    avg_rate=('rate_balance', lambda x: (x * df.loc[x.index, 'out_rub']).sum() / df.loc[x.index, 'out_rub'].sum())
-).reset_index()
+cn_sql = pyodbc.connect(
+    "DRIVER={ODBC Driver 17 for SQL Server};"
+    "SERVER=trading-db.ahml1.ru;"
+    "DATABASE=ALM;"
+    "Trusted_Connection=yes"
+)
 
-monthly['promo_flag'] = monthly['is_promo'].map({0: 'base', 1: 'promo'})
-monthly = monthly[['month_open', 'promo_flag', 'volume', 'avg_rate']]
+sql_query = dedent(f"""
+    DECLARE @rep_dt   DATE = '{REP_DT}';
+    DECLARE @DateFrom DATE = '{DATE_FR}';
+    DECLARE @DateTo   DATE = '{DATE_TO}';
+    DECLARE @incl_float BIT = {INCL_FLT};
 
-print(monthly.sort_values(['month_open', 'promo_flag']))
+    SELECT
+        t.con_id,
+        t.dt_open,
+        t.OUT_RUB                      AS bal_out_rub,
+        t.rate_con                     AS rate_con_src,
+        r.rate                         AS rate_ref_src,
+        t.is_floatrate,
+        r.dt_from, r.dt_to
+    FROM  ALM.ALM.vw_balance_rest_all      AS t WITH (NOLOCK)
+    LEFT  JOIN LIQUIDITY.liq.DepositContract_Rate AS r WITH (NOLOCK)
+           ON  r.con_id = t.con_id
+           AND CASE WHEN t.dt_open = @rep_dt
+                    THEN DATEADD(DAY,1,@rep_dt)
+                    ELSE @rep_dt END
+               BETWEEN r.dt_from AND r.dt_to
+    WHERE t.dt_rep       = @rep_dt
+      AND t.acc_role     = N'LIAB'
+      AND t.block_name   = N'Привлечение ФЛ'
+      AND t.section_name = N'Накопительный счёт'
+      AND t.od_flag      = 1
+      AND t.cur          = '810'
+      AND t.OUT_RUB IS NOT NULL
+      AND (@incl_float = 1 OR ISNULL(t.is_floatrate,0) = 0)
+      AND t.dt_open BETWEEN @DateFrom AND @DateTo
+    ORDER BY t.dt_open, t.con_id;
+""")
+
+df_sql = pd.read_sql(sql_query, cn_sql, dtype={'con_id': 'Int64'})  # ← важен dtype
+cn_sql.close()
+
+print(f'Шаг 1 (MSSQL): {len(df_sql):,} строк')
 
 
-⸻
-
-✅ ВЫХОД:
-	•	summary — сводка по клиентским типам (only_base / only_promo / both)
-	•	monthly — объёмы и ставки по месяцам открытия и типу ставки
-
-⸻
-
-Хочешь я сразу выведу это в Excel (xlsx) с форматированием?
+понял ли ты задачу?
