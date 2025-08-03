@@ -1,82 +1,103 @@
-Отлично, ты прав — наиболее надёжный способ определить закрытие вклада — это сравнить snapshot’ы баланса на 30.06 и 30.07 и выявить con_id, которые были в июне, но исчезли к июлю.
+Чтобы отследить, где именно теряются объемы при расчёте «Среза» ФЛ на 01.07, мы можем пошагово разбить процедуру и выполнить несколько промежуточных проверок. Ниже приведён план отладки:
 
 ⸻
 
-✅ Новый корректный подход:
+🔍 Шаг 1. Посмотреть, какие сделки вообще попадают в DepositInterestsRateSnap на 01.07
 
-⸻
+Проверь объём всех ФЛ-сделок с ненулевыми остатками и трансфертной ставкой:
 
-🔧 1. Выгрузим con_id на 30.06.2025:
-
-SELECT DISTINCT t.con_id, t.cli_id, t.out_rub
-INTO #balance_june
-FROM alm.ALM.vw_balance_rest_all t WITH (NOLOCK)
-WHERE t.dt_rep = '2025-06-30'
-  AND t.section_name = N'Срочные'
-  AND t.is_floatrate = 0
-  AND t.block_name = N'Привлечение ФЛ'
-  AND t.od_flag = 1
-  AND t.cur = '810'
-  AND t.OUT_RUB IS NOT NULL
-
-
-⸻
-
-🔧 2. Выгрузим con_id на 30.07.2025:
-
-SELECT DISTINCT t.con_id
-INTO #balance_july
-FROM alm.ALM.vw_balance_rest_all t WITH (NOLOCK)
-WHERE t.dt_rep = '2025-07-30'
-  AND t.section_name = N'Срочные'
-  AND t.is_floatrate = 0
-  AND t.block_name = N'Привлечение ФЛ'
-  AND t.od_flag = 1
-  AND t.cur = '810'
-  AND t.OUT_RUB IS NOT NULL
-
-
-⸻
-
-🔧 3. Найдём закрытые con_id и сгруппируем по клиенту:
-
-WITH closed_accounts AS (
-    SELECT b.con_id, b.cli_id, b.out_rub
-    FROM #balance_june b
-    LEFT JOIN #balance_july j
-           ON b.con_id = j.con_id
-    WHERE j.con_id IS NULL  -- не найден во втором срезе
-)
-, grouped AS (
-    SELECT
-        cli_id,
-        SUM(out_rub) AS total_out_rub,
-        STRING_AGG(CAST(con_id AS NVARCHAR), ',') AS con_id_list
-    FROM closed_accounts
-    GROUP BY cli_id
-)
 SELECT 
-    g.cli_id,
-    g.total_out_rub,
-    g.con_id_list,
-    t.*
-FROM grouped g
-JOIN ALM.[ehd].[VW_transfers_FL_det] t WITH (NOLOCK)
-  ON g.cli_id = t.cli_id
-WHERE t.dt_rep BETWEEN '2025-07-01' AND '2025-07-31'
+    COUNT(*) AS total_deals,
+    SUM(saldo.OUT_RUB) AS total_rub
+FROM [ALM_TEST].[WORK].[DepositInterestsRateSnap] dep
+JOIN [LIQUIDITY].[liq].[DepositContract_Saldo] saldo 
+    ON dep.CON_ID = saldo.CON_ID
+    AND '2025-07-01' BETWEEN saldo.DT_FROM AND saldo.DT_TO
+WHERE dep.DT_REP = (SELECT MAX(DT_REP) FROM [ALM_TEST].[WORK].[DepositInterestsRateSnap])
+  AND dep.CLI_SUBTYPE = 'ФЛ'
+  AND ISNULL(dep.isfloat, 0) = 0
+  AND dep.MonthlyCONV_ALM_TransfertRate IS NOT NULL
+  AND saldo.OUT_RUB != 0
+
+Если тут объём близок к 49 млрд — уже сужаем круг.
+
+⸻
+
+🔍 Шаг 2. Добавить построчно причины исключения сделок
+
+Создай временную таблицу с диагностикой по фильтрам:
+
+SELECT 
+    dep.CON_ID,
+    saldo.OUT_RUB,
+    CASE WHEN dep.MonthlyCONV_ALM_TransfertRate IS NULL THEN 1 ELSE 0 END AS no_transf,
+    CASE WHEN saldo.OUT_RUB = 0 THEN 1 ELSE 0 END AS zero_saldo,
+    CASE WHEN dep.RATE <= 0.01 THEN 1 ELSE 0 END AS low_rate,
+    CASE WHEN dep.MonthlyCONV_RATE IS NULL THEN 1 ELSE 0 END AS no_base_rate,
+    CASE WHEN dep.LIQ_ФОР IS NULL THEN 1 ELSE 0 END AS no_liq_for,
+    CASE WHEN dep.MonthlyCONV_ALM_TransfertRate - 
+              (dep.MonthlyCONV_Rate + dep.LIQ_ССВ_Fcast + dep.ALM_OptionRate * dep.IS_OPTION)
+             NOT BETWEEN -0.07 AND 0.07 THEN 1 ELSE 0 END AS spread_out_of_range
+INTO #diag
+FROM [ALM_TEST].[WORK].[DepositInterestsRateSnap] dep
+JOIN [LIQUIDITY].[liq].[DepositContract_Saldo] saldo 
+    ON dep.CON_ID = saldo.CON_ID
+    AND '2025-07-01' BETWEEN saldo.DT_FROM AND saldo.DT_TO
+WHERE dep.DT_REP = (SELECT MAX(DT_REP) FROM [ALM_TEST].[WORK].[DepositInterestsRateSnap])
+  AND dep.CLI_SUBTYPE = 'ФЛ'
+  AND ISNULL(dep.isfloat, 0) = 0
+
+Теперь можно агрегировать:
+
+SELECT 
+    COUNT(*) AS deals,
+    SUM(OUT_RUB) AS rub,
+    SUM(no_transf) AS null_transf,
+    SUM(zero_saldo) AS zero_saldo,
+    SUM(low_rate) AS low_rate,
+    SUM(no_base_rate) AS null_base_rate,
+    SUM(no_liq_for) AS null_liq_for,
+    SUM(spread_out_of_range) AS bad_spread
+FROM #diag
 
 
 ⸻
 
-📌 Результат:
-	•	Учитываются только con_id, исчезнувшие между 30.06 и 30.07
-	•	Получаем cli_id, сумму вкладов, список счетов
-	•	Добавляем к ним переводы в июле
+🔍 Шаг 3. Проверить фильтрацию calendar
+
+Убедись, что дата 2025-07-01 точно попадает в #calendar. Бывали случаи, когда даты исчезали из VW_Calendar из-за глюков в источнике.
+
+SELECT * 
+FROM [ALM].[info].[VW_Calendar]
+WHERE [Date] = '2025-07-01'
+
 
 ⸻
 
-💡 Дополнительно:
+🔍 Шаг 4. Отдельно посчитать входящие сделки на 01.07 через i=1
 
-Если хочешь — можно также проверить saldo для этих con_id, чтобы убедиться, что их реально не существует на дату — но основная логика уже корректна, без риска пропустить нулевые остатки или неточные интервалы.
+Ты хочешь понять, сколько сделок ФЛ попадает в тип 'Срез':
 
-Готов также переписать всё в одном SQL-блоке без временных таблиц, если нужно.
+SELECT COUNT(*) AS deals, SUM(saldo.OUT_RUB) AS rub
+FROM [ALM_TEST].[WORK].[DepositInterestsRateSnap] dep
+JOIN [LIQUIDITY].[liq].[DepositContract_Saldo] saldo ON dep.CON_ID = saldo.CON_ID
+JOIN [ALM].[info].[VW_Calendar] cal ON dep.DT_OPEN <= cal.[Date] 
+    AND dep.DT_CLOSE > cal.[Date]
+WHERE cal.[Date] = '2025-07-01'
+  AND dep.DT_REP = (SELECT MAX(DT_REP) FROM [ALM_TEST].[WORK].[DepositInterestsRateSnap])
+  AND dep.CLI_SUBTYPE = 'ФЛ'
+  AND ISNULL(dep.isfloat, 0) = 0
+  AND saldo.DT_FROM <= '2025-07-01' AND saldo.DT_TO >= '2025-07-01'
+
+
+⸻
+
+✔️ Резюме
+
+Пошаговый план позволит выявить:
+	1.	Все сделки, вообще имеющиеся в снапе с сальдо на 01.07;
+	2.	Какие именно фильтры обнулили объёмы — и сколько;
+	3.	Проблему с источником календаря;
+	4.	Потерю типа 'Срез' по join-ам cal.Date.
+
+Если хочешь, могу сразу прислать версию всей процедуры с дополнительным логированием в temp-таблицы на всех ключевых шагах.
