@@ -1,25 +1,43 @@
-WITH base AS (
-    SELECT
-        dt_open,
-        rate_trf,
-        rate_trf_src,
-        out_rub
-    FROM [ALM].[ALM].[balance_rest_all] WITH (NOLOCK)
+WITH target_clients AS (
+    SELECT DISTINCT cli_id
+    FROM ALM.vw_balance_rest_all WITH (NOLOCK)
+    WHERE 
+        dt_rep = '2025-07-30'
+        AND section_name = 'Накопительный счёт'
+        AND od_flag = 1
+        AND MONTH(dt_open) IN (5, 6)
+),
+data_0208 AS (
+    SELECT *
+    FROM ALM.vw_balance_rest_all WITH (NOLOCK)
     WHERE 
         dt_rep = '2025-08-02'
-        AND OUT_RUB IS NOT NULL
         AND od_flag = 1
-        AND block_name = 'Привлечение ФЛ'
-        AND section_name IN ('Срочные')
-        AND dt_open BETWEEN CAST(GETDATE() - 6 AS DATE) AND CAST(GETDATE() - 2 AS DATE)
+        AND section_name IN ('Накопительный счёт', 'Срочные')
+        AND cli_id IN (SELECT cli_id FROM target_clients)
 )
 SELECT
-    dt_open,
-    rate_trf,
-    rate_trf_src,
-    COUNT(*) AS deal_count,
-    SUM(out_rub) AS total_out_rub,
-    SUM(out_rub) * 1.0 / SUM(SUM(out_rub)) OVER (PARTITION BY dt_open) AS share_per_dt_open
-FROM base
-GROUP BY dt_open, rate_trf, rate_trf_src
-ORDER BY dt_open, share_per_dt_open DESC;
+    -- Объёмы
+    SUM(CASE WHEN section_name = 'Накопительный счёт' THEN OUT_RUB ELSE 0 END) AS ns_out_rub_0208,
+    SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB ELSE 0 END) AS dep_out_rub_0208,
+
+    -- Ставки
+    CASE 
+        WHEN SUM(CASE WHEN section_name = 'Накопительный счёт' THEN OUT_RUB ELSE 0 END) > 0
+        THEN SUM(CASE WHEN section_name = 'Накопительный счёт' THEN OUT_RUB * con_rate ELSE 0 END) /
+             NULLIF(SUM(CASE WHEN section_name = 'Накопительный счёт' THEN OUT_RUB ELSE 0 END), 0)
+    END AS ns_avg_rate_0208,
+
+    CASE 
+        WHEN SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB ELSE 0 END) > 0
+        THEN SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB * con_rate ELSE 0 END) /
+             NULLIF(SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB ELSE 0 END), 0)
+    END AS dep_avg_rate_0208,
+
+    -- Срочность
+    CASE 
+        WHEN SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB ELSE 0 END) > 0
+        THEN SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB * termdays ELSE 0 END) /
+             NULLIF(SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB ELSE 0 END), 0)
+    END AS dep_avg_termdays_0208
+FROM data_0208
