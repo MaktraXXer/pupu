@@ -1,49 +1,45 @@
-Вот обновлённый скрипт с сохранением в таблицу price.key_rate_fact:
-
-USE ALM_TEST;
-GO
-
-/*------------------------------------------------------------
-  0. Параметры
-------------------------------------------------------------*/
-DECLARE @Anchor date = (SELECT MAX(DT_REP)
-                        FROM ALM.info.VW_ForecastKEY_interval);
-
--- создаём схему, если ещё не существует
-IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'price')
-    EXEC('CREATE SCHEMA price');
-GO
-
-/*------------------------------------------------------------
-  1. Пересоздание таблицы price.key_rate_fact
-------------------------------------------------------------*/
-IF OBJECT_ID('price.key_rate_fact', 'U') IS NOT NULL
-    DROP TABLE price.key_rate_fact;
-GO
-
-CREATE TABLE price.key_rate_fact (
-    DT_REP   date         NOT NULL,
-    KEY_RATE decimal(9,4) NOT NULL,
-    RUONIA   decimal(9,4) NOT NULL,
-    CONSTRAINT PK_key_rate_fact PRIMARY KEY CLUSTERED (DT_REP)
-);
-GO
-
-/*------------------------------------------------------------
-  2. Загрузка данных: только строки, где Date = DT_REP
-------------------------------------------------------------*/
-INSERT INTO price.key_rate_fact (DT_REP, KEY_RATE, RUONIA)
-SELECT DT_REP,
-       KEY_RATE,
-       ROUND(KEY_RATE - 0.002, 4) AS RUONIA
-FROM ALM.info.VW_ForecastKEY_everyday WITH (NOLOCK)
-WHERE DT_REP <= @Anchor
-  AND [Date] = DT_REP;
-
-Что делает скрипт:
-	•	Проверяет наличие схемы price, создаёт её при необходимости.
-	•	Удаляет старую таблицу price.key_rate_fact, если она уже есть.
-	•	Создаёт новую таблицу с полями DT_REP, KEY_RATE, RUONIA.
-	•	Загружает значения, где [Date] = DT_REP, и считает RUONIA = KEY_RATE - 0.002.
-
-Если нужно не удалять таблицу при повторном запуске, а делать MERGE или INSERT WHERE NOT EXISTS, могу адаптировать.
+WITH active_ns AS (
+    SELECT DISTINCT con_id
+    FROM ALM.vw_balance_rest_all WITH (NOLOCK)
+    WHERE 
+        od_flag = 1
+        AND ap = 'Пассив'
+        AND block_name = 'Привлечение ФЛ'
+        AND section_name = 'Накопительный счёт'
+        AND TSegmentName IN ('ДЧБО', 'Розничный бизнес')
+        AND prod_id = '654'
+        AND dt_rep BETWEEN '2025-07-27' AND '2025-08-02'
+),
+ns_open_dates AS (
+    SELECT 
+        con_id,
+        cli_id,
+        MIN(dt_open) AS dt_open -- одна строка на клиента
+    FROM ALM.vw_balance_rest_all WITH (NOLOCK)
+    WHERE 
+        od_flag = 1
+        AND ap = 'Пассив'
+        AND block_name = 'Привлечение ФЛ'
+        AND section_name = 'Накопительный счёт'
+        AND TSegmentName IN ('ДЧБО', 'Розничный бизнес')
+        AND prod_id = '654'
+        AND dt_open >= '2025-07-01' -- отсекаем всё старше июля
+    GROUP BY con_id, cli_id
+),
+filtered_clients AS (
+    SELECT 
+        d.con_id,
+        n.cli_id,
+        CASE 
+            WHEN MONTH(n.dt_open) = 7 THEN 1 
+            ELSE 0 
+        END AS has_ns_july,
+        CASE 
+            WHEN MONTH(n.dt_open) = 8 THEN 1 
+            ELSE 0 
+        END AS has_ns_aug
+    FROM active_ns d
+    JOIN ns_open_dates n ON d.con_id = n.con_id
+)
+SELECT *
+FROM filtered_clients;
