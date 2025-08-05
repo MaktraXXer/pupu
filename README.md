@@ -1,17 +1,21 @@
-Отлично, значит нужно:
-
-📊 Сравнить портфельные метрики на три даты:
-	•	2025-06-30 — конец июня,
-	•	2025-07-30 — основная дата отбора клиентов,
-	•	2025-08-02 — проверка, как переложились.
-
-📌 Все показатели считаются только по клиентам, у которых НС был открыт в мае или июне по срезу на 2025-07-30.
+Отлично, вот полный SQL-запрос, который:
 
 ⸻
 
-✅ Унифицированный скрипт для трёх дат:
+✅ Делает всё в одной таблице:
+	•	Берёт только тех cli_id, у кого на 30.07 был НС, открытый в мае-июне;
+	•	Считает по этим клиентам портфель в разрезе:
+	•	на 30.07 и на 02.08;
+	•	отдельно по НС и срочным вкладам;
+	•	Строит дельты (разницы) по:
+	•	объёму;
+	•	ставке;
+	•	срочности (по вкладам).
 
--- 1. Отбор клиентов с НС, открытым в мае-июне (по балансу на 30.07)
+⸻
+
+✅ Полный SQL-запрос
+
 WITH target_clients AS (
     SELECT DISTINCT cli_id
     FROM ALM.vw_balance_rest_all WITH (NOLOCK)
@@ -22,79 +26,137 @@ WITH target_clients AS (
         AND MONTH(dt_open) IN (5, 6)
 ),
 
--- 2. Универсальная таблица со всеми нужными данными за 3 даты
-all_data AS (
-    SELECT 
-        dt_rep,
-        cli_id,
-        section_name,
-        OUT_RUB,
-        con_rate,
-        termdays
+data_0730 AS (
+    SELECT *
     FROM ALM.vw_balance_rest_all WITH (NOLOCK)
     WHERE 
-        dt_rep IN ('2025-06-30', '2025-07-30', '2025-08-02')
+        dt_rep = '2025-07-30'
         AND od_flag = 1
         AND section_name IN ('Накопительный счёт', 'Срочные')
         AND cli_id IN (SELECT cli_id FROM target_clients)
+),
+
+data_0208 AS (
+    SELECT *
+    FROM ALM.vw_balance_rest_all WITH (NOLOCK)
+    WHERE 
+        dt_rep = '2025-08-02'
+        AND od_flag = 1
+        AND section_name IN ('Накопительный счёт', 'Срочные')
+        AND cli_id IN (SELECT cli_id FROM target_clients)
+),
+
+agg_0730 AS (
+    SELECT
+        -- объёмы
+        SUM(CASE WHEN section_name = 'Накопительный счёт' THEN OUT_RUB ELSE 0 END) AS ns_out_rub_0730,
+        SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB ELSE 0 END) AS dep_out_rub_0730,
+
+        -- средневзвешенная ставка НС
+        SUM(CASE WHEN section_name = 'Накопительный счёт' THEN OUT_RUB * con_rate ELSE 0 END) AS ns_weighted_rate_0730,
+        SUM(CASE WHEN section_name = 'Накопительный счёт' THEN OUT_RUB ELSE 0 END) AS ns_base_0730,
+
+        -- средневзвешенная ставка и срочность по вкладам
+        SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB * con_rate ELSE 0 END) AS dep_weighted_rate_0730,
+        SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB * termdays ELSE 0 END) AS dep_weighted_term_0730,
+        SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB ELSE 0 END) AS dep_base_0730
+    FROM data_0730
+),
+
+agg_0208 AS (
+    SELECT
+        -- объёмы
+        SUM(CASE WHEN section_name = 'Накопительный счёт' THEN OUT_RUB ELSE 0 END) AS ns_out_rub_0208,
+        SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB ELSE 0 END) AS dep_out_rub_0208,
+
+        -- средневзвешенная ставка НС
+        SUM(CASE WHEN section_name = 'Накопительный счёт' THEN OUT_RUB * con_rate ELSE 0 END) AS ns_weighted_rate_0208,
+        SUM(CASE WHEN section_name = 'Накопительный счёт' THEN OUT_RUB ELSE 0 END) AS ns_base_0208,
+
+        -- средневзвешенная ставка и срочность по вкладам
+        SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB * con_rate ELSE 0 END) AS dep_weighted_rate_0208,
+        SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB * termdays ELSE 0 END) AS dep_weighted_term_0208,
+        SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB ELSE 0 END) AS dep_base_0208
+    FROM data_0208
 )
 
--- 3. Агрегация по каждой дате
-SELECT 
-    dt_rep,
+SELECT
+    -- ========== ОБЪЕМЫ ==========
+    a.ns_out_rub_0730,
+    b.ns_out_rub_0208,
+    b.ns_out_rub_0208 - a.ns_out_rub_0730 AS delta_ns_out_rub,
 
-    -- Объёмы
-    SUM(CASE WHEN section_name = 'Накопительный счёт' THEN OUT_RUB ELSE 0 END) AS ns_out_rub,
-    SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB ELSE 0 END) AS dep_out_rub,
+    a.dep_out_rub_0730,
+    b.dep_out_rub_0208,
+    b.dep_out_rub_0208 - a.dep_out_rub_0730 AS delta_dep_out_rub,
 
-    -- Ставки
+    -- ========== СТАВКИ ==========
     CASE 
-        WHEN SUM(CASE WHEN section_name = 'Накопительный счёт' THEN OUT_RUB ELSE 0 END) > 0
-        THEN SUM(CASE WHEN section_name = 'Накопительный счёт' THEN OUT_RUB * con_rate ELSE 0 END) /
-             NULLIF(SUM(CASE WHEN section_name = 'Накопительный счёт' THEN OUT_RUB ELSE 0 END), 0)
-    END AS ns_avg_rate,
+        WHEN a.ns_base_0730 > 0 THEN a.ns_weighted_rate_0730 / a.ns_base_0730
+        ELSE NULL
+    END AS ns_avg_rate_0730,
 
     CASE 
-        WHEN SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB ELSE 0 END) > 0
-        THEN SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB * con_rate ELSE 0 END) /
-             NULLIF(SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB ELSE 0 END), 0)
-    END AS dep_avg_rate,
+        WHEN b.ns_base_0208 > 0 THEN b.ns_weighted_rate_0208 / b.ns_base_0208
+        ELSE NULL
+    END AS ns_avg_rate_0208,
 
-    -- Срочность
     CASE 
-        WHEN SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB ELSE 0 END) > 0
-        THEN SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB * termdays ELSE 0 END) /
-             NULLIF(SUM(CASE WHEN section_name = 'Срочные' THEN OUT_RUB ELSE 0 END), 0)
-    END AS dep_avg_termdays
+        WHEN a.ns_base_0730 > 0 AND b.ns_base_0208 > 0 THEN 
+            (b.ns_weighted_rate_0208 / b.ns_base_0208) - (a.ns_weighted_rate_0730 / a.ns_base_0730)
+        ELSE NULL
+    END AS delta_ns_rate,
 
-FROM all_data
-GROUP BY dt_rep
-ORDER BY dt_rep
+    CASE 
+        WHEN a.dep_base_0730 > 0 THEN a.dep_weighted_rate_0730 / a.dep_base_0730
+        ELSE NULL
+    END AS dep_avg_rate_0730,
+
+    CASE 
+        WHEN b.dep_base_0208 > 0 THEN b.dep_weighted_rate_0208 / b.dep_base_0208
+        ELSE NULL
+    END AS dep_avg_rate_0208,
+
+    CASE 
+        WHEN a.dep_base_0730 > 0 AND b.dep_base_0208 > 0 THEN 
+            (b.dep_weighted_rate_0208 / b.dep_base_0208) - (a.dep_weighted_rate_0730 / a.dep_base_0730)
+        ELSE NULL
+    END AS delta_dep_rate,
+
+    -- ========== СРОЧНОСТЬ ==========
+    CASE 
+        WHEN a.dep_base_0730 > 0 THEN a.dep_weighted_term_0730 / a.dep_base_0730
+        ELSE NULL
+    END AS dep_avg_term_0730,
+
+    CASE 
+        WHEN b.dep_base_0208 > 0 THEN b.dep_weighted_term_0208 / b.dep_base_0208
+        ELSE NULL
+    END AS dep_avg_term_0208,
+
+    CASE 
+        WHEN a.dep_base_0730 > 0 AND b.dep_base_0208 > 0 THEN 
+            (b.dep_weighted_term_0208 / b.dep_base_0208) - (a.dep_weighted_term_0730 / a.dep_base_0730)
+        ELSE NULL
+    END AS delta_dep_term
+
+FROM agg_0730 a
+JOIN agg_0208 b ON 1=1
 
 
 ⸻
 
-📋 Результат:
+🧾 Что покажет результат:
 
-Таблица из 3 строк:
-
-dt_rep	ns_out_rub	ns_avg_rate	dep_out_rub	dep_avg_rate	dep_avg_termdays
-2025-06-30	…	…	…	…	…
-2025-07-30	…	…	…	…	…
-2025-08-02	…	…	…	…	…
+Показатель	Назначение
+ns_out_rub_0730 / 0208	общий объём на НС на даты
+dep_out_rub_0730 / 0208	общий объём по вкладам
+ns_avg_rate_0730 / 0208	средневзв. ставка по НС
+dep_avg_rate_0730 / 0208	средневзв. ставка по вкладам
+dep_avg_term_0730 / 0208	средневзв. срочность вкладов
+delta_*	разницы по всем показателям
 
 
 ⸻
 
-💡 Хочешь дельты (изменения) между датами?
-
-Могу сразу преобразовать результат в форму:
-
-Метрика	30.06	30.07	02.08	Δ июль	Δ август
-Объем НС					
-Ставка НС					
-Объем вкладов					
-Ставка вкладов					
-Срочность вкладов					
-
-Готов собрать — просто скажи.
+Если тебе нужно это в разбивке по cli_id — можно адаптировать. Сейчас расчёт по всему портфелю (в рамках target_clients).
