@@ -1,154 +1,123 @@
-Ниже — обновлённая версия **reports.fn\_NewAttractionVolumes** с правильной формулой долей.
-
-* **SegmentSharePct**
-
-  * для строк-сегментов = `SegmentVolume / Σ SegmentVolume данного сегмента по всем бакетам`;
-  * для строк *Итого* = `BucketVolume / GrandTotal` (доля бакета в общем объёме).
-* **BucketSharePct** показывает ту же долю бакета в общем объёме (удобно видеть в любой строке).
-
-> Достаточно выполнить скрипт — функция перезапишется, а все отчёты начнут считать корректно.
+### Шаг 1. SQL-запрос, который сразу разворачивает результат функции в “плоскую” таблицу
 
 ```sql
-/*-----------------------------------------------------------
-  1. Подготовка среды
------------------------------------------------------------*/
-USE alm_test;
-GO
-
-IF SCHEMA_ID(N'reports') IS NULL
-    EXEC('CREATE SCHEMA reports');
-GO
-
-/*-----------------------------------------------------------
-  2. Корректная функция
------------------------------------------------------------*/
-CREATE OR ALTER FUNCTION reports.fn_NewAttractionVolumes
-(
-      @ReportDate  date,
-      @OpenFrom    date,
-      @OpenTo      date,
-      @ExcludeMP   bit = 1          -- 1 = исключить маркетплейсы, 0 = оставить
-)
-RETURNS TABLE
-AS
-RETURN
-/*----------------  Шаг 1. список маркетплейсов ----------------*/
-WITH mp_list(prod_name_res) AS (
-    SELECT N'ДОМа надёжно'  UNION ALL SELECT N'Всё в ДОМ'     UNION ALL
-    SELECT N'Надёжный'      UNION ALL SELECT N'Надёжный VIP'  UNION ALL
-    SELECT N'Надёжный премиум' UNION ALL SELECT N'Надёжный промо' UNION ALL
-    SELECT N'Надёжный старт' UNION ALL SELECT N'Надёжный T2'  UNION ALL
-    SELECT N'Надёжный Мегафон' UNION ALL SELECT N'Надёжный прайм' UNION ALL
-    SELECT N'Надёжный процент'
-),
-/*----------------  Шаг 2. источник ----------------------------*/
-src AS (
-    SELECT  v.OUT_RUB,
-            v.TSegmentName,
-            v.termdays
-    FROM    ALM.vw_balance_rest_all v WITH (NOLOCK)
-    WHERE   v.od_flag       = 1
-      AND   v.CON_ID NOT IN (SELECT con_id FROM LIQUIDITY.liq.man_FloatContracts)
-      AND   v.ap            = N'Пассив'
-      AND   v.block_name    = N'Привлечение ФЛ'
-      AND   v.DT_REP        = @ReportDate
-      AND   ISNULL(v.OUT_RUB,0) > 0
-      AND   v.SECTION_NAME  = N'Срочные'
-      AND   v.cur           = '810'
-      AND   v.dt_open BETWEEN @OpenFrom AND @OpenTo
-      AND ( @ExcludeMP = 0 OR v.prod_name_res NOT IN (SELECT prod_name_res FROM mp_list) )
-),
-/*----------------  Шаг 3. бакетирование -----------------------*/
-bucketed AS (
-    SELECT  CASE
-              WHEN termdays BETWEEN  28 AND  44  THEN  31
-              WHEN termdays BETWEEN  45 AND  70  THEN  61
-              WHEN termdays BETWEEN  85 AND 110  THEN  91
-              WHEN termdays BETWEEN 119 AND 140  THEN 124
-              WHEN termdays BETWEEN 175 AND 200  THEN 181
-              WHEN termdays BETWEEN 245 AND 290  THEN 274
-              WHEN termdays BETWEEN 340 AND 405  THEN 365
-              WHEN termdays BETWEEN 540 AND 621  THEN 550
-              WHEN termdays BETWEEN 720 AND 763  THEN 750
-              WHEN termdays BETWEEN 1090 AND 1140 THEN 1100
-              WHEN termdays BETWEEN 1450 AND 1475 THEN 1460
-              WHEN termdays BETWEEN 1795 AND 1830 THEN 1825
-            END            AS bucket_code,
-            TSegmentName,
-            OUT_RUB
-    FROM    src
-    WHERE   termdays BETWEEN 28 AND 1830               -- вне интервала не берём
-),
-/*----------------  Шаг 4. агрегации ---------------------------*/
-seg_bucket AS (       -- объём бакета в сегменте
-    SELECT  bucket_code,
-            TSegmentName,
-            SUM(OUT_RUB) AS segment_vol
-    FROM    bucketed
-    GROUP BY bucket_code, TSegmentName
-),
-seg_total AS (        -- суммарный объём по сегменту
-    SELECT  TSegmentName,
-            SUM(segment_vol) AS segment_total
-    FROM    seg_bucket
-    GROUP BY TSegmentName
-),
-bucket_total AS (     -- суммарный объём по бакету
-    SELECT  bucket_code,
-            SUM(segment_vol) AS bucket_total
-    FROM    seg_bucket
-    GROUP BY bucket_code
-),
-grand AS (            -- общий объём всех бакетов
-    SELECT SUM(bucket_total) AS grand_total FROM bucket_total
-)
-/*----------------  Шаг 5. финальный SELECT --------------------*/
-SELECT
-      sb.bucket_code                                   AS Bucket,          -- бакет
-      sb.TSegmentName                                  AS Segment,         -- сегмент
-      sb.segment_vol                                   AS SegmentVolume,   -- объём
-      CAST(sb.segment_vol * 100.0 / st.segment_total AS decimal(18,4))
-                                                     AS SegmentSharePct,  -- доля бакета в сегменте
-      bt.bucket_total                                  AS BucketVolume,    -- объём бакета
-      CAST(bt.bucket_total * 100.0 / g.grand_total AS decimal(18,4))
-                                                     AS BucketSharePct    -- доля бакета в общем
-FROM      seg_bucket   sb
-JOIN      seg_total    st ON st.TSegmentName = sb.TSegmentName
-JOIN      bucket_total bt ON bt.bucket_code  = sb.bucket_code
-CROSS JOIN grand       g
-
-UNION ALL                                                -- строка «Итого» по бакету
-SELECT
-      bt.bucket_code,
-      N'Итого',
-      bt.bucket_total,
-      CAST(bt.bucket_total * 100.0 / g.grand_total AS decimal(18,4)),
-      bt.bucket_total,
-      CAST(bt.bucket_total * 100.0 / g.grand_total AS decimal(18,4))
-FROM      bucket_total bt
-CROSS JOIN grand       g;
-GO
-```
-
-### Проверка
-
-```sql
+/*  ► ПАРАМЕТРЫ — вместо PLACEHOLDER вставляет VBA-код            ◄
+    ► bucket_code 124→122, 274→273, 550→548, чтобы ровно 10 колонок ◄ */
 DECLARE
-      @ReportDate date = '2025-08-03',
-      @OpenFrom   date = '2025-07-29',
-      @OpenTo     date = '2025-08-03',
-      @ExcludeMP  bit  = 0;          -- маркетплейсы включаем
+    @ReportDate date = '{ReportDate}',      -- B2
+    @OpenFrom   date = '{OpenFrom}',        -- B3
+    @OpenTo     date = '{OpenTo}',          -- B4
+    @ExcludeMP  bit  = {ExcludeMP};         -- B5  (1=искл.,0=оставить)
 
-SELECT *
-FROM reports.fn_NewAttractionVolumes
-     ( @ReportDate = @ReportDate,
-       @OpenFrom   = @OpenFrom,
-       @OpenTo     = @OpenTo,
-       @ExcludeMP  = @ExcludeMP );
+;WITH base AS (
+    SELECT
+        Bucket = CASE bucket_code
+                   WHEN 124 THEN 122 WHEN 274 THEN 273 WHEN 550 THEN 548
+                   ELSE bucket_code END,
+        Segment = CASE WHEN Segment = N'Итого' THEN N'Общая структура'
+                       ELSE Segment END,
+        Share   = CASE WHEN Segment = N'Общая структура'
+                       THEN BucketSharePct ELSE SegmentSharePct END,
+        Vol     = CASE WHEN Segment = N'Общая структура'
+                       THEN BucketVolume   ELSE SegmentVolume   END
+    FROM reports.fn_NewAttractionVolumes(@ReportDate,@OpenFrom,@OpenTo,@ExcludeMP)
+),
+share_pivot AS (          -- проценты
+    SELECT *
+    FROM base
+    PIVOT (SUM(Share) FOR Bucket IN
+           ([31],[61],[91],[122],[181],[273],[365],[548],[730],[1100])) p
+),
+vol_pivot AS (            -- объёмы
+    SELECT *
+    FROM base
+    PIVOT (SUM(Vol) FOR Bucket IN
+           ([31],[61],[91],[122],[181],[273],[365],[548],[730],[1100])) p
+)
+SELECT 1   AS ord, Segment, * INTO #tmp FROM share_pivot
+UNION ALL
+SELECT 2   AS ord, Segment + N' (объём)', * FROM vol_pivot;
+
+SELECT Segment,
+       [31],[61],[91],[122],[181],[273],[365],[548],[730],[1100]
+FROM   #tmp
+ORDER  BY ord, Segment;
+DROP TABLE #tmp;
 ```
 
-Теперь:
+* **Первая группа строк** — проценты (как в вашем примере).
+* **Вторая** — объёмы, помечены «(объём)».
+* Итоговая строка «Общая структура» появляется автоматически.
 
-* для «Розничный бизнес» сумма всех **SegmentSharePct** по двум бакетам = 100 %;
-* для «ДЧБО» — то же;
-* в строках *Итого* доля показывает, какую часть общего портфеля занимает сам бакет.
+---
+
+### Шаг 2. VBA-макрос **LoadDepositStructure** (добавьте в модуль)
+
+```vba
+Option Explicit
+Sub LoadDepositStructure()
+
+    Application.ScreenUpdating = False
+    
+    '--- 1. Читаем параметры с листа “Input” -------------------------------
+    Dim wsIn As Worksheet: Set wsIn = ThisWorkbook.Worksheets("Input")
+    Dim pRep  As String: pRep  = Format(wsIn.Range("B2").Value, "yyyy-mm-dd")
+    Dim pFrom As String: pFrom = Format(wsIn.Range("B3").Value, "yyyy-mm-dd")
+    Dim pTo   As String: pTo   = Format(wsIn.Range("B4").Value, "yyyy-mm-dd")
+    Dim pExc  As String: pExc  = IIf(wsIn.Range("B5").Value = 1, "1", "0")
+    
+    '--- 2. Формируем SQL (через Replace) ----------------------------------
+    Dim sqlTmpl As String, sqlText As String
+    sqlTmpl = Worksheets("SQL").Range("A1").Text          'положите шаблон ↑ в ячейку A1 листа SQL
+    sqlText = Replace(Replace(Replace(Replace(sqlTmpl, _
+                       "{ReportDate}", pRep), _
+                       "{OpenFrom}",   pFrom), _
+                       "{OpenTo}",     pTo), _
+                       "{ExcludeMP}",  pExc)
+    
+    '--- 3. Подключаемся и тянем данные ------------------------------------
+    Dim cn As New ADODB.Connection, rs As New ADODB.Recordset
+    cn.ConnectionString = "Provider=SQLOLEDB;Data Source=trading-db.ahml1.ru;" & _
+                          "Initial Catalog=alm_test;Integrated Security=SSPI;"
+    cn.Open
+    rs.Open sqlText, cn, adOpenForwardOnly, adLockReadOnly
+    
+    '--- 4. Вывод на лист “Структура” --------------------------------------
+    Dim wsOut As Worksheet: Set wsOut = ThisWorkbook.Worksheets("Структура")
+    wsOut.Range("A10:K1000").ClearContents          'чистим старое
+    wsOut.Range("A10").CopyFromRecordset rs         'вставляем новое
+    
+    '--- 5. Формат: проценты → “x,xx %” ------------------------------------
+    With wsOut
+        Dim lastRow As Long: lastRow = .Cells(.Rows.Count, 1).End(xlUp).Row
+        .Range("B11:K" & lastRow).NumberFormat = "0.00%"
+        .Columns("A:K").AutoFit
+    End With
+    
+    '--- 6. Финал -----------------------------------------------------------
+    rs.Close: cn.Close
+    Set rs = Nothing: Set cn = Nothing
+    Application.ScreenUpdating = True
+    MsgBox "Структура депозитов загружена!", vbInformation
+
+End Sub
+```
+
+#### Как это работает
+
+1. **SQL шаблон** лежит в ячейке **SQL!A1** (скопируйте текст из раздела «Шаг 1»).
+2. Макрос подставляет даты и признак маркетплейсов, выполняет запрос.
+3. Результат (проценты + объёмы) попадает, начиная с `A10` листа **«Структура»**
+
+   ```
+   A10  │ Segment / bucket-колонки
+   A11+ │ …проценты…
+   ↓    │ …объёмы…
+   ```
+4. Проценты форматируются `0.00 %`; объёмы остаются в числовом формате.
+5. Кнопке «Обновить структуру» присвойте макрос `LoadDepositStructure`.
+
+> При необходимости поменять порядок/набор бакетов — поправьте список
+> `IN ([31] … [1100])` одновременно в обоих PIVOT’ах шаблона.
+
+Готово: нажимаете кнопку — таблица на листе заполняется ровно в том виде, который показан в примере.
