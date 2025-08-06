@@ -1,140 +1,146 @@
-Ниже — единственная процедура **Load\_Deposit\_Structure()**.
-Она НЕ читает SQL-шаблоны из ячеек: все T-SQL-тексты «зашиты» прямо в код, поэтому исчезают любые проблемы с чтением/переносами строк.
+### Рабочий VBA код для Excel
 
-### Что делает макрос
+**Создайте новый Excel-файл и выполните следующие шаги:**
 
-| Шаг | Действие                                                                                                                             | Где видно результат |
-| --- | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------- |
-| 1   | Читает параметры из **Input**: B2 – баланс, B3/B4 – окно `dt_open`, B5 – флаг маркетов                                               | —                   |
-| 2   | Формирует два SQL-запроса (доли / объёмы) прямо в памяти                                                                             | —                   |
-| 3   | Выполняет их через ADO (late binding, без References)                                                                                | —                   |
-| 4   | Размещает результаты **точно** в диапазонах: <br>• **B11\:K13** — доли (формат «0,00 %»)<br>• **B16\:K18** — объёмы (формат «#,##0») | лист *Input*        |
-| 5   | Показывает подробный отчёт: сколько строк/столбцов считано, сколько ячеек заполнено, сколько осталось пустыми                        | MsgBox              |
+1. **Настройте лист:**
+   - Назовите лист "Отчет"
+   - Заполните ячейки как показано:
 
-> Сегменты сводятся к двум строкам:
-> • всё, что в базе имеет `TSegmentName = 'ДЧБО'` → строка **«УЧК»**
-> • остальные → строка **«Розничный бизнес»**
-> Строка **«Общая структура»** строится автоматически.
+| Ячейка | Значение             | Описание                              |
+|--------|----------------------|---------------------------------------|
+| B1     | `03.08.2025`         | Баланс на дату                        |
+| B3     | `29.07.2025`         | Начальная дата периода                |
+| B4     | `03.08.2025`         | Конечная дата периода                 |
+| B5     | `1`                  | Исключать маркетплейсы (1-да, 0-нет) |
 
-### Код (вставьте в любой стандартный модуль VBA)
+2. **Добавьте VBA код:**
+   - Откройте редактор VBA (Alt+F11)
+   - Вставьте следующий код в модуль:
 
 ```vba
-Option Explicit
-Sub Load_Deposit_Structure()
-
-'------------------------------------------------------------
-'  НАСТРОЙКИ (поменяйте только при реальной необходимости)
-'------------------------------------------------------------
-    Const SH_IO      As String = "Input"                'лист с параметрами + вывод
-    Const SVR        As String = "trading-db.ahml1.ru"  'SQL Server
-    Const DB         As String = "alm_test"             'база
-    Const OUT_PCT    As String = "B11:K13"              'доли
-    Const OUT_VOL    As String = "B16:K18"              'объёмы
-'------------------------------------------------------------
-
-    Dim ws As Worksheet: Set ws = ThisWorkbook.Sheets(SH_IO)
-
-    '--- 1. параметры ------------------------------------------------------
-    Dim pRep$, pFrom$, pTo$, pExc$
-    pRep  = Format$(ws.Range("B2").Value, "yyyy-mm-dd")
-    pFrom = Format$(ws.Range("B3").Value, "yyyy-mm-dd")
-    pTo   = Format$(ws.Range("B4").Value, "yyyy-mm-dd")
-    pExc  = IIf(ws.Range("B5").Value = 1, "1", "0")
-
-    '--- 2. SQL-тексты -----------------------------------------------------
-    Dim sqlPct$, sqlVol$
-    sqlPct = BuildSQL(pRep, pFrom, pTo, pExc, True)     'True  = проценты
-    sqlVol = BuildSQL(pRep, pFrom, pTo, pExc, False)    'False = рубли
-
-    '--- 3. ADO ------------------------------------------------------------
-    Dim cn As Object, rs As Object
-    Set cn = CreateObject("ADODB.Connection")
-    cn.Open "Provider=SQLOLEDB;Data Source=" & SVR & _
-            ";Initial Catalog=" & DB & ";Integrated Security=SSPI;"
+Sub RunAttractionReport()
+    Dim conn As Object
+    Dim rs As Object
+    Dim ws As Worksheet
+    Dim sqlVolumes As String, sqlShares As String
+    Dim reportDate As String, dateFrom As String, dateTo As String
+    Dim excludeMP As Integer
+    
+    ' Настройка подключения (измените сервер!)
+    Set conn = CreateObject("ADODB.Connection")
+    conn.ConnectionString = "Provider=SQLNCLI11;Server=ВАШ_SQL_СЕРВЕР;" & _
+                            "Database=ALM_TEST;Trusted_Connection=yes;"
+    conn.Open
+    
+    Set ws = ThisWorkbook.Sheets("Отчет")
+    
+    ' Форматирование дат
+    reportDate = Format(ws.Range("B1").Value, "yyyymmdd")
+    dateFrom = Format(ws.Range("B3").Value, "yyyymmdd")
+    dateTo = Format(ws.Range("B4").Value, "yyyymmdd")
+    excludeMP = ws.Range("B5").Value
+    
+    ' Запрос для объемов
+    sqlVolumes = _
+        "DECLARE " & _
+        "   @ReportDate date = '" & reportDate & "', " & _
+        "   @OpenFrom   date = '" & dateFrom & "', " & _
+        "   @OpenTo     date = '" & dateTo & "', " & _
+        "   @ExcludeMP  bit  = " & excludeMP & "; " & _
+        "WITH src AS ( " & _
+        "   SELECT " & _
+        "       Bucket = CASE WHEN Bucket IN (124, 274, 550) THEN Bucket - 2 ELSE Bucket END, " & _
+        "       Segment = CASE WHEN Segment = N'ДЧБО' THEN N'УЧК' " & _
+        "                     WHEN Segment = N'Итого' THEN N'Общая структура' " & _
+        "                     ELSE N'Розничный бизнес' END, " & _
+        "       Vol = SegmentVolume, " & _
+        "       BktVol = BucketVolume " & _
+        "   FROM ALM_TEST.reports.fn_NewAttractionVolumes(@ReportDate, @OpenFrom, @OpenTo, @ExcludeMP) " & _
+        "), " & _
+        "agg AS ( " & _
+        "   SELECT Bucket, Segment, SUM(Vol) AS Vol " & _
+        "   FROM src " & _
+        "   WHERE Segment <> N'Общая структура' " & _
+        "   GROUP BY Bucket, Segment " & _
+        "   UNION ALL " & _
+        "   SELECT Bucket, N'Общая структура', SUM(BktVol) " & _
+        "   FROM src " & _
+        "   GROUP BY Bucket " & _
+        ") " & _
+        "SELECT Segment, " & _
+        "   ISNULL(SUM(CASE WHEN Bucket = 31 THEN Vol END), 0) AS [31], " & _
+        "   ISNULL(SUM(CASE WHEN Bucket = 61 THEN Vol END), 0) AS [61], " & _
+        "   ISNULL(SUM(CASE WHEN Bucket = 91 THEN Vol END), 0) AS [91], " & _
+        "   ISNULL(SUM(CASE WHEN Bucket = 122 THEN Vol END), 0) AS [122], " & _
+        "   ISNULL(SUM(CASE WHEN Bucket = 181 THEN Vol END), 0) AS [181], " & _
+        "   ISNULL(SUM(CASE WHEN Bucket = 273 THEN Vol END), 0) AS [273], " & _
+        "   ISNULL(SUM(CASE WHEN Bucket = 365 THEN Vol END), 0) AS [365], " & _
+        "   ISNULL(SUM(CASE WHEN Bucket = 548 THEN Vol END), 0) AS [548], " & _
+        "   ISNULL(SUM(CASE WHEN Bucket = 730 THEN Vol END), 0) AS [730], " & _
+        "   ISNULL(SUM(CASE WHEN Bucket = 1100 THEN Vol END), 0) AS [1100] " & _
+        "FROM agg " & _
+        "GROUP BY Segment " & _
+        "ORDER BY CASE Segment " & _
+        "   WHEN N'Розничный бизнес' THEN 1 " & _
+        "   WHEN N'УЧК' THEN 2 " & _
+        "   ELSE 3 END;"
+    
+    ' Запрос для долей
+    sqlShares = Replace(sqlVolumes, "Vol = SegmentVolume", "Pct = SegmentSharePct / 100.0")
+    sqlShares = Replace(sqlShares, "BktVol = BucketVolume", "BktPct = BucketSharePct / 100.0")
+    sqlShares = Replace(sqlShares, "SUM(Vol)", "SUM(Pct)")
+    sqlShares = Replace(sqlShares, "SUM(BktVol)", "SUM(BktPct)")
+    
+    ' Выполняем запрос объемов
     Set rs = CreateObject("ADODB.Recordset")
-
-    Application.ScreenUpdating = False
-    ws.Range(OUT_PCT).ClearContents
-    ws.Range(OUT_VOL).ClearContents
-
-    Dim infoMsg As String
-
-    '========== ДОЛИ =======================================================
-    rs.Open sqlPct, cn, 0, 1
+    rs.Open sqlVolumes, conn
     If Not rs.EOF Then
-        ws.Range(Left(OUT_PCT, InStr(OUT_PCT, ":") - 1)).CopyFromRecordset rs
-        infoMsg = infoMsg & "Доли: считано " & rs.RecordCount & _
-                  " строк × " & rs.Fields.Count & " колонок." & vbCrLf
-    Else
-        infoMsg = infoMsg & "Доли: пустая выборка!" & vbCrLf
+        ' Заголовки
+        ws.Range("A10").Value = "Структура привлечений (объемы)"
+        ws.Range("A11").CopyFromRecordset rs
     End If
     rs.Close
-    ws.Range(OUT_PCT).NumberFormat = "0.00%"
-
-    '========== ОБЪЁМЫ =====================================================
-    rs.Open sqlVol, cn, 0, 1
+    
+    ' Выполняем запрос долей
+    rs.Open sqlShares, conn
     If Not rs.EOF Then
-        ws.Range(Left(OUT_VOL, InStr(OUT_VOL, ":") - 1)).CopyFromRecordset rs
-        infoMsg = infoMsg & "Объёмы: считано " & rs.RecordCount & _
-                  " строк × " & rs.Fields.Count & " колонок." & vbCrLf
-    Else
-        infoMsg = infoMsg & "Объёмы: пустая выборка!" & vbCrLf
+        ' Заголовки
+        ws.Range("A20").Value = "Структура привлечений (доли)"
+        ws.Range("A21").CopyFromRecordset rs
     End If
     rs.Close
-    cn.Close
-    ws.Range(OUT_VOL).NumberFormat = "#,##0"
-
-    '--- 4. отчёт ----------------------------------------------------------
-    infoMsg = infoMsg & "Готово!  " & Now
-    Application.ScreenUpdating = True
-    MsgBox infoMsg, vbInformation, "Load_Deposit_Structure"
-
+    
+    ' Очистка
+    conn.Close
+    MsgBox "Отчет сформирован!", vbInformation
 End Sub
-
-
-'=========== генератор SQL (isPct = True → проценты, False → объёмы) =====
-Private Function BuildSQL(rep$, dF$, dT$, exc$, isPct As Boolean) As String
-
-    Dim mCol$, mVal$
-    If isPct Then
-        mCol = "Pct"
-        mVal = "SegmentSharePct/100.0"
-    Else
-        mCol = "Vol"
-        mVal = "SegmentVolume"
-    End If
-
-    BuildSQL = _
-"DECLARE @ReportDate date='" & rep & "', @OpenFrom date='" & dF & "'," & _
-"@OpenTo date='" & dT & "', @ExcludeMP bit=" & exc & ";" & vbCrLf & _
-";WITH src AS (" & vbCrLf & _
-" SELECT Bucket = CASE Bucket WHEN 124 THEN 122 WHEN 274 THEN 273 WHEN 550 THEN 548 ELSE Bucket END," & vbCrLf & _
-"        Segment = CASE WHEN Segment=N'ДЧБО' THEN N'УЧК' " & _
-"                       WHEN Segment=N'Итого' THEN N'Общая структура' " & _
-"                       ELSE N'Розничный бизнес' END," & vbCrLf & _
-"        " & mCol & " = " & mVal & "," & vbCrLf & _
-"        Bkt_" & mCol & " = " & IIf(isPct, "BucketSharePct/100.0", "BucketVolume") & vbCrLf & _
-" FROM reports.fn_NewAttractionVolumes(@ReportDate,@OpenFrom,@OpenTo,@ExcludeMP)" & vbCrLf & _
-"), agg AS (" & vbCrLf & _
-" SELECT Bucket, Segment, SUM(" & mCol & ") AS " & mCol & " " & _
-" FROM src WHERE Segment<>N'Общая структура' GROUP BY Bucket, Segment" & vbCrLf & _
-" UNION ALL SELECT DISTINCT Bucket, N'Общая структура', Bkt_" & mCol & " FROM src)" & vbCrLf & _
-"SELECT Segment,[31],[61],[91],[122],[181],[273],[365],[548],[730],[1100]" & vbCrLf & _
-"FROM agg PIVOT (SUM(" & mCol & ") FOR Bucket IN" & vbCrLf & _
-"([31],[61],[91],[122],[181],[273],[365],[548],[730],[1100])) p" & vbCrLf & _
-"ORDER BY CASE WHEN Segment=N'Общая структура' THEN 3 " & _
-"WHEN Segment=N'Розничный бизнес' THEN 1 ELSE 2 END;"
-End Function
 ```
 
-### Что, если снова «пусто»?
+3. **Добавьте кнопку запуска:**
+   - На листе "Отчет" вставьте кнопку (Разработчик > Вставить > Кнопка)
+   - Назначьте макрос `RunAttractionReport`
 
-* Снимите галочку в `Application.ScreenUpdating = False` (поставьте `True`) и
-  запустите по шагам (**F8**) — увидите, на какой строке ничего не прилетает.
-* В окне *Immediate* (`Ctrl + G`) напишите `? sqlPct`, скопируйте текст запроса
-  и выполните его в SSMS под той же учёткой, что и Excel.
-  Если результат в SSMS пустой – значит данные в базе действительно 0.
-* Если в SSMS всё есть, а в VBA `rs.EOF = True` – проблема в строке
-  подключения (учётная запись не видит данные).
+### Ключевые особенности:
+1. **Форматирование дат:** Автоматическое преобразование в формат `yyyymmdd`
+2. **Обработка NULL:** Все NULL значения заменяются на 0
+3. **Динамические запросы:** Для долей используется модифицированный запрос объемов
+4. **Упрощенный PIVOT:** Используется группировка вместо PIVOT для совместимости
+5. **Авто-заголовки:** Результаты выводятся с поясняющими заголовками
 
-После установки этого макроса кликните «Выполнить» — диапазоны B11\:K13 и B16\:K18 перезапишутся новыми значениями, а в окне отчёта получите точную статистику по загруженным строкам.
+### Требования к системе:
+1. Windows OS
+2. Установленные драйверы SQL Server (SQL Server Native Client 11.0)
+3. Разрешения на доступ к SQL Server и функции `fn_NewAttractionVolumes`
+4. Разрешение Excel на подключение к базам данных
+
+**Важно!** Замените `ВАШ_SQL_СЕРВЕР` в строке подключения на актуальное имя вашего SQL-сервера.
+
+После запуска макроса результаты появятся:
+- Объемы: начиная с ячейки A11
+- Доли: начиная с ячейки A21
+
+Если возникнут ошибки, проверьте:
+1. Корректность имени сервера
+2. Доступность функции в БД
+3. Соответствие версии SQL Native Client
+4. Разрешения на выполнение хранимых процедур
