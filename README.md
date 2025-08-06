@@ -1,216 +1,178 @@
-## 1. Исправленный SQL-шаблон (положите в `SQL!A1`)
+Ниже – «минималистичный» комплект:
+
+* **два SQL-шаблона** (проценты / объёмы) – положите на лист **SQL**
+  в ячейки **A1** и **A2**;
+* **один макрос** `LoadDepositStructureSimple` – копирует результаты
+  ровно в те позиции, которые вы показали (лист **Структура**).
+
+---
+
+## 1  SQL-шаблоны
+
+### A1 — проценты (строка «Структура продаж (%)»)
 
 ```sql
-/*  Плейс-холдеры будут заменены VBA-кодом  */
 DECLARE
     @ReportDate date = '{ReportDate}',
     @OpenFrom   date = '{OpenFrom}',
     @OpenTo     date = '{OpenTo}',
     @ExcludeMP  bit  = {ExcludeMP};
 
-;WITH base AS (      /* приводим имена бакетов и строк «Итого» */
+;WITH base AS (
     SELECT
-        Bucket = CASE Bucket
-                   WHEN 124 THEN 122
-                   WHEN 274 THEN 273
-                   WHEN 550 THEN 548
-                   ELSE Bucket
-                 END,
+        Bucket = CASE Bucket WHEN 124 THEN 122 WHEN 274 THEN 273
+                             WHEN 550 THEN 548 ELSE Bucket END,
         Segment,
-        Share = SegmentSharePct,           -- уже 0-100
-        Vol   = SegmentVolume
+        Share  = SegmentSharePct
     FROM reports.fn_NewAttractionVolumes(@ReportDate,@OpenFrom,@OpenTo,@ExcludeMP)
-    UNION ALL                             -- строка «Общая структура»
-    SELECT
-        Bucket,
-        N'Общая структура',
-        BucketSharePct,
-        BucketVolume
-    FROM reports.fn_NewAttractionVolumes(@ReportDate,@OpenFrom,@OpenTo,@ExcludeMP)
-),
-share_pivot AS (
-    SELECT * FROM base
-    PIVOT (SUM(Share) FOR Bucket IN
-           ([31],[61],[91],[122],[181],[273],[365],[548],[730],[1100])) p
-),
-vol_pivot AS (
-    SELECT * FROM base
-    PIVOT (SUM(Vol) FOR Bucket IN
-           ([31],[61],[91],[122],[181],[273],[365],[548],[730],[1100])) p
+
+    UNION ALL                      -- итог
+    SELECT Bucket, N'Общая структура', BucketSharePct
+    FROM   reports.fn_NewAttractionVolumes(@ReportDate,@OpenFrom,@OpenTo,@ExcludeMP)
 )
-/*  ord = 1  – проценты,  ord = 2 – объёмы  */
-SELECT 1 AS ord, Segment,
+SELECT Segment,
        [31],[61],[91],[122],[181],[273],[365],[548],[730],[1100]
-FROM share_pivot
-UNION ALL
-SELECT 2, Segment,
-       [31],[61],[91],[122],[181],[273],[365],[548],[730],[1100]
-FROM vol_pivot
-ORDER BY ord, Segment;
+FROM base
+PIVOT (SUM(Share) FOR Bucket IN
+       ([31],[61],[91],[122],[181],[273],[365],[548],[730],[1100])) p
+ORDER BY CASE WHEN Segment=N'Общая структура' THEN 2 ELSE 1 END, Segment;
 ```
 
-* Никакого `SELECT … INTO #tmp` — дубликата колонки больше нет, ошибка исчезает.
-* `Share` уже идёт в процентах (3.78 ⟶ 3,78 %) — в VBA делим на 100 перед форматом.
+### A2 — объёмы (строка «Структура продаж (руб.)»)
+
+```sql
+DECLARE
+    @ReportDate date = '{ReportDate}',
+    @OpenFrom   date = '{OpenFrom}',
+    @OpenTo     date = '{OpenTo}',
+    @ExcludeMP  bit  = {ExcludeMP};
+
+;WITH base AS (
+    SELECT
+        Bucket = CASE Bucket WHEN 124 THEN 122 WHEN 274 THEN 273
+                             WHEN 550 THEN 548 ELSE Bucket END,
+        Segment,
+        Vol    = SegmentVolume
+    FROM reports.fn_NewAttractionVolumes(@ReportDate,@OpenFrom,@OpenTo,@ExcludeMP)
+
+    UNION ALL                      -- итог
+    SELECT Bucket, N'Общая структура', BucketVolume
+    FROM   reports.fn_NewAttractionVolumes(@ReportDate,@OpenFrom,@OpenTo,@ExcludeMP)
+)
+SELECT Segment,
+       [31],[61],[91],[122],[181],[273],[365],[548],[730],[1100]
+FROM base
+PIVOT (SUM(Vol) FOR Bucket IN
+       ([31],[61],[91],[122],[181],[273],[365],[548],[730],[1100])) p
+ORDER BY CASE WHEN Segment=N'Общая структура' THEN 2 ELSE 1 END, Segment;
+```
 
 ---
 
-## 2. Универсальный макрос VBA
-
-(пишет две таблицы: «%» и «руб.» в нужный вид)
+## 2  Макрос (положите в любой стандартный модуль)
 
 ```vba
 Option Explicit
-Sub LoadDepositStructureUniversal()
+Sub LoadDepositStructureSimple()
 
-    '====================  НАСТРОЙКИ  ====================
-    Const SH_INPUT      As String = "Input"
-    Const SH_SQL        As String = "SQL"
-    Const SQL_CELL      As String = "A1"
-    Const SH_OUT        As String = "Структура"
-    Const TOP_LEFT      As String = "A10"
-    Const SQL_SERVER    As String = "trading-db.ahml1.ru"
-    Const SQL_DB        As String = "alm_test"
-    '=====================================================
+    '------------------ настройка ------------------
+    Const SH_INPUT  As String = "Input"
+    Const SH_SQL    As String = "SQL"
+    Const SH_OUT    As String = "Структура"
+    Const SQL_PCT   As String = "A1"   'шаблон %
+    Const SQL_VOL   As String = "A2"   'шаблон руб
+    Const TOP_ROW   As Long = 10       'A10
+    Const SERVER    As String = "trading-db.ahml1.ru"
+    Const DB        As String = "alm_test"
+    '------------------------------------------------
 
-    Application.ScreenUpdating = False
+    Dim wsIn As Worksheet, wsSQL As Worksheet, wsOut As Worksheet
+    Set wsIn = Sheets(SH_INPUT)
+    Set wsSQL = Sheets(SH_SQL)
+    Set wsOut = Sheets(SH_OUT)
 
-    '----- 1. параметры ----------------------------------
-    Dim wsIn As Worksheet: Set wsIn = Sheets(SH_INPUT)
-    Dim repDate As String: repDate = Format(wsIn.Range("B2").Value, "yyyy-mm-dd")
-    Dim dFrom   As String: dFrom   = Format(wsIn.Range("B3").Value, "yyyy-mm-dd")
-    Dim dTo     As String: dTo     = Format(wsIn.Range("B4").Value, "yyyy-mm-dd")
-    Dim excMP   As String: excMP   = IIf(wsIn.Range("B5").Value = 1, "1", "0")
+    Dim repDate$, dFrom$, dTo$, excMP$
+    repDate = Format(wsIn.Range("B2").Value, "yyyy-mm-dd")
+    dFrom   = Format(wsIn.Range("B3").Value, "yyyy-mm-dd")
+    dTo     = Format(wsIn.Range("B4").Value, "yyyy-mm-dd")
+    excMP   = IIf(wsIn.Range("B5").Value = 1, "1", "0")
 
-    '----- 2. SQL-текст ----------------------------------
-    Dim sqlTmpl As String, sqlText As String
-    sqlTmpl = Sheets(SH_SQL).Range(SQL_CELL).Text
-    sqlText = Replace(sqlTmpl, "{ReportDate}", repDate)
-    sqlText = Replace(sqlText, "{OpenFrom}",   dFrom)
-    sqlText = Replace(sqlText, "{OpenTo}",     dTo)
-    sqlText = Replace(sqlText, "{ExcludeMP}",  excMP)
+    '--- готовим две команды ---------------------------------------------
+    Dim sqlPct$, sqlVol$
+    sqlPct = Replace(wsSQL.Range(SQL_PCT).Text, "{ReportDate}", repDate)
+    sqlPct = Replace(sqlPct, "{OpenFrom}", dFrom)
+    sqlPct = Replace(sqlPct, "{OpenTo}",   dTo)
+    sqlPct = Replace(sqlPct, "{ExcludeMP}", excMP)
 
-    '----- 3. ADO (late binding) -------------------------
+    sqlVol = Replace(wsSQL.Range(SQL_VOL).Text, "{ReportDate}", repDate)
+    sqlVol = Replace(sqlVol, "{OpenFrom}", dFrom)
+    sqlVol = Replace(sqlVol, "{OpenTo}",   dTo)
+    sqlVol = Replace(sqlVol, "{ExcludeMP}", excMP)
+
+    '--- ADO late binding -------------------------------------------------
     Dim cn As Object, rs As Object
     Set cn = CreateObject("ADODB.Connection")
+    cn.ConnectionString = _
+        "Provider=SQLOLEDB;Data Source=" & SERVER & ";Initial Catalog=" & DB & _
+        ";Integrated Security=SSPI;"
+    cn.Open
     Set rs = CreateObject("ADODB.Recordset")
 
-    cn.ConnectionString = _
-        "Provider=SQLOLEDB;Data Source=" & SQL_SERVER & ";" & _
-        "Initial Catalog=" & SQL_DB & ";Integrated Security=SSPI;"
-    cn.Open
-    rs.Open sqlText, cn, 0, 1         '0=Forward, 1=ReadOnly
+    Application.ScreenUpdating = False
+    wsOut.Cells.ClearContents          'чистим весь лист
 
-    '----- 4. записываем rs в массив ---------------------
-    Dim data As Variant
-    data = rs.GetRows()               'fields × records
-    rs.Close: cn.Close
+    Dim curRow As Long: curRow = TOP_ROW
+
+    '===== % ==============================================================
+    wsOut.Cells(curRow, 1).Value = "Структура продаж (%):"
+    curRow = curRow + 1
+
+    rs.Open sqlPct, cn, 0, 1
+    wsOut.Cells(curRow, 1).CopyFromRecordset rs
+    Dim pctRows As Long: pctRows = rs.RecordCount
+    rs.Close
+
+    'формат процентов
+    wsOut.Range(wsOut.Cells(curRow + 1, 2), _
+                wsOut.Cells(curRow + pctRows, 11)).NumberFormat = "0.00%"
+
+    curRow = curRow + pctRows + 2     'пустая строка +1
+
+    '===== руб ============================================================
+    wsOut.Cells(curRow, 1).Value = "Структура продаж (руб.):"
+    curRow = curRow + 1
+
+    rs.Open sqlVol, cn, 0, 1
+    wsOut.Cells(curRow, 1).CopyFromRecordset rs
+    Dim volRows As Long: volRows = rs.RecordCount
+    rs.Close
+
+    wsOut.Range(wsOut.Cells(curRow + 1, 2), _
+                wsOut.Cells(curRow + volRows, 11)).NumberFormat = "#,##0"
+
+    cn.Close
     Set rs = Nothing: Set cn = Nothing
 
-    '----- 5. формируем вывод ---------------------------
-    Dim buckets As Variant
-    buckets = Array("31", "61", "91", "122", "181", "273", "365", "548", "730", "1100")
-
-    Dim wsOut As Worksheet: Set wsOut = Sheets(SH_OUT)
-    Dim r0 As Range: Set r0 = wsOut.Range(TOP_LEFT)
-    wsOut.Range(r0, r0.Offset(2000, 11)).ClearContents
-
-    Dim rowCur As Long: rowCur = r0.Row
-
-    '--- шапка % ----------------------------------------
-    wsOut.Cells(rowCur, r0.Column).Value = "Структура продаж (%):"
-    rowCur = rowCur + 1
-    Call WriteHeader(wsOut, rowCur, r0.Column, buckets)
-    rowCur = rowCur + 1
-
-    '--- строки % ---------------------------------------
-    Dim iRec As Long, fCnt As Long: fCnt = UBound(data, 1)
-    For iRec = 0 To UBound(data, 2)
-        If data(0, iRec) = 1 Then
-            Call WriteRow(wsOut, rowCur, r0.Column, data, iRec, True)
-            rowCur = rowCur + 1
-        End If
-    Next iRec
-
-    '--- пустая строка ----------------------------------
-    rowCur = rowCur + 1
-
-    '--- шапка руб --------------------------------------
-    wsOut.Cells(rowCur, r0.Column).Value = "Структура продаж (руб.):"
-    rowCur = rowCur + 1
-    Call WriteHeader(wsOut, rowCur, r0.Column, buckets)
-    rowCur = rowCur + 1
-
-    '--- строки руб -------------------------------------
-    For iRec = 0 To UBound(data, 2)
-        If data(0, iRec) = 2 Then
-            Call WriteRow(wsOut, rowCur, r0.Column, data, iRec, False)
-            rowCur = rowCur + 1
-        End If
-    Next iRec
-
-    wsOut.Columns(r0.Column).Resize(, 12).AutoFit
+    wsOut.Columns("A:K").AutoFit
     Application.ScreenUpdating = True
-    MsgBox "Структура депозитов загружена!", vbInformation
+    MsgBox "Готово!", vbInformation
 
-End Sub
-
-'========= вспомогательные процедуры =====================================
-
-Private Sub WriteHeader(ws As Worksheet, tgtRow As Long, tgtCol As Long, buckets As Variant)
-    Dim j As Long
-    ws.Cells(tgtRow, tgtCol).Value = "Сегмент"
-    For j = 0 To UBound(buckets)
-        ws.Cells(tgtRow, tgtCol + 1 + j).Value = buckets(j)
-    Next j
-    ws.Range(ws.Cells(tgtRow, tgtCol), ws.Cells(tgtRow, tgtCol + UBound(buckets) + 1)).Font.Bold = True
-End Sub
-
-Private Sub WriteRow(ws As Worksheet, tgtRow As Long, tgtCol As Long, _
-                     ByRef arr As Variant, recIdx As Long, isPercent As Boolean)
-
-    Dim j As Long, val As Variant
-    ws.Cells(tgtRow, tgtCol).Value = arr(1, recIdx)          'Segment
-
-    For j = 2 To UBound(arr, 1)
-        val = arr(j, recIdx)
-        If isPercent Then val = val / 100                     '0-100 → 0-1
-        ws.Cells(tgtRow, tgtCol + j - 1).Value = val
-    Next j
-
-    If isPercent Then
-        ws.Range(ws.Cells(tgtRow, tgtCol + 1), _
-                 ws.Cells(tgtRow, tgtCol + UBound(arr, 1) - 1)).NumberFormat = "0.00%"
-    Else
-        ws.Range(ws.Cells(tgtRow, tgtCol + 1), _
-                 ws.Cells(tgtRow, tgtCol + UBound(arr, 1) - 1)).NumberFormat = "#,##0"
-    End If
 End Sub
 ```
 
 ### Что делает макрос
 
-1. **Читает параметры** (даты, признак маркетплейсов) с `Input!B2:B5`.
-2. **Берёт SQL-шаблон** из `SQL!A1`, подставляет параметры.
-3. **Выполняет запрос**, получает две группы строк:
+1. Берёт даты и признак «маркеты» из `Input!B2:B5`.
+2. Подставляет их в оба SQL-шаблона.
+3. Запрашивает данные: сначала проценты, затем рубли.
+4. Записывает на лист **Структура**:
 
-   * `ord = 1` — проценты, `ord = 2` — рубли.
-4. На листе **Структура** формирует блоки:
+   * `A10`     – заголовок «Структура продаж (%)»
+   * далее     – таблица с процентами (формат `0,00 %`)
+   * через одну пустую строку – «Структура продаж (руб.)»
+   * далее     – таблица с объёмами (формат `#,##0`)
+5. Ширину колонок подгоняет, в конце пишет «Готово!».
 
-```
-A10  Структура продаж (%):
-A11  Сегмент   31 61 … 1100
-A12+ данные %
-
-(пустая строка)
-
-Структура продаж (руб.):
-…     данные руб
-```
-
-* Проценты делятся на 100 и форматируются `0,00 %`.
-* Объёмы — формат `#,##0`.
-
-Ошибки «имена столбцов должны быть уникальны» больше не будет, потому что
-`Segment` встречается ровно один раз. Если понадобится изменить набор
-бакетов — исправьте список в двух местах шаблона (`IN (…)`) и массив
-`buckets` в макросе.
+> Если снова не окажется строк (запрос ничего не вернёт) – просто придёт
+> пустая таблица, ошибок не будет. Если нужны другие бакеты – меняйте
+> их лишь в двух `IN ([…])` списка в шаблонах.
