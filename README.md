@@ -1,52 +1,49 @@
-WITH excluded_clients AS (
-    SELECT DISTINCT cli_id
-    FROM ALM.vw_balance_rest_all WITH (NOLOCK)
-    WHERE 
-        dt_rep = '2025-07-30'
-        AND section_name = 'Накопительный счёт'
-        AND od_flag = 1
-        AND MONTH(dt_open) IN (5, 6)
-        AND prod_id = '654'
-),
+Вот обновлённый скрипт с сохранением в таблицу price.key_rate_fact:
 
-clients_0730 AS (
-    SELECT DISTINCT cli_id
-    FROM ALM.vw_balance_rest_all a WITH (NOLOCK)
-    WHERE 
-        dt_rep = '2025-07-30'
-        AND od_flag = 1
-        AND block_name = N'Привлечение ФЛ'
-),
+USE ALM_TEST;
+GO
 
-clients_0208 AS (
-    SELECT DISTINCT cli_id
-    FROM ALM.vw_balance_rest_all a WITH (NOLOCK)
-    WHERE 
-        dt_rep = '2025-08-02'
-        AND od_flag = 1
-        AND block_name = N'Привлечение ФЛ'
-),
+/*------------------------------------------------------------
+  0. Параметры
+------------------------------------------------------------*/
+DECLARE @Anchor date = (SELECT MAX(DT_REP)
+                        FROM ALM.info.VW_ForecastKEY_interval);
 
-new_clients_0208 AS (
-    -- те, кто есть на 02.08, но НЕ было на 30.07
-    SELECT a.cli_id
-    FROM clients_0208 a
-    LEFT JOIN clients_0730 b ON a.cli_id = b.cli_id
-    WHERE b.cli_id IS NULL
-),
+-- создаём схему, если ещё не существует
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'price')
+    EXEC('CREATE SCHEMA price');
+GO
 
-target_clients AS (
-    SELECT DISTINCT cli_id
-    FROM (
-        -- обычные (были 30.07 и не входят в excluded)
-        SELECT a.cli_id
-        FROM clients_0730 a
-        LEFT JOIN excluded_clients b ON a.cli_id = b.cli_id
-        WHERE b.cli_id IS NULL
+/*------------------------------------------------------------
+  1. Пересоздание таблицы price.key_rate_fact
+------------------------------------------------------------*/
+IF OBJECT_ID('price.key_rate_fact', 'U') IS NOT NULL
+    DROP TABLE price.key_rate_fact;
+GO
 
-        UNION
+CREATE TABLE price.key_rate_fact (
+    DT_REP   date         NOT NULL,
+    KEY_RATE decimal(9,4) NOT NULL,
+    RUONIA   decimal(9,4) NOT NULL,
+    CONSTRAINT PK_key_rate_fact PRIMARY KEY CLUSTERED (DT_REP)
+);
+GO
 
-        -- новые клиенты
-        SELECT cli_id FROM new_clients_0208
-    ) all_clients
-)
+/*------------------------------------------------------------
+  2. Загрузка данных: только строки, где Date = DT_REP
+------------------------------------------------------------*/
+INSERT INTO price.key_rate_fact (DT_REP, KEY_RATE, RUONIA)
+SELECT DT_REP,
+       KEY_RATE,
+       ROUND(KEY_RATE - 0.002, 4) AS RUONIA
+FROM ALM.info.VW_ForecastKEY_everyday WITH (NOLOCK)
+WHERE DT_REP <= @Anchor
+  AND [Date] = DT_REP;
+
+Что делает скрипт:
+	•	Проверяет наличие схемы price, создаёт её при необходимости.
+	•	Удаляет старую таблицу price.key_rate_fact, если она уже есть.
+	•	Создаёт новую таблицу с полями DT_REP, KEY_RATE, RUONIA.
+	•	Загружает значения, где [Date] = DT_REP, и считает RUONIA = KEY_RATE - 0.002.
+
+Если нужно не удалять таблицу при повторном запуске, а делать MERGE или INSERT WHERE NOT EXISTS, могу адаптировать.
