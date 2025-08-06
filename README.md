@@ -1,127 +1,140 @@
-### Как самому «шаг-за-шагом» проверить макрос
+Ниже — единственная процедура **Load\_Deposit\_Structure()**.
+Она НЕ читает SQL-шаблоны из ячеек: все T-SQL-тексты «зашиты» прямо в код, поэтому исчезают любые проблемы с чтением/переносами строк.
 
-1. **Alt + F11** – открыть редактор VBA.
-2. Двойным кликом открыть модуль, где лежит `LoadDepositStructureUniversal`.
-3. Поставить курсор внутри процедуры и нажать **F9** – появится красная точка (break-point).
-   Код остановится на этой строке при запуске.
-4. Запустить макрос (**F5** или из Excel). Когда исполнение остановится на красной строке --
-   • **F8** – выполняет текущую строку и переходит к следующей;
-   • **Ctrl + G** – открывает окно **Immediate**: туда можно печатать `Debug.Print переменная`
-   или просто `? переменная` и Enter, чтобы увидеть её значение.
-5. Чтобы выйти из режима отладки – **Run ▸ Reset** или клавиша **Ctrl + Break**.
+### Что делает макрос
 
----
+| Шаг | Действие                                                                                                                             | Где видно результат |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------- |
+| 1   | Читает параметры из **Input**: B2 – баланс, B3/B4 – окно `dt_open`, B5 – флаг маркетов                                               | —                   |
+| 2   | Формирует два SQL-запроса (доли / объёмы) прямо в памяти                                                                             | —                   |
+| 3   | Выполняет их через ADO (late binding, без References)                                                                                | —                   |
+| 4   | Размещает результаты **точно** в диапазонах: <br>• **B11\:K13** — доли (формат «0,00 %»)<br>• **B16\:K18** — объёмы (формат «#,##0») | лист *Input*        |
+| 5   | Показывает подробный отчёт: сколько строк/столбцов считано, сколько ячеек заполнено, сколько осталось пустыми                        | MsgBox              |
 
-## Макрос без чтения из ячеек ‒ вся логика «зашита» прямо в коде
+> Сегменты сводятся к двум строкам:
+> • всё, что в базе имеет `TSegmentName = 'ДЧБО'` → строка **«УЧК»**
+> • остальные → строка **«Розничный бизнес»**
+> Строка **«Общая структура»** строится автоматически.
+
+### Код (вставьте в любой стандартный модуль VBA)
 
 ```vba
 Option Explicit
-Sub LoadDepositStructureHardCoded()
+Sub Load_Deposit_Structure()
 
-'=================== НАСТРОЙКИ ============================================
-    Const SH_IO As String = "Input"        'лист с параметрами и выводом
-    Const SVR   As String = "trading-db.ahml1.ru"
-    Const DB    As String = "alm_test"
-    Const OUT_PCT_TOP As String = "A10"
-    Const OUT_VOL_TOP As String = "A15"
-'==========================================================================
+'------------------------------------------------------------
+'  НАСТРОЙКИ (поменяйте только при реальной необходимости)
+'------------------------------------------------------------
+    Const SH_IO      As String = "Input"                'лист с параметрами + вывод
+    Const SVR        As String = "trading-db.ahml1.ru"  'SQL Server
+    Const DB         As String = "alm_test"             'база
+    Const OUT_PCT    As String = "B11:K13"              'доли
+    Const OUT_VOL    As String = "B16:K18"              'объёмы
+'------------------------------------------------------------
 
-    Dim ws As Worksheet: Set ws = Sheets(SH_IO)
+    Dim ws As Worksheet: Set ws = ThisWorkbook.Sheets(SH_IO)
 
-    '--- параметры с листа -----------------------------------------------
-    Dim rep$, dFrom$, dTo$, exc$
-    rep  = Format(ws.Range("B2").Value, "yyyy-mm-dd")
-    dFrom = Format(ws.Range("B3").Value, "yyyy-mm-dd")
-    dTo   = Format(ws.Range("B4").Value, "yyyy-mm-dd")
-    exc   = IIf(ws.Range("B5").Value = 1, "1", "0")
+    '--- 1. параметры ------------------------------------------------------
+    Dim pRep$, pFrom$, pTo$, pExc$
+    pRep  = Format$(ws.Range("B2").Value, "yyyy-mm-dd")
+    pFrom = Format$(ws.Range("B3").Value, "yyyy-mm-dd")
+    pTo   = Format$(ws.Range("B4").Value, "yyyy-mm-dd")
+    pExc  = IIf(ws.Range("B5").Value = 1, "1", "0")
 
-    '------------ формируем SQL прямо в коде ------------------------------
-    Dim sqlPct As String, sqlVol As String
-    sqlPct = BuildSqlPct(rep, dFrom, dTo, exc)
-    sqlVol = BuildSqlVol(rep, dFrom, dTo, exc)
+    '--- 2. SQL-тексты -----------------------------------------------------
+    Dim sqlPct$, sqlVol$
+    sqlPct = BuildSQL(pRep, pFrom, pTo, pExc, True)     'True  = проценты
+    sqlVol = BuildSQL(pRep, pFrom, pTo, pExc, False)    'False = рубли
 
-    '-- хотим убедиться, что тексты корректны?
-    'Debug.Print sqlPct
-    'Debug.Print sqlVol
-    'Stop            'сняв комментарий, макрос остановится здесь
-
-    '------------ ADO -----------------------------------------------------
+    '--- 3. ADO ------------------------------------------------------------
     Dim cn As Object, rs As Object
     Set cn = CreateObject("ADODB.Connection")
+    cn.Open "Provider=SQLOLEDB;Data Source=" & SVR & _
+            ";Initial Catalog=" & DB & ";Integrated Security=SSPI;"
     Set rs = CreateObject("ADODB.Recordset")
 
-    cn.ConnectionString = "Provider=SQLOLEDB;Data Source=" & SVR & _
-                          ";Initial Catalog=" & DB & ";Integrated Security=SSPI;"
-    cn.Open
-
     Application.ScreenUpdating = False
-    ws.Range("A11:K1000").ClearContents
+    ws.Range(OUT_PCT).ClearContents
+    ws.Range(OUT_VOL).ClearContents
 
-    '=========== ДОЛИ =====================================================
+    Dim infoMsg As String
+
+    '========== ДОЛИ =======================================================
     rs.Open sqlPct, cn, 0, 1
     If Not rs.EOF Then
-        ws.Range(OUT_PCT_TOP).CopyFromRecordset rs
-        Dim rPct As Long: rPct = rs.RecordCount
-        ws.Range(OUT_PCT_TOP).Offset(1, 1).Resize(rPct - 1, 10).NumberFormat = "0.00%"
+        ws.Range(Left(OUT_PCT, InStr(OUT_PCT, ":") - 1)).CopyFromRecordset rs
+        infoMsg = infoMsg & "Доли: считано " & rs.RecordCount & _
+                  " строк × " & rs.Fields.Count & " колонок." & vbCrLf
+    Else
+        infoMsg = infoMsg & "Доли: пустая выборка!" & vbCrLf
     End If
     rs.Close
+    ws.Range(OUT_PCT).NumberFormat = "0.00%"
 
-    '=========== ОБЪЁМЫ ===================================================
+    '========== ОБЪЁМЫ =====================================================
     rs.Open sqlVol, cn, 0, 1
     If Not rs.EOF Then
-        ws.Range(OUT_VOL_TOP).CopyFromRecordset rs
-        Dim rVol As Long: rVol = rs.RecordCount
-        ws.Range(OUT_VOL_TOP).Offset(1, 1).Resize(rVol - 1, 10).NumberFormat = "#,##0"
+        ws.Range(Left(OUT_VOL, InStr(OUT_VOL, ":") - 1)).CopyFromRecordset rs
+        infoMsg = infoMsg & "Объёмы: считано " & rs.RecordCount & _
+                  " строк × " & rs.Fields.Count & " колонок." & vbCrLf
+    Else
+        infoMsg = infoMsg & "Объёмы: пустая выборка!" & vbCrLf
     End If
-    rs.Close: cn.Close
+    rs.Close
+    cn.Close
+    ws.Range(OUT_VOL).NumberFormat = "#,##0"
 
+    '--- 4. отчёт ----------------------------------------------------------
+    infoMsg = infoMsg & "Готово!  " & Now
     Application.ScreenUpdating = True
-    MsgBox "Обновлено!", vbInformation
+    MsgBox infoMsg, vbInformation, "Load_Deposit_Structure"
+
 End Sub
 
-'----------------------- генерация SQL ------------------------------------
-Private Function BuildSqlPct(rep$, dFrom$, dTo$, exc$) As String
-    BuildSqlPct = _
-"DECLARE @ReportDate date='" & rep & "', @OpenFrom date='" & dFrom & "'," & _
-"@OpenTo date='" & dTo & "', @ExcludeMP bit=" & exc & ";" & vbCrLf & _
-";WITH src AS (" & vbCrLf & _
-" SELECT Bucket=CASE Bucket WHEN 124 THEN 122 WHEN 274 THEN 273 WHEN 550 THEN 548 ELSE Bucket END," & vbCrLf & _
-"        Segment=CASE WHEN Segment=N'ДЧБО' THEN N'УЧК' WHEN Segment=N'Итого' THEN N'Общая структура' ELSE N'Розничный бизнес' END," & vbCrLf & _
-"        Pct     =SegmentSharePct/100.0,  BktPct=BucketSharePct/100.0" & vbCrLf & _
-" FROM  reports.fn_NewAttractionVolumes(@ReportDate,@OpenFrom,@OpenTo,@ExcludeMP)" & vbCrLf & _
-"), agg AS (" & vbCrLf & _
-" SELECT Bucket,Segment,SUM(Pct) Pct FROM src WHERE Segment<>N'Общая структура' GROUP BY Bucket,Segment" & vbCrLf & _
-" UNION ALL SELECT DISTINCT Bucket,N'Общая структура',BktPct FROM src)" & vbCrLf & _
-"SELECT Segment,[31],[61],[91],[122],[181],[273],[365],[548],[730],[1100]" & vbCrLf & _
-"FROM agg PIVOT (SUM(Pct) FOR Bucket IN ([31],[61],[91],[122],[181],[273],[365],[548],[730],[1100])) p" & vbCrLf & _
-"ORDER BY CASE WHEN Segment=N'Общая структура' THEN 3 WHEN Segment=N'Розничный бизнес' THEN 1 ELSE 2 END;"
-End Function
 
-Private Function BuildSqlVol(rep$, dFrom$, dTo$, exc$) As String
-    BuildSqlVol = _
-"DECLARE @ReportDate date='" & rep & "', @OpenFrom date='" & dFrom & "'," & _
-"@OpenTo date='" & dTo & "', @ExcludeMP bit=" & exc & ";" & vbCrLf & _
+'=========== генератор SQL (isPct = True → проценты, False → объёмы) =====
+Private Function BuildSQL(rep$, dF$, dT$, exc$, isPct As Boolean) As String
+
+    Dim mCol$, mVal$
+    If isPct Then
+        mCol = "Pct"
+        mVal = "SegmentSharePct/100.0"
+    Else
+        mCol = "Vol"
+        mVal = "SegmentVolume"
+    End If
+
+    BuildSQL = _
+"DECLARE @ReportDate date='" & rep & "', @OpenFrom date='" & dF & "'," & _
+"@OpenTo date='" & dT & "', @ExcludeMP bit=" & exc & ";" & vbCrLf & _
 ";WITH src AS (" & vbCrLf & _
-" SELECT Bucket=CASE Bucket WHEN 124 THEN 122 WHEN 274 THEN 273 WHEN 550 THEN 548 ELSE Bucket END," & vbCrLf & _
-"        Segment=CASE WHEN Segment=N'ДЧБО' THEN N'УЧК' WHEN Segment=N'Итого' THEN N'Общая структура' ELSE N'Розничный бизнес' END," & vbCrLf & _
-"        Vol=SegmentVolume,  BktVol=BucketVolume" & vbCrLf & _
-" FROM  reports.fn_NewAttractionVolumes(@ReportDate,@OpenFrom,@OpenTo,@ExcludeMP)" & vbCrLf & _
+" SELECT Bucket = CASE Bucket WHEN 124 THEN 122 WHEN 274 THEN 273 WHEN 550 THEN 548 ELSE Bucket END," & vbCrLf & _
+"        Segment = CASE WHEN Segment=N'ДЧБО' THEN N'УЧК' " & _
+"                       WHEN Segment=N'Итого' THEN N'Общая структура' " & _
+"                       ELSE N'Розничный бизнес' END," & vbCrLf & _
+"        " & mCol & " = " & mVal & "," & vbCrLf & _
+"        Bkt_" & mCol & " = " & IIf(isPct, "BucketSharePct/100.0", "BucketVolume") & vbCrLf & _
+" FROM reports.fn_NewAttractionVolumes(@ReportDate,@OpenFrom,@OpenTo,@ExcludeMP)" & vbCrLf & _
 "), agg AS (" & vbCrLf & _
-" SELECT Bucket,Segment,SUM(Vol) Vol FROM src WHERE Segment<>N'Общая структура' GROUP BY Bucket,Segment" & vbCrLf & _
-" UNION ALL SELECT DISTINCT Bucket,N'Общая структура',BktVol FROM src)" & vbCrLf & _
+" SELECT Bucket, Segment, SUM(" & mCol & ") AS " & mCol & " " & _
+" FROM src WHERE Segment<>N'Общая структура' GROUP BY Bucket, Segment" & vbCrLf & _
+" UNION ALL SELECT DISTINCT Bucket, N'Общая структура', Bkt_" & mCol & " FROM src)" & vbCrLf & _
 "SELECT Segment,[31],[61],[91],[122],[181],[273],[365],[548],[730],[1100]" & vbCrLf & _
-"FROM agg PIVOT (SUM(Vol) FOR Bucket IN ([31],[61],[91],[122],[181],[273],[365],[548],[730],[1100])) p" & vbCrLf & _
-"ORDER BY CASE WHEN Segment=N'Общая структура' THEN 3 WHEN Segment=N'Розничный бизнес' THEN 1 ELSE 2 END;"
+"FROM agg PIVOT (SUM(" & mCol & ") FOR Bucket IN" & vbCrLf & _
+"([31],[61],[91],[122],[181],[273],[365],[548],[730],[1100])) p" & vbCrLf & _
+"ORDER BY CASE WHEN Segment=N'Общая структура' THEN 3 " & _
+"WHEN Segment=N'Розничный бизнес' THEN 1 ELSE 2 END;"
 End Function
 ```
 
-### Как отладить именно «пустую выборку»
+### Что, если снова «пусто»?
 
-1. Снимите комментарий со строки `Debug.Print sqlPct` и добавьте `Stop`.
-   Запустите макрос – в окне **Immediate** увидите готовый SQL;
-   Ctrl + A, Ctrl + C и выполните его прямо в SSMS -- убедитесь, что данные приходят.
-2. Если в SSMS таблица есть, но `rs.EOF = True` в VBA – проблема только в строке подключения
-   (не та база, нет доступа).
-   *Проверьте `SVR`, `DB`, работает ли в той же учётке запрос в SSMS.*
+* Снимите галочку в `Application.ScreenUpdating = False` (поставьте `True`) и
+  запустите по шагам (**F8**) — увидите, на какой строке ничего не прилетает.
+* В окне *Immediate* (`Ctrl + G`) напишите `? sqlPct`, скопируйте текст запроса
+  и выполните его в SSMS под той же учёткой, что и Excel.
+  Если результат в SSMS пустой – значит данные в базе действительно 0.
+* Если в SSMS всё есть, а в VBA `rs.EOF = True` – проблема в строке
+  подключения (учётная запись не видит данные).
 
-Так вы точно увидите, в каком месте «обнуляется» результат.
+После установки этого макроса кликните «Выполнить» — диапазоны B11\:K13 и B16\:K18 перезапишутся новыми значениями, а в окне отчёта получите точную статистику по загруженным строкам.
