@@ -1,146 +1,145 @@
-### Рабочий VBA код для Excel
+Ниже ‒ готовая inline-TVF **reports.fn\_DepositStructure**.
+Функция возвращает **один** результирующий набор, в котором уже есть и доли, и объёмы.
+Столбец **DataKind** показывает, что это за строка:
 
-**Создайте новый Excel-файл и выполните следующие шаги:**
+| DataKind   | Что внутри                     |
+| ---------- | ------------------------------ |
+| **Share**  | доля сегмента в бакете (0 … 1) |
+| **Volume** | объём в рублях                 |
 
-1. **Настройте лист:**
-   - Назовите лист "Отчет"
-   - Заполните ячейки как показано:
+> Если нужны только доли — просто сделайте `WHERE DataKind = 'Share'`;
+> если только объёмы — `WHERE DataKind = 'Volume'`.
 
-| Ячейка | Значение             | Описание                              |
-|--------|----------------------|---------------------------------------|
-| B1     | `03.08.2025`         | Баланс на дату                        |
-| B3     | `29.07.2025`         | Начальная дата периода                |
-| B4     | `03.08.2025`         | Конечная дата периода                 |
-| B5     | `1`                  | Исключать маркетплейсы (1-да, 0-нет) |
+```sql
+/*-----------------------------------------------------------
+  база       : alm_test
+  схема      : reports     (создаётся, если ещё нет)
+  функция    : fn_DepositStructure
+-----------------------------------------------------------*/
+USE alm_test;
+GO
 
-2. **Добавьте VBA код:**
-   - Откройте редактор VBA (Alt+F11)
-   - Вставьте следующий код в модуль:
+IF SCHEMA_ID(N'reports') IS NULL
+    EXEC('CREATE SCHEMA reports');
+GO
 
-```vba
-Sub RunAttractionReport()
-    Dim conn As Object
-    Dim rs As Object
-    Dim ws As Worksheet
-    Dim sqlVolumes As String, sqlShares As String
-    Dim reportDate As String, dateFrom As String, dateTo As String
-    Dim excludeMP As Integer
-    
-    ' Настройка подключения (измените сервер!)
-    Set conn = CreateObject("ADODB.Connection")
-    conn.ConnectionString = "Provider=SQLNCLI11;Server=ВАШ_SQL_СЕРВЕР;" & _
-                            "Database=ALM_TEST;Trusted_Connection=yes;"
-    conn.Open
-    
-    Set ws = ThisWorkbook.Sheets("Отчет")
-    
-    ' Форматирование дат
-    reportDate = Format(ws.Range("B1").Value, "yyyymmdd")
-    dateFrom = Format(ws.Range("B3").Value, "yyyymmdd")
-    dateTo = Format(ws.Range("B4").Value, "yyyymmdd")
-    excludeMP = ws.Range("B5").Value
-    
-    ' Запрос для объемов
-    sqlVolumes = _
-        "DECLARE " & _
-        "   @ReportDate date = '" & reportDate & "', " & _
-        "   @OpenFrom   date = '" & dateFrom & "', " & _
-        "   @OpenTo     date = '" & dateTo & "', " & _
-        "   @ExcludeMP  bit  = " & excludeMP & "; " & _
-        "WITH src AS ( " & _
-        "   SELECT " & _
-        "       Bucket = CASE WHEN Bucket IN (124, 274, 550) THEN Bucket - 2 ELSE Bucket END, " & _
-        "       Segment = CASE WHEN Segment = N'ДЧБО' THEN N'УЧК' " & _
-        "                     WHEN Segment = N'Итого' THEN N'Общая структура' " & _
-        "                     ELSE N'Розничный бизнес' END, " & _
-        "       Vol = SegmentVolume, " & _
-        "       BktVol = BucketVolume " & _
-        "   FROM ALM_TEST.reports.fn_NewAttractionVolumes(@ReportDate, @OpenFrom, @OpenTo, @ExcludeMP) " & _
-        "), " & _
-        "agg AS ( " & _
-        "   SELECT Bucket, Segment, SUM(Vol) AS Vol " & _
-        "   FROM src " & _
-        "   WHERE Segment <> N'Общая структура' " & _
-        "   GROUP BY Bucket, Segment " & _
-        "   UNION ALL " & _
-        "   SELECT Bucket, N'Общая структура', SUM(BktVol) " & _
-        "   FROM src " & _
-        "   GROUP BY Bucket " & _
-        ") " & _
-        "SELECT Segment, " & _
-        "   ISNULL(SUM(CASE WHEN Bucket = 31 THEN Vol END), 0) AS [31], " & _
-        "   ISNULL(SUM(CASE WHEN Bucket = 61 THEN Vol END), 0) AS [61], " & _
-        "   ISNULL(SUM(CASE WHEN Bucket = 91 THEN Vol END), 0) AS [91], " & _
-        "   ISNULL(SUM(CASE WHEN Bucket = 122 THEN Vol END), 0) AS [122], " & _
-        "   ISNULL(SUM(CASE WHEN Bucket = 181 THEN Vol END), 0) AS [181], " & _
-        "   ISNULL(SUM(CASE WHEN Bucket = 273 THEN Vol END), 0) AS [273], " & _
-        "   ISNULL(SUM(CASE WHEN Bucket = 365 THEN Vol END), 0) AS [365], " & _
-        "   ISNULL(SUM(CASE WHEN Bucket = 548 THEN Vol END), 0) AS [548], " & _
-        "   ISNULL(SUM(CASE WHEN Bucket = 730 THEN Vol END), 0) AS [730], " & _
-        "   ISNULL(SUM(CASE WHEN Bucket = 1100 THEN Vol END), 0) AS [1100] " & _
-        "FROM agg " & _
-        "GROUP BY Segment " & _
-        "ORDER BY CASE Segment " & _
-        "   WHEN N'Розничный бизнес' THEN 1 " & _
-        "   WHEN N'УЧК' THEN 2 " & _
-        "   ELSE 3 END;"
-    
-    ' Запрос для долей
-    sqlShares = Replace(sqlVolumes, "Vol = SegmentVolume", "Pct = SegmentSharePct / 100.0")
-    sqlShares = Replace(sqlShares, "BktVol = BucketVolume", "BktPct = BucketSharePct / 100.0")
-    sqlShares = Replace(sqlShares, "SUM(Vol)", "SUM(Pct)")
-    sqlShares = Replace(sqlShares, "SUM(BktVol)", "SUM(BktPct)")
-    
-    ' Выполняем запрос объемов
-    Set rs = CreateObject("ADODB.Recordset")
-    rs.Open sqlVolumes, conn
-    If Not rs.EOF Then
-        ' Заголовки
-        ws.Range("A10").Value = "Структура привлечений (объемы)"
-        ws.Range("A11").CopyFromRecordset rs
-    End If
-    rs.Close
-    
-    ' Выполняем запрос долей
-    rs.Open sqlShares, conn
-    If Not rs.EOF Then
-        ' Заголовки
-        ws.Range("A20").Value = "Структура привлечений (доли)"
-        ws.Range("A21").CopyFromRecordset rs
-    End If
-    rs.Close
-    
-    ' Очистка
-    conn.Close
-    MsgBox "Отчет сформирован!", vbInformation
-End Sub
+CREATE OR ALTER FUNCTION reports.fn_DepositStructure
+(
+      @ReportDate  date,         -- дата баланса (DT_REP)
+      @OpenFrom    date,         -- окно dt_open: «с»
+      @OpenTo      date,         -- окно dt_open: «по»
+      @ExcludeMP   bit = 1       -- 1 = исключить маркетплейсы, 0 = оставить
+)
+RETURNS TABLE
+AS
+RETURN
+/*======================== 1. источник =======================*/
+WITH src AS (
+    SELECT
+        Bucket = CASE Bucket
+                   WHEN 124 THEN 122
+                   WHEN 274 THEN 273
+                   WHEN 550 THEN 548
+                   ELSE Bucket END,
+
+        Segment = CASE
+                    WHEN Segment = N'ДЧБО' THEN N'УЧК'
+                    WHEN Segment = N'Итого' THEN N'Общая структура'
+                    ELSE N'Розничный бизнес'
+                  END,
+
+        ShareSeg = SegmentSharePct/100.0,   -- для каждого сегмента
+        VolSeg   = SegmentVolume,
+
+        ShareBkt = BucketSharePct/100.0,    -- для «Общей структуры»
+        VolBkt   = BucketVolume
+    FROM   reports.fn_NewAttractionVolumes(@ReportDate,@OpenFrom,@OpenTo,@ExcludeMP)
+),
+/*======================== 2. агрегат ========================*/
+agg AS (
+    /* две строки по сегментам */
+    SELECT Bucket, Segment,
+           SUM(ShareSeg) AS ShareVal,
+           SUM(VolSeg)   AS VolVal
+    FROM   src
+    WHERE  Segment <> N'Общая структура'
+    GROUP  BY Bucket, Segment
+
+    UNION ALL
+    /* строка «Общая структура» */
+    SELECT DISTINCT Bucket, N'Общая структура',
+           ShareBkt, VolBkt
+    FROM   src
+),
+/*======================== 3. два поворота ===================*/
+p_share AS (
+    SELECT Segment,
+           [31],[61],[91],[122],[181],
+           [273],[365],[548],[730],[1100]
+    FROM agg
+    PIVOT (SUM(ShareVal) FOR Bucket IN
+           ([31],[61],[91],[122],[181],[273],[365],[548],[730],[1100])) p
+),
+p_vol AS (
+    SELECT Segment,
+           [31],[61],[91],[122],[181],
+           [273],[365],[548],[730],[1100]
+    FROM agg
+    PIVOT (SUM(VolVal) FOR Bucket IN
+           ([31],[61],[91],[122],[181],[273],[365],[548],[730],[1100])) p
+)
+/*======================== 4. финальный SELECT ===============*/
+SELECT 'Share'   AS DataKind, * FROM p_share
+UNION ALL
+SELECT 'Volume', * FROM p_vol
+ORDER BY                   -- порядок строк «как в Excel»
+       CASE Segment
+            WHEN N'Розничный бизнес' THEN 1
+            WHEN N'УЧК'              THEN 2
+            ELSE 3                   -- «Общая структура»
+       END,
+       DataKind DESC;               -- сначала доли, потом объёмы
+GO
 ```
 
-3. **Добавьте кнопку запуска:**
-   - На листе "Отчет" вставьте кнопку (Разработчик > Вставить > Кнопка)
-   - Назначьте макрос `RunAttractionReport`
+### Как пользоваться
 
-### Ключевые особенности:
-1. **Форматирование дат:** Автоматическое преобразование в формат `yyyymmdd`
-2. **Обработка NULL:** Все NULL значения заменяются на 0
-3. **Динамические запросы:** Для долей используется модифицированный запрос объемов
-4. **Упрощенный PIVOT:** Используется группировка вместо PIVOT для совместимости
-5. **Авто-заголовки:** Результаты выводятся с поясняющими заголовками
+```sql
+/* только доли */
+SELECT *
+FROM   reports.fn_DepositStructure
+       ( '2025-08-03', '2025-07-29', '2025-08-03', 0 )
+WHERE  DataKind = 'Share';
 
-### Требования к системе:
-1. Windows OS
-2. Установленные драйверы SQL Server (SQL Server Native Client 11.0)
-3. Разрешения на доступ к SQL Server и функции `fn_NewAttractionVolumes`
-4. Разрешение Excel на подключение к базам данных
+/* только объёмы */
+SELECT *
+FROM   reports.fn_DepositStructure
+       ( '2025-08-03', '2025-07-29', '2025-08-03', 0 )
+WHERE  DataKind = 'Volume';
+```
 
-**Важно!** Замените `ВАШ_SQL_СЕРВЕР` в строке подключения на актуальное имя вашего SQL-сервера.
+или целиком:
 
-После запуска макроса результаты появятся:
-- Объемы: начиная с ячейки A11
-- Доли: начиная с ячейки A21
+```sql
+SELECT *
+FROM   reports.fn_DepositStructure
+       ( @ReportDate = '2025-08-03',
+         @OpenFrom   = '2025-07-29',
+         @OpenTo     = '2025-08-03',
+         @ExcludeMP  = 0 );   -- 1 = минус маркет-вклады
+```
 
-Если возникнут ошибки, проверьте:
-1. Корректность имени сервера
-2. Доступность функции в БД
-3. Соответствие версии SQL Native Client
-4. Разрешения на выполнение хранимых процедур
+| DataKind   | Segment             | 31          | 61 | 91 | … | 1100       |
+| ---------- | ------------------- | ----------- | -- | -- | - | ---------- |
+| **Share**  | Розничный бизнес    | 0,0378      | …  | …  |   | …          |
+| **Share**  | УЧК                 | 0,0000      | …  | …  |   | …          |
+| **Share**  | **Общая структура** | 0,0326      | …  | …  |   | …          |
+| **Volume** | Розничный бизнес    | 392 365 126 | …  | …  |   | 30 667 380 |
+| **Volume** | УЧК                 | 0           | …  | …  |   | 180 000    |
+| **Volume** | **Общая структура** | 392 365 126 | …  | …  |   | 30 847 380 |
+
+* Проценты уже 0 … 1 → в Excel форматируйте «0,00 %».
+* Объёмы — целые рубли.
+* Если нужно отделить доли и объёмы в разные блоки, используйте фильтр `WHERE DataKind`.
+
+Теперь всё в одной функции, никакого VBA. Коллеги могут подключить её к отчёту или к Excel-PowerQuery за 30 секунд.
