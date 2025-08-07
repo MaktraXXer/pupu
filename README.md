@@ -1,265 +1,92 @@
-/*═════════════════════════════════════════════════════════════════════
-   МОНOLITH: прогноз накопительных счетов (FIX-promo, FIX-base, FLOAT)
-   версия 2025-08-07 – правка PK + корректный конец promo-окна
-═════════════════════════════════════════════════════════════════════*/
-USE ALM_TEST;
-GO
-/*---------------------------------------------------------------*
- | 0. ПАРАМЕТРЫ                                                  |
- *---------------------------------------------------------------*/
-DECLARE
-    @scen        tinyint      = 1,             -- сценарий ключа
-    @Anchor      date         = '2025-08-04',  -- последний факт-день
-    @HorizonTo   date         = '2025-12-31',  -- конец горизонта
-    @BaseRate    decimal(9,4) = 0.0650;        -- базовая ставка (после promo)
+/* Диапазон дат, который нужен в задании */
+DECLARE @dt_start date = '2025-01-01';
+DECLARE @dt_end   date = '2025-07-30';
 
-/*---------------------------------------------------------------*
- | 1. ИТОГОВЫЕ ТАБЛИЦЫ                                           |
- *---------------------------------------------------------------*/
-IF OBJECT_ID('WORK.Forecast_BalanceDaily_NS','U') IS NULL
-    CREATE TABLE WORK.Forecast_BalanceDaily_NS(
-        dt_rep        date         PRIMARY KEY,
-        out_rub_total decimal(20,2),
-        rate_avg      decimal(9,4)
-);
-TRUNCATE TABLE WORK.Forecast_BalanceDaily_NS;
+/*=========================================================
+  1. Агрегация по собственной ставке договора (t.rate_con)
+=========================================================*/
+IF OBJECT_ID('tempdb..#rate_con_agg') IS NOT NULL DROP TABLE #rate_con_agg;
 
-/*── справочник спредов O / R, фиксируемых на @Anchor ───────────*/
-IF OBJECT_ID('WORK.NS_Spreads','U') IS NULL
-    CREATE TABLE WORK.NS_Spreads(
-        anchor date       NOT NULL,
-        seg    char(1)    NOT NULL,
-        spread decimal(9,4) NOT NULL,
-        CONSTRAINT PK_NSSpreads PRIMARY KEY(anchor,seg)
-);
-ELSE TRUNCATE TABLE WORK.NS_Spreads;
+SELECT
+    CAST(t.dt_rep AS date)                         AS dt_rep,          -- дата отчёта
+    t.section_name,                                                -- «Накопительный счёт»
+    t.TSEGMENTNAME,                                                -- сегмент
+    t.rate_con                                   AS rate_int,       -- ставка, по которой агрегируем
+    SUM(t.out_rub)                               AS sum_out_rub,    -- сумма остатков
+    COUNT(DISTINCT t.con_id)                     AS count_con_id    -- количество договоров
+INTO #rate_con_agg
+FROM alm.ALM.vw_balance_rest_all   t  WITH (NOLOCK)
+WHERE t.dt_rep BETWEEN @dt_start AND @dt_end
+  AND t.section_name = N'Накопительный счёт'
+  AND t.prod_id      = '654'
+  AND t.block_name   = N'Привлечение ФЛ'
+  AND t.od_flag      = 1          -- без начисленных %
+  AND t.cur          = '810'      -- RUB
+  AND t.out_rub IS NOT NULL
+GROUP BY
+    CAST(t.dt_rep AS date),
+    t.section_name,
+    t.TSEGMENTNAME,
+    t.rate_con;
 
-/*── promo-ставки O / R на первое число месяца ──────────────────*/
-IF OBJECT_ID('WORK.NS_PromoRates','U') IS NULL
-    CREATE TABLE WORK.NS_PromoRates(
-        month_first date       NOT NULL,
-        seg         char(1)    NOT NULL,
-        promo_rate  decimal(9,4) NOT NULL,
-        CONSTRAINT  PK_NSPromo PRIMARY KEY(month_first,seg)
-);
-ELSE
-BEGIN
-    /* на случай, если старый PK был только по дате            */
-    IF NOT EXISTS (SELECT 1 FROM sys.indexes
-                   WHERE object_id = OBJECT_ID('WORK.NS_PromoRates')
-                     AND is_primary_key = 1
-                     AND name = 'PK_NSPromo')
-    BEGIN
-        DECLARE @PK nvarchar(128) =
-                (SELECT name FROM sys.indexes
-                 WHERE object_id = OBJECT_ID('WORK.NS_PromoRates')
-                   AND is_primary_key = 1);
-        EXEC('ALTER TABLE WORK.NS_PromoRates DROP CONSTRAINT ' + @PK);
-        ALTER TABLE WORK.NS_PromoRates
-              ADD CONSTRAINT PK_NSPromo PRIMARY KEY(month_first,seg);
-    END
-    TRUNCATE TABLE WORK.NS_PromoRates;
-END
+/*=========================================================
+  2. Агрегация по ставке из справочника ликвидности (r.rate)
+=========================================================*/
+IF OBJECT_ID('tempdb..#rate_liq_agg') IS NOT NULL DROP TABLE #rate_liq_agg;
 
-/*---------------------------------------------------------------*
- | 2. КАЛЕНДАРЬ                                                  |
- *---------------------------------------------------------------*/
-IF OBJECT_ID('tempdb..#cal') IS NOT NULL DROP TABLE #cal;
-SELECT d=@Anchor INTO #cal;
-WHILE (SELECT MAX(d) FROM #cal) < @HorizonTo
-      INSERT #cal SELECT DATEADD(day,1,MAX(d)) FROM #cal;
+SELECT
+    CAST(t.dt_rep AS date)                         AS dt_rep,
+    t.section_name,
+    t.TSEGMENTNAME,
+    r.rate                                      AS rate_int,       -- ставка из Depo­sitContract_Rate
+    SUM(t.out_rub)                              AS sum_out_rub,
+    COUNT(DISTINCT t.con_id)                    AS count_con_id
+INTO #rate_liq_agg
+FROM alm.ALM.vw_balance_rest_all           t  WITH (NOLOCK)
+LEFT JOIN LIQUIDITY.liq.DepositContract_Rate r
+       ON  r.con_id = t.con_id
+       AND t.dt_rep BETWEEN r.dt_from AND r.dt_to
+WHERE t.dt_rep BETWEEN @dt_start AND @dt_end
+  AND t.section_name = N'Накопительный счёт'
+  AND t.prod_id      = '654'
+  AND t.block_name   = N'Привлечение ФЛ'
+  AND t.od_flag      = 1
+  AND t.cur          = '810'
+  AND t.out_rub IS NOT NULL
+GROUP BY
+    CAST(t.dt_rep AS date),
+    t.section_name,
+    t.TSEGMENTNAME,
+    r.rate;
 
-/*---------------------------------------------------------------*
- | 3. KEY-spot (TERM=1)  и  KEY-open                            |
- *---------------------------------------------------------------*/
-IF OBJECT_ID('tempdb..#key_spot') IS NOT NULL DROP TABLE #key_spot;
-SELECT fc.DT_REP,fc.KEY_RATE
-INTO   #key_spot
-FROM   WORK.ForecastKey_Cache_Scen fc
-JOIN   #cal c ON c.d = fc.DT_REP
-WHERE  fc.Scenario = @scen
-  AND  fc.TERM     = 1;
+/*=========================================================
+  3. Быстрый просмотр результатов (по желанию)
+=========================================================*/
+-- Сводка по собственной ставке
+SELECT * 
+FROM #rate_con_agg
+ORDER BY dt_rep, section_name, TSEGMENTNAME, rate_int;
 
-IF OBJECT_ID('tempdb..#key_open') IS NOT NULL DROP TABLE #key_open;
-SELECT DT_REP,TERM,AVG_KEY_RATE
-INTO   #key_open
-FROM   WORK.ForecastKey_Cache_Scen
-WHERE  Scenario = @scen
-  AND  DT_REP BETWEEN '2000-01-01' AND @HorizonTo;
+-- Сводка по ставке ликвидности
+SELECT *
+FROM #rate_liq_agg
+ORDER BY dt_rep, section_name, TSEGMENTNAME, rate_int;
 
-/*---------------------------------------------------------------*
- | 4. ФАКТ-портфель НС (FIX=654, FLOAT=3103)                     |
- *---------------------------------------------------------------*/
-IF OBJECT_ID('tempdb..#bal_fact') IS NOT NULL DROP TABLE #bal_fact;
-
-SELECT  t.con_id,t.cli_id,t.prod_id,
-        t.out_rub,t.rate_con,t.is_floatrate,t.termdays,
-        CAST(t.dt_open  AS date) AS dt_open,
-        CAST(t.dt_close AS date) AS dt_close,
-        t.TSEGMENTNAME,
-        seg = CASE WHEN t.TSEGMENTNAME=N'Розничный Бизнес' THEN 'R' ELSE 'O' END,
-        t.conv
-INTO    #bal_fact
-FROM    ALM.ALM.vw_balance_rest_all t WITH(NOLOCK)
-WHERE   t.dt_rep = @Anchor
-  AND   t.section_name = N'Накопительный счёт'
-  AND   t.block_name   = N'Привлечение ФЛ'
-  AND   t.od_flag      = 1
-  AND   t.cur          = '810'
-  AND   t.out_rub      IS NOT NULL
-  AND  (t.dt_close_fact IS NULL OR t.dt_close_fact >= @Anchor);
-
-/*---------------------------------------------------------------*
- | 5. СПРЕДЫ O / R  (фиксируем на @Anchor)                       |
- *---------------------------------------------------------------*/
-DECLARE @SpreadO decimal(9,4), @SpreadR decimal(9,4);
-
-SELECT @SpreadO = MAX(CASE WHEN seg='O' THEN rate_con - KEY_RATE END),
-       @SpreadR = MAX(CASE WHEN seg='R' THEN rate_con - KEY_RATE END)
-FROM (
-      SELECT b.seg,b.rate_con,ks.KEY_RATE
-      FROM   #bal_fact b
-      JOIN   #key_spot ks ON ks.DT_REP = @Anchor
-      WHERE  b.prod_id = 654
-        AND  DATEDIFF(month,b.dt_open,@Anchor) IN (0,1)   -- promo-FIX
-) x;
-
-INSERT INTO WORK.NS_Spreads(anchor,seg,spread)
-VALUES (@Anchor,'O',@SpreadO),(@Anchor,'R',@SpreadR);
-
-/*---------------------------------------------------------------*
- | 6. PROMO-окна FIX (prod_id = 654, 2 полных месяца)            |
- *---------------------------------------------------------------*/
-IF OBJECT_ID('tempdb..#promo') IS NOT NULL DROP TABLE #promo;
-
-SELECT  b.con_id,b.cli_id,b.seg,b.out_rub,
-        win_start = b.dt_open,
-        win_end   = DATEADD(day,-1,EOMONTH(DATEADD(month,1,b.dt_open))) -- 2 мес –1д
-INTO    #promo
-FROM    #bal_fact b
-WHERE   b.prod_id = 654
-  AND   DATEDIFF(month,b.dt_open,@Anchor) IN (0,1);
-
-/*---------------------------------------------------------------*
- | 7. ДНЕВНЫЕ СТАВКИ                                             |
- *---------------------------------------------------------------*/
--- 7.1 FIX-promo  + базовый день (win_end + 1)
-IF OBJECT_ID('tempdb..#rate_fixed') IS NOT NULL DROP TABLE #rate_fixed;
-SELECT p.con_id,p.cli_id,p.out_rub,
-       c.d AS dt_rep,
-       rate_con = CASE
-                     WHEN c.d <= p.win_end      -- promo до включ. win_end
-                          THEN (CASE WHEN p.seg='O' THEN @SpreadO ELSE @SpreadR END)
-                               + ks.KEY_RATE
-                     ELSE @BaseRate
-                  END
-INTO   #rate_fixed
-FROM   #promo p
-JOIN   #cal  c  ON c.d BETWEEN p.win_start AND DATEADD(day,1,p.win_end)
-JOIN   #key_spot ks ON ks.DT_REP = c.d;
-
--- 7.2 FLOAT  (prod_id = 3103)
-IF OBJECT_ID('tempdb..#rate_float') IS NOT NULL DROP TABLE #rate_float;
-SELECT f.con_id,f.cli_id,f.out_rub,
-       c.d AS dt_rep,
-       rate_con = (f.rate_con - ks.KEY_RATE) + ks2.KEY_RATE
-INTO   #rate_float
-FROM   #bal_fact f
-JOIN   #key_spot ks   ON ks.DT_REP = @Anchor                     -- фиксируем спред
-JOIN   #cal      c    ON c.d BETWEEN f.dt_open AND ISNULL(f.dt_close,@HorizonTo)
-JOIN   #key_spot ks2  ON ks2.DT_REP = c.d
-WHERE  f.prod_id = 3103;
-
--- 7.3 FIX-base  (старые 654)
-IF OBJECT_ID('tempdb..#rate_base') IS NOT NULL DROP TABLE #rate_base;
-SELECT b.con_id,b.cli_id,b.out_rub,
-       c.d AS dt_rep,
-       rate_con = b.rate_con
-INTO   #rate_base
-FROM   #bal_fact b
-JOIN   #cal c ON c.d BETWEEN b.dt_open AND ISNULL(b.dt_close,@HorizonTo)
-WHERE  b.prod_id = 654
-  AND  DATEDIFF(month,b.dt_open,@Anchor) >= 2;
-
-/*---------------------------------------------------------------*
- | 8. promo-ставка месяца и MERGE                               |
- *---------------------------------------------------------------*/
-IF OBJECT_ID('tempdb..#promo_month') IS NOT NULL DROP TABLE #promo_month;
-SELECT  m1   = DATEFROMPARTS(YEAR(ks.DT_REP),MONTH(ks.DT_REP),1),
-        seg,
-        promo_rate = (CASE WHEN seg='O' THEN @SpreadO ELSE @SpreadR END)
-                     + MIN(KEY_RATE)
-INTO    #promo_month
-FROM    #key_spot ks
-CROSS JOIN (VALUES('O'),('R')) s(seg)          -- обе группы
-GROUP BY DATEFROMPARTS(YEAR(ks.DT_REP),MONTH(ks.DT_REP),1), seg;
-
-MERGE WORK.NS_PromoRates AS tgt
-USING #promo_month        AS src
-ON   tgt.month_first = src.m1
- AND tgt.seg         = src.seg
-WHEN NOT MATCHED THEN
-     INSERT (month_first,seg,promo_rate)
-     VALUES (src.m1,src.seg,src.promo_rate)
-WHEN MATCHED THEN
-     UPDATE SET promo_rate = src.promo_rate;
-
-/*---------------------------------------------------------------*
- | 9. ОБЪЕДИНЯЕМ ВСЕ СТАВКИ                                       |
- *---------------------------------------------------------------*/
-IF OBJECT_ID('tempdb..#daily_all') IS NOT NULL DROP TABLE #daily_all;
-
-SELECT con_id,cli_id,out_rub,dt_rep,rate_con
-INTO   #daily_all
-FROM (
-      SELECT con_id,cli_id,out_rub,dt_rep,rate_con FROM #rate_fixed
-      UNION ALL
-      SELECT con_id,cli_id,out_rub,dt_rep,rate_con FROM #rate_float
-      UNION ALL
-      SELECT con_id,cli_id,out_rub,dt_rep,rate_con FROM #rate_base
-) AS t;
-
-/* клиенты, у кого 1-го числа есть promo-FIX */
-;WITH promo_1 AS (
-       SELECT DISTINCT cli_id,
-              m1 = DATEFROMPARTS(YEAR(dt_rep),MONTH(dt_rep),1)
-       FROM   #rate_fixed
-       WHERE  dt_rep = DATEFROMPARTS(YEAR(dt_rep),MONTH(dt_rep),1)
-)
-, best AS (   /* ставка, куда клиент «переливает» */
-       SELECT f.cli_id,
-              f.dt_rep,
-              out_rub = (SELECT SUM(out_rub)
-                         FROM  #rate_fixed f2
-                         WHERE f2.cli_id = f.cli_id
-                           AND DATEFROMPARTS(YEAR(f2.dt_rep),MONTH(f2.dt_rep),1) = f.dt_rep),
-              rate_con = MAX(f.rate_con)
-       FROM   #rate_fixed f
-       JOIN   promo_1 p ON p.cli_id = f.cli_id AND p.m1 = f.dt_rep
-       GROUP  BY f.cli_id,f.dt_rep
-)
-, final AS (
-       /* перелитые promo-деньги */
-       SELECT NULL AS con_id, cli_id, out_rub, dt_rep, rate_con FROM best
-       UNION ALL
-       /* остальные записи, которых перелив не касается */
-       SELECT con_id,cli_id,out_rub,dt_rep,rate_con
-       FROM   #daily_all d
-       WHERE  NOT EXISTS (SELECT 1
-                          FROM promo_1 p
-                          WHERE p.cli_id = d.cli_id
-                            AND p.m1     = DATEFROMPARTS(YEAR(d.dt_rep),MONTH(d.dt_rep),1))
-)
-INSERT INTO WORK.Forecast_BalanceDaily_NS(dt_rep,out_rub_total,rate_avg)
-SELECT  dt_rep,
-        SUM(out_rub),
-        SUM(out_rub*rate_con)/SUM(out_rub)
-FROM    final
-GROUP  BY dt_rep;
-
-/*---------------------------------------------------------------*
- | 10. ОТЧЁТ                                                     |
- *---------------------------------------------------------------*/
-SELECT * FROM WORK.NS_Spreads;
-SELECT * FROM WORK.NS_PromoRates ORDER BY month_first,seg;
-SELECT * FROM WORK.Forecast_BalanceDaily_NS ORDER BY dt_rep;
+/*---------------------------------------------------------
+-- Если нужно свести обе таблицы в один результат:
+SELECT COALESCE(c.dt_rep, l.dt_rep)            AS dt_rep,
+       COALESCE(c.section_name, l.section_name) AS section_name,
+       COALESCE(c.TSEGMENTNAME, l.TSEGMENTNAME) AS TSEGMENTNAME,
+       COALESCE(c.rate_int, l.rate_int)         AS rate_int_con,   -- ставка из t
+       c.sum_out_rub                            AS sum_out_rub_con,
+       c.count_con_id                           AS cnt_con_id_con,
+       l.rate_int                               AS rate_int_liq,   -- ставка из r
+       l.sum_out_rub                            AS sum_out_rub_liq,
+       l.count_con_id                           AS cnt_con_id_liq
+FROM #rate_con_agg c
+FULL JOIN #rate_liq_agg l
+       ON  c.dt_rep        = l.dt_rep
+       AND c.section_name  = l.section_name
+       AND c.TSEGMENTNAME  = l.TSEGMENTNAME
+       AND c.rate_int      = l.rate_int;
+---------------------------------------------------------*/
