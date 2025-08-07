@@ -1,62 +1,39 @@
 /* ════════════════════════════════════════
-     NS forecast: FIX-promo (2 мес), FIX-base, FLOAT
-     version 2025-08-07 m
+   NS forecast   version 2025-08-07-rev
 ════════════════════════════════════════ */
 
 USE ALM_TEST;
 GO
-/* 0. Параметры */
+/* ПАРАМЕТРЫ ----------------------------------------------------*/
 DECLARE
-    @scen      tinyint      = 1,
-    @Anchor    date         = '2025-08-04',
+    @scen      tinyint      = 1,              -- сценарий ключа
+    @Anchor    date         = '2025-08-04',   -- последний факт
     @HorizonTo date         = '2025-12-31',
-    @BaseRate  decimal(9,4) = 0.0650;
+    @BaseRate  decimal(9,4) = 0.0650;         -- ставка после promo
 
-/* 1. Чистим / создаём итоговые таблицы */
-DROP TABLE IF EXISTS WORK.Forecast_BalanceDaily_NS;
-CREATE TABLE WORK.Forecast_BalanceDaily_NS(
-  dt_rep date PRIMARY KEY,
-  out_rub_total decimal(20,2),
-  rate_avg      decimal(9,4));
+/* ВРЕМЕННЫЕ НАБОРЫ --------------------------------------------*/
+DROP TABLE IF EXISTS #cal, #key, #bal, #promo, #float, #base, #daily;
 
-DROP TABLE IF EXISTS WORK.NS_Spreads;
-CREATE TABLE WORK.NS_Spreads(            -- фиксируем на dt_open!
-  dt_open      date         NOT NULL,
-  TSEGMENTNAME nvarchar(40) NOT NULL,
-  spread       decimal(9,4) NOT NULL,
-  CONSTRAINT PK_NSSpreads PRIMARY KEY(dt_open,TSEGMENTNAME));
-
-DROP TABLE IF EXISTS WORK.NS_PromoRates;
-CREATE TABLE WORK.NS_PromoRates(
-  month_first  date         NOT NULL,
-  TSEGMENTNAME nvarchar(40) NOT NULL,
-  promo_rate   decimal(9,4) NOT NULL,
-  CONSTRAINT PK_NSPromo PRIMARY KEY(month_first,TSEGMENTNAME));
-
-/* 2. Календарь горизонта */
-DROP TABLE IF EXISTS #cal;
+/* календарь горизонта */
 SELECT d=@Anchor INTO #cal;
 WHILE (SELECT MAX(d) FROM #cal) < @HorizonTo
       INSERT #cal SELECT DATEADD(day,1,MAX(d)) FROM #cal;
 
-/* 3. Ключевая ставка */
-DROP TABLE IF EXISTS #key_spot;
-SELECT fc.DT_REP,fc.KEY_RATE
-INTO   #key_spot
-FROM   WORK.ForecastKey_Cache_Scen fc
-JOIN   #cal c ON c.d = fc.DT_REP
-WHERE  fc.Scenario=@scen AND fc.TERM=1;
+/* ключ (TERM=1) день-в-день */
+SELECT DT_REP, KEY_RATE
+INTO   #key
+FROM   WORK.ForecastKey_Cache_Scen
+WHERE  Scenario=@scen AND TERM=1
+  AND  DT_REP BETWEEN @Anchor AND @HorizonTo;
 
-/* 4. Факт-портфель НС */
-DROP TABLE IF EXISTS #bal_fact;
+/* факт-портфель */
 SELECT  t.con_id,t.cli_id,t.prod_id,
         t.out_rub,t.rate_con,t.is_floatrate,
         CAST(t.dt_open  AS date) AS dt_open,
         CAST(t.dt_close AS date) AS dt_close,
-        t.TSEGMENTNAME,
-        t.conv
-INTO    #bal_fact
-FROM    ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
+        t.TSEGMENTNAME
+INTO    #bal
+FROM    ALM.ALM.vw_balance_rest_all t WITH(NOLOCK)
 WHERE   t.dt_rep = @Anchor
   AND   t.section_name = N'Накопительный счёт'
   AND   t.block_name   = N'Привлечение ФЛ'
@@ -65,115 +42,124 @@ WHERE   t.dt_rep = @Anchor
   AND   t.out_rub IS NOT NULL
   AND  (t.dt_close_fact IS NULL OR t.dt_close_fact >= @Anchor);
 
-/* 5. Spread promo-FIX (только август-2025 открытие!) */
+/* ==== 1. СПРЕДЫ (promo-FIX, июль+август) =====================*/
+DROP TABLE IF EXISTS #spread;
 ;WITH src AS (
-     SELECT bf.dt_open, bf.TSEGMENTNAME,
-            w_rate = SUM(bf.out_rub*bf.rate_con)/SUM(bf.out_rub)
-     FROM   #bal_fact bf
-     WHERE  bf.prod_id = 654
-       AND  bf.dt_open BETWEEN '2025-08-01' AND '2025-08-31'
-     GROUP  BY bf.dt_open,bf.TSEGMENTNAME)
-INSERT INTO WORK.NS_Spreads
-SELECT s.dt_open,
-       s.TSEGMENTNAME,
-       s.w_rate - ks.KEY_RATE
-FROM   src   s
-JOIN   #key_spot ks ON ks.DT_REP = s.dt_open;     -- ключ на день открытия
+        SELECT bf.dt_open, bf.TSEGMENTNAME,
+               w_rate = SUM(bf.out_rub*bf.rate_con)/SUM(bf.out_rub)
+        FROM   #bal bf
+        WHERE  bf.prod_id = 654
+          AND  DATEDIFF(month,bf.dt_open,@Anchor) IN (0,1)
+        GROUP  BY bf.dt_open,bf.TSEGMENTNAME)
+SELECT  s.dt_open,
+        s.TSEGMENTNAME,
+        spread = s.w_rate - k.KEY_RATE           -- KEY того же дня!
+INTO    #spread
+FROM   src s
+JOIN   #key k ON k.DT_REP = s.dt_open;
 
-/* 6. Promo-цепочки (2 полных мес. + rollover) */
-DROP TABLE IF EXISTS #promo_seq;
+/* ==== 2. PROMO-ОКНА (2 мес) ===================================*/
+DROP TABLE IF EXISTS #promo;
 ;WITH seed AS (
-     SELECT bf.con_id,bf.cli_id,bf.TSEGMENTNAME,bf.out_rub,
-            win_start = bf.dt_open,
-            win_end   = DATEADD(day,-1,EOMONTH(DATEADD(month,1,bf.dt_open))),
-            bf.dt_open AS id_open
-     FROM   #bal_fact bf
-     WHERE  bf.prod_id = 654
-       AND  bf.dt_open BETWEEN '2025-08-01' AND '2025-08-31'
+        SELECT bf.con_id,bf.cli_id,bf.TSEGMENTNAME,bf.out_rub,
+               win_start = bf.dt_open,
+               win_end   = EOMONTH(bf.dt_open,1),      -- L-день promo
+               bf.dt_open AS id_open
+        FROM   #bal bf
+        WHERE  bf.prod_id = 654
+          AND  DATEDIFF(month,bf.dt_open,@Anchor) IN (0,1)
 ), seq AS (
-     SELECT *,0 AS n FROM seed
-     UNION ALL
-     SELECT s.con_id,s.cli_id,s.TSEGMENTNAME,s.out_rub,
-            DATEADD(day,1,s.win_end),
-            DATEADD(day,-1,EOMONTH(DATEADD(month,1,DATEADD(day,1,s.win_end)))),
-            s.id_open, n+1
-     FROM   seq s
-     WHERE  DATEADD(day,1,s.win_end) <= @HorizonTo)
-SELECT * INTO #promo_seq FROM seq OPTION (MAXRECURSION 0);
+        SELECT *,0 AS n FROM seed
+        UNION ALL
+        SELECT con_id,cli_id,TSEGMENTNAME,out_rub,
+               DATEADD(day,1,win_end),
+               EOMONTH(DATEADD(day,1,win_end),1),
+               id_open, n+1
+        FROM   seq
+        WHERE  DATEADD(day,1,win_end) <= @HorizonTo )
+SELECT * INTO #promo FROM seq OPTION (MAXRECURSION 0);
 
-/* 7. Ставки */
----- FIX-promo (+ базовый день)
-DROP TABLE IF EXISTS #rate_fixed;
-SELECT p.con_id,p.cli_id,p.TSEGMENTNAME,p.out_rub,
-       c.d AS dt_rep,
-       rate_con = CASE
-                     WHEN c.d <= p.win_end
-                          THEN sp.spread + ks.KEY_RATE
-                     ELSE @BaseRate
-                  END
-INTO   #rate_fixed
-FROM   #promo_seq p
-JOIN   WORK.NS_Spreads sp
-          ON sp.dt_open = p.id_open AND sp.TSEGMENTNAME = p.TSEGMENTNAME
-JOIN   #cal c  ON c.d BETWEEN p.win_start AND DATEADD(day,1,p.win_end)
-JOIN   #key_spot ks ON ks.DT_REP = c.d;
+/* ==== 3. СТАВКИ ==============================================*/
+---- 3.1 FIX-promo и Base-day
+SELECT  p.con_id,p.cli_id,p.TSEGMENTNAME,p.out_rub,
+        c.d                                            AS dt_rep,
+        CASE WHEN c.d <= p.win_end                     -- promo
+             THEN sp.spread + k.KEY_RATE
+             ELSE @BaseRate END                        AS rate_con
+INTO    #promo_rates
+FROM   #promo p
+JOIN   #spread  sp ON sp.dt_open = p.id_open
+                  AND sp.TSEGMENTNAME = p.TSEGMENTNAME
+JOIN   #cal     c  ON c.d BETWEEN p.win_start AND DATEADD(day,1,p.win_end)
+JOIN   #key     k  ON k.DT_REP = c.d;
 
----- FLOAT
-DROP TABLE IF EXISTS #rate_float;
-SELECT f.con_id,f.cli_id,f.TSEGMENTNAME,f.out_rub,
-       c.d AS dt_rep,
-       rate_con = (f.rate_con - ks.KEY_RATE) + ks2.KEY_RATE
-INTO   #rate_float
-FROM   #bal_fact f
-JOIN   #key_spot ks  ON ks.DT_REP = f.dt_open
-JOIN   #cal      c   ON c.d BETWEEN f.dt_open AND ISNULL(f.dt_close,@HorizonTo)
-JOIN   #key_spot ks2 ON ks2.DT_REP = c.d
+---- 3.2 FLOAT
+SELECT  f.con_id,f.cli_id,f.TSEGMENTNAME,f.out_rub,
+        c.d,
+        (f.rate_con - k0.KEY_RATE) + k1.KEY_RATE       AS rate_con
+INTO   #float
+FROM   #bal    f
+JOIN   #key    k0 ON k0.DT_REP = f.dt_open
+JOIN   #cal    c  ON c.d BETWEEN f.dt_open AND ISNULL(f.dt_close,@HorizonTo)
+JOIN   #key    k1 ON k1.DT_REP = c.d
 WHERE  f.prod_id = 3103;
 
----- FIX-base
-DROP TABLE IF EXISTS #rate_base;
-SELECT b.con_id,b.cli_id,b.TSEGMENTNAME,b.out_rub,
-       c.d AS dt_rep,
-       rate_con = b.rate_con
-INTO   #rate_base
-FROM   #bal_fact b
+---- 3.3 FIX-base (старые)
+SELECT  b.con_id,b.cli_id,b.TSEGMENTNAME,b.out_rub,
+        c.d, b.rate_con
+INTO   #base
+FROM   #bal b
 JOIN   #cal c ON c.d BETWEEN b.dt_open AND ISNULL(b.dt_close,@HorizonTo)
 WHERE  b.prod_id = 654
-  AND  b.dt_open <  '2025-08-01';      -- старые FIX
+  AND  b.dt_open < DATEFROMPARTS(2025,8,1);
 
-/* 8. Promo-rate месяца */
-WITH min_key AS (
-     SELECT DATEFROMPARTS(YEAR(DT_REP),MONTH(DT_REP),1) AS m1,
-            MIN(KEY_RATE) AS min_key
-     FROM   #key_spot
-     GROUP  BY DATEFROMPARTS(YEAR(DT_REP),MONTH(DT_REP),1))
-INSERT INTO WORK.NS_PromoRates
-SELECT k.m1, s.TSEGMENTNAME,
-       k.min_key + s.spread
-FROM   min_key k
-JOIN   (SELECT DISTINCT TSEGMENTNAME,spread FROM WORK.NS_Spreads) s
-     ON 1=1;
+/* ==== 4. СЛИЯНИЕ И «ПЕРЕЛИВ» 1-ГО ЧИСЛА ======================*/
+DROP TABLE IF EXISTS #daily_all;
+SELECT * INTO #daily_all FROM
+(SELECT * FROM #promo_rates
+ UNION ALL
+ SELECT * FROM #float
+ UNION ALL
+ SELECT * FROM #base) q;
 
-/* 9. День-в-день: убираем двойной учёт promo */
-DROP TABLE IF EXISTS #all_rates;
-SELECT * INTO #all_rates FROM (
-     SELECT * FROM #rate_fixed
-     UNION ALL SELECT * FROM #rate_float
-     UNION ALL SELECT * FROM #rate_base) q;
+/* promos-first-day */
+DROP TABLE IF EXISTS #m1;
+SELECT DISTINCT DATEFROMPARTS(YEAR(d),MONTH(d),1) d INTO #m1 FROM #cal;
 
-;WITH ranked AS (
-     SELECT *, ROW_NUMBER() OVER
-                (PARTITION BY cli_id,dt_rep ORDER BY rate_con DESC) AS rn
-     FROM   #all_rates)
-INSERT INTO WORK.Forecast_BalanceDaily_NS
+;WITH promos_1 AS (
+     SELECT  cli_id, d            AS m1
+     FROM    #daily_all
+     WHERE   d IN (SELECT d FROM #m1)
+       AND   con_id IS NOT NULL   -- только реальные promo-FIX
+       AND   prod_id IS NULL      -- (feat) prod_id нет ⇒ promo-FIX
+     GROUP BY cli_id,d)
+, best AS (
+     SELECT p.cli_id,p.m1 AS dt_rep,
+            SUM(out_rub)              AS out_rub,
+            MAX(rate_con)             AS rate_con
+     FROM   #daily_all d
+     JOIN   promos_1  p
+       ON   p.cli_id=d.cli_id AND p.m1=d.d
+     GROUP  BY p.cli_id,p.m1)
+, final AS (
+     /* заменить промо-набор агрегированной строкой */
+     SELECT NULL con_id,cli_id,TSEGMENTNAME=NULL,
+            out_rub,dt_rep,rate_con FROM best
+     UNION ALL
+     SELECT con_id,cli_id,TSEGMENTNAME,out_rub,d,rate_con
+     FROM   #daily_all d
+     WHERE  NOT EXISTS (SELECT 1
+                        FROM promos_1 p
+                        WHERE p.cli_id=d.cli_id AND p.m1=d.d))
+/* ==== 5. ИТОГ ПОРТФЕЛЯ =======================================*/
+INSERT WORK.Forecast_BalanceDaily_NS
 SELECT  dt_rep,
-        SUM(out_rub)                           AS out_rub_total,
-        SUM(out_rub*rate_con)/SUM(out_rub)     AS rate_avg
-FROM   ranked
-WHERE  rn = 1                                  -- «перелили» всё на макс. ставку
+        SUM(out_rub)                       AS out_rub_total,
+        SUM(out_rub*rate_con)/SUM(out_rub) AS rate_avg
+FROM   final
 GROUP  BY dt_rep;
 
-/* 10. Проверка */
-SELECT * FROM WORK.NS_Spreads           ORDER BY dt_open,TSEGMENTNAME;
-SELECT * FROM WORK.NS_PromoRates        ORDER BY month_first,TSEGMENTNAME;
-SELECT * FROM WORK.Forecast_BalanceDaily_NS ORDER BY dt_rep;
+/* ==== TEST-BLOCK (оставьте, пожалуйста) =====================*/
+--SELECT TOP (20) * FROM #promo ORDER BY cli_id, win_start;           -- окна
+--SELECT TOP (10) * FROM #promo_rates ORDER BY cli_id,dt_rep;         -- ставки
+--SELECT TOP (20) * FROM WORK.Forecast_BalanceDaily_NS ORDER BY dt_rep; -- итог
