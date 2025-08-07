@@ -1,3 +1,4 @@
+
 /* ══════════════════════════════════════════════════════════════
    NS-forecast — ЧАСТЬ 2
    FIX-promo-roll (июль-авг-25, prod_id 654)
@@ -192,3 +193,5 @@ ORDER BY dt_rep;
 PRINT N'=== portfolio TOP-40 ===';
 SELECT TOP (40) * FROM WORK.Forecast_BalanceDaily_NS ORDER BY dt_rep;
 GO
+
+Главное изменение — типизированный CAST(NULL AS nvarchar(40)) AS TSEGMENTNAME в glue-секции (а con_id — CAST(NULL AS bigint) для симметрии). Теперь типы во всех UNION ALL совпадают, и конверсия nvarchar → int больше не случается.
