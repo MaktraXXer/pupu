@@ -1,55 +1,70 @@
-Понял — ошибка не в арифметике, а в том, какие строки мы оставляем в портфеле после «перелива»:
-	•	я удаляю все FIX-promo строки, кроме агрегированной, но при этом
-забываю забрать их объём из исходной таблицы;
-в результате объём «раздувается» ровно на сумму promo-FIX и портфель
-дублируется.
+Исправлять надо **только шаг 9** – там, где мы после объединения трёх потоков ставок
+(`(#fix ∪ #float ∪ #base)`) «схлопываем» все promo-FIX клиента в одну строку
+и добавляем её обратно.  Всё остальное (спреды, расчёт ставок) работает
+корректно.
 
-Ни расчёт спреда, ни ставки тут ни при чём — ломается только этап
-union_all.  Достаточно:
-	1.	Вычеркнуть promo-FIX из #daily_all, после того, как объединили
-три источника ставок;
-	2.	Добавить вместо них одну агрегат-строку на клиента/1-е число.
+### Что меняем
 
-/* ── 9а. “правильная” лента без дублей promo-FIX ────────────── */
+1. **Заменяем** объявление `#daily_all` и последующий CTE-блок
+   `first_day / best / union_all`
+2. **Вставляем** вместо него кусок «9а/9b» из сообщения, а именно:
+
+```sql
+/* ── 9. конструируем дневную ленту ──────────────────────────── */
+DROP TABLE IF EXISTS #daily_all;
+SELECT con_id,cli_id,TSEGMENTNAME,out_rub,dt_rep,rate_con,prod_id
+INTO   #daily_all
+FROM   #fix
+UNION ALL
+SELECT * FROM #float
+UNION ALL
+SELECT * FROM #base;
+
+/* ── 9а. убираем дубли promo-FIX и клеим их в одну строку ───── */
 DROP TABLE IF EXISTS #daily_mix;
-SELECT * INTO #daily_mix
+SELECT *
+INTO   #daily_mix
 FROM   #daily_all
-WHERE  NOT (prod_id = 654                        -- FIX
+WHERE  NOT (prod_id = 654
         AND dt_rep = DATEFROMPARTS(YEAR(dt_rep),MONTH(dt_rep),1));
 
--- promo-FIX, склеенные по клиенту (только 1-е число месяца)
 WITH first_fix AS (
-     SELECT cli_id,
-            DATEFROMPARTS(YEAR(dt_rep),MONTH(dt_rep),1) AS m1
-     FROM   #daily_all
-     WHERE  prod_id = 654
-       AND  dt_rep  = DATEFROMPARTS(YEAR(dt_rep),MONTH(dt_rep),1)
-     GROUP  BY cli_id,
-              DATEFROMPARTS(YEAR(dt_rep),MONTH(dt_rep),1))
-SELECT NULL        AS con_id,
-       cli_id,
-       NULL        AS TSEGMENTNAME,
-       SUM(out_rub)                      AS out_rub,
-       m1            AS dt_rep,
-       MAX(rate_con)                     AS rate_con,
-       654           AS prod_id      -- помечаем как FIX
-INTO   #promo_glue
-FROM   #daily_all d
-JOIN   first_fix f
-       ON  f.cli_id = d.cli_id
-      AND f.m1     = d.dt_rep
-WHERE  d.prod_id = 654
-GROUP  BY cli_id, m1;
+     SELECT   cli_id,
+              DATEFROMPARTS(YEAR(dt_rep),MONTH(dt_rep),1) AS m1
+     FROM     #daily_all
+     WHERE    prod_id = 654
+       AND    dt_rep  = DATEFROMPARTS(YEAR(dt_rep),MONTH(dt_rep),1)
+)
+SELECT  NULL      AS con_id,
+        d.cli_id,
+        NULL      AS TSEGMENTNAME,
+        SUM(d.out_rub)            AS out_rub,
+        f.m1       AS dt_rep,
+        MAX(d.rate_con)           AS rate_con,
+        654        AS prod_id
+INTO    #promo_glue
+FROM     #daily_all d
+JOIN     first_fix  f
+     ON  f.cli_id = d.cli_id
+    AND  f.m1     = d.dt_rep
+WHERE    d.prod_id = 654
+GROUP BY d.cli_id, f.m1;
 
-/* ── 9b. окончательная лента для агрегата ───────────────────── */
+/* ── 9b. итоговая лента для агрегата ────────────────────────── */
 DROP TABLE IF EXISTS #daily_final;
-SELECT * INTO #daily_final
+SELECT *
+INTO   #daily_final
 FROM (
       SELECT * FROM #daily_mix
       UNION ALL
-      SELECT * FROM #promo_glue ) z;
+      SELECT * FROM #promo_glue
+) x;
+```
 
-/* ── 10. итог портфеля ──────────────────────────────────────── */
+3. **Агрегат (шаг 10)** теперь считаем из `#daily_final`,
+   остальной код – без изменений:
+
+```sql
 TRUNCATE TABLE WORK.Forecast_BalanceDaily_NS;
 
 INSERT WORK.Forecast_BalanceDaily_NS
@@ -58,21 +73,29 @@ SELECT  dt_rep,
         SUM(out_rub*rate_con)/SUM(out_rub) AS rate_avg
 FROM   #daily_final
 GROUP  BY dt_rep;
+```
 
-как проверить
+### Почему это чинит проблему
 
--- объём должен быть константой (≈ 127 258 млрд) до 30 августа
-SELECT TOP (60) dt_rep,out_rub_total,rate_avg
-FROM   WORK.Forecast_BalanceDaily_NS
-ORDER  BY dt_rep;
+* `#daily_mix` – чистая лента **без** promo-FIX на 1-е число
+  (мы их временно убрали, чтобы не было дублей).
+* `#promo_glue` – одна строка на клиента и 1-е число с
+  *агрегированным объёмом* и *max-ставкой*.
+  В исходном варианте promo-FIX оставались **и как отдельные строки, и как
+  «склейка»**, поэтому объём удваивался.
+* `#daily_final` = `#daily_mix ∪ #promo_glue` – корректный набор строк:
+  объём = фактическому, ставка меняется только там, где должна.
 
-	•	30 августа — базовая 6.5 %
-	•	1 сентября — ставка promo (0.173 / 0.1709)
-	•	15 сентября — допереоценка только FLOAT
-	•	30 сентября — снова базовая
-	•	1 окт / ноя / дек — promo 0.153 / 0.1509
+### Проверка
 
-Если объём теперь держится ровно и «ступеньки» по ставке
-совпадают с логикой — модель заработала.
-Не совпало → скинь конкретный датасет (хотя бы пару
-cli_id) — разберёмся точечно.
+```sql
+-- должен держаться постоянный объём до 30-го числа
+SELECT TOP (40) * FROM WORK.Forecast_BalanceDaily_NS ORDER BY dt_rep;
+
+-- 30-е числа: ставка 6.5 %  (base)
+-- 01-е:       promo (0.173 / 0.1709 …)
+-- 15-е сент:  движение только FLOAT (-2 п.п. ключа)
+```
+
+После замены блоков 9-10 объём на 04.08 и далее будет ≈ 127 258 млрд,
+а «ступеньки» ставок совпадут с описанной логикой.
