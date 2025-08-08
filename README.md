@@ -1,348 +1,194 @@
-/* ══════════════════════════════════════════════════════════════
-   NS-forecast — Part 2 (FIX-promo-roll, prod_id = 654)
-   ⚠ СНАПШОТ @Anchor как в mail.usp_fill_balance_metrics_savings:
-     rate_use через ULTRA(+1/+2) и LIQ vs balance (те же фильтры).
-   v.2025-08-10 — base-day half-shift + full shift on 1st; no dupes
-═══════════════════════════════════════════════════════════════*/
-USE ALM_TEST;
+USE [ALM_TEST];
 GO
-SET NOCOUNT ON;
 
-/* ── параметры ─────────────────────────────────────────────── */
-DECLARE
-    @Scenario  tinyint      = 1,
-    @Anchor    date         = '2025-08-04',
-    @HorizonTo date         = '2025-12-31',
-    @BaseRate  decimal(9,4) = 0.0650;  -- 6.5%
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
 
-/* ── 0) Календарь горизонта + KEY(TERM=1) ───────────────────── */
-IF OBJECT_ID('tempdb..#cal') IS NOT NULL DROP TABLE #cal;
-SELECT d = @Anchor INTO #cal;
-WHILE (SELECT MAX(d) FROM #cal) < @HorizonTo
-    INSERT #cal SELECT DATEADD(day,1,MAX(d)) FROM #cal;
+/*--------------------------------------------------------------------
+   mail.usp_fill_balance_metrics_savings
+   Исправлено: исключён фан-аут объёмов за счёт OUTER APPLY TOP(1)
+   для ставки из LIQUIDITY.liq.DepositContract_Rate.
+   Сохраняет те же поля/агрегаты: 'портфель' и 'новые'.
 
-IF OBJECT_ID('tempdb..#key') IS NOT NULL DROP TABLE #key;
-SELECT DT_REP, KEY_RATE
-INTO   #key
-FROM   WORK.ForecastKey_Cache_Scen
-WHERE  Scenario = @Scenario AND TERM = 1
-  AND  DT_REP BETWEEN @Anchor AND @HorizonTo;
+   Основные моменты:
+   • Эффективная дата для ставки (eff_dt):
+       - если dt_open = dt_rep  → eff_dt = dt_rep + 1 (ULTRA «нулевой» день)
+       - иначе                  → eff_dt = dt_rep
+   • На eff_dt выбираем ровно одну ставку из DCR:
+       TOP(1) по ORDER BY r.dt_from DESC, r.dt_to DESC
+   • Фильтр t.out_rub IS NOT NULL — чтобы не тянуть «пустые» объёмы
+--------------------------------------------------------------------*/
+ALTER PROCEDURE [mail].[usp_fill_balance_metrics_savings]
+      @DateTo   date = NULL        -- «включительно»
+    , @DaysBack int  = 21
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
 
-DECLARE @KeyAtAnchor decimal(9,4);
-SELECT @KeyAtAnchor = KEY_RATE FROM #key WHERE DT_REP = @Anchor;
+    /* --------------------------------------------------------------
+       1) Диапазоны дат
+    ----------------------------------------------------------------*/
+    IF @DateTo IS NULL
+        SET @DateTo = DATEADD(day,-2,CAST(GETDATE() AS date));
 
-/* ── 1) СНАПШОТ promo-портфеля на @Anchor (ровно как в SP) ─── */
-IF OBJECT_ID('tempdb..#bal_src') IS NOT NULL DROP TABLE #bal_src;
-SELECT
-    t.dt_rep,
-    CAST(t.dt_open  AS date)                 AS dt_open,
-    CAST(t.dt_close AS date)                 AS dt_close,
-    CAST(t.con_id   AS bigint)               AS con_id,
-    CAST(t.cli_id   AS bigint)               AS cli_id,
-    CAST(t.prod_id  AS int)                  AS prod_id,
-    CAST(t.out_rub  AS decimal(20,2))        AS out_rub,
-    CAST(t.rate_con AS decimal(9,4))         AS rate_balance,
-    t.rate_con_src,
-    t.TSEGMENTNAME,
-    CAST(r.rate     AS decimal(9,4))         AS rate_liq
-INTO #bal_src
-FROM   alm.ALM.vw_balance_rest_all AS t WITH (NOLOCK)
-LEFT   JOIN LIQUIDITY.liq.DepositContract_Rate r
-       ON  r.con_id = t.con_id
-       AND CASE WHEN t.dt_open = t.dt_rep
-                THEN DATEADD(day,1,t.dt_rep)        -- ULTRA «нулевой» день → +1
-                ELSE t.dt_rep
-           END BETWEEN r.dt_from AND r.dt_to
-WHERE  t.dt_rep BETWEEN DATEADD(day,-2,@Anchor) AND DATEADD(day,2,@Anchor)
-  AND  t.section_name = N'Накопительный счёт'
-  AND  t.block_name   = N'Привлечение ФЛ'
-  AND  t.od_flag      = 1
-  AND  t.cur          = '810'
-  AND  t.prod_id      = 654;                         -- promo-продукт
+    DECLARE @DateFrom      date = DATEADD(day,-@DaysBack+1,@DateTo);
+    DECLARE @DateFromWide  date = DATEADD(day,-2,@DateFrom);   -- «-2» для look-ahead
+    DECLARE @DateToWide    date = DATEADD(day, 2,@DateTo);     -- «+2» для look-ahead
 
-CREATE CLUSTERED INDEX IX_bal_src ON #bal_src (con_id, dt_rep);
+    /* --------------------------------------------------------------
+       2) Снимок баланса + присоединение ставки DCR без размножения
+          (ровно одна ставка на eff_dt через OUTER APPLY TOP 1)
+    ----------------------------------------------------------------*/
+    IF OBJECT_ID('tempdb..#bal') IS NOT NULL DROP TABLE #bal;
 
-IF OBJECT_ID('tempdb..#bal_prom') IS NOT NULL DROP TABLE #bal_prom;
-;WITH bal_pos AS (
-    SELECT *,
-           /* первая положительная ULTRA-ставка на +1/+2 день */
-           MIN(CASE WHEN rate_balance > 0
-                     AND rate_con_src = N'счет ультра,вручную'
-                    THEN rate_balance END)
-               OVER (PARTITION BY con_id
-                     ORDER BY dt_rep
-                     ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) AS rate_pos
-    FROM #bal_src
-    WHERE dt_rep = @Anchor
-),
-rate_calc AS (
-    SELECT *,
-           CASE
-             WHEN rate_liq IS NULL
-                  THEN CASE
-                           WHEN rate_balance < 0
-                                THEN COALESCE(rate_pos, rate_balance)
-                           ELSE rate_balance
-                       END
-             WHEN rate_liq < 0  AND rate_balance > 0 THEN rate_balance
-             WHEN rate_liq < 0  AND rate_balance < 0 THEN COALESCE(rate_pos, rate_balance)
-             WHEN rate_liq >= 0 AND rate_balance >= 0 THEN rate_liq
-             WHEN rate_liq > 0  AND rate_balance < 0 THEN rate_liq
-             ELSE rate_liq
-           END AS rate_use
-    FROM bal_pos
-)
-SELECT
-    con_id,
-    cli_id,
-    out_rub,
-    rate_anchor = CAST(rate_use AS decimal(9,4)),   -- ставка на Anchor из той же логики
-    dt_open,
-    TSEGMENTNAME
-INTO #bal_prom
-FROM rate_calc
-WHERE out_rub IS NOT NULL
-  AND dt_open BETWEEN '2025-07-01' AND '2025-08-31';
--- Если нужно дополнительно исключать «плавающие» договоры, а колонки нет — оставляем как есть.
-
-/* контроль общего объёма на Anchor для sanity */
-DECLARE @PromoTotal decimal(20,2) = (SELECT SUM(out_rub) FROM #bal_prom);
-
-/* ── 2) Фикс-спреды по август-25 (из #bal_prom) ─────────────── */
-IF OBJECT_ID('WORK.NS_Spreads','U') IS NOT NULL DROP TABLE WORK.NS_Spreads;
-CREATE TABLE WORK.NS_Spreads(
-  TSEGMENTNAME nvarchar(40) PRIMARY KEY,
-  spread       decimal(9,4) NOT NULL
-);
-
-DECLARE @Spread_DChbo  decimal(9,4),
-        @Spread_Retail decimal(9,4);
-
-;WITH aug AS (
-    SELECT TSEGMENTNAME,
-           w_rate = SUM(out_rub*rate_anchor)/SUM(out_rub)
-    FROM   #bal_prom
-    WHERE  dt_open BETWEEN '2025-08-01' AND '2025-08-31'
-    GROUP  BY TSEGMENTNAME
-)
-SELECT
-    @Spread_DChbo   = MAX(CASE WHEN TSEGMENTNAME=N'ДЧБО'             THEN w_rate END) - @KeyAtAnchor,
-    @Spread_Retail  = MAX(CASE WHEN TSEGMENTNAME=N'Розничный бизнес' THEN w_rate END) - @KeyAtAnchor;
-
-INSERT WORK.NS_Spreads VALUES
-       (N'ДЧБО',            @Spread_DChbo),
-       (N'Розничный бизнес',@Spread_Retail);
-
-/* ── 3) Циклы (base_day = EOM(next), promo_end = base_day-1) ── */
-IF OBJECT_ID('tempdb..#cycles') IS NOT NULL DROP TABLE #cycles;
-;WITH seed AS (
+    ;WITH src AS (
+        SELECT
+              t.dt_rep,
+              t.dt_open,
+              t.con_id,
+              CAST(t.out_rub   AS decimal(20,2)) AS out_rub,
+              CAST(t.rate_con  AS decimal(9,4))  AS rate_balance,
+              t.rate_con_src,
+              CASE WHEN t.dt_open = t.dt_rep
+                   THEN DATEADD(day,1,t.dt_rep)      -- ULTRA «нулевой» день → +1
+                   ELSE t.dt_rep
+              END AS eff_dt
+        FROM   alm.ALM.vw_balance_rest_all AS t
+        WHERE  t.dt_rep BETWEEN @DateFromWide AND @DateToWide
+          AND  t.section_name = N'Накопительный счёт'
+          AND  t.block_name   = N'Привлечение ФЛ'
+          AND  t.od_flag      = 1
+          AND  t.cur          = '810'
+          AND  t.out_rub IS NOT NULL           -- ⚠️ важно для совпадения объёмов
+    )
     SELECT
-        b.con_id, b.cli_id, b.TSEGMENTNAME, b.out_rub,
-        CAST(0 AS int) AS cycle_no,
-        b.dt_open AS win_start,
-        EOMONTH(DATEADD(month,1, b.dt_open))                   AS base_day,   -- последний день
-        DATEADD(day,-1, EOMONTH(DATEADD(month,1, b.dt_open)))  AS promo_end   -- предпоследний
-    FROM #bal_prom b
-),
-seq AS (
-    SELECT * FROM seed
-    UNION ALL
-    SELECT
-        s.con_id, s.cli_id, s.TSEGMENTNAME, s.out_rub,
-        s.cycle_no + 1,
-        DATEADD(day,1, s.base_day) AS win_start,               -- 1-е след. месяца
-        EOMONTH(DATEADD(month,1, DATEADD(day,1, s.base_day))) AS base_day,
-        DATEADD(day,-1, EOMONTH(DATEADD(month,1, DATEADD(day,1, s.base_day)))) AS promo_end
-    FROM seq s
-    WHERE DATEADD(day,1, s.base_day) <= @HorizonTo
-)
-SELECT * INTO #cycles FROM seq OPTION (MAXRECURSION 0);
+          s.dt_rep,
+          s.dt_open,
+          s.con_id,
+          s.out_rub,
+          s.rate_balance,
+          s.rate_con_src,
+          dcr.rate AS rate_liq
+    INTO   #bal
+    FROM   src s
+    OUTER APPLY (
+        SELECT TOP (1) r.rate
+        FROM LIQUIDITY.liq.DepositContract_Rate r
+        WHERE r.con_id = s.con_id
+          AND s.eff_dt BETWEEN r.dt_from AND r.dt_to
+        ORDER BY r.dt_from DESC, r.dt_to DESC
+    ) dcr;
 
-/* ── 4) Дневная лента без 1-х чисел (promo + base-day) ──────── */
-IF OBJECT_ID('tempdb..#daily_pre') IS NOT NULL DROP TABLE #daily_pre;
-SELECT
-    c.con_id, c.cli_id, c.TSEGMENTNAME, c.out_rub,
-    c.cycle_no, c.win_start, c.promo_end, c.base_day,
-    d.d AS dt_rep,
-    CASE
-      WHEN d.d <= c.promo_end THEN
-           CASE WHEN c.cycle_no = 0
-                THEN bp.rate_anchor
-                ELSE (CASE c.TSEGMENTNAME
-                        WHEN N'ДЧБО'             THEN @Spread_DChbo  + k_open.KEY_RATE
-                        ELSE                           @Spread_Retail+ k_open.KEY_RATE
-                     END)
-           END
-      WHEN d.d = c.base_day THEN @BaseRate
-    END AS rate_con
-INTO   #daily_pre
-FROM   #cycles c
-JOIN   #cal d
-       ON d.d BETWEEN c.win_start AND c.base_day
-LEFT   JOIN #key k_open
-       ON k_open.DT_REP = c.win_start
-JOIN   #bal_prom bp
-       ON bp.con_id = c.con_id
-WHERE  DAY(d.d) <> 1;   -- 1-е числа делаем отдельно
+    CREATE CLUSTERED INDEX IX_bal ON #bal (con_id, dt_rep);
 
-/* ── 5) BASE-DAY HALF-SHIFT: 50% с «базы» → к счёту с max ставкой ─ */
-IF OBJECT_ID('tempdb..#base_dates') IS NOT NULL DROP TABLE #base_dates;
-SELECT DISTINCT dp.cli_id, dp.dt_rep
-INTO   #base_dates
-FROM   #daily_pre dp
-JOIN   #cycles c ON c.con_id=dp.con_id AND c.cycle_no=dp.cycle_no
-WHERE  dp.dt_rep = c.base_day;
+    /* --------------------------------------------------------------
+       3) rate_pos (+1/+2 день) и выбор rate_use по правилам
+    ----------------------------------------------------------------*/
+    ;WITH bal_pos AS (
+        SELECT *,
+               /* первая положительная ставка ULTRA на +1 / +2 день */
+               MIN(CASE WHEN rate_balance > 0
+                         AND rate_con_src = N'счет ультра,вручную'
+                        THEN rate_balance END)
+                   OVER (PARTITION BY con_id
+                         ORDER BY dt_rep
+                         ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) AS rate_pos
+        FROM   #bal
+        WHERE  dt_rep BETWEEN @DateFrom AND @DateTo
+    ),
+    rate_calc AS (
+        SELECT *,
+               CAST(
+               CASE
+                 /* r IS NULL */
+                 WHEN rate_liq IS NULL
+                      THEN CASE
+                               WHEN rate_balance < 0
+                                    THEN COALESCE(rate_pos, rate_balance)
+                               ELSE rate_balance
+                           END
 
-IF OBJECT_ID('tempdb..#daily_base_adj') IS NOT NULL DROP TABLE #daily_base_adj;
-;WITH base_pool AS (
-    SELECT dp.*,
-           is_base = CASE WHEN dp.dt_rep = c.base_day THEN 1 ELSE 0 END
-    FROM   #daily_pre dp
-    JOIN   #base_dates bd ON bd.cli_id=dp.cli_id AND bd.dt_rep=dp.dt_rep
-    LEFT  JOIN #cycles c  ON c.con_id=dp.con_id AND c.cycle_no=dp.cycle_no
-),
-halves AS (
-    SELECT cli_id, dt_rep, con_id, TSEGMENTNAME, rate_con,
-           out_half = CASE WHEN is_base=1 THEN ROUND(out_rub*0.5,2) ELSE CAST(0.00 AS decimal(20,2)) END,
-           is_base
-    FROM base_pool
-),
-shift AS (
-    SELECT cli_id, dt_rep, SUM(out_half) AS shift_amt
-    FROM halves
-    GROUP BY cli_id, dt_rep
-),
-ranked AS (
-    SELECT bp.*,
-           ROW_NUMBER() OVER (PARTITION BY bp.cli_id, bp.dt_rep
-                              ORDER BY bp.rate_con DESC, bp.TSEGMENTNAME, bp.con_id) AS rn
-    FROM   base_pool bp
-)
-SELECT
-    r.con_id,
-    r.cli_id,
-    r.TSEGMENTNAME,
-    out_rub =
-        CASE
-          WHEN r.rn=1 AND r.is_base=1 THEN ROUND(r.out_rub*0.5,2) + s.shift_amt
-          WHEN r.rn=1 AND r.is_base=0 THEN r.out_rub + s.shift_amt
-          WHEN r.is_base=1                  THEN ROUND(r.out_rub*0.5,2)
-          ELSE                                   r.out_rub
-        END,
-    r.dt_rep,
-    r.rate_con
-INTO   #daily_base_adj
-FROM   ranked r
-JOIN   shift  s ON s.cli_id=r.cli_id AND s.dt_rep=r.dt_rep;
+                 /* (1) r<0 , t>0 */
+                 WHEN rate_liq < 0  AND rate_balance > 0
+                      THEN rate_balance
 
-/* ── 6) Кандидаты на 1-е числа (внутри окна и новое окно) ──── */
-IF OBJECT_ID('tempdb..#day1_candidates') IS NOT NULL DROP TABLE #day1_candidates;
-;WITH marks AS (
-    SELECT
-      c.con_id, c.cli_id, c.TSEGMENTNAME, c.out_rub, c.cycle_no, c.win_start, c.promo_end, c.base_day,
-      DATEFROMPARTS(YEAR(DATEADD(month,1,c.win_start)), MONTH(DATEADD(month,1,c.win_start)), 1) AS m1_in,
-      DATEADD(day,1,c.base_day) AS m1_new
-    FROM #cycles c
-),
-cand AS (
-    /* 1-е внутри текущего окна — ставка фикс цикла */
-    SELECT
-        m.con_id, m.cli_id, m.TSEGMENTNAME, m.out_rub, m.cycle_no,
-        dt_rep = m.m1_in,
-        rate_con =
-            CASE WHEN m.cycle_no=0
-                 THEN bp.rate_anchor
-                 ELSE (CASE m.TSEGMENTNAME
-                        WHEN N'ДЧБО'             THEN @Spread_DChbo  + k_open.KEY_RATE
-                        ELSE                           @Spread_Retail+ k_open.KEY_RATE
-                      END)
-            END
-    FROM marks m
-    JOIN #bal_prom bp ON bp.con_id = m.con_id
-    LEFT JOIN #key k_open ON k_open.DT_REP = m.win_start
-    WHERE m.m1_in BETWEEN m.win_start AND m.promo_end
-      AND m.m1_in BETWEEN @Anchor AND @HorizonTo
+                 /* (2) r<0 , t<0 */
+                 WHEN rate_liq < 0  AND rate_balance < 0
+                      THEN COALESCE(rate_pos, rate_balance)
 
-    UNION ALL
+                 /* (3) r≥0 , t≥0 */
+                 WHEN rate_liq >= 0 AND rate_balance >= 0
+                      THEN rate_liq
 
-    /* 1-е нового окна — новая promo: KEY(1-е)+spread */
-    SELECT
-        m.con_id, m.cli_id, m.TSEGMENTNAME, m.out_rub, m.cycle_no + 1 AS cycle_no,
-        dt_rep = m.m1_new,
-        rate_con =
-            CASE m.TSEGMENTNAME
-              WHEN N'ДЧБО'             THEN @Spread_DChbo  + k_new.KEY_RATE
-              ELSE                           @Spread_Retail+ k_new.KEY_RATE
-            END
-    FROM marks m
-    LEFT JOIN #key k_new ON k_new.DT_REP = m.m1_new
-    WHERE m.m1_new BETWEEN @Anchor AND @HorizonTo
-)
-SELECT * INTO #day1_candidates FROM cand;
+                 /* (4) r>0 , t<0 */
+                 WHEN rate_liq > 0  AND rate_balance < 0
+                      THEN rate_liq
 
-/* Σ-объём клиента на Anchor — для 1-х чисел (полный перелив) ─ */
-IF OBJECT_ID('tempdb..#cli_sum') IS NOT NULL DROP TABLE #cli_sum;
-SELECT cli_id, SUM(out_rub) AS out_rub_sum
-INTO   #cli_sum
-FROM   #bal_prom
-GROUP  BY cli_id;
+                 ELSE rate_liq
+               END AS decimal(9,4)) AS rate_use
+        FROM bal_pos
+    ),
 
-/* ── 7) Перелив 1-го числа: max ставка, кладём Σ клиента ───── */
-IF OBJECT_ID('tempdb..#firstday_assigned') IS NOT NULL DROP TABLE #firstday_assigned;
-;WITH ranked AS (
-    SELECT
-        c.*,
-        ROW_NUMBER() OVER (PARTITION BY c.cli_id, c.dt_rep
-                           ORDER BY c.rate_con DESC, c.TSEGMENTNAME, c.con_id) AS rn
-    FROM #day1_candidates c
-)
-SELECT
-    con_id        = MAX(CASE WHEN rn=1 THEN con_id END),
-    r.cli_id,
-    TSEGMENTNAME  = MAX(CASE WHEN rn=1 THEN TSEGMENTNAME END),
-    out_rub       = cs.out_rub_sum,        -- весь promo-объём клиента
-    r.dt_rep,
-    rate_con      = MAX(CASE WHEN rn=1 THEN rate_con END)
-INTO   #firstday_assigned
-FROM   ranked r
-JOIN   #cli_sum cs ON cs.cli_id = r.cli_id
-GROUP  BY r.cli_id, r.dt_rep, cs.out_rub_sum;
+    /* --------------------------------------------------------------
+       4) Агрегаты: «портфель» и «новые»
+    ----------------------------------------------------------------*/
+    aggr_all AS (
+        SELECT dt_rep,
+               SUM(out_rub)                                AS out_rub_total,
+               NULL                                        AS term_day,
+               SUM(rate_use * out_rub) / NULLIF(SUM(out_rub),0) AS rate_con
+        FROM rate_calc
+        GROUP BY dt_rep
+    ),
+    aggr_new AS (
+        SELECT dt_rep,
+               SUM(out_rub)                                AS out_rub_total,
+               NULL                                        AS term_day,
+               SUM(rate_use * out_rub) / NULLIF(SUM(out_rub),0) AS rate_con
+        FROM rate_calc
+        WHERE dt_open = dt_rep
+        GROUP BY dt_rep
+    ),
 
-/* ── 8) Финальная promo-лента (без дублей) ─────────────────── */
-IF OBJECT_ID('WORK.Forecast_NS_Promo','U') IS NOT NULL DROP TABLE WORK.Forecast_NS_Promo;
+    /* каркас всех дат и скоупов, чтобы гарантированно иметь 2 строки на день */
+    cal AS (
+        SELECT TOP (DATEDIFF(day,@DateFrom,@DateTo)+1)
+               DATEADD(day,ROW_NUMBER() OVER (ORDER BY (SELECT 0))-1,@DateFrom) AS dt_rep
+        FROM master..spt_values
+    ),
+    scopes AS (SELECT 'портфель' AS data_scope UNION ALL SELECT 'новые'),
+    frame  AS (SELECT c.dt_rep, s.data_scope FROM cal c CROSS JOIN scopes s),
 
-SELECT
-    dt_rep,
-    out_rub_total = SUM(out_rub),
-    rate_avg      = SUM(out_rub * rate_con) / NULLIF(SUM(out_rub),0)
-INTO WORK.Forecast_NS_Promo
-FROM (
-    /* дни КРОМЕ 1-х и base-day — их заменим */
-    SELECT dp.con_id, dp.cli_id, dp.TSEGMENTNAME, dp.out_rub, dp.dt_rep, dp.rate_con
-    FROM   #daily_pre dp
-    WHERE  NOT EXISTS (SELECT 1 FROM #base_dates bd WHERE bd.cli_id=dp.cli_id AND bd.dt_rep=dp.dt_rep)
+    src_merge AS (
+        SELECT
+              f.dt_rep,
+              f.data_scope,
+              CASE WHEN f.data_scope = 'портфель' THEN a.out_rub_total ELSE n.out_rub_total END AS out_rub_total,
+              NULL                                        AS term_day,
+              CASE WHEN f.data_scope = 'портфель' THEN a.rate_con      ELSE n.rate_con      END AS rate_con
+        FROM frame f
+        LEFT JOIN aggr_all a ON a.dt_rep = f.dt_rep AND f.data_scope = 'портфель'
+        LEFT JOIN aggr_new n ON n.dt_rep = f.dt_rep AND f.data_scope = 'новые'
+    )
 
-    UNION ALL
-    /* base-day — скорректированные (half-shift) */
-    SELECT con_id, cli_id, TSEGMENTNAME, out_rub, dt_rep, rate_con
-    FROM   #daily_base_adj
+    /* --------------------------------------------------------------
+       5) MERGE в целевую таблицу
+    ----------------------------------------------------------------*/
+    MERGE mail.balance_metrics_savings AS tgt
+    USING src_merge                   AS src
+      ON  tgt.dt_rep     = src.dt_rep
+      AND tgt.data_scope = src.data_scope
+    WHEN MATCHED THEN
+        UPDATE SET tgt.out_rub_total = src.out_rub_total,
+                   tgt.rate_con      = src.rate_con,
+                   tgt.load_dttm     = SYSUTCDATETIME()
+    WHEN NOT MATCHED BY TARGET THEN
+        INSERT (dt_rep, data_scope, out_rub_total, term_day, rate_con)
+        VALUES (src.dt_rep, src.data_scope, src.out_rub_total,
+                src.term_day, src.rate_con);
 
-    UNION ALL
-    /* 1-е числа — полный перелив (одна строка на клиента) */
-    SELECT con_id, cli_id, TSEGMENTNAME, out_rub, dt_rep, rate_con
-    FROM   #firstday_assigned
-) u
-GROUP BY dt_rep;
-
-/* ── 9) Контрольки ─────────────────────────────────────────── */
-PRINT N'=== spreads (Aug-25) ===';  SELECT * FROM WORK.NS_Spreads;
-PRINT N'=== sanity total (= @PromoTotal) ===';
-SELECT TOP (90) f.dt_rep, f.out_rub_total,
-       diff_vs_anchor = CAST(f.out_rub_total - @PromoTotal AS decimal(20,2))
-FROM WORK.Forecast_NS_Promo f ORDER BY f.dt_rep;
-
-PRINT N'=== window check: 2025-08-29 .. 2025-10-02 ===';
-SELECT dt_rep, out_rub_total, rate_avg
-FROM   WORK.Forecast_NS_Promo
-ORDER  BY dt_rep;
+END;
 GO
