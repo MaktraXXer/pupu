@@ -1,45 +1,73 @@
-/* ── 5b) BASE-DAY HALF-SHIFT: корректный перенос половинок и добавление победителю ─ */
-DROP TABLE IF EXISTS #daily_base_adj;
+/* ══════════════════════════════════════════════════════════════
+   NS-forecast — ЧАСТЬ 3 (сводка по бакетам + общий итог)
+   Берём агрегаты из Частей 1 и 2:
+     • WORK.Forecast_NS_Float    (FLOAT)
+     • WORK.Forecast_NS_FixBase  (FIX-base)
+     • WORK.Forecast_NS_Promo    (FIX-promo)
+   Создаём/перезаписываем:
+     • WORK.Forecast_NS_Buckets  — по бакетам (FLOAT/FIX_base/FIX_promo)
+     • WORK.Forecast_NS_All      — общий итог по всем НС
+   v.2025-08-10
+═══════════════════════════════════════════════════════════════*/
+USE ALM_TEST;
+GO
 
-WITH base_pool AS (   -- все строки клиента на base-day
-    SELECT
-        dp.*,
-        is_base = CASE WHEN dp.dt_rep = c.base_day THEN 1 ELSE 0 END
-    FROM   #daily_pre dp
-    JOIN   #base_dates bd ON bd.cli_id=dp.cli_id AND bd.dt_rep=dp.dt_rep
-    LEFT  JOIN #cycles c  ON c.con_id=dp.con_id AND c.cycle_no=dp.cycle_no
-),
-halves AS (           -- списываем половины С ОКРУГЛЕНИЕМ по каждой базовой строке
-    SELECT
-        cli_id, dt_rep, con_id, TSEGMENTNAME, rate_con,
-        out_half = CASE WHEN is_base=1 THEN ROUND(out_rub*0.5,2) ELSE CAST(0.00 AS decimal(20,2)) END,
-        is_base
-    FROM base_pool
-),
-shift AS (            -- ровно та сумма, что сняли (сумма округлённых половин)
-    SELECT cli_id, dt_rep, SUM(out_half) AS shift_amt
-    FROM halves
-    GROUP BY cli_id, dt_rep
-),
-ranked AS (           -- выбираем победителя по ставке
-    SELECT bp.*,
-           ROW_NUMBER() OVER (PARTITION BY bp.cli_id, bp.dt_rep
-                              ORDER BY bp.rate_con DESC, bp.TSEGMENTNAME, bp.con_id) AS rn
-    FROM   base_pool bp
-)
+/* ── 0. sanity: проверяем, что есть исходные агрегаты ───────── */
+IF OBJECT_ID('WORK.Forecast_NS_Float','U')    IS NULL
+BEGIN RAISERROR('Нет WORK.Forecast_NS_Float (Часть 1)', 16, 1); RETURN; END;
+
+IF OBJECT_ID('WORK.Forecast_NS_FixBase','U')  IS NULL
+BEGIN RAISERROR('Нет WORK.Forecast_NS_FixBase (Часть 1)', 16, 1); RETURN; END;
+
+IF OBJECT_ID('WORK.Forecast_NS_Promo','U')    IS NULL
+BEGIN RAISERROR('Нет WORK.Forecast_NS_Promo (Часть 2)', 16, 1); RETURN; END;
+
+/* ── 1. сводка по бакетам (FLOAT / FIX_base / FIX_promo) ───── */
+IF OBJECT_ID('WORK.Forecast_NS_Buckets','U') IS NOT NULL
+    TRUNCATE TABLE WORK.Forecast_NS_Buckets;
+ELSE
+    CREATE TABLE WORK.Forecast_NS_Buckets(
+        dt_rep        date         NOT NULL,
+        bucket        nvarchar(20) NOT NULL,  -- 'FLOAT' | 'FIX_base' | 'FIX_promo'
+        out_rub_total decimal(20,2) NOT NULL,
+        rate_avg      decimal(9,4)  NULL,
+        CONSTRAINT PK_Forecast_NS_Buckets PRIMARY KEY (dt_rep, bucket)
+    );
+
+INSERT WORK.Forecast_NS_Buckets (dt_rep, bucket, out_rub_total, rate_avg)
+SELECT dt_rep, N'FLOAT'    AS bucket, out_rub_total, rate_avg FROM WORK.Forecast_NS_Float
+UNION ALL
+SELECT dt_rep, N'FIX_base' AS bucket, out_rub_total, rate_avg FROM WORK.Forecast_NS_FixBase
+UNION ALL
+SELECT dt_rep, N'FIX_promo' AS bucket, out_rub_total, rate_avg FROM WORK.Forecast_NS_Promo;
+
+/* ── 2. общий итог по всем НС (взвешенное среднее ставки) ───── */
+IF OBJECT_ID('WORK.Forecast_NS_All','U') IS NOT NULL
+    TRUNCATE TABLE WORK.Forecast_NS_All;
+ELSE
+    CREATE TABLE WORK.Forecast_NS_All(
+        dt_rep        date         PRIMARY KEY,
+        out_rub_total decimal(20,2),
+        rate_avg      decimal(9,4)
+    );
+
+INSERT WORK.Forecast_NS_All (dt_rep, out_rub_total, rate_avg)
 SELECT
-    r.con_id,
-    r.cli_id,
-    r.TSEGMENTNAME,
-    out_rub =
-        CASE
-          WHEN r.rn=1 AND r.is_base=1 THEN ROUND(r.out_rub*0.5,2) + s.shift_amt  -- победитель-базовый: половина + перелив
-          WHEN r.rn=1 AND r.is_base=0 THEN r.out_rub + s.shift_amt               -- победитель-небазовый: исходный + перелив
-          WHEN r.is_base=1                  THEN ROUND(r.out_rub*0.5,2)          -- прочие базовые: оставляем половину
-          ELSE                                   r.out_rub                        -- остальным ничего не меняем
-        END,
-    r.dt_rep,
-    r.rate_con
-INTO   #daily_base_adj
-FROM   ranked r
-JOIN   shift  s ON s.cli_id=r.cli_id AND s.dt_rep=r.dt_rep;
+    b.dt_rep,
+    SUM(b.out_rub_total)                                              AS out_rub_total,
+    SUM(b.out_rub_total * ISNULL(b.rate_avg,0)) / NULLIF(SUM(b.out_rub_total),0) AS rate_avg
+FROM WORK.Forecast_NS_Buckets b
+GROUP BY b.dt_rep;
+
+/* ── 3. проверки/вывод ──────────────────────────────────────── */
+PRINT N'=== NS — сводка по бакетам (первые 45 строк) ===';
+SELECT TOP (45) * FROM WORK.Forecast_NS_Buckets ORDER BY dt_rep, bucket;
+
+PRINT N'=== NS — общий итог (первые 45 строк) ===';
+SELECT TOP (45) * FROM WORK.Forecast_NS_All ORDER BY dt_rep;
+
+-- Удобный срез по конкретному окну, если нужно:
+-- SELECT * FROM WORK.Forecast_NS_Buckets WHERE dt_rep BETWEEN '2025-08-25' AND '2025-09-05' ORDER BY dt_rep, bucket;
+-- SELECT * FROM WORK.Forecast_NS_All     WHERE dt_rep BETWEEN '2025-08-25' AND '2025-09-05' ORDER BY dt_rep;
+
+GO
