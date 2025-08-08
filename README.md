@@ -47,7 +47,6 @@ SELECT
     CAST(t.out_rub  AS decimal(20,2))        AS out_rub,
     CAST(t.rate_con AS decimal(9,4))         AS rate_balance,   -- ставка из баланса (t)
     t.rate_con_src,
-    CAST(COALESCE(t.is_floatrate,0) AS tinyint) AS is_floatrate,
     t.TSEGMENTNAME,
     CAST(r.rate    AS decimal(9,4))          AS rate_liq
 INTO #bal_src
@@ -66,7 +65,6 @@ WHERE  t.dt_rep BETWEEN DATEADD(day,-2,@Anchor) AND DATEADD(day,2,@Anchor)
 
 CREATE CLUSTERED INDEX IX_bal_src ON #bal_src (con_id, dt_rep);
 
--- подготовим приёмник #bal заранее (чтобы после CTE не вставлять DROP/IF)
 IF OBJECT_ID('tempdb..#bal') IS NOT NULL DROP TABLE #bal;
 
 ;WITH bal_pos AS (
@@ -103,7 +101,6 @@ rate_calc AS (
            END AS rate_use
     FROM bal_pos
 )
--- ВАЖНО: этот SELECT завершает CTE
 SELECT
     con_id,
     cli_id,
@@ -112,7 +109,6 @@ SELECT
     rate_con = CAST(rate_use AS decimal(9,4)),   -- унифицируем имя
     dt_open,
     dt_close,
-    is_floatrate,
     TSEGMENTNAME
 INTO #bal
 FROM rate_calc
@@ -153,7 +149,7 @@ SELECT  dt_rep,
 FROM   #FLOAT_daily
 GROUP  BY dt_rep;
 
-/* ───────────── 4-B) FIX-base daily (prod 654, dt_open < 2025-07-01, is_floatrate=0) ─────────────
+/* ───────────── 4-B) FIX-base daily (prod 654, dt_open < 2025-07-01) ─────────────
    ставка = rate_use(@Anchor) константой по горизонту
 */
 IF OBJECT_ID('tempdb..#FIX_base_daily') IS NOT NULL DROP TABLE #FIX_base_daily;
@@ -168,8 +164,7 @@ INTO    #FIX_base_daily
 FROM    #bal b
 JOIN    #cal c ON c.d BETWEEN b.dt_open AND ISNULL(b.dt_close,@HorizonTo)
 WHERE   b.prod_id = 654
-  AND   b.dt_open < '2025-07-01'
-  AND   b.is_floatrate = 0;
+  AND   b.dt_open < '2025-07-01';
 
 /* агрегат FIX-base */
 IF OBJECT_ID('WORK.Forecast_NS_FixBase','U') IS NOT NULL
