@@ -1,6 +1,6 @@
 /* ══════════════════════════════════════════════════════════════
    NS-forecast — Part 2 (FIX-promo-roll, prod_id = 654)
-   v.2025-08-09  —  numeric IDs, no dupes, two-month windows
+   v.2025-08-09 — без init_rate в рекурсии, без дублей
 ═══════════════════════════════════════════════════════════════*/
 USE ALM_TEST;
 GO
@@ -31,11 +31,11 @@ SELECT @KeyAnchor = KEY_RATE FROM #key WHERE DT_REP=@Anchor;
 /* ── 1) Снимок promo-портфеля (только июль–август-25) ───────── */
 DROP TABLE IF EXISTS #bal_prom;
 SELECT
-    CAST(t.con_id AS bigint)       AS con_id,
-    CAST(t.cli_id AS bigint)       AS cli_id,
-    CAST(t.out_rub AS decimal(20,2)) AS out_rub,
-    CAST(t.rate_con AS decimal(9,4)) AS rate_con,   -- ставка на @Anchor
-    CAST(t.dt_open AS date)        AS dt_open,
+    CAST(t.con_id AS bigint)          AS con_id,
+    CAST(t.cli_id AS bigint)          AS cli_id,
+    CAST(t.out_rub AS decimal(20,2))  AS out_rub,
+    CAST(t.rate_con AS decimal(9,4))  AS rate_open,    -- ставка на @Anchor (для cycle 0)
+    CAST(t.dt_open AS date)           AS dt_open,
     t.TSEGMENTNAME
 INTO #bal_prom
 FROM   ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
@@ -60,27 +60,25 @@ DECLARE @Spread_DChbo  decimal(9,4),
 
 ;WITH aug AS (
     SELECT TSEGMENTNAME,
-           w_rate = SUM(out_rub*rate_con)/SUM(out_rub)
+           w_rate = SUM(out_rub*rate_open)/SUM(out_rub)
     FROM   #bal_prom
     WHERE  dt_open BETWEEN '2025-08-01' AND '2025-08-31'
     GROUP  BY TSEGMENTNAME
 )
 SELECT
     @Spread_DChbo   = MAX(CASE WHEN TSEGMENTNAME=N'ДЧБО'            THEN w_rate END) - @KeyAnchor,
-    @Spread_Retail  = MAX(CASE WHEN TSEGMENTNAME=N'Розничный бизнес' THEN w_rate END) - @KeyAnchor
-FROM aug;
+    @Spread_Retail  = MAX(CASE WHEN TSEGMENTNAME=N'Розничный бизнес' THEN w_rate END) - @KeyAnchor;
 
 INSERT WORK.NS_Spreads VALUES
        (N'ДЧБО', @Spread_DChbo),
        (N'Розничный бизнес', @Spread_Retail);
 
-/* ── 3) Циклы promo: ровно «2 прожитых месяца» на клиента/счёт ─ */
+/* ── 3) Циклы promo: «2 прожитых месяца» на каждую запись ──── */
 DROP TABLE IF EXISTS #cycles;
 ;WITH seed AS (
     SELECT
         p.con_id, p.cli_id, p.TSEGMENTNAME, p.out_rub,
         CAST(0 AS int) AS cycle_no,
-        p.rate_con     AS init_rate,                    -- ставка текущего (нулевого) окна
         p.dt_open      AS win_start,
         DATEADD(day,-1, EOMONTH(DATEADD(month,1,p.dt_open))) AS win_end
     FROM #bal_prom p
@@ -91,7 +89,6 @@ seq AS (
     SELECT
         s.con_id, s.cli_id, s.TSEGMENTNAME, s.out_rub,
         s.cycle_no + 1,
-        CAST(NULL AS decimal(9,4)) AS init_rate,        -- для следующих окон не нужна
         DATEADD(day,1, s.win_end) AS win_start,
         DATEADD(day,-1, EOMONTH(DATEADD(month,1, DATEADD(day,1,s.win_end)))) AS win_end
     FROM seq s
@@ -102,10 +99,11 @@ INTO   #cycles
 FROM   seq
 OPTION (MAXRECURSION 0);
 
-/* ── 4) Дневная лента без «первых чисел» ──────────────────────
-      (внутри окна ставка фиксирована: init_rate для cycle_no=0,
-       либо KEY(win_start)+spread для следующих окон;
-       в день win_end — базовая)                                */
+/* ── 4) Дневная лента без 1-х чисел ───────────────────────────
+      d ∈ [win_start, win_end], внутри окна ставка фиксирована:
+        • для cycle 0 → rate_open (#bal_prom),
+        • для cycle ≥1 → KEY(win_start)+spread;
+      в день win_end → @BaseRate                                     */
 DROP TABLE IF EXISTS #daily_pre;
 
 SELECT
@@ -114,58 +112,57 @@ SELECT
     d.d AS dt_rep,
     CASE
       WHEN d.d < c.win_end THEN
-           CASE WHEN c.cycle_no=0
-                THEN c.init_rate
-                ELSE (s.spread + kw.KEY_RATE) END      -- KEY на старт окна
-      WHEN d.d = c.win_end THEN @BaseRate               -- базовый день
-      ELSE NULL                                         -- 1-е число обработаем отдельно
+         CASE WHEN c.cycle_no = 0
+              THEN bp.rate_open
+              ELSE (s.spread + kw.KEY_RATE) END
+      WHEN d.d = c.win_end THEN @BaseRate
     END AS rate_con
 INTO   #daily_pre
 FROM   #cycles c
 JOIN   #cal d
-       ON d.d BETWEEN c.win_start AND c.win_end         -- строго до win_end
+       ON d.d BETWEEN c.win_start AND c.win_end
 LEFT   JOIN #key kw
-       ON kw.DT_REP = c.win_start                       -- только для cycle_no>=1
+       ON kw.DT_REP = c.win_start       -- только для cycle>=1
 JOIN   WORK.NS_Spreads s
-       ON s.TSEGMENTNAME = c.TSEGMENTNAME;
+       ON s.TSEGMENTNAME = c.TSEGMENTNAME
+JOIN   #bal_prom bp
+       ON bp.con_id = c.con_id;
 
-/* ── 5) Кандидаты на 1-е число: все промо-счета клиента в этот день ─ */
+/* ── 5) Кандидаты на 1-е число (внутренние 1-е и старт новые) ─ */
 DROP TABLE IF EXISTS #day1_candidates;
 
 ;WITH day1 AS (
-    SELECT c.con_id, c.cli_id, c.TSEGMENTNAME, c.out_rub, c.cycle_no,
-           c.win_start, c.win_end,
-           DATEFROMPARTS(YEAR(d.d),MONTH(d.d),1) AS dt_rep
+    SELECT
+        c.con_id, c.cli_id, c.TSEGMENTNAME, c.out_rub, c.cycle_no,
+        c.win_start, c.win_end,
+        DATEFROMPARTS(YEAR(d.d),MONTH(d.d),1) AS dt_rep
     FROM   #cycles c
     JOIN   #cal d
-      ON   d.d BETWEEN c.win_start AND DATEADD(day,1,c.win_end) -- включая 1-е после окна
+      ON   d.d BETWEEN c.win_start AND DATEADD(day,1,c.win_end)
     WHERE  d.d = DATEFROMPARTS(YEAR(d.d),MONTH(d.d),1)
 )
 SELECT
     y.con_id, y.cli_id, y.TSEGMENTNAME, y.out_rub,
     y.cycle_no, y.win_start, y.win_end,
     y.dt_rep,
-    /* ставка на 1-е число:
-       если 1-е попадает как продолжение окна → KEY(win_start)+spread (либо init_rate для cycle_no=0),
-       если 1-е = старт нового окна → KEY(1-е)+spread                                  */
     CASE
+      /* 1-е число внутри текущего окна */
       WHEN y.dt_rep > y.win_start AND y.dt_rep <= y.win_end
            THEN CASE WHEN y.cycle_no=0
-                     THEN c0.init_rate
-                     ELSE (s.spread + kw.KEY_RATE) END        -- mid-window на 1-е
+                     THEN bp.rate_open
+                     ELSE (s.spread + kw.KEY_RATE) END
+      /* 1-е число — старт нового окна (после базового дня) */
       WHEN y.dt_rep = DATEADD(day,1,y.win_end)
-           THEN (s.spread + k1.KEY_RATE)                      -- старт нового окна
-      ELSE NULL
+           THEN (s.spread + k1.KEY_RATE)
     END AS rate_con
 INTO   #day1_candidates
 FROM   day1 y
-LEFT   JOIN (SELECT con_id, init_rate FROM #cycles WHERE cycle_no=0) c0
-       ON c0.con_id = y.con_id
-LEFT   JOIN #key kw  ON kw.DT_REP = y.win_start
-LEFT   JOIN #key k1  ON k1.DT_REP = y.dt_rep
+JOIN   #bal_prom bp ON bp.con_id = y.con_id
+LEFT   JOIN #key kw ON kw.DT_REP = y.win_start
+LEFT   JOIN #key k1 ON k1.DT_REP = y.dt_rep
 JOIN   WORK.NS_Spreads s ON s.TSEGMENTNAME = y.TSEGMENTNAME;
 
-/* ── 6) Перелив 1-го числа: кладём весь promo-объём клиента на max ставку ─ */
+/* ── 6) Перелив 1-го числа: весь promo-объём клиента на max ставку ─ */
 DROP TABLE IF EXISTS #day1_glue;
 
 ;WITH ranked AS (
@@ -178,29 +175,29 @@ SELECT
     CAST(NULL AS bigint)              AS con_id,
     r.cli_id,
     CAST(MAX(CASE WHEN rn=1 THEN TSEGMENTNAME END) AS nvarchar(40)) AS TSEGMENTNAME,
-    SUM(r.out_rub) AS out_rub,        -- весь promo-объём клиента
+    SUM(r.out_rub) AS out_rub,        -- суммарно по клиенту
     r.dt_rep,
-    MAX(r.rate_con) AS rate_con       -- максимальная ставка среди доступных счётов
+    MAX(r.rate_con) AS rate_con
 INTO   #day1_glue
 FROM   ranked r
 GROUP  BY r.cli_id, r.dt_rep;
 
-/* ── 7) Финальная лента promo и агрегат по дням ─────────────── */
+/* ── 7) Финальная promo-лента и агрегат по дням ─────────────── */
 DROP TABLE IF EXISTS WORK.Forecast_NS_Promo;
 
 SELECT dt_rep,
-       SUM(out_rub)                                         AS out_rub_total,
-       SUM(out_rub*rate_con)/NULLIF(SUM(out_rub),0)         AS rate_avg
+       SUM(out_rub)                                 AS out_rub_total,
+       SUM(out_rub*rate_con)/NULLIF(SUM(out_rub),0) AS rate_avg
 INTO   WORK.Forecast_NS_Promo
 FROM (
-      /* все дни, кроме 1-х чисел — живём на собственных окнах без переливов */
+      /* все дни, кроме 1-х чисел */
       SELECT con_id,cli_id,TSEGMENTNAME,out_rub,dt_rep,rate_con
       FROM   #daily_pre
       WHERE  dt_rep <> DATEFROMPARTS(YEAR(dt_rep),MONTH(dt_rep),1)
 
       UNION ALL
 
-      /* 1-е числа — одна строка на клиента с max-ставкой */
+      /* 1-е числа — одна строка на клиента */
       SELECT con_id,cli_id,TSEGMENTNAME,out_rub,dt_rep,rate_con
       FROM   #day1_glue
 ) x
