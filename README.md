@@ -5,7 +5,7 @@ DECLARE @DateFrom date = '2025-01-01';
 DECLARE @DateTo   date = CAST(GETDATE() AS date);
 
 ------------------------------------------------------------
--- 1) Баланс → #src  (prod_id=654, «портфель»)
+-- 1) Баланс (prod_id=654) → #src
 ------------------------------------------------------------
 IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
 
@@ -15,8 +15,7 @@ SELECT
     t.con_id,
     CAST(t.out_rub  AS decimal(20,2)) AS out_rub,
     CAST(t.rate_con AS decimal(9,6))  AS rate_balance,
-    t.rate_con_src,
-    -- для "возраста" по месяцам:
+    -- для месячных флагов:
     DATEFROMPARTS(YEAR(t.dt_rep),  MONTH(t.dt_rep),  1) AS rep_month,
     DATEFROMPARTS(YEAR(t.dt_open), MONTH(t.dt_open), 1) AS open_month,
     CASE WHEN t.dt_open = t.dt_rep THEN DATEADD(day,1,t.dt_rep) ELSE t.dt_rep END AS eff_dt
@@ -33,7 +32,7 @@ WHERE t.dt_rep BETWEEN @DateFrom AND @DateTo
 CREATE CLUSTERED INDEX IX_src ON #src(con_id, dt_rep);
 
 ------------------------------------------------------------
--- 2) Ужимаем LIQUIDITY → #dcr_small
+-- 2) Ужимаем LIQUIDITY до нужных договоров → #dcr_small
 ------------------------------------------------------------
 IF OBJECT_ID('tempdb..#con') IS NOT NULL DROP TABLE #con;
 SELECT DISTINCT con_id INTO #con FROM #src;
@@ -49,12 +48,12 @@ CREATE NONCLUSTERED INDEX IX_dcr_small_seek
 ON #dcr_small(con_id, dt_from DESC) INCLUDE (dt_to, rate);
 
 ------------------------------------------------------------
--- 3) Договорная ставка на дату (cover-first / fallback одним APPLY) → #bal
+-- 3) Договорная ставка: покрывающая eff_dt, иначе последняя до eff_dt → #bal
 ------------------------------------------------------------
 IF OBJECT_ID('tempdb..#bal') IS NOT NULL DROP TABLE #bal;
 
 SELECT
-    s.dt_rep, s.dt_open, s.con_id, s.out_rub, s.rate_balance, s.rate_con_src,
+    s.dt_rep, s.dt_open, s.con_id, s.out_rub, s.rate_balance,
     s.rep_month, s.open_month,
     DATEDIFF(MONTH, s.open_month, s.rep_month) AS age_months,  -- 0/1/2/3+
     pick.rate AS rate_liq
@@ -66,7 +65,7 @@ OUTER APPLY (
     WHERE d.con_id = s.con_id
       AND d.dt_from <= s.eff_dt
     ORDER BY
-      CASE WHEN (d.dt_to IS NULL OR d.dt_to >= s.eff_dt) THEN 0 ELSE 1 END,
+      CASE WHEN (d.dt_to IS NULL OR d.dt_to >= s.eff_dt) THEN 0 ELSE 1 END, -- покрывающая сначала
       d.dt_from DESC,
       ISNULL(d.dt_to,'9999-12-31')
 ) AS pick;
@@ -74,63 +73,39 @@ OUTER APPLY (
 CREATE CLUSTERED INDEX IX_bal ON #bal(con_id, dt_rep);
 
 ------------------------------------------------------------
--- 4) rate_use + флаги возраста и ПРОМО → #rc
+-- 4) Итоговые флаги + rate_use (без «ультра») → #rc
 ------------------------------------------------------------
 IF OBJECT_ID('tempdb..#rc') IS NOT NULL DROP TABLE #rc;
 
-;WITH bal_pos AS (
-    SELECT  b.*,
-            MIN(CASE WHEN b.rate_balance > 0
-                      AND b.rate_con_src = N'счет ультра,вручную'
-                     THEN b.rate_balance END)
-                OVER (PARTITION BY b.con_id
-                      ORDER BY b.dt_rep
-                      ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) AS rate_pos
-    FROM #bal b
-)
 SELECT
-    bp.dt_rep,
-    bp.dt_open,
-    bp.con_id,
-    bp.out_rub,
-    bp.rate_balance,
-    bp.rate_con_src,
-    bp.age_months,
+    b.dt_rep,
+    b.dt_open,
+    b.con_id,
+    b.out_rub,
+    -- простое правило ставки:
+    CAST(COALESCE(b.rate_liq, b.rate_balance) AS decimal(9,6)) AS rate_use,
+    -- возрастные флаги:
+    b.age_months,
     CASE
-      WHEN bp.age_months = 0 THEN N'M0'
-      WHEN bp.age_months = 1 THEN N'M-1'
-      WHEN bp.age_months = 2 THEN N'M-2'
-      WHEN bp.age_months >= 3 THEN N'older'
+      WHEN b.age_months = 0 THEN N'M0'
+      WHEN b.age_months = 1 THEN N'M-1'
+      WHEN b.age_months = 2 THEN N'M-2'
+      WHEN b.age_months >= 3 THEN N'older'
       ELSE N'unknown'
     END AS age_bucket,
-    -- итоговая ставка:
-    CAST(
-        CASE
-          WHEN bp.rate_liq IS NULL THEN
-               CASE WHEN bp.rate_balance < 0
-                        THEN COALESCE(bp.rate_pos, bp.rate_balance)
-                    ELSE bp.rate_balance
-               END
-          WHEN bp.rate_liq < 0  AND bp.rate_balance > 0 THEN bp.rate_balance
-          WHEN bp.rate_liq < 0  AND bp.rate_balance < 0 THEN COALESCE(bp.rate_pos, bp.rate_balance)
-          WHEN bp.rate_liq >= 0 AND bp.rate_balance >= 0 THEN bp.rate_liq
-          WHEN bp.rate_liq > 0  AND bp.rate_balance  < 0 THEN bp.rate_liq
-          ELSE bp.rate_liq
-        END AS decimal(9,6)
-    ) AS rate_use,
-    -- промо-правило: по месяцу открытия
+    -- PROMO: по месяцу открытия и возрасту
     CASE
-      WHEN bp.dt_open <  '2025-07-01' AND bp.age_months <= 2 THEN N'promo'     -- 3 месяца: 0,1,2
-      WHEN bp.dt_open >= '2025-07-01' AND bp.age_months <= 1 THEN N'promo'     -- 2 месяца: 0,1
+      WHEN b.dt_open <  '2025-07-01' AND b.age_months <= 2 THEN N'promo'     -- 3 мес: 0,1,2
+      WHEN b.dt_open >= '2025-07-01' AND b.age_months <= 1 THEN N'promo'     -- 2 мес: 0,1
       ELSE N'non_promo'
     END AS promo_flag
 INTO #rc
-FROM bal_pos bp;
+FROM #bal b;
 
 CREATE NONCLUSTERED INDEX IX_rc_dt ON #rc(dt_rep, age_bucket, promo_flag) INCLUDE(out_rub, rate_use);
 
 ------------------------------------------------------------
--- 5) ПАНЕЛЬ 1: весь портфель (день → объём, средняя ставка)
+-- A) ПАНЕЛЬ «портфель» (день → объём, средняя ставка)
 ------------------------------------------------------------
 SELECT
     r.dt_rep,
@@ -146,27 +121,11 @@ GROUP BY r.dt_rep
 ORDER BY r.dt_rep;
 
 ------------------------------------------------------------
--- 6) ПАНЕЛЬ 2: по возрастным флагам (M0 / M-1 / M-2 / older)
+-- B) ПАНЕЛЬ «день × возраст × промо»
 ------------------------------------------------------------
 SELECT
     r.dt_rep,
     r.age_bucket,
-    SUM(r.out_rub) AS out_rub_total,
-    SUM(CASE WHEN r.rate_use IS NOT NULL THEN r.out_rub END) AS out_rub_with_rate,
-    CAST(
-      SUM(CASE WHEN r.rate_use IS NOT NULL THEN r.rate_use * r.out_rub END)
-      / NULLIF(SUM(CASE WHEN r.rate_use IS NOT NULL THEN r.out_rub END),0)
-      AS decimal(9,6)
-    ) AS rate_con
-FROM #rc r
-GROUP BY r.dt_rep, r.age_bucket
-ORDER BY r.dt_rep, r.age_bucket;
-
-------------------------------------------------------------
--- 7) ПАНЕЛЬ 3: по PROMO / NON_PROMO
-------------------------------------------------------------
-SELECT
-    r.dt_rep,
     r.promo_flag,
     SUM(r.out_rub) AS out_rub_total,
     SUM(CASE WHEN r.rate_use IS NOT NULL THEN r.out_rub END) AS out_rub_with_rate,
@@ -176,5 +135,5 @@ SELECT
       AS decimal(9,6)
     ) AS rate_con
 FROM #rc r
-GROUP BY r.dt_rep, r.promo_flag
-ORDER BY r.dt_rep, r.promo_flag;
+GROUP BY r.dt_rep, r.age_bucket, r.promo_flag
+ORDER BY r.dt_rep, r.age_bucket, r.promo_flag;
