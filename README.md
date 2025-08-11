@@ -4,16 +4,13 @@ SET NOCOUNT ON;
 DECLARE @DateFrom date = '2025-01-01';
 DECLARE @DateTo   date = CAST(GETDATE() AS date);
 
--- Если у вас ставки (и key rate, и договорные) уже в процентах, оставьте @scale_* = 1.
--- Если в долях (0.105), поставьте 100.
-DECLARE @scale_key  decimal(6,2) = 1;     -- 1 или 100
-DECLARE @scale_liq  decimal(6,2) = 1;     -- 1 или 100
-
--- Допуск сравнения в процентных пунктах после масштабирования:
-DECLARE @eps_pp decimal(9,4) = 0.01;      -- 0.01 п.п.
+-- шкалы: 1 если % хранятся как 10.5; 100 если как 0.105
+DECLARE @scale_key  decimal(6,2) = 1;
+DECLARE @scale_liq  decimal(6,2) = 1;
+DECLARE @eps_pp     decimal(9,4) = 0.01;   -- допуск в п.п.
 
 ------------------------------------------------------------
--- 1) Снимок из баланса (ТОЛЬКО нужный диапазон) → #src
+-- 1) Снимок из баланса → #src
 ------------------------------------------------------------
 IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
 
@@ -35,12 +32,10 @@ WHERE t.dt_rep BETWEEN @DateFrom AND @DateTo
   AND t.prod_id      = '3103'
   AND t.out_rub IS NOT NULL;
 
--- Кластерный индекс помогает всем последующим оконным и APPLY
 CREATE CLUSTERED INDEX IX_src ON #src(con_id, dt_rep);
 
 ------------------------------------------------------------
--- 2) Предфильтруем LIQUIDITY по набору con_id → #dcr_small
---    Это резко режет объём сканов по большой таблице DCR
+-- 2) Урезаем LIQUIDITY по набору con_id → #dcr_small
 ------------------------------------------------------------
 IF OBJECT_ID('tempdb..#con') IS NOT NULL DROP TABLE #con;
 SELECT DISTINCT s.con_id INTO #con FROM #src s;
@@ -51,21 +46,25 @@ SELECT r.con_id, r.dt_from, r.dt_to, r.rate
 INTO #dcr_small
 FROM LIQUIDITY.liq.DepositContract_Rate r WITH (NOLOCK)
 JOIN #con c ON c.con_id = r.con_id;
-/* Индекс под поиск «последний до даты / покрывающий дату»: */
+
 CREATE NONCLUSTERED INDEX IX_dcr_small_seek
 ON #dcr_small(con_id, dt_from DESC)
 INCLUDE (dt_to, rate);
 
 ------------------------------------------------------------
--- 3) Присоединяем договорную ставку (rate_liq) к #src → #bal
---    Ищем запись, которая покрывает eff_dt; если нет — берём
---    последнюю до eff_dt. Всё через один APPLY, который SEEK-ится.
+-- 3) Присоединяем договорную: cover (покрывает eff_dt) или fallback
+--    → #bal (БЕЗ последующих UPDATE; rate_liq берём через COALESCE)
 ------------------------------------------------------------
 IF OBJECT_ID('tempdb..#bal') IS NOT NULL DROP TABLE #bal;
 
 SELECT
-    s.dt_rep, s.dt_open, s.con_id, s.out_rub, s.rate_balance, s.rate_con_src,
-    da.rate AS rate_liq
+    s.dt_rep,
+    s.dt_open,
+    s.con_id,
+    s.out_rub,
+    s.rate_balance,
+    s.rate_con_src,
+    COALESCE(cover.rate, fallback.rate) AS rate_liq
 INTO #bal
 FROM #src s
 OUTER APPLY (
@@ -75,46 +74,20 @@ OUTER APPLY (
       AND d.dt_from <= s.eff_dt
       AND (d.dt_to IS NULL OR d.dt_to >= s.eff_dt)
     ORDER BY d.dt_from DESC, ISNULL(d.dt_to,'9999-12-31')
-) da
+) AS cover
 OUTER APPLY (
-    -- Фоллбэк: если покрывающей нет, берём последнюю до eff_dt
     SELECT TOP (1) d.rate
     FROM #dcr_small d
-    WHERE da.rate IS NULL             -- фоллбэк нужен
+    WHERE cover.rate IS NULL
       AND d.con_id = s.con_id
       AND d.dt_from <= s.eff_dt
     ORDER BY d.dt_from DESC
-) df
--- Выбираем покрывающую, иначе фоллбэк
-UPDATE #bal SET rate_liq = COALESCE(rate_liq, df.rate)
-FROM #bal b
-JOIN (
-    SELECT s.dt_rep, s.con_id,
-           COALESCE(da.rate, df.rate) AS rate_liq
-    FROM #src s
-    OUTER APPLY (
-        SELECT TOP (1) d.rate
-        FROM #dcr_small d
-        WHERE d.con_id = s.con_id
-          AND d.dt_from <= s.eff_dt
-          AND (d.dt_to IS NULL OR d.dt_to >= s.eff_dt)
-        ORDER BY d.dt_from DESC, ISNULL(d.dt_to,'9999-12-31')
-    ) da
-    OUTER APPLY (
-        SELECT TOP (1) d.rate
-        FROM #dcr_small d
-        WHERE da.rate IS NULL
-          AND d.con_id = s.con_id
-          AND d.dt_from <= s.eff_dt
-        ORDER BY d.dt_from DESC
-    ) df
-) u ON u.dt_rep = b.dt_rep AND u.con_id = b.con_id;
+) AS fallback;
 
--- Индекс под оконку по con_id,dt_rep
 CREATE CLUSTERED INDEX IX_bal ON #bal(con_id, dt_rep);
 
 ------------------------------------------------------------
--- 4) Рабочая ставка rate_use (как у тебя), с rate_pos
+-- 4) Вычисляем rate_use (как у тебя), с rate_pos → #rc0
 ------------------------------------------------------------
 IF OBJECT_ID('tempdb..#rc0') IS NOT NULL DROP TABLE #rc0;
 
@@ -150,7 +123,7 @@ FROM bal_pos bp;
 CREATE NONCLUSTERED INDEX IX_rc0_dt ON #rc0(dt_rep) INCLUDE(out_rub, rate_use, rate_liq);
 
 ------------------------------------------------------------
--- 5) Периоды ключевой ставки (one scan, no per-row lookup) → #key_p
+-- 5) Периоды ключевой (LEAD) → #key_p
 ------------------------------------------------------------
 IF OBJECT_ID('tempdb..#key_p') IS NOT NULL DROP TABLE #key_p;
 
@@ -168,13 +141,14 @@ kp AS (
         key_rate_pct
     FROM k
 )
-SELECT * INTO #key_p FROM kp
+SELECT * INTO #key_p
+FROM kp
 WHERE dt_to >= @DateFrom AND dt_from <= @DateTo;
 
 CREATE NONCLUSTERED INDEX IX_key_p ON #key_p(dt_from, dt_to);
 
 ------------------------------------------------------------
--- 6) Присоединяем ключевую по диапазону + строим бакеты → #rc
+-- 6) Присоединяем ключевую и строим бакеты → #rc
 ------------------------------------------------------------
 IF OBJECT_ID('tempdb..#rc') IS NOT NULL DROP TABLE #rc;
 
@@ -197,8 +171,7 @@ JOIN #key_p k
 CREATE NONCLUSTERED INDEX IX_rc_dt_bucket ON #rc(dt_rep, rate_bucket) INCLUDE(out_rub, rate_use);
 
 ------------------------------------------------------------
--- 7) Панель 1: весь портфель (1 строка/день)
---    средняя только по тем, где rate_use IS NOT NULL
+-- 7) Панель 1: весь портфель (средняя только по rate_use NOT NULL)
 ------------------------------------------------------------
 IF OBJECT_ID('tempdb..#panel_all') IS NOT NULL DROP TABLE #panel_all;
 
@@ -216,7 +189,7 @@ FROM #rc r
 GROUP BY r.dt_rep;
 
 ------------------------------------------------------------
--- 8) Панель 2: бакеты (до 3 строк/день)
+-- 8) Панель 2: бакеты
 ------------------------------------------------------------
 IF OBJECT_ID('tempdb..#panel_bucket') IS NOT NULL DROP TABLE #panel_bucket;
 
@@ -238,12 +211,10 @@ GROUP BY r.dt_rep, r.rate_bucket;
 ------------------------------------------------------------
 -- 9) Результаты
 ------------------------------------------------------------
--- Панель 1
 SELECT dt_rep, out_rub_total, out_rub_with_rate, rate_con
 FROM #panel_all
 ORDER BY dt_rep;
 
--- Панель 2
 SELECT dt_rep, rate_bucket, out_rub_total, out_rub_with_rate, rate_con
 FROM #panel_bucket
 ORDER BY dt_rep, rate_bucket;
