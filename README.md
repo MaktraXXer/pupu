@@ -19,7 +19,8 @@ target_dates AS (
     UNION ALL
     SELECT @Special
 ),
-src AS (  -- 1) Источник по датам и фильтрам
+-- 1) Источник по нужным датам и фильтрам
+src AS (
     SELECT
         t.dt_rep,
         t.cli_id,
@@ -35,32 +36,47 @@ src AS (  -- 1) Источник по датам и фильтрам
       AND t.section_name IN (N'Накопительный счёт', N'Срочные ', N'До востребования')
       AND ISNULL(t.TSEGMENTNAME, N'0') IN (N'ДЧБО', N'Розничный бизнес', N'0')
 ),
--- 2) Агрегация по клиенту на каждую дату
-client_totals AS (
+-- 2) Сумма по клиенту на каждую дату (только внутри даты)
+client_sum AS (
     SELECT
         s.dt_rep,
         s.cli_id,
-        SUM(CASE WHEN s.out_rub < 0 THEN 0 ELSE s.out_rub END) AS total_out_rub,
-        MAX(CASE WHEN LTRIM(RTRIM(s.TSEGMENTNAME)) = N'ДЧБО' THEN 1 ELSE 0 END) AS has_dchbo
+        SUM(CASE WHEN s.out_rub < 0 THEN 0 ELSE s.out_rub END) AS total_out_rub
     FROM src s
     GROUP BY s.dt_rep, s.cli_id
 ),
--- 3) Сегмент и бакет
+-- 3) Сегмент на каждую дату: УЧК, если в ЭТУ дату есть хоть один договор с TSEGMENTNAME='ДЧБО'
+client_segment AS (
+    SELECT
+        cs.dt_rep,
+        cs.cli_id,
+        cs.total_out_rub,
+        CASE WHEN EXISTS (
+            SELECT 1
+            FROM src s2
+            WHERE s2.dt_rep = cs.dt_rep
+              AND s2.cli_id = cs.cli_id
+              AND LTRIM(RTRIM(s2.TSEGMENTNAME)) = N'ДЧБО'
+        )
+        THEN N'УЧК' ELSE N'Розница' END AS segment
+    FROM client_sum cs
+),
+-- 4) Бакеты по сумме клиента на дату
 labeled AS (
     SELECT
         dt_rep,
         cli_id,
+        segment,
         total_out_rub,
-        CASE WHEN has_dchbo = 1 THEN N'УЧК' ELSE N'Розница' END AS segment,
         CASE
             WHEN total_out_rub >=        0     AND total_out_rub <   1500000       THEN N'[0; 1.5 млн)'
             WHEN total_out_rub >=   1500000     AND total_out_rub <  15000000       THEN N'[1.5 млн; 15 млн)'
             WHEN total_out_rub >=  15000000     AND total_out_rub <= 3000000000000  THEN N'[15 млн; 3000 млрд]'
             ELSE N'вне диапазона'
         END AS bucket
-    FROM client_totals
+    FROM client_segment
 )
--- 4) Агрегат по датам
+-- 5) Агрегат по датам/сегментам/бакетам
 SELECT
     dt_rep,
     segment,
