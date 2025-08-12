@@ -1,33 +1,32 @@
 USE [ALM];
 SET NOCOUNT ON;
 
--- 1) Источник с фильтрами на дату и витрину
 WITH src AS (
     SELECT
+        t.dt_rep,
         t.cli_id,
         t.con_id,
-        t.out_rub,
-        t.TSEGMENTNAME
+        t.PROD_NAME_res,
+        t.TSEGMENTNAME,
+        CAST(t.out_rub AS decimal(20,2)) AS out_rub
     FROM alm.ALM.vw_balance_rest_all t WITH (NOLOCK)
     WHERE t.dt_rep = '2025-08-10'
       AND t.block_name   = N'Привлечение ФЛ'
       AND t.od_flag      = 1
       AND t.cur          = '810'
       AND t.out_rub IS NOT NULL
-      AND t.section_name IN (N'Накопительный счёт', N'Срочные ', N'До востребования') -- обратите внимание на пробел в 'Срочные '
+      AND t.section_name IN (N'Накопительный счёт', N'Срочные ', N'До востребования') -- 'Срочные ' с пробелом
       AND ISNULL(t.TSEGMENTNAME, N'0') IN (N'ДЧБО', N'Розничный бизнес', N'0')
 ),
--- 2) Агрегация по клиенту: общий объём и флаг наличия ДЧБО
-client_totals AS (
+client_totals AS (       -- сумма по клиенту + флаг наличия ДЧБО
     SELECT
         s.cli_id,
         SUM(CASE WHEN s.out_rub < 0 THEN 0 ELSE s.out_rub END) AS total_out_rub,
-        MAX(CASE WHEN s.TSEGMENTNAME = N'ДЧБО' THEN 1 ELSE 0 END) AS has_dchbo
+        MAX(CASE WHEN LTRIM(RTRIM(s.TSEGMENTNAME)) = N'ДЧБО' THEN 1 ELSE 0 END) AS has_dchbo
     FROM src s
     GROUP BY s.cli_id
 ),
--- 3) Присвоение сегмента и бакета
-labeled AS (
+labeled AS (             -- сегмент клиента + бакет по сумме
     SELECT
         cli_id,
         total_out_rub,
@@ -39,21 +38,22 @@ labeled AS (
             ELSE N'вне диапазона'
         END AS bucket
     FROM client_totals
+),
+uchk_min_bucket AS (     -- только УЧК с минимальным бакетом
+    SELECT cli_id, total_out_rub, segment, bucket
+    FROM labeled
+    WHERE segment = N'УЧК' AND bucket = N'[0; 1.5 млн)'
 )
--- 4) Результат как временная таблица
-IF OBJECT_ID('tempdb..#client_buckets', 'U') IS NOT NULL DROP TABLE #client_buckets;
-
 SELECT
-    segment,
-    bucket,
-    COUNT(DISTINCT cli_id)         AS clients_cnt,
-    SUM(total_out_rub)             AS sum_out_rub
-INTO #client_buckets
-FROM labeled
-WHERE bucket <> N'вне диапазона'
-GROUP BY segment, bucket;
-
--- Посмотреть результат:
-SELECT *
-FROM #client_buckets
-ORDER BY segment, bucket;
+    u.segment,
+    u.bucket,
+    u.cli_id,
+    u.total_out_rub                 AS total_out_rub_client,
+    s.con_id,
+    s.PROD_NAME_res,
+    s.TSEGMENTNAME                  AS TSEGMENTNAME_raw,
+    CAST(CASE WHEN s.out_rub < 0 THEN 0 ELSE s.out_rub END AS decimal(20,2)) AS out_rub_con
+FROM uchk_min_bucket u
+JOIN src s
+  ON s.cli_id = u.cli_id
+ORDER BY u.cli_id, out_rub_con DESC, s.con_id;
