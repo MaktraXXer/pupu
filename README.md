@@ -21,7 +21,7 @@ FROM (
 ) d;
 CREATE UNIQUE CLUSTERED INDEX IX_dates ON #dates(dt_rep);
 
-/* 2) Агрегация клиента на дату (сегмент УЧК внутри даты) */
+/* 2) Агрегация клиента на дату (внутри каждой даты) */
 IF OBJECT_ID('tempdb..#client_on_date','U') IS NOT NULL DROP TABLE #client_on_date;
 SELECT
     t.dt_rep,
@@ -32,48 +32,40 @@ INTO #client_on_date
 FROM alm.ALM.vw_balance_rest_all AS t WITH (NOLOCK)
 JOIN #dates d ON d.dt_rep = t.dt_rep
 WHERE
-    t.block_name = N'Привлечение ФЛ'
-    AND t.od_flag = 1
-    AND t.cur = '810'
+    t.block_name   = N'Привлечение ФЛ'
+    AND t.od_flag  = 1
+    AND t.cur      = '810'
     AND t.out_rub IS NOT NULL
-    AND t.section_name IN (N'Накопительный счёт', N'Срочные', N'Срочные ', N'До востребования') -- без функций на колонке
+    AND t.section_name IN (N'Накопительный счёт', N'Срочные', N'Срочные ', N'До востребования')
     AND (t.TSEGMENTNAME IN (N'ДЧБО', N'Розничный бизнес') OR t.TSEGMENTNAME IS NULL)
 GROUP BY t.dt_rep, t.cli_id;
 
--- Индекс для финальной группировки
 CREATE CLUSTERED INDEX IX_client_on_date ON #client_on_date(dt_rep, cli_id);
 
 /* 3) Финальный агрегат по датам/сегментам/бакетам */
 SELECT
     c.dt_rep,
-    CASE WHEN c.has_dchbo = 1 THEN N'УЧК' ELSE N'Розница' END AS segment,
-    CASE
-        WHEN c.total_out_rub >=        0     AND c.total_out_rub <   1500000       THEN N'[0; 1.5 млн)'
-        WHEN c.total_out_rub >=   1500000     AND c.total_out_rub <  15000000       THEN N'[1.5 млн; 15 млн)'
-        WHEN c.total_out_rub >=  15000000     AND c.total_out_rub <= 3000000000000  THEN N'[15 млн; 3000 млрд]'
-        ELSE N'вне диапазона'
-    END AS bucket,
-    COUNT(DISTINCT c.cli_id) AS clients_cnt,
+    v.segment,
+    v.bucket,
+    COUNT(*)                 AS clients_cnt,   -- по одной строке на клиента → COUNT(*) = число клиентов
     SUM(c.total_out_rub)     AS sum_out_rub
 FROM #client_on_date AS c
+CROSS APPLY (
+    VALUES (
+        CASE WHEN c.has_dchbo = 1 THEN N'УЧК' ELSE N'Розница' END,
+        CASE
+            WHEN c.total_out_rub >=         0    AND c.total_out_rub <   1000000        THEN N'[0; 1 млн)'
+            WHEN c.total_out_rub >=   1000000    AND c.total_out_rub <   1500000        THEN N'[1; 1.5 млн)'
+            WHEN c.total_out_rub >=   1500000    AND c.total_out_rub <  15000000        THEN N'[1.5 млн; 15 млн)'
+            WHEN c.total_out_rub >=  15000000    AND c.total_out_rub <= 3000000000000   THEN N'[15 млн; 3000 млрд]'
+            ELSE N'вне диапазона'
+        END
+    )
+) v(segment, bucket)
 WHERE
-    -- исключаем «вне диапазона» без вычисления в SELECT дважды
     c.total_out_rub >= 0
+    AND v.bucket <> N'вне диапазона'
 GROUP BY
-    c.dt_rep,
-    CASE WHEN c.has_dchbo = 1 THEN N'УЧК' ELSE N'Розница' END,
-    CASE
-        WHEN c.total_out_rub >=        0     AND c.total_out_rub <   1500000       THEN N'[0; 1.5 млн)'
-        WHEN c.total_out_rub >=   1500000     AND c.total_out_rub <  15000000       THEN N'[1.5 млн; 15 млн)'
-        WHEN c.total_out_rub >=  15000000     AND c.total_out_rub <= 3000000000000  THEN N'[15 млн; 3000 млрд]'
-        ELSE N'вне диапазона'
-    END
-HAVING
-    -- отбрасываем «вне диапазона»
-    CASE
-        WHEN c.total_out_rub >=        0     AND c.total_out_rub <   1500000       THEN 0
-        WHEN c.total_out_rub >=   1500000     AND c.total_out_rub <  15000000       THEN 0
-        WHEN c.total_out_rub >=  15000000     AND c.total_out_rub <= 3000000000000  THEN 0
-        ELSE 1
-    END = 0
-ORDER BY c.dt_rep, segment, bucket;
+    c.dt_rep, v.segment, v.bucket
+ORDER BY
+    c.dt_rep, v.segment, v.bucket;
