@@ -5,7 +5,7 @@ DECLARE @Start   date = '2024-01-01';
 DECLARE @End     date = '2025-07-31';   -- конец июля 2025
 DECLARE @Special date = '2025-08-10';   -- доп. дата
 
-/* 1) Целевые даты: все month-end + спец-дата (без рекурсии) */
+/* 1) Целевые даты: все month-end + спец‑дата (без рекурсии) */
 IF OBJECT_ID('tempdb..#dates','U') IS NOT NULL DROP TABLE #dates;
 WITH tally AS (
     SELECT TOP (1 + DATEDIFF(MONTH, @Start, @End))
@@ -21,13 +21,15 @@ FROM (
 ) d;
 CREATE UNIQUE CLUSTERED INDEX IX_dates ON #dates(dt_rep);
 
-/* 2) Агрегация клиента на дату (внутри каждой даты) */
+/* 2) Агрегация клиента на дату (внутри каждой даты), с исключением заданных продуктов */
 IF OBJECT_ID('tempdb..#client_on_date','U') IS NOT NULL DROP TABLE #client_on_date;
+
 SELECT
     t.dt_rep,
     t.cli_id,
-    SUM(CASE WHEN t.out_rub < 0 THEN 0 ELSE t.out_rub END) AS total_out_rub,
-    MAX(CASE WHEN LTRIM(RTRIM(t.TSEGMENTNAME)) = N'ДЧБО' THEN 1 ELSE 0 END) AS has_dchbo
+    SUM(CASE WHEN t.out_rub < 0 THEN 0 ELSE t.out_rub END)               AS total_out_rub,
+    MAX(CASE WHEN LTRIM(RTRIM(t.TSEGMENTNAME)) = N'ДЧБО' THEN 1 ELSE 0 END) AS has_dchbo,
+    COUNT(DISTINCT t.con_id)                                              AS accounts_cnt  -- кол-во счетов клиента на дату
 INTO #client_on_date
 FROM alm.ALM.vw_balance_rest_all AS t WITH (NOLOCK)
 JOIN #dates d ON d.dt_rep = t.dt_rep
@@ -38,6 +40,12 @@ WHERE
     AND t.out_rub IS NOT NULL
     AND t.section_name IN (N'Накопительный счёт', N'Срочные', N'Срочные ', N'До востребования')
     AND (t.TSEGMENTNAME IN (N'ДЧБО', N'Розничный бизнес') OR t.TSEGMENTNAME IS NULL)
+    AND t.PROD_NAME_res NOT IN (  -- исключаем продукты
+        N'Надёжный прайм', N'Надёжный VIP', N'Надёжный премиум',
+        N'Надёжный промо', N'Надёжный старт', N'Надёжный Т2',
+        N'Надёжный Мегафон', N'Надёжный процент',
+        N'Надёжный', N'ДОМа надёжно', N'Всё в ДОМ'
+    )
 GROUP BY t.dt_rep, t.cli_id;
 
 CREATE CLUSTERED INDEX IX_client_on_date ON #client_on_date(dt_rep, cli_id);
@@ -47,7 +55,8 @@ SELECT
     c.dt_rep,
     v.segment,
     v.bucket,
-    COUNT(*)                 AS clients_cnt,   -- по одной строке на клиента → COUNT(*) = число клиентов
+    COUNT(*)                 AS clients_cnt,      -- по одной строке на клиента → это число уникальных клиентов
+    SUM(c.accounts_cnt)      AS accounts_cnt,     -- суммарное число счетов (уникальных con_id) в группе
     SUM(c.total_out_rub)     AS sum_out_rub
 FROM #client_on_date AS c
 CROSS APPLY (
@@ -63,7 +72,7 @@ CROSS APPLY (
     )
 ) v(segment, bucket)
 WHERE
-    c.total_out_rub >= 0
+    c.total_out_rub >= 0            -- защитный фильтр
     AND v.bucket <> N'вне диапазона'
 GROUP BY
     c.dt_rep, v.segment, v.bucket
