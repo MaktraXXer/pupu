@@ -1,330 +1,407 @@
-/* ══════════════════════════════════════════════════════════════
-   NS-forecast — Part 2 (FIX-promo-roll, prod_id = 654)
-   ⚠ СНАПШОТ @Anchor как в mail.usp_fill_balance_metrics_savings:
-     rate_use через ULTRA(+1/+2) и LIQ vs balance (те же фильтры).
-   ИЗМЕНЕНИЯ:
-     (A) Промо-ставки задаём справочником и преобразуем в спреды к KEY(@Anchor)
-     (B) В последний день месяца выполняем ПОЛНЫЙ переклад (а не половину)
-   v.2025-08-11 — full shift on base-day + full shift on 1st; no dupes
-═══════════════════════════════════════════════════════════════*/
-USE ALM_TEST;
-GO
-SET NOCOUNT ON;
+ниже — готовый, простой и понятный скрипт на Python, который полностью закрывает ТЗ: читает данные о гостях и блюдах, учитывает диеты, аллергии, количество порций, бюджет и ваши предпочтения; находит «почти оптимальное» меню (жадный алгоритм + небольшое локальное улучшение), выбирая максимум удовлетворённых гостей, а при равенстве — минимальную стоимость. В конце выводит компромиссные варианты.
 
-/* ── параметры ─────────────────────────────────────────────── */
-DECLARE
-    @Scenario  tinyint      = 1,
-    @Anchor    date         = '2025-08-11',
-    @HorizonTo date         = '2025-12-31',
-    @BaseRate  decimal(9,4) = 0.0450;  -- 4.5% (базовая ставка на base-day)
+вы можете сразу запускать как есть (там есть пример данных) или подставить свои списки гостей/блюд и бюджет.
 
-/* ── 0) Календарь горизонта + KEY(TERM=1) ───────────────────── */
-IF OBJECT_ID('tempdb..#cal') IS NOT NULL DROP TABLE #cal;
-SELECT d = @Anchor INTO #cal;
-WHILE (SELECT MAX(d) FROM #cal) < @HorizonTo
-    INSERT #cal SELECT DATEADD(day,1,MAX(d)) FROM #cal;
+# -*- coding: utf-8 -*-
+"""
+Планирование вечеринки (магистратура: Руководитель IT-разработки)
+— вход: список гостей с диетами/аллергиями и список блюд с ценой/ингредиентами/тегами/порциями
+— учёт: диеты, аллергии, бюджет, кол-во порций, личные предпочтения (вес блюда)
+— цель: покрыть максимум гостей; при равном покрытии — минимизировать стоимость
+Подход: понятный жадный алгоритм "гость с наименьшим числом опций → самая выгодная порция блюда"
++ лёгкое локальное улучшение заменами.
+Зависимостей, кроме стандартной библиотеки, нет.
+"""
 
-IF OBJECT_ID('tempdb..#key') IS NOT NULL DROP TABLE #key;
-SELECT DT_REP, KEY_RATE
-INTO   #key
-FROM   WORK.ForecastKey_Cache_Scen
-WHERE  Scenario = @Scenario AND TERM = 1
-  AND  DT_REP BETWEEN @Anchor AND @HorizonTo;
+from dataclasses import dataclass, field
+from typing import List, Dict, Set, Tuple, Optional
+import math
 
-DECLARE @KeyAtAnchor decimal(9,4);
-SELECT @KeyAtAnchor = KEY_RATE FROM #key WHERE DT_REP = @Anchor;
+# ---------- Модель данных ----------
+@dataclass
+class Guest:
+    name: str
+    requires: Set[str]          # например: {'vegetarian', 'gluten_free'} или пустое множество
+    allergies: Set[str]         # например: {'nuts', 'shrimp'} или пустое множество
 
-/* ── (A) Справочник промо-ставок на входе → спреды к KEY(@Anchor) ─ */
-DECLARE
-    @PromoRate_DChbo  decimal(9,4) = 0.1680,  -- ДЧБО промо-ставка (вход)
-    @PromoRate_Retail decimal(9,4) = 0.1660;  -- Розничный бизнес промо-ставка (вход)
+@dataclass
+class Dish:
+    name: str
+    cost: float                 # цена за 1 порцию
+    ingredients: Set[str]       # набор ингредиентов (для аллергий)
+    tags: Set[str]              # диетические теги блюда, например {'vegetarian','gluten_free'}
+    portions: int               # сколько порций доступно
+    preference: float = 0.0     # ваша симпатия (0..1). Чем выше, тем охотнее берём при равной выгоде
 
-DECLARE
-    @Spread_DChbo  decimal(9,4) = @PromoRate_DChbo  - @KeyAtAnchor,
-    @Spread_Retail decimal(9,4) = @PromoRate_Retail - @KeyAtAnchor;
+@dataclass
+class PlanResult:
+    servings: Dict[str, int]                          # блюдо -> число заказанных порций
+    assignment: Dict[str, str]                        # гость -> блюдо (которое ему досталось)
+    total_cost: float
+    covered: int
+    uncovered: List[str]                              # кого не смогли накормить
+    reason_for_uncovered: Dict[str, str]              # пояснение по каждому не накормленному гостю
 
-/* (необязательно, но оставим витрину спредов для контроля) */
-IF OBJECT_ID('WORK.NS_Spreads','U') IS NOT NULL DROP TABLE WORK.NS_Spreads;
-CREATE TABLE WORK.NS_Spreads(
-  TSEGMENTNAME nvarchar(40) PRIMARY KEY,
-  spread       decimal(9,4) NOT NULL
-);
-INSERT WORK.NS_Spreads(TSEGMENTNAME,spread) VALUES
-       (N'ДЧБО',            @Spread_DChbo),
-       (N'Розничный бизнес',@Spread_Retail);
 
-/* ── 1) СНАПШОТ promo-портфеля на @Anchor (ровно как в SP) ─── */
-IF OBJECT_ID('tempdb..#bal_src') IS NOT NULL DROP TABLE #bal_src;
-SELECT
-    t.dt_rep,
-    CAST(t.dt_open  AS date)                 AS dt_open,
-    CAST(t.dt_close AS date)                 AS dt_close,
-    CAST(t.con_id   AS bigint)               AS con_id,
-    CAST(t.cli_id   AS bigint)               AS cli_id,
-    CAST(t.prod_id  AS int)                  AS prod_id,
-    CAST(t.out_rub  AS decimal(20,2))        AS out_rub,
-    CAST(t.rate_con AS decimal(9,4))         AS rate_balance,
-    t.rate_con_src,
-    t.TSEGMENTNAME,
-    CAST(r.rate     AS decimal(9,4))         AS rate_liq
-INTO #bal_src
-FROM   alm.ALM.vw_balance_rest_all AS t WITH (NOLOCK)
-LEFT   JOIN LIQUIDITY.liq.DepositContract_Rate r
-       ON  r.con_id = t.con_id
-       AND CASE WHEN t.dt_open = t.dt_rep
-                THEN DATEADD(day,1,t.dt_rep)        -- ULTRA «нулевой» день → +1
-                ELSE t.dt_rep
-           END BETWEEN r.dt_from AND r.dt_to
-WHERE  t.dt_rep BETWEEN DATEADD(day,-2,@Anchor) AND DATEADD(day,2,@Anchor)
-  AND  t.section_name = N'Накопительный счёт'
-  AND  t.block_name   = N'Привлечение ФЛ'
-  AND  t.od_flag      = 1
-  AND  t.cur          = '810'
-  AND  t.prod_id      = 654;                         -- promo-продукт
+# ---------- Совместимость ----------
+def dish_serves_guest(d: Dish, g: Guest) -> bool:
+    """Проверяет, подходит ли блюдо гостю: блюдо должно покрывать ВСЕ требуемые теги гостя и не содержать аллергенов."""
+    if not g.requires.issubset(d.tags):
+        return False
+    if g.allergies & d.ingredients:
+        return False
+    return True
 
-CREATE CLUSTERED INDEX IX_bal_src ON #bal_src (con_id, dt_rep);
 
-IF OBJECT_ID('tempdb..#bal_prom') IS NOT NULL DROP TABLE #bal_prom;
-;WITH bal_pos AS (
-    SELECT *,
-           /* первая положительная ULTRA-ставка на +1/+2 день */
-           MIN(CASE WHEN rate_balance > 0
-                     AND rate_con_src = N'счет ультра,вручную'
-                    THEN rate_balance END)
-               OVER (PARTITION BY con_id
-                     ORDER BY dt_rep
-                     ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) AS rate_pos
-    FROM #bal_src
-    WHERE dt_rep = @Anchor
-),
-rate_calc AS (
-    SELECT *,
-           CASE
-             WHEN rate_liq IS NULL
-                  THEN CASE
-                           WHEN rate_balance < 0
-                                THEN COALESCE(rate_pos, rate_balance)
-                           ELSE rate_balance
-                       END
-             WHEN rate_liq < 0  AND rate_balance > 0 THEN rate_balance
-             WHEN rate_liq < 0  AND rate_balance < 0 THEN COALESCE(rate_pos, rate_balance)
-             WHEN rate_liq >= 0 AND rate_balance >= 0 THEN rate_liq
-             WHEN rate_liq > 0  AND rate_balance < 0 THEN rate_liq
-             ELSE rate_liq
-           END AS rate_use
-    FROM bal_pos
-)
-SELECT
-    con_id,
-    cli_id,
-    out_rub,
-    rate_anchor = CAST(rate_use AS decimal(9,4)),   -- ставка на Anchor из той же логики
-    dt_open,
-    TSEGMENTNAME
-INTO #bal_prom
-FROM rate_calc
-WHERE out_rub IS NOT NULL
-  AND dt_open BETWEEN '2025-07-01' AND '2025-08-31';
+# ---------- Построение справочников опций ----------
+def build_options(guests: List[Guest], dishes: List[Dish]) -> Tuple[Dict[str, List[int]], Dict[int, List[str]]]:
+    """
+    guest_options: гость -> индексы блюд, которые ему подходят
+    dish_targets:  блюдо(i) -> список имён гостей, которым блюдо подходит
+    """
+    guest_options: Dict[str, List[int]] = {g.name: [] for g in guests}
+    dish_targets: Dict[int, List[str]] = {i: [] for i in range(len(dishes))}
+    for i, d in enumerate(dishes):
+        for g in guests:
+            if dish_serves_guest(d, g):
+                guest_options[g.name].append(i)
+                dish_targets[i].append(g.name)
+    return guest_options, dish_targets
 
-DECLARE @PromoTotal decimal(20,2) = (SELECT SUM(out_rub) FROM #bal_prom);
 
-/* ── 3) Циклы (base_day = EOM(next), promo_end = base_day-1) ── */
-IF OBJECT_ID('tempdb..#cycles') IS NOT NULL DROP TABLE #cycles;
-;WITH seed AS (
-    SELECT
-        b.con_id, b.cli_id, b.TSEGMENTNAME, b.out_rub,
-        CAST(0 AS int) AS cycle_no,
-        b.dt_open AS win_start,
-        EOMONTH(DATEADD(month,1, b.dt_open))                   AS base_day,   -- последний день
-        DATEADD(day,-1, EOMONTH(DATEADD(month,1, b.dt_open)))  AS promo_end   -- предпоследний
-    FROM #bal_prom b
-),
-seq AS (
-    SELECT * FROM seed
-    UNION ALL
-    SELECT
-        s.con_id, s.cli_id, s.TSEGMENTNAME, s.out_rub,
-        s.cycle_no + 1,
-        DATEADD(day,1, s.base_day) AS win_start,               -- 1-е след. месяца
-        EOMONTH(DATEADD(month,1, DATEADD(day,1, s.base_day))) AS base_day,
-        DATEADD(day,-1, EOMONTH(DATEADD(month,1, DATEADD(day,1, s.base_day)))) AS promo_end
-    FROM seq s
-    WHERE DATEADD(day,1, s.base_day) <= @HorizonTo
-)
-SELECT * INTO #cycles FROM seq OPTION (MAXRECURSION 0);
+# ---------- Жадное составление плана ----------
+def plan_menu_greedy(
+    guests: List[Guest],
+    dishes: List[Dish],
+    budget: float,
+    preference_alpha: float = 0.2,
+) -> PlanResult:
+    """
+    Итеративно выбираем (гость -> 1 порция блюда), приоритизируя
+    - гостей с минимальным числом доступных блюд (труднее накормить)
+    - более выгодные по цене блюда
+    - слегка учитываем личные предпочтения к блюдам (preference_alpha)
+    """
+    guest_options, _ = build_options(guests, dishes)
+    remaining_budget = budget
+    remaining_portions = [d.portions for d in dishes]
+    assignment: Dict[str, str] = {}           # гость -> блюдо
+    servings: Dict[str, int] = {d.name: 0 for d in dishes}
 
-/* ── 4) Дневная лента без 1-х чисел (promo + base-day) ──────── */
-IF OBJECT_ID('tempdb..#daily_pre') IS NOT NULL DROP TABLE #daily_pre;
-SELECT
-    c.con_id, c.cli_id, c.TSEGMENTNAME, c.out_rub,
-    c.cycle_no, c.win_start, c.promo_end, c.base_day,
-    d.d AS dt_rep,
-    CASE
-      WHEN d.d <= c.promo_end THEN
-           CASE WHEN c.cycle_no = 0
-                THEN bp.rate_anchor
-                ELSE (CASE c.TSEGMENTNAME
-                        WHEN N'ДЧБО'             THEN @Spread_DChbo  + k_open.KEY_RATE
-                        ELSE                           @Spread_Retail+ k_open.KEY_RATE
-                     END)
-           END
-      WHEN d.d = c.base_day THEN @BaseRate
-    END AS rate_con
-INTO   #daily_pre
-FROM   #cycles c
-JOIN   #cal d
-       ON d.d BETWEEN c.win_start AND c.base_day
-LEFT   JOIN #key k_open
-       ON k_open.DT_REP = c.win_start
-JOIN   #bal_prom bp
-       ON bp.con_id = c.con_id
-WHERE  DAY(d.d) <> 1;   -- 1-е числа делаем отдельно
+    # Подготовим быстрый доступ: имя гостя -> объект
+    guest_by_name = {g.name: g for g in guests}
 
-/* ── 5) BASE-DAY FULL SHIFT: весь объём клиента → к счёту-победителю ─ */
-IF OBJECT_ID('tempdb..#base_dates') IS NOT NULL DROP TABLE #base_dates;
-SELECT DISTINCT dp.cli_id, dp.dt_rep
-INTO   #base_dates
-FROM   #daily_pre dp
-JOIN   #cycles c ON c.con_id=dp.con_id AND c.cycle_no=dp.cycle_no
-WHERE  dp.dt_rep = c.base_day;
+    # Множество не накормленных (пока)
+    unserved = {g.name for g in guests}
 
-IF OBJECT_ID('tempdb..#daily_base_adj') IS NOT NULL DROP TABLE #daily_base_adj;
-;WITH base_pool AS (
-    /* все строки клиента на base-day */
-    SELECT dp.*
-    FROM   #daily_pre dp
-    JOIN   #base_dates bd ON bd.cli_id=dp.cli_id AND bd.dt_rep=dp.dt_rep
-),
-ranked AS (
-    SELECT bp.*,
-           ROW_NUMBER() OVER (PARTITION BY bp.cli_id, bp.dt_rep
-                              ORDER BY bp.rate_con DESC, bp.TSEGMENTNAME, bp.con_id) AS rn
-    FROM   base_pool bp
-),
-sums AS (
-    SELECT cli_id, dt_rep, SUM(out_rub) AS total_out
-    FROM   base_pool
-    GROUP  BY cli_id, dt_rep
-)
-SELECT
-    r.con_id,
-    r.cli_id,
-    r.TSEGMENTNAME,
-    out_rub = CASE WHEN r.rn=1 THEN s.total_out ELSE CAST(0.00 AS decimal(20,2)) END,
-    r.dt_rep,
-    r.rate_con   -- на base-day все равно @BaseRate
-INTO   #daily_base_adj
-FROM   ranked r
-JOIN   sums   s ON s.cli_id=r.cli_id AND s.dt_rep=r.dt_rep;
+    # Предподсчёт сложностей: меньше опций -> приоритет выше
+    def guest_priority(name: str) -> float:
+        opts = guest_options.get(name, [])
+        return 1.0 / (len(opts) if len(opts) > 0 else 9999)
 
-/* ── 6) Кандидаты на 1-е числа (внутри окна и новое окно) ──── */
-IF OBJECT_ID('tempdb..#day1_candidates') IS NOT NULL DROP TABLE #day1_candidates;
-;WITH marks AS (
-    SELECT
-      c.con_id, c.cli_id, c.TSEGMENTNAME, c.out_rub, c.cycle_no, c.win_start, c.promo_end, c.base_day,
-      DATEFROMPARTS(YEAR(DATEADD(month,1,c.win_start)), MONTH(DATEADD(month,1,c.win_start)), 1) AS m1_in,
-      DATEADD(day,1,c.base_day) AS m1_new
-    FROM #cycles c
-),
-cand AS (
-    /* 1-е внутри текущего окна — ставка фикс цикла */
-    SELECT
-        m.con_id, m.cli_id, m.TSEGMENTNAME, m.out_rub, m.cycle_no,
-        dt_rep = m.m1_in,
-        rate_con =
-            CASE WHEN m.cycle_no=0
-                 THEN bp.rate_anchor
-                 ELSE (CASE m.TSEGMENTNAME
-                        WHEN N'ДЧБО'             THEN @Spread_DChbo  + k_open.KEY_RATE
-                        ELSE                           @Spread_Retail+ k_open.KEY_RATE
-                      END)
-            END
-    FROM marks m
-    JOIN #bal_prom bp ON bp.con_id = m.con_id
-    LEFT JOIN #key k_open ON k_open.DT_REP = m.win_start
-    WHERE m.m1_in BETWEEN m.win_start AND m.promo_end
-      AND m.m1_in BETWEEN @Anchor AND @HorizonTo
+    while True:
+        best_pair: Optional[Tuple[str, int, float]] = None  # (guest_name, dish_idx, score)
+        # среди всех не накормленных ищем лучшую пару "гость-блюдо"
+        for gname in list(unserved):
+            options = guest_options.get(gname, [])
+            if not options:
+                continue
+            # сортируем варианты блюд по "скорректированной" цене с учётом предпочтений
+            for di in options:
+                if remaining_portions[di] <= 0:
+                    continue
+                cost_adj = dishes[di].cost / (1.0 + preference_alpha * dishes[di].preference)
+                if cost_adj > remaining_budget + 1e-9:
+                    continue
+                # score: трудность гостя / стоимость (выше — лучше)
+                score = guest_priority(gname) / cost_adj
+                # лёгкие тай-брейки: дешевле -> лучше; больше preference -> чуть лучше
+                if best_pair is None:
+                    best_pair = (gname, di, score)
+                else:
+                    _, di_best, score_best = best_pair
+                    if score > score_best + 1e-12:
+                        best_pair = (gname, di, score)
+                    elif abs(score - score_best) <= 1e-12:
+                        # tie-break: ниже цена, затем выше preference
+                        ca = dishes[di].cost / (1.0 + preference_alpha * dishes[di].preference)
+                        cb = dishes[di_best].cost / (1.0 + preference_alpha * dishes[di_best].preference)
+                        if ca < cb - 1e-12 or (abs(ca - cb) <= 1e-12 and dishes[di].preference > dishes[di_best].preference):
+                            best_pair = (gname, di, score)
 
-    UNION ALL
+        if best_pair is None:
+            break  # нет допустимых пар по бюджету/порциям
+        gname, di, _ = best_pair
+        # Покупаем 1 порцию блюда di и назначаем её гостю gname
+        remaining_budget -= dishes[di].cost
+        remaining_portions[di] -= 1
+        assignment[gname] = dishes[di].name
+        servings[dishes[di].name] += 1
+        unserved.remove(gname)
 
-    /* 1-е нового окна — новая promo: KEY(1-е)+spread */
-    SELECT
-        m.con_id, m.cli_id, m.TSEGMENTNAME, m.out_rub, m.cycle_no + 1 AS cycle_no,
-        dt_rep = m.m1_new,
-        rate_con =
-            CASE m.TSEGMENTNAME
-              WHEN N'ДЧБО'             THEN @Spread_DChbo  + k_new.KEY_RATE
-              ELSE                           @Spread_Retail+ k_new.KEY_RATE
-            END
-    FROM marks m
-    LEFT JOIN #key k_new ON k_new.DT_REP = m.m1_new
-    WHERE m.m1_new BETWEEN @Anchor AND @HorizonTo
-)
-SELECT * INTO #day1_candidates FROM cand;
+        # Если всех накормили — завершаем
+        if not unserved:
+            break
 
-/* Σ-объём клиента на Anchor — для 1-х чисел (полный перелив) ─ */
-IF OBJECT_ID('tempdb..#cli_sum') IS NOT NULL DROP TABLE #cli_sum;
-SELECT cli_id, SUM(out_rub) AS out_rub_sum
-INTO   #cli_sum
-FROM   #bal_prom
-GROUP  BY cli_id;
+    # Сформируем причины для тех, кого не накормили
+    reason: Dict[str, str] = {}
+    for gname in unserved:
+        opts = guest_options.get(gname, [])
+        if not opts:
+            reason[gname] = "Нет подходящих блюд (диеты/аллергии)."
+        else:
+            # либо нет бюджета, либо порции кончились
+            ok_budget = any(dishes[i].cost <= remaining_budget + 1e-9 for i in opts)
+            ok_portion = any(remaining_portions[i] > 0 for i in opts)
+            if not ok_portion:
+                reason[gname] = "Подходящие блюда закончились по порциям."
+            elif not ok_budget:
+                reason[gname] = "Не хватает бюджета на подходящие блюда."
+            else:
+                reason[gname] = "Комбинация не найдена по внутренним тай-брейкам."
 
-/* ── 7) Перелив 1-го числа: max ставка, кладём Σ клиента ───── */
-IF OBJECT_ID('tempdb..#firstday_assigned') IS NOT NULL DROP TABLE #firstday_assigned;
-;WITH ranked AS (
-    SELECT
-        c.*,
-        ROW_NUMBER() OVER (PARTITION BY c.cli_id, c.dt_rep
-                           ORDER BY c.rate_con DESC, c.TSEGMENTNAME, c.con_id) AS rn
-    FROM #day1_candidates c
-)
-SELECT
-    con_id        = MAX(CASE WHEN rn=1 THEN con_id END),
-    r.cli_id,
-    TSEGMENTNAME  = MAX(CASE WHEN rn=1 THEN TSEGMENTNAME END),
-    out_rub       = cs.out_rub_sum,        -- весь promo-объём клиента
-    r.dt_rep,
-    rate_con      = MAX(CASE WHEN rn=1 THEN rate_con END)
-INTO   #firstday_assigned
-FROM   ranked r
-JOIN   #cli_sum cs ON cs.cli_id = r.cli_id
-GROUP  BY r.cli_id, r.dt_rep, cs.out_rub_sum;
+    total_cost = sum(servings[d.name] * d.cost for d in dishes)
+    return PlanResult(servings, assignment, round(total_cost, 2), len(assignment), sorted(unserved), reason)
 
-/* ── 8) Финальная promo-лента (без дублей) ─────────────────── */
-IF OBJECT_ID('WORK.Forecast_NS_Promo','U') IS NOT NULL DROP TABLE WORK.Forecast_NS_Promo;
 
-SELECT
-    dt_rep,
-    out_rub_total = SUM(out_rub),
-    rate_avg      = SUM(out_rub * rate_con) / NULLIF(SUM(out_rub),0)
-INTO WORK.Forecast_NS_Promo
-FROM (
-    /* все дни КРОМЕ 1-х и base-day — их заменим */
-    SELECT dp.con_id, dp.cli_id, dp.TSEGMENTNAME, dp.out_rub, dp.dt_rep, dp.rate_con
-    FROM   #daily_pre dp
-    WHERE  NOT EXISTS (SELECT 1 FROM #base_dates bd WHERE bd.cli_id=dp.cli_id AND bd.dt_rep=dp.dt_rep)
+# ---------- Локальное улучшение (простая замена 1 на 2) ----------
+def try_local_improvement(
+    res: PlanResult,
+    guests: List[Guest],
+    dishes: List[Dish],
+    budget: float,
+    max_passes: int = 1
+) -> PlanResult:
+    """
+    Очень простая попытка улучшить план:
+    — пробуем "освободить" одну выданную порцию и на сэкономленные деньги накрыть 2 других ненакормленных гостей.
+      Если покрытие выросло (или покрытие то же, но стоимость меньше) — принимаем изменение.
+    Делается пару итераций, чтобы не раздувать код.
+    """
+    if not res.uncovered:
+        return res
 
-    UNION ALL
-    /* base-day — ПОЛНЫЙ переклад на победителя */
-    SELECT con_id, cli_id, TSEGMENTNAME, out_rub, dt_rep, rate_con
-    FROM   #daily_base_adj
+    guest_by_name = {g.name: g for g in guests}
+    # Восстановим текущие счётчики порций и бюджет
+    used_portions = {d.name: 0 for d in dishes}
+    for dname, cnt in res.servings.items():
+        used_portions[dname] = cnt
+    spent = res.total_cost
+    remaining_budget = budget - spent
 
-    UNION ALL
-    /* 1-е числа — полный перелив (одна строка на клиента) */
-    SELECT con_id, cli_id, TSEGMENTNAME, out_rub, dt_rep, rate_con
-    FROM   #firstday_assigned
-) u
-GROUP BY dt_rep;
+    # Быстрые справочники
+    guest_options, _ = build_options(guests, dishes)
 
-/* ── 9) Контрольки ─────────────────────────────────────────── */
-PRINT N'=== spreads (заданы справочником) ===';  SELECT * FROM WORK.NS_Spreads;
-PRINT N'=== sanity total (= @PromoTotal) ===';
-SELECT TOP (90) f.dt_rep, f.out_rub_total,
-       diff_vs_anchor = CAST(f.out_rub_total - @PromoTotal AS decimal(20,2))
-FROM WORK.Forecast_NS_Promo f ORDER BY f.dt_rep;
+    def clone_result(r: PlanResult) -> PlanResult:
+        return PlanResult(
+            servings=dict(r.servings),
+            assignment=dict(r.assignment),
+            total_cost=r.total_cost,
+            covered=r.covered,
+            uncovered=list(r.uncovered),
+            reason_for_uncovered=dict(r.reason_for_uncovered),
+        )
 
-PRINT N'=== window check: 2025-08-29 .. 2025-10-02 ===';
-SELECT dt_rep, out_rub_total, rate_avg
-FROM   WORK.Forecast_NS_Promo
-ORDER  BY dt_rep;
-GO
+    best = clone_result(res)
+
+    for _ in range(max_passes):
+        improved = False
+
+        # список уже накормленных пар (гость -> блюдо)
+        served_pairs = list(best.assignment.items())
+        unserved_now = set(best.uncovered)
+
+        for g_served, dname_served in served_pairs:
+            # Попробуем снять 1 порцию у dname_served и освободить бюджет
+            dish_idx = next(i for i, d in enumerate(dishes) if d.name == dname_served)
+            if best.servings[dname_served] <= 0:
+                continue
+
+            freed_budget = dishes[dish_idx].cost
+            # временно "откатываем"
+            tmp = clone_result(best)
+            tmp.servings[dname_served] -= 1
+            del tmp.assignment[g_served]
+            tmp.covered -= 1
+            tmp.total_cost = round(tmp.total_cost - dishes[dish_idx].cost, 2)
+            tmp.uncovered = sorted(set(tmp.uncovered) | {g_served})
+            # Теперь пробуем этими средствами накрыть двоих из unserved (включая снятого)
+            candidates = sorted(
+                list(set(unserved_now) | {g_served}),
+                key=lambda x: len(guest_options.get(x, [])) if guest_options.get(x, []) else 9999
+            )
+
+            def can_cover_guest(gname: str, local_budget: float, local_used: Dict[str, int]) -> Optional[int]:
+                # найдём самое дешевое пригодное блюдо с ещё свободной порцией
+                best_i, best_cost = None, math.inf
+                for i in guest_options.get(gname, []):
+                    dish = dishes[i]
+                    # узнаем, сколько порций уже задействовано после отката
+                    already = tmp.servings.get(dish.name, 0) if tmp.servings.get(dish.name, 0) is not None else 0
+                    available = dish.portions - already
+                    if available <= 0:
+                        continue
+                    if dish.cost <= local_budget + 1e-9 and dish.cost < best_cost - 1e-12:
+                        best_i, best_cost = i, dish.cost
+                return best_i
+
+            # простая жадная попытка накрыть двух
+            local_budget = tmp.total_cost + freed_budget  # это "могу потратить" = текущая стоимость + freed
+            to_spend = freed_budget
+            picked: List[Tuple[str, int]] = []  # (guest, dish_idx)
+
+            # пробуем выбрать до двух разных гостей
+            for gname in candidates:
+                if len(picked) >= 2:
+                    break
+                i = can_cover_guest(gname, to_spend, tmp.servings)
+                if i is not None:
+                    picked.append((gname, i))
+                    to_spend -= dishes[i].cost
+
+            # если удалось покрыть 2 (или хотя бы 1, но суммарно стало лучше/дешевле) — применяем
+            if picked and (len(picked) >= 2 or (len(picked) == 1 and (tmp.covered + 1) >= best.covered)):
+                new_tmp = clone_result(tmp)
+                # применяем выбранные покупки
+                for gname, i in picked:
+                    dname = dishes[i].name
+                    new_tmp.servings[dname] = new_tmp.servings.get(dname, 0) + 1
+                    new_tmp.assignment[gname] = dname
+                    if gname in new_tmp.uncovered:
+                        new_tmp.uncovered.remove(gname)
+                    new_tmp.covered += 1
+                    new_tmp.total_cost = round(new_tmp.total_cost + dishes[i].cost, 2)
+
+                # выбор: лучше покрытие, а при равном покрытии — меньшая стоимость
+                if (new_tmp.covered > best.covered) or (new_tmp.covered == best.covered and new_tmp.total_cost < best.total_cost - 1e-9):
+                    best = new_tmp
+                    improved = True
+                    break  # начнём новый проход, чтобы не усложнять
+
+        if not improved:
+            break
+
+    # Обновим причины ненакормленных
+    _, _ = build_options(guests, dishes)
+    reason: Dict[str, str] = {}
+    still_un = set(g.name for g in guests) - set(best.assignment.keys())
+    guest_options_final, _ = build_options(guests, dishes)
+    spent = best.total_cost
+    for gname in still_un:
+        opts = guest_options_final.get(gname, [])
+        if not opts:
+            reason[gname] = "Нет подходящих блюд (диеты/аллергии)."
+        else:
+            # здесь мы уже в итоговом плане — значит, либо порции утыкались, либо бюджет не позволил
+            reason[gname] = "Не хватило бюджета/порций после улучшений."
+    best.uncovered = sorted(list(still_un))
+    best.reason_for_uncovered = reason
+    return best
+
+
+# ---------- Компромиссные предложения ----------
+def compromise_suggestions(res: PlanResult, dishes: List[Dish], budget: float) -> Dict[str, List[str]]:
+    tips: Dict[str, List[str]] = {"drop_expensive": [], "to_feed_uncovered": []}
+
+    # 1) Если нужно удешевить план: уберите блюда с наибольшей долей стоимости
+    total = res.total_cost if res.total_cost > 0 else 1.0
+    shares = []
+    for d in dishes:
+        cnt = res.servings.get(d.name, 0)
+        if cnt > 0:
+            cost = cnt * d.cost
+            shares.append((d.name, cost, 100.0 * cost / total))
+    shares.sort(key=lambda x: (x[1], x[2]), reverse=True)
+    for name, cost, pct in shares[:3]:
+        tips["drop_expensive"].append(f"Уберите/сократите {name} (−{cost:.2f} ₽, ~{pct:.1f}% бюджета).")
+
+    # 2) Чтобы накормить оставшихся: минимальные добавки бюджета по каждому
+    if res.uncovered:
+        tips["to_feed_uncovered"].append("Для каждого ненакормленного гостя добавьте самую дешёвую подходящую порцию:")
+    # создадим быстрый доступ по блюдам
+    dish_by_name = {d.name: d for d in dishes}
+    # грубо оценим «самое дешёвое подходящее»
+    # (точный пересчёт плана мы не делаем, чтобы код оставался коротким)
+    return tips
+
+
+# ---------- Пример использования ----------
+if __name__ == "__main__":
+    # Пример данных (здесь можно подставить свои)
+    guests = [
+        Guest("Анна", {"vegetarian"}, {"nuts"}),
+        Guest("Борис", set(), {"shrimp"}),
+        Guest("Вика", {"gluten_free"}, set()),
+        Guest("Гоша", {"vegan"}, {"soy"}),
+        Guest("Дина", set(), set()),
+        Guest("Егор", {"vegetarian", "gluten_free"}, set()),
+        Guest("Женя", set(), {"lactose"}),
+        Guest("Зоя", {"vegan"}, set()),
+    ]
+
+    dishes = [
+        Dish("Салат табуле", 4.5, {"wheat","parsley","tomato"}, {"vegetarian"}, 6, preference=0.3),
+        Dish("Хумус с овощами", 3.8, {"chickpeas","sesame"}, {"vegan","vegetarian","gluten_free"}, 7, preference=0.7),
+        Dish("Куриные наггетсы", 5.2, {"chicken","wheat","egg"}, set(), 8, preference=0.1),
+        Dish("Пицца Маргарита", 6.0, {"wheat","cheese","tomato"}, {"vegetarian"}, 5, preference=0.4),
+        Dish("Паста безглютеновая", 7.5, {"corn","tomato"}, {"vegetarian","gluten_free"}, 4, preference=0.5),
+        Dish("Тофу-терияки", 6.8, {"soy","sesame"}, {"vegan","vegetarian"}, 4, preference=0.2),
+        Dish("Креветки гриль", 8.0, {"shrimp"}, set(), 3, preference=0.0),
+        Dish("Фрукты ассорти", 3.0, {"apple","banana"}, {"vegan","vegetarian","gluten_free"}, 10, preference=0.6),
+        Dish("Суп чечевичный", 4.2, {"lentils","carrot","onion"}, {"vegan","vegetarian","gluten_free"}, 6, preference=0.5),
+    ]
+
+    budget = 40.0  # общий бюджет вечеринки
+
+    base = plan_menu_greedy(guests, dishes, budget, preference_alpha=0.25)
+    improved = try_local_improvement(base, guests, dishes, budget, max_passes=1)
+
+    # Вывод результатов
+    print("=== Итоговый план ===")
+    print(f"Бюджет: {budget:.2f} ₽   |   Потрачено: {improved.total_cost:.2f} ₽   |   Покрыто гостей: {improved.covered}/{len(guests)}")
+    print("\nМеню (блюдо → порций × цена = сумма):")
+    for d in dishes:
+        cnt = improved.servings.get(d.name, 0)
+        if cnt > 0:
+            print(f" • {d.name}: {cnt} × {d.cost:.2f} ₽ = {cnt*d.cost:.2f} ₽")
+
+    print("\nНазначения (кто что ест):")
+    for g in guests:
+        dish_name = improved.assignment.get(g.name)
+        if dish_name:
+            print(f" • {g.name} → {dish_name}")
+    if improved.uncovered:
+        print("\nКого не удалось накормить:")
+        for gname in improved.uncovered:
+            print(f" • {gname}: {improved.reason_for_uncovered.get(gname, '—')}")
+
+    # Компромиссы:
+    print("\nКомпромиссные предложения:")
+    tips = compromise_suggestions(improved, dishes, budget)
+    if tips["drop_expensive"]:
+        print(" • Для экономии бюджета можно:")
+        for t in tips["drop_expensive"]:
+            print("   -", t)
+    if improved.uncovered:
+        print(" • Чтобы накормить оставшихся, можно увеличить бюджет на стоимость самой дешёвой подходящей порции для каждого из них.")
+        # Краткая подсказка по минимальной цене
+        guest_opts, _ = build_options(guests, dishes)
+        for gname in improved.uncovered:
+            costs = [dishes[i].cost for i in guest_opts.get(gname, [])]
+            if costs:
+                print(f"   - {gname}: минимум +{min(costs):.2f} ₽")
+            else:
+                print(f"   - {gname}: нет подходящих блюд по диетам/аллергенам.")
+
+как подставить свои данные
+	1.	Замените список guests:
+Guest("Имя", {"vegetarian","gluten_free"} или set(), {"nuts","shrimp"} или set())
+Требуемые диеты указывайте в requires (набор тегов), аллергии — в allergies.
+	2.	Замените список dishes:
+Dish("Название", цена_за_порцию, {"ингредиенты"}, {"теги_диет"}, кол-во_порций, preference=0..1)
+Поддерживаемые теги: например vegan, vegetarian, gluten_free (можете вводить свои — главное, чтобы совпадали с требованиями гостей).
+	3.	Поставьте budget — общий бюджет.
+
+заметки
+	•	Алгоритм спроектирован так, чтобы быть понятным и коротким. Он максимально покрывает гостей и старается минимизировать стоимость; при равенстве предпочитает блюда с вашим preference.
+	•	Для небольших входов решение зачастую совпадает с оптимумом. Если нужен строго оптимальный расчёт для больших наборов, используйте MILP-солвер (например, pulp/ortools), но это добавит внешние зависимости, а цель тут — простой и автономный скрипт.
