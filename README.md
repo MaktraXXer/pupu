@@ -1,80 +1,66 @@
-USE [ALM];
-SET NOCOUNT ON;
-
-DECLARE @Start   date = '2024-01-01';
-DECLARE @End     date = '2025-07-31';   -- конец июля 2025
-DECLARE @Special date = '2025-08-10';   -- доп. дата
-
-/* 1) Целевые даты: все month-end + спец‑дата (без рекурсии) */
-IF OBJECT_ID('tempdb..#dates','U') IS NOT NULL DROP TABLE #dates;
-WITH tally AS (
-    SELECT TOP (1 + DATEDIFF(MONTH, @Start, @End))
-           ROW_NUMBER() OVER (ORDER BY (SELECT 1)) - 1 AS n
-    FROM sys.all_objects
-)
-SELECT dt_rep
-INTO #dates
-FROM (
-    SELECT EOMONTH(DATEADD(MONTH, n, @Start)) AS dt_rep FROM tally
+;WITH months AS (
+    SELECT CAST('2023-01-01' AS date) AS month_start
     UNION ALL
-    SELECT @Special
-) d;
-CREATE UNIQUE CLUSTERED INDEX IX_dates ON #dates(dt_rep);
-
-/* 2) Агрегация клиента на дату (внутри каждой даты), с исключением заданных продуктов */
-IF OBJECT_ID('tempdb..#client_on_date','U') IS NOT NULL DROP TABLE #client_on_date;
-
-SELECT
-    t.dt_rep,
-    t.cli_id,
-    SUM(CASE WHEN t.out_rub < 0 THEN 0 ELSE t.out_rub END)               AS total_out_rub,
-    MAX(CASE WHEN LTRIM(RTRIM(t.TSEGMENTNAME)) = N'ДЧБО' THEN 1 ELSE 0 END) AS has_dchbo,
-    COUNT(DISTINCT t.con_id)                                              AS accounts_cnt  -- кол-во счетов клиента на дату
-INTO #client_on_date
-FROM alm.ALM.vw_balance_rest_all AS t WITH (NOLOCK)
-JOIN #dates d ON d.dt_rep = t.dt_rep
-WHERE
-    t.block_name   = N'Привлечение ФЛ'
-    AND t.od_flag  = 1
-    AND t.cur      = '810'
-    AND t.out_rub IS NOT NULL
-    AND t.section_name IN (N'Накопительный счёт', N'Срочные', N'Срочные ', N'До востребования')
-    AND (t.TSEGMENTNAME IN (N'ДЧБО', N'Розничный бизнес') OR t.TSEGMENTNAME IS NULL)
-    AND t.PROD_NAME_res NOT IN (  -- исключаем продукты
-        N'Надёжный прайм', N'Надёжный VIP', N'Надёжный премиум',
-        N'Надёжный промо', N'Надёжный старт', N'Надёжный Т2',
-        N'Надёжный Мегафон', N'Надёжный процент',
-        N'Надёжный', N'ДОМа надёжно', N'Всё в ДОМ'
-    )
-GROUP BY t.dt_rep, t.cli_id;
-
-CREATE CLUSTERED INDEX IX_client_on_date ON #client_on_date(dt_rep, cli_id);
-
-/* 3) Финальный агрегат по датам/сегментам/бакетам */
-SELECT
-    c.dt_rep,
-    v.segment,
-    v.bucket,
-    COUNT(*)                 AS clients_cnt,      -- по одной строке на клиента → это число уникальных клиентов
-    SUM(c.accounts_cnt)      AS accounts_cnt,     -- суммарное число счетов (уникальных con_id) в группе
-    SUM(c.total_out_rub)     AS sum_out_rub
-FROM #client_on_date AS c
-CROSS APPLY (
-    VALUES (
-        CASE WHEN c.has_dchbo = 1 THEN N'УЧК' ELSE N'Розница' END,
+    SELECT DATEADD(month, 1, month_start)
+    FROM   months
+    WHERE  month_start < '2025-08-01'          -- последним будет Июль 2025
+),
+month_latest AS (
+    SELECT
+        EOMONTH(m.month_start) AS month_end,   -- 31.01.2023, 29.02.2024, …
+        latest.dt_rep
+    FROM months m
+    CROSS APPLY (
+        SELECT TOP (1) dt_rep
+        FROM   ALM.ALM.VW_Balance_Rest_All
+        WHERE  dt_rep BETWEEN m.month_start AND EOMONTH(m.month_start)
+          AND  BLOCK_NAME   = 'Привлечение ФЛ'
+          AND  SECTION_NAME = 'Срочные'
+          AND  CUR = '810'
+        ORDER BY dt_rep DESC
+    ) latest
+    WHERE latest.dt_rep IS NOT NULL
+),
+base AS (
+    SELECT
+        ml.month_end             AS dt_rep,
         CASE
-            WHEN c.total_out_rub >=         0    AND c.total_out_rub <   1000000        THEN N'[0; 1 млн)'
-            WHEN c.total_out_rub >=   1000000    AND c.total_out_rub <   1500000        THEN N'[1; 1.5 млн)'
-            WHEN c.total_out_rub >=   1500000    AND c.total_out_rub <  15000000        THEN N'[1.5 млн; 15 млн)'
-            WHEN c.total_out_rub >=  15000000    AND c.total_out_rub <= 3000000000000   THEN N'[15 млн; 3000 млрд]'
-            ELSE N'вне диапазона'
-        END
-    )
-) v(segment, bucket)
-WHERE
-    c.total_out_rub >= 0            -- защитный фильтр
-    AND v.bucket <> N'вне диапазона'
-GROUP BY
-    c.dt_rep, v.segment, v.bucket
-ORDER BY
-    c.dt_rep, v.segment, v.bucket;
+            WHEN w.termdays BETWEEN  28 AND  33 THEN  31
+            WHEN w.termdays BETWEEN  60 AND  70 THEN  61
+            WHEN w.termdays BETWEEN  85 AND 110 THEN  91
+            WHEN w.termdays BETWEEN 119 AND 140 THEN 124
+            WHEN w.termdays BETWEEN 175 AND 200 THEN 181
+            WHEN w.termdays BETWEEN 245 AND 290 THEN 274
+            WHEN w.termdays BETWEEN 340 AND 405 THEN 365
+            WHEN w.termdays BETWEEN 540 AND 621 THEN 550
+            WHEN w.termdays BETWEEN 720 AND 763 THEN 750
+            WHEN w.termdays BETWEEN 1090 AND 1140 THEN 1100
+            WHEN w.termdays BETWEEN 1450 AND 1475 THEN 1460
+            WHEN w.termdays BETWEEN 1795 AND 1830 THEN 1825
+            ELSE w.termdays
+        END                       AS term_bucket,
+        w.out_rub,
+        w.rate_con                -- добавили для взвешивания
+    FROM   month_latest ml
+    JOIN   ALM.ALM.VW_Balance_Rest_All w
+           ON  w.dt_rep       = ml.dt_rep
+           AND w.BLOCK_NAME   = 'Привлечение ФЛ'
+           AND w.SECTION_NAME = 'Срочные'
+           AND w.CUR          = '810'
+    -- учитываем только депозиты, открытые в том же месяце
+    WHERE  EOMONTH(w.DT_OPEN_fact) = ml.month_end
+)
+SELECT
+    dt_rep,
+    term_bucket                                        AS [Срок, дн.],
+    SUM(out_rub)                                       AS sum_out_rub,          -- все объёмы (в т.ч. без ставки)
+    CAST(
+        SUM(CASE WHEN rate_con IS NOT NULL AND out_rub IS NOT NULL
+                 THEN rate_con * out_rub END)
+        / NULLIF(SUM(CASE WHEN rate_con IS NOT NULL AND out_rub IS NOT NULL
+                          THEN out_rub END), 0)
+        AS decimal(12,6)
+    )                                                  AS wavg_rate_con          -- средневзвешенная ставка по «не-NULL»
+FROM base
+GROUP BY dt_rep, term_bucket
+ORDER BY dt_rep, term_bucket;
