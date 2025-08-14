@@ -1,11 +1,11 @@
 SET NOCOUNT ON;
 
-DECLARE @JulEOM      date = '2025-07-31';
-DECLARE @ChkDate     date = '2025-08-12';
-DECLARE @CloseFrom   date = '2025-08-01';
-DECLARE @CloseTo     date = '2025-08-11';   -- окно «1–11 августа»
+DECLARE @JulEOM    date = '2025-07-31';
+DECLARE @ChkDate   date = '2025-08-12';
+DECLARE @CloseFrom date = '2025-08-01';
+DECLARE @CloseTo   date = '2025-08-11';  -- плановые 1–11 августа
 
-/* 0) Справочник ФУ */
+/* 0) Крошечный справочник ФУ → дешёвый join */
 IF OBJECT_ID('tempdb..#fu') IS NOT NULL DROP TABLE #fu;
 CREATE TABLE #fu (prod_name_res nvarchar(255) NOT NULL PRIMARY KEY);
 INSERT INTO #fu(prod_name_res) VALUES
@@ -13,170 +13,166 @@ INSERT INTO #fu(prod_name_res) VALUES
  (N'Надёжный промо'),(N'Надёжный старт'),(N'Надёжный Т2'),
  (N'Надёжный Мегафон'),(N'Надёжный процент'),(N'Надёжный');
 
-/* 1) Когорта: клиенты с ФУ-закрытиями 1–11 августа */
-IF OBJECT_ID('tempdb..#cohort') IS NOT NULL DROP TABLE #cohort;
-SELECT DISTINCT t.cli_id
-INTO #cohort
-FROM alm.ALM.balance_rest_all t WITH (NOLOCK)
-JOIN #fu f ON f.prod_name_res = t.PROD_NAME_res
-WHERE t.block_name   = N'Привлечение ФЛ'
-  AND t.od_flag      = 1
-  AND t.cur          = '810'
-  AND t.out_rub     IS NOT NULL
-  AND t.section_name IN (N'Срочные', N'Срочные ')
-  AND (t.TSEGMENTNAME IN (N'Розничный бизнес') OR t.TSEGMENTNAME IS NULL)
-  AND t.dt_close BETWEEN @CloseFrom AND @CloseTo;
-CREATE UNIQUE CLUSTERED INDEX IX_cohort_cli ON #cohort(cli_id);
-
-/* 2) Seed: берём только клиентов, у кого ФУ было на 31.07 (отрезаем OUT) */
-IF OBJECT_ID('tempdb..#seed_0731') IS NOT NULL DROP TABLE #seed_0731;
-SELECT DISTINCT t.cli_id
-INTO #seed_0731
-FROM alm.ALM.balance_rest_all t WITH (NOLOCK)
-JOIN #cohort c ON c.cli_id = t.cli_id
-JOIN #fu f     ON f.prod_name_res = t.PROD_NAME_res
-WHERE t.dt_rep = @JulEOM
-  AND t.block_name   = N'Привлечение ФЛ'
-  AND t.od_flag      = 1
-  AND t.cur          = '810'
-  AND t.out_rub     IS NOT NULL
-  AND t.section_name IN (N'Срочные', N'Срочные ')
-  AND (t.TSEGMENTNAME IN (N'Розничный бизнес') OR t.TSEGMENTNAME IS NULL);
-CREATE UNIQUE CLUSTERED INDEX IX_seed_cli ON #seed_0731(cli_id);
-
-/* 3) Снимок 31.07 по договорам (для разбиения по закрытиям) */
-IF OBJECT_ID('tempdb..#july31') IS NOT NULL DROP TABLE #july31;
+/* 1) Снимок 31.07: договоры (нужны vol и dt_close) */
+IF OBJECT_ID('tempdb..#j31') IS NOT NULL DROP TABLE #j31;
 SELECT
     t.con_id,
     t.cli_id,
-    CAST(t.dt_close AS date) AS dt_close,
-    vol31 = SUM(CASE WHEN t.out_rub > 0 THEN CAST(t.out_rub AS decimal(20,2)) ELSE 0 END)
-INTO #july31
+    is_fu    = CASE WHEN f.prod_name_res IS NULL THEN 0 ELSE 1 END,
+    dt_close = CAST(t.dt_close AS date),
+    vol31    = SUM(CASE WHEN t.out_rub > 0 THEN CAST(t.out_rub AS decimal(20,2)) ELSE 0 END)
+INTO #j31
 FROM alm.ALM.balance_rest_all t WITH (NOLOCK)
-JOIN #seed_0731 s ON s.cli_id = t.cli_id
-WHERE t.dt_rep = @JulEOM
+LEFT JOIN #fu f ON f.prod_name_res = t.PROD_NAME_res
+WHERE t.dt_rep       = @JulEOM
   AND t.block_name   = N'Привлечение ФЛ'
   AND t.od_flag      = 1
   AND t.cur          = '810'
   AND t.out_rub     IS NOT NULL
   AND t.section_name IN (N'Срочные', N'Срочные ')
   AND (t.TSEGMENTNAME IN (N'Розничный бизнес') OR t.TSEGMENTNAME IS NULL)
-GROUP BY t.con_id, t.cli_id, t.dt_close;
-CREATE UNIQUE CLUSTERED INDEX IX_july31_con ON #july31(con_id);
+GROUP BY t.con_id, t.cli_id, CASE WHEN f.prod_name_res IS NULL THEN 0 ELSE 1 END, t.dt_close;
 
-/* 4) Снимок 12.08 по договорам (для разбиения по открытиям) */
-IF OBJECT_ID('tempdb..#aug12') IS NOT NULL DROP TABLE #aug12;
-SELECT
-    t.con_id,
-    t.cli_id,
-    CAST(t.dt_open  AS date) AS dt_open,
-    vol12 = SUM(CASE WHEN t.out_rub > 0 THEN CAST(t.out_rub AS decimal(20,2)) ELSE 0 END)
-INTO #aug12
-FROM alm.ALM.balance_rest_all t WITH (NOLOCK)
-JOIN #seed_0731 s ON s.cli_id = t.cli_id
-WHERE t.dt_rep = @ChkDate
-  AND t.block_name   = N'Привлечение ФЛ'
-  AND t.od_flag      = 1
-  AND t.cur          = '810'
-  AND t.out_rub     IS NOT NULL
-  AND t.section_name IN (N'Срочные', N'Срочные ')
-  AND (t.TSEGMENTNAME IN (N'Розничный бизнес') OR t.TSEGMENTNAME IS NULL)
-GROUP BY t.con_id, t.cli_id, t.dt_open;
-CREATE UNIQUE CLUSTERED INDEX IX_aug12_con ON #aug12(con_id);
+CREATE CLUSTERED INDEX IX_j31_cli ON #j31(cli_id);
 
-/* 5) Флаги состояний и total-объёмы по клиенту на обе даты (для A0/B0 → A1/B1/C1/N1) */
-IF OBJECT_ID('tempdb..#state') IS NOT NULL DROP TABLE #state;
-WITH s_raw AS (
-  SELECT t.cli_id,
-         vol_total_0731 = SUM(CASE WHEN t.dt_rep=@JulEOM  AND t.out_rub>0 THEN CAST(t.out_rub AS decimal(20,2)) ELSE 0 END),
-         vol_total_0812 = SUM(CASE WHEN t.dt_rep=@ChkDate AND t.out_rub>0 THEN CAST(t.out_rub AS decimal(20,2)) ELSE 0 END),
-         has_fu_0731    = MAX(CASE WHEN t.dt_rep=@JulEOM  AND f.prod_name_res IS NOT NULL THEN 1 ELSE 0 END),
-         has_nonfu_0731 = MAX(CASE WHEN t.dt_rep=@JulEOM  AND f.prod_name_res IS NULL THEN 1 ELSE 0 END),
-         has_fu_0812    = MAX(CASE WHEN t.dt_rep=@ChkDate AND f.prod_name_res IS NOT NULL THEN 1 ELSE 0 END),
-         has_nonfu_0812 = MAX(CASE WHEN t.dt_rep=@ChkDate AND f.prod_name_res IS NULL THEN 1 ELSE 0 END)
+/* 2) «Чистые» клиенты:
+      — на 31.07 нет не-ФУ (только ФУ),
+      — все ФУ из 31.07 закрываются 01–11.08,
+      — в августе нет закрытий не-ФУ вообще. */
+IF OBJECT_ID('tempdb..#eligible') IS NOT NULL DROP TABLE #eligible;
+WITH per_client AS (
+  SELECT
+      j.cli_id,
+      has_nonfu_31     = MAX(CASE WHEN j.is_fu=0 THEN 1 ELSE 0 END),
+      fu_cnt_31        = SUM(CASE WHEN j.is_fu=1 THEN 1 ELSE 0 END),
+      fu_cnt_close_aug = SUM(CASE WHEN j.is_fu=1 AND j.dt_close BETWEEN @CloseFrom AND @CloseTo THEN 1 ELSE 0 END)
+  FROM #j31 j
+  GROUP BY j.cli_id
+),
+clients31 AS (
+  SELECT DISTINCT cli_id FROM #j31
+),
+nonfu_close_aug AS (   -- исключаем клиентов с закрытиями не-ФУ в августе
+  SELECT DISTINCT t.cli_id
   FROM alm.ALM.balance_rest_all t WITH (NOLOCK)
-  JOIN #seed_0731 s ON s.cli_id = t.cli_id
-  LEFT JOIN #fu f   ON f.prod_name_res = t.PROD_NAME_res
-  WHERE t.dt_rep IN (@JulEOM, @ChkDate)
-    AND t.block_name=N'Привлечение ФЛ' AND t.od_flag=1 AND t.cur='810'
-    AND t.out_rub IS NOT NULL
-    AND t.section_name IN (N'Срочные',N'Срочные ')
+  JOIN clients31 c ON c.cli_id = t.cli_id
+  LEFT JOIN #fu f ON f.prod_name_res = t.PROD_NAME_res
+  WHERE CAST(t.dt_close AS date) BETWEEN @CloseFrom AND @CloseTo
+    AND f.prod_name_res IS NULL
+    AND t.block_name   = N'Привлечение ФЛ'
+    AND t.od_flag      = 1
+    AND t.cur          = '810'
+    AND t.section_name IN (N'Срочные', N'Срочные ')
     AND (t.TSEGMENTNAME IN (N'Розничный бизнес') OR t.TSEGMENTNAME IS NULL)
-  GROUP BY t.cli_id
 )
+SELECT pc.cli_id
+INTO #eligible
+FROM per_client pc
+LEFT JOIN nonfu_close_aug x ON x.cli_id = pc.cli_id
+WHERE pc.has_nonfu_31 = 0                 -- на 31.07 был только ФУ
+  AND pc.fu_cnt_31 > 0
+  AND pc.fu_cnt_close_aug = pc.fu_cnt_31  -- все ФУ из 31.07 закрываются 1–11.08
+  AND x.cli_id IS NULL;                   -- нет закрытий не-ФУ в августе
+
+CREATE UNIQUE CLUSTERED INDEX IX_elig_cli ON #eligible(cli_id);
+
+/* 3) База: сколько клиентов и какой объём закрывался (по 31.07) */
+IF OBJECT_ID('tempdb..#base') IS NOT NULL DROP TABLE #base;
 SELECT
-  cli_id,
-  vol_total_0731,
-  vol_total_0812,
-  has_fu_0731,
-  has_nonfu_0731,
-  has_fu_0812,
-  has_nonfu_0812
-INTO #state
-FROM s_raw;
-CREATE UNIQUE CLUSTERED INDEX IX_state_cli ON #state(cli_id);
+    seed_clients = COUNT(DISTINCT j.cli_id),
+    vol_closed_31 = SUM(CASE WHEN j.is_fu=1 AND j.dt_close BETWEEN @CloseFrom AND @CloseTo THEN j.vol31 ELSE 0 END)
+INTO #base
+FROM #j31 j
+JOIN #eligible e ON e.cli_id = j.cli_id;
 
-/* 6) Классификация путей по клиенту */
-IF OBJECT_ID('tempdb..#class') IS NOT NULL DROP TABLE #class;
+/* 4) Снимок 12.08 для eligible: что открылось 01–12.08 и какой объём на 12.08 */
+IF OBJECT_ID('tempdb..#a12') IS NOT NULL DROP TABLE #a12;
 SELECT
-  st.cli_id,
-  st.vol_total_0731,
-  st.vol_total_0812,
-  initial_state = CASE WHEN st.has_fu_0731=1 AND st.has_nonfu_0731=0 THEN 'A0' ELSE 'B0' END,
-  final_state   = CASE
-                    WHEN st.has_fu_0812=1 AND st.has_nonfu_0812=0 THEN 'A1'
-                    WHEN st.has_fu_0812=1 AND st.has_nonfu_0812=1 THEN 'B1'
-                    WHEN st.has_fu_0812=0 AND st.has_nonfu_0812=1 THEN 'C1'
-                    ELSE 'N1'
-                  END
-INTO #class
-FROM #state st;
-CREATE UNIQUE CLUSTERED INDEX IX_class_cli ON #class(cli_id);
+    t.cli_id,
+    is_fu   = CASE WHEN f.prod_name_res IS NULL THEN 0 ELSE 1 END,
+    dt_open = CAST(t.dt_open AS date),
+    vol12   = SUM(CASE WHEN t.out_rub > 0 THEN CAST(t.out_rub AS decimal(20,2)) ELSE 0 END)
+INTO #a12
+FROM alm.ALM.balance_rest_all t WITH (NOLOCK)
+JOIN #eligible e ON e.cli_id = t.cli_id
+LEFT JOIN #fu  f ON f.prod_name_res = t.PROD_NAME_res
+WHERE t.dt_rep       = @ChkDate
+  AND t.block_name   = N'Привлечение ФЛ'
+  AND t.od_flag      = 1
+  AND t.cur          = '810'
+  AND t.out_rub     IS NOT NULL
+  AND t.section_name IN (N'Срочные', N'Срочные ')
+  AND (t.TSEGMENTNAME IN (N'Розничный бизнес') OR t.TSEGMENTNAME IS NULL)
+  AND t.dt_open BETWEEN @CloseFrom AND @ChkDate
+GROUP BY t.cli_id, CASE WHEN f.prod_name_res IS NULL THEN 0 ELSE 1 END, t.dt_open;
 
-/* 7) Разбивка объёмов по клиенту на 31.07 и 12.08 */
-IF OBJECT_ID('tempdb..#b31') IS NOT NULL DROP TABLE #b31;
-SELECT
-  j.cli_id,
-  vol_31_total        = SUM(j.vol31),
-  vol_31_close_plan   = SUM(CASE WHEN j.dt_close BETWEEN @CloseFrom AND @CloseTo THEN j.vol31 ELSE 0 END),
-  vol_31_other        = SUM(j.vol31) - SUM(CASE WHEN j.dt_close BETWEEN @CloseFrom AND @CloseTo THEN j.vol31 ELSE 0 END)
-INTO #b31
-FROM #july31 j
-GROUP BY j.cli_id;
-CREATE UNIQUE CLUSTERED INDEX IX_b31_cli ON #b31(cli_id);
+CREATE CLUSTERED INDEX IX_a12_cli ON #a12(cli_id);
 
-IF OBJECT_ID('tempdb..#b12') IS NOT NULL DROP TABLE #b12;
-SELECT
-  a.cli_id,
-  vol_12_total      = SUM(a.vol12),
-  vol_12_open_aug   = SUM(CASE WHEN a.dt_open BETWEEN @CloseFrom AND @CloseTo THEN a.vol12 ELSE 0 END),
-  vol_12_other      = SUM(a.vol12) - SUM(CASE WHEN a.dt_open BETWEEN @CloseFrom AND @CloseTo THEN a.vol12 ELSE 0 END)
-INTO #b12
-FROM #aug12 a
-GROUP BY a.cli_id;
-CREATE UNIQUE CLUSTERED INDEX IX_b12_cli ON #b12(cli_id);
+/* 5) Классификация клиентов по исходу + объёмы открытий на 12.08 */
+WITH opened AS (
+  SELECT
+      cli_id,
+      opened_fu    = MAX(CASE WHEN is_fu=1 THEN 1 ELSE 0 END),
+      opened_bank  = MAX(CASE WHEN is_fu=0 THEN 1 ELSE 0 END),
+      vol_open_fu  = SUM(CASE WHEN is_fu=1 THEN vol12 ELSE 0 END),
+      vol_open_bank= SUM(CASE WHEN is_fu=0 THEN vol12 ELSE 0 END)
+  FROM #a12
+  GROUP BY cli_id
+),
+outcomes AS (
+  SELECT
+    o.cli_id,
+    outcome = CASE
+                WHEN o.opened_fu=1 AND o.opened_bank=0 THEN 'FU_only'
+                WHEN o.opened_fu=0 AND o.opened_bank=1 THEN 'Bank_only'
+                WHEN o.opened_fu=1 AND o.opened_bank=1 THEN 'FU_and_Bank'
+                ELSE 'No_opens'
+              END,
+    o.vol_open_fu,
+    o.vol_open_bank
+  FROM opened o
+),
+summary_open AS (
+  SELECT
+    outcome,
+    clients_cnt = COUNT(*),
+    vol_fu   = SUM(vol_open_fu),
+    vol_bank = SUM(vol_open_bank)
+  FROM outcomes
+  GROUP BY outcome
+),
+no_opens AS (
+  SELECT
+    clients_cnt = b.seed_clients - ISNULL( (SELECT SUM(clients_cnt) FROM summary_open WHERE outcome <> 'No_opens'), 0)
+  FROM #base b
+)
+-- ===== Итоговый "принт" =====
+SELECT 'SEED (31.07 только ФУ, все закрытия 1–11.08)' AS label,
+       b.seed_clients      AS clients_cnt,
+       b.vol_closed_31     AS volume_rub,
+       NULL AS extra1, NULL AS extra2
+FROM #base b
 
-/* 8) ФИНАЛ — тот же формат, но с разбивкой объёмов на 2+2 колонки */
-SELECT
-  c.initial_state,             -- 'A0' / 'B0'
-  c.final_state,               -- 'A1' / 'B1' / 'C1' / 'N1'
+UNION ALL
+SELECT 'OPEN: только Банк (01–12.08)', s.clients_cnt, s.vol_bank, NULL, NULL
+FROM summary_open s WHERE s.outcome='Bank_only'
 
-  /* объёмы на 31.07 (2 колонки вместо vol_total_start) */
-  vol_start_close_plan = SUM(ISNULL(b31.vol_31_close_plan,0)),   -- был 31.07 и закроется 1–11.08
-  vol_start_other      = SUM(ISNULL(b31.vol_31_other,0)),        -- остальной объём на 31.07
+UNION ALL
+SELECT 'OPEN: только ФУ (01–12.08)', s.clients_cnt, s.vol_fu, NULL, NULL
+FROM summary_open s WHERE s.outcome='FU_only'
 
-  /* объёмы на 12.08 (2 колонки вместо vol_total_end) */
-  vol_end_open_aug     = SUM(ISNULL(b12.vol_12_open_aug,0)),     -- открылся 1–11.08
-  vol_end_other        = SUM(ISNULL(b12.vol_12_other,0)),        -- остальной объём на 12.08
+UNION ALL
+SELECT 'OPEN: ФУ и Банк (01–12.08)', s.clients_cnt, s.vol_fu, s.vol_bank, NULL
+FROM summary_open s WHERE s.outcome='FU_and_Bank'
 
-  /* количество клиентов — как было */
-  path_clients_cnt = COUNT(*),
-  clients_start    = COUNT(DISTINCT CASE WHEN c.vol_total_0731 > 0 THEN c.cli_id END),
-  clients_end      = COUNT(DISTINCT CASE WHEN c.vol_total_0812 > 0 THEN c.cli_id END)
-
-FROM #class c
-LEFT JOIN #b31 b31 ON b31.cli_id = c.cli_id
-LEFT JOIN #b12 b12 ON b12.cli_id = c.cli_id
-GROUP BY c.initial_state, c.final_state
-ORDER BY c.initial_state, c.final_state
+UNION ALL
+SELECT 'NO OPENS (ничего не открыто 01–12.08)', n.clients_cnt, CAST(0 AS decimal(20,2)), NULL, NULL
+FROM no_opens n
+ORDER BY CASE label
+           WHEN 'SEED (31.07 только ФУ, все закрытия 1–11.08)' THEN 1
+           WHEN 'OPEN: только Банк (01–12.08)' THEN 2
+           WHEN 'OPEN: только ФУ (01–12.08)' THEN 3
+           WHEN 'OPEN: ФУ и Банк (01–12.08)' THEN 4
+           WHEN 'NO OPENS (ничего не открыто 01–12.08)' THEN 5
+         END
 OPTION (RECOMPILE, USE HINT('ENABLE_BATCH_MODE'));
