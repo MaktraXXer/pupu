@@ -1,4 +1,3 @@
-/* --- Параметры --- */
 DECLARE @JulEOM     date = '2025-07-31';
 DECLARE @ChkDate    date = '2025-08-12';
 DECLARE @CloseFrom  date = '2025-08-01';
@@ -21,7 +20,7 @@ WITH base AS (
         t.section_name,
         CAST(t.out_rub AS decimal(20,2)) AS out_rub,
         CAST(t.dt_close AS date)         AS dt_close
-    FROM alm.ALM.balance_rest_all t WITH (NOLOCK)   -- без vw_ для скорости
+    FROM alm.ALM.balance_rest_all t WITH (NOLOCK) -- без vw_ для скорости
     WHERE t.block_name = N'Привлечение ФЛ'
       AND t.od_flag    = 1
       AND t.cur        = '810'
@@ -31,70 +30,45 @@ WITH base AS (
           )
       AND (t.TSEGMENTNAME IN (N'Розничный бизнес') OR t.TSEGMENTNAME IS NULL)
 ),
-/* --- Когорта (закрытия ФУ 1-11 августа) --- */
+/* --- Когорта закрытий ФУ --- */
 cohort AS (
-    SELECT DISTINCT b.cli_id
+    SELECT 
+        b.cli_id,
+        SUM(CASE WHEN b.out_rub < 0 THEN 0 ELSE b.out_rub END) AS vol_closed_fu
     FROM base b
     JOIN @FU f ON f.prod_name_res = b.PROD_NAME_res
     WHERE b.dt_close BETWEEN @CloseFrom AND @CloseTo
+    GROUP BY b.cli_id
 ),
-/* --- Срезы --- */
-snap_0731 AS (
+/* --- Срез на дату --- */
+snap AS (
     SELECT
+        b.dt_rep,
         b.cli_id,
-        SUM(CASE WHEN b.out_rub < 0 THEN 0 ELSE b.out_rub END) AS vol_total_0731,
-        MAX(CASE WHEN f.prod_name_res IS NOT NULL THEN 1 ELSE 0 END) AS has_fu_0731,
-        MAX(CASE WHEN f.prod_name_res IS NULL OR b.section_name = N'Накопительный счёт' THEN 1 ELSE 0 END) AS has_bank_0731
+        SUM(CASE WHEN f.prod_name_res IS NOT NULL THEN b.out_rub ELSE 0 END) AS vol_fu,
+        SUM(CASE WHEN f.prod_name_res IS NULL AND b.section_name <> N'Накопительный счёт' THEN b.out_rub ELSE 0 END) AS vol_nonfu,
+        SUM(CASE WHEN b.section_name = N'Накопительный счёт' THEN b.out_rub ELSE 0 END) AS vol_ns
     FROM base b
     JOIN cohort c ON c.cli_id = b.cli_id
     LEFT JOIN @FU f ON f.prod_name_res = b.PROD_NAME_res
-    WHERE b.dt_rep = @JulEOM
-    GROUP BY b.cli_id
+    WHERE b.dt_rep IN (@JulEOM, @ChkDate)
+    GROUP BY b.dt_rep, b.cli_id
 ),
-snap_0812 AS (
+/* --- Аггрегат по датам --- */
+agg AS (
     SELECT
-        b.cli_id,
-        SUM(CASE WHEN b.out_rub < 0 THEN 0 ELSE b.out_rub END) AS vol_total_0812,
-        MAX(CASE WHEN f.prod_name_res IS NOT NULL THEN 1 ELSE 0 END) AS has_fu_0812,
-        MAX(CASE WHEN f.prod_name_res IS NULL OR b.section_name = N'Накопительный счёт' THEN 1 ELSE 0 END) AS has_bank_0812
-    FROM base b
-    JOIN cohort c ON c.cli_id = b.cli_id
-    LEFT JOIN @FU f ON f.prod_name_res = b.PROD_NAME_res
-    WHERE b.dt_rep = @ChkDate
-    GROUP BY b.cli_id
-),
-/* --- Классификация --- */
-detail AS (
-    SELECT
-        c.cli_id,
-        ISNULL(s7.vol_total_0731,0) AS vol_total_0731,
-        ISNULL(s8.vol_total_0812,0) AS vol_total_0812,
-
-        CASE 
-          WHEN ISNULL(s7.has_fu_0731,0)=1 AND ISNULL(s7.has_bank_0731,0)=0 THEN 'A0'  -- только ФУ
-          WHEN ISNULL(s7.has_fu_0731,0)=1 AND ISNULL(s7.has_bank_0731,0)=1 THEN 'B0'  -- ФУ+банк
-          ELSE 'OUT'
-        END AS initial_state,
-
-        CASE 
-          WHEN ISNULL(s8.has_fu_0812,0)=1 AND ISNULL(s8.has_bank_0812,0)=0 THEN 'A1'  -- только ФУ
-          WHEN ISNULL(s8.has_fu_0812,0)=1 AND ISNULL(s8.has_bank_0812,0)=1 THEN 'B1'  -- ФУ+банк
-          WHEN ISNULL(s8.has_fu_0812,0)=0 AND ISNULL(s8.has_bank_0812,0)=1 THEN 'C1'  -- только банк
-          ELSE 'N1'                                                                  -- нет вкладов
-        END AS final_state
-    FROM cohort c
-    LEFT JOIN snap_0731 s7 ON s7.cli_id = c.cli_id
-    LEFT JOIN snap_0812 s8 ON s8.cli_id = c.cli_id
+        s.dt_rep,
+        SUM(s.vol_fu)    AS total_fu,
+        SUM(s.vol_nonfu) AS total_nonfu,
+        SUM(s.vol_ns)    AS total_ns,
+        COUNT(DISTINCT s.cli_id) AS clients_cnt
+    FROM snap s
+    GROUP BY s.dt_rep
 )
 /* --- Итог --- */
 SELECT
-    initial_state,
-    final_state,
-    SUM(vol_total_0731)                         AS vol_total_start,
-    COUNT(DISTINCT CASE WHEN vol_total_0731>0 THEN cli_id END) AS clients_start,
-    COUNT(DISTINCT CASE WHEN vol_total_0812>0 THEN cli_id END) AS clients_end,
-    SUM(vol_total_0812)                         AS vol_total_end
-FROM detail
-WHERE initial_state IN ('A0','B0')
-GROUP BY initial_state, final_state
-ORDER BY initial_state, final_state;
+    (SELECT SUM(vol_closed_fu) FROM cohort) AS closed_fu_volume,
+    (SELECT COUNT(*) FROM cohort)           AS closed_fu_clients,
+    a.*
+FROM agg a
+ORDER BY a.dt_rep;
