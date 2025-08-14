@@ -11,32 +11,29 @@ COHORT_FROM = pd.Timestamp('2024-01-01')
 SNAP_DATE   = pd.Timestamp('2025-08-12')
 COHORT_TO   = SNAP_DATE
 
-# df_sql — уже загружен из БД
+# ===== ДАННЫЕ =====
 df = df_sql.copy()
 
-# --- НОРМАЛИЗУЕМ КОЛОНКИ С САЛЬДО ---
-# Ожидаем, что saldo.OUT_RUB в SQL отдали как OUT_RUB.
-# Просим также алиасить saldo.OUT_RUB как BALANCE_RUB в SQL.
-# Если BALANCE_RUB нет, подхватим из OUT_RUB — но лучше исправить SQL.
-if 'BALANCE_RUB' not in df.columns and 'OUT_RUB' in df.columns:
-    df['BALANCE_RUB'] = df['OUT_RUB']
-
-# OUT_RUB для статуса на дату — жёстко выделим
-df['OUT_RUB_SNAP'] = df['OUT_RUB']  # только из Saldo
-
-# Даты
-for c in ['DT_OPEN','DT_CLOSE']:
+# Нормализуем даты и колонки
+for c in ['DT_OPEN','DT_CLOSE','DT_CLOSE_PLAN']:
     if c in df.columns:
         df[c] = pd.to_datetime(df[c], errors='coerce')
 
-# Уберём "быстро закрытые" (<= 2 суток)
+# Страховка: если нет BALANCE_RUB, используем OUT_RUB (лучше иметь в SQL оба явно)
+if 'BALANCE_RUB' not in df.columns and 'OUT_RUB' in df.columns:
+    df['BALANCE_RUB'] = df['OUT_RUB']
+
+# OUT_RUB на дату снепшота — для ясности переименуем
+df['OUT_RUB_SNAP'] = df['OUT_RUB']  # saldo на SNAP_DATE
+
+# Уберём быстро закрытые (<= 2 суток)
 fast = df['DT_CLOSE'].notna() & ((df['DT_CLOSE'] - df['DT_OPEN']).dt.days <= 2)
 df = df[~fast].copy()
 
-# Флаги ФУ
+# ФУ-флаг
 df['is_fu'] = df['PROD_NAME'].isin(FU_PRODUCTS)
 
-# ---- ПЕРВЫЙ ФУ-вклад по клиенту в окне когорты ----
+# ===== КОГОРТА: первый ФУ-вклад клиента в окне =====
 first_fu = (
     df.loc[df['is_fu'] & (df['DT_OPEN'] >= COHORT_FROM) & (df['DT_OPEN'] <= COHORT_TO)]
       .sort_values(['CLI_ID','DT_OPEN'])
@@ -44,22 +41,27 @@ first_fu = (
       .first()[['DT_OPEN']]
 )
 
-# ---- Снимок на SNAP_DATE для статуса (используем ТОЛЬКО OUT_RUB_SNAP) ----
-live_all = df.loc[
+# ===== ЖИВЫ на SNAP_DATE по плановой дате закрытия =====
+alive_mask = (
     (df['DT_OPEN'] <= SNAP_DATE) &
-    (df['OUT_RUB_SNAP'].fillna(0) >= MIN_BAL_RUB) &
-    (df['DT_CLOSE'].isna() | (df['DT_CLOSE'] > SNAP_DATE))
+    (df['DT_CLOSE_PLAN'].isna() | (df['DT_CLOSE_PLAN'] > SNAP_DATE))
+)
+
+# ===== СВОДКА "статус на дату" (ТОЛЬКО живые, OUT_RUB_SNAP) =====
+live = df.loc[
+    alive_mask &
+    (df['OUT_RUB_SNAP'].fillna(0) >= MIN_BAL_RUB)
 ].copy()
 
-live_all['vol_fu_snap'] = live_all['OUT_RUB_SNAP'].where(live_all['is_fu'], 0.0)
-live_all['vol_nb_snap'] = live_all['OUT_RUB_SNAP'].where(~live_all['is_fu'], 0.0)
+live['vol_fu_snap'] = live['OUT_RUB_SNAP'].where(live['is_fu'], 0.0)
+live['vol_nb_snap'] = live['OUT_RUB_SNAP'].where(~live['is_fu'], 0.0)
 
-g_all_snap = (live_all.groupby('CLI_ID', as_index=True)
-                      .agg(vol_fu=('vol_fu_snap','sum'),
-                           vol_nb=('vol_nb_snap','sum')))
+g_all_snap = (live.groupby('CLI_ID', as_index=True)
+                    .agg(vol_fu=('vol_fu_snap','sum'),
+                         vol_nb=('vol_nb_snap','sum')))
 
-# ---- Функция снепшота (статус на дату) ТОЛЬКО по OUT_RUB_SNAP ----
 def snapshot_for_cli(cli_ids):
+    """Статус на SNAP_DATE по когорте: только живые, объёмы из OUT_RUB_SNAP."""
     if not cli_ids:
         return pd.DataFrame([[0,0.0,0.0]]*4,
                             columns=['Клиентов','Баланс ФУ','Баланс Банк'],
@@ -82,54 +84,59 @@ def snapshot_for_cli(cli_ids):
                         columns=['Клиентов','Баланс ФУ','Баланс Банк'],
                         index=['только ФУ','только Банк','ФУ + Банк','ИТОГО'])
 
-# ---- Объём ФУ когорты (ШАПКА) по BALANCE_RUB ----
-# Здесь считаем сумму BALANCE_RUB ТОЛЬКО по ФУ-счетам клиентов когорты.
-def cohort_fu_volume_by_balance(cli_ids):
+# ===== "Вошли в месяц": сколько клиентов + объём ФУ по BALANCE_RUB (договорам, открыт. в месяце) =====
+def entered_fu_volume_by_balance(cli_ids, month_start, month_end):
+    """
+    Объём ФУ когорты для строки 'Новые ФУ-клиенты YYYY-MM':
+    суммируем BALANCE_RUB по ФУ-договорам, ОТКРЫТЫМ в этом месяце, у клиентов когорты.
+    BALANCE_RUB — остаток на последний день жизни/последний живой (как ты и хочешь).
+    """
     if not cli_ids:
         return 0.0
     sub = df.loc[
         (df['CLI_ID'].isin(cli_ids)) &
         (df['is_fu']) &
-        (df['DT_OPEN'] <= SNAP_DATE) &
-        (df['DT_CLOSE'].isna() | (df['DT_CLOSE'] > SNAP_DATE))
+        (df['DT_OPEN'] >= month_start) & (df['DT_OPEN'] <= month_end)
     ]
-    return float(sub['BALANCE_RUB'].fillna(0).sum())
+    return float(sub['BALANCE_RUB'].fillna(0.0).sum())
 
-# ---- Список месяцев ----
+# ===== Месяцы и экспорт =====
 months = pd.period_range(start=COHORT_FROM.to_period('M'),
                          end=COHORT_TO.to_period('M'), freq='M')
 
-# ---- Формирование вывода в Excel ----
 export_rows = []
-columns = ['Заголовок/Категория', 'Клиентов', 'Объём ФУ (BALANCE_RUB)', 'Баланс Банк (OUT_RUB_SNAP)']
+columns = ['Заголовок/Категория', 'Клиентов', 'Баланс ФУ', 'Баланс Банк']
 
 for p in months:
     month_start = pd.Timestamp(p.start_time.date())
     month_end   = pd.Timestamp(p.end_time.date())
 
-    # Клиенты, у кого ПЕРВЫЙ ФУ-вклад открыт в этом месяце
+    # Когорты: клиенты, чей ПЕРВЫЙ ФУ-вклад открыт в этом месяце
     mask = (first_fu['DT_OPEN'] >= month_start) & (first_fu['DT_OPEN'] <= month_end)
-    cli_ids = set(first_fu.index[mask])
+    cohort_cli = set(first_fu.index[mask])
 
-    # --- Шапка: текст | кол-во | объём ФУ по BALANCE_RUB | пусто
-    cohort_vol_fu = cohort_fu_volume_by_balance(cli_ids)
-    export_rows.append([f'Новые ФУ-клиенты {p.strftime("%Y-%m")}', len(cli_ids), cohort_vol_fu, ''])
+    # --- ШАПКА: "вошли" (без фильтра на живых)
+    entered_cnt = len(cohort_cli)
+    entered_fu_vol = entered_fu_volume_by_balance(cohort_cli, month_start, month_end)
+    export_rows.append([f'Новые ФУ-клиенты {p.strftime("%Y-%m")}', entered_cnt, entered_fu_vol, ''])
 
-    # --- Таблица статуса на дату (ТОЛЬКО OUT_RUB_SNAP)
-    snap_df = snapshot_for_cli(cli_ids)
+    # --- ЖИВЫ на SNAP_DATE из этой когорты
+    alive_cli = set(df.loc[alive_mask & df['CLI_ID'].isin(cohort_cli), 'CLI_ID'].unique())
+
+    # Табличка статуса на дату (OUT_RUB_SNAP)
+    snap_df = snapshot_for_cli(alive_cli)
     for idx, row in snap_df.iterrows():
         export_rows.append([
             idx,
             int(row['Клиентов']),
-            float(row['Баланс ФУ']),     # из OUT_RUB_SNAP
-            float(row['Баланс Банк'])    # из OUT_RUB_SNAP
+            float(row['Баланс ФУ']),
+            float(row['Баланс Банк']),
         ])
 
-    # --- Две пустые строки-разделители
-    export_rows.append(['', '', '', ''])
-    export_rows.append(['', '', '', ''])
+    # Разделитель: две пустые строки
+    export_rows.extend([['','','',''], ['','','','']])
 
-# В DataFrame и в Excel
+# В Excel
 export_df = pd.DataFrame(export_rows, columns=columns)
 export_df.to_excel('monthly_fu_clients.xlsx', index=False)
-print("Файл 'monthly_fu_clients.xlsx' сохранён.")
+print("Готово: monthly_fu_clients.xlsx")
