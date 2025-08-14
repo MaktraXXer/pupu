@@ -1,215 +1,95 @@
-SET NOCOUNT ON;
+import pandas as pd
+from datetime import date
 
-DECLARE @JulEOM    date = '2025-07-31';
-DECLARE @ChkDate   date = '2025-08-12';
-DECLARE @CloseFrom date = '2025-08-01';
-DECLARE @CloseTo   date = '2025-08-11';  -- плановые закрытия (включительно)
+# ===== НАСТРОЙКИ =====
+FU_PRODUCTS = {
+    'Надёжный','Надёжный VIP','Надёжный премиум',
+    'Надёжный промо','Надёжный старт',
+    'Надёжный T2','Надёжный Мегафон'
+}
+MIN_BAL_RUB = 1.0
+COHORT_FROM = pd.Timestamp('2024-01-01')
+SNAP_DATE   = pd.Timestamp('2025-08-12')   # «на дату августа»
+COHORT_TO   = SNAP_DATE
 
--- ФУ-продукты (инлайн-список: быстрее, чем лишний JOIN)
--- N'Надёжный прайм', N'Надёжный VIP', N'Надёжный премиум',
--- N'Надёжный промо', N'Надёжный старт', N'Надёжный Т2',
--- N'Надёжный Мегафон', N'Надёжный процент', N'Надёжный'
+# df_sql уже загружен из БД
+df = df_sql.copy()
 
-/* ===== 1) 31.07: агрегат по клиенту (вклады «Срочные» + НС) ===== */
-IF OBJECT_ID('tempdb..#j31_dep') IS NOT NULL DROP TABLE #j31_dep;
-SELECT
-    t.cli_id,
-    t.con_id,
-    is_fu = CASE WHEN t.PROD_NAME_res IN (N'Надёжный прайм',N'Надёжный VIP',N'Надёжный премиум',
-                                          N'Надёжный промо',N'Надёжный старт',N'Надёжный Т2',
-                                          N'Надёжный Мегафон',N'Надёжный процент',N'Надёжный')
-                 THEN 1 ELSE 0 END,
-    dt_close = t.dt_close,  -- datetime оставляем как есть (SARGable сравнение ниже)
-    vol31 = SUM(CASE WHEN t.out_rub>0 THEN CONVERT(decimal(19,2),t.out_rub) ELSE 0 END)
-INTO #j31_dep
-FROM alm.ALM.balance_rest_all t WITH (NOLOCK)
-WHERE t.dt_rep = @JulEOM
-  AND t.block_name = N'Привлечение ФЛ'
-  AND t.od_flag = 1
-  AND t.cur = '810'
-  AND t.out_rub IS NOT NULL
-  AND t.section_name IN (N'Срочные',N'Срочные ')      -- без LTRIM/RTRIM для индексов
-  AND (t.TSEGMENTNAME IS NULL OR t.TSEGMENTNAME IN (N'Розничный бизнес'))
-GROUP BY t.cli_id, t.con_id, CASE WHEN t.PROD_NAME_res IN (N'Надёжный прайм',N'Надёжный VIP',N'Надёжный премиум',
-                                                           N'Надёжный промо',N'Надёжный старт',N'Надёжный Т2',
-                                                           N'Надёжный Мегафон',N'Надёжный процент',N'Надёжный')
-                                  THEN 1 ELSE 0 END,
-         t.dt_close;
-CREATE CLUSTERED INDEX IX_j31_dep_cli ON #j31_dep(cli_id);
+# Даты
+for c in ['DT_OPEN','DT_CLOSE']:
+    if c in df.columns:
+        df[c] = pd.to_datetime(df[c], errors='coerce')
 
-IF OBJECT_ID('tempdb..#ns31') IS NOT NULL DROP TABLE #ns31;
-SELECT t.cli_id,
-       vol_ns31 = SUM(CASE WHEN t.out_rub>0 THEN CONVERT(decimal(19,2),t.out_rub) ELSE 0 END)
-INTO #ns31
-FROM alm.ALM.balance_rest_all t WITH (NOLOCK)
-WHERE t.dt_rep = @JulEOM
-  AND t.block_name = N'Привлечение ФЛ'
-  AND t.od_flag = 1
-  AND t.cur = '810'
-  AND t.out_rub IS NOT NULL
-  AND t.section_name IN (N'Накопительный счёт',N'Накопительный счёт ')
-  AND (t.TSEGMENTNAME IS NULL OR t.TSEGMENTNAME IN (N'Розничный бизнес'))
-GROUP BY t.cli_id;
-CREATE UNIQUE CLUSTERED INDEX IX_ns31_cli ON #ns31(cli_id);
+# Уберём "быстро закрытые" (<= 2 суток)
+fast = df['DT_CLOSE'].notna() & ((df['DT_CLOSE'] - df['DT_OPEN']).dt.days <= 2)
+df = df[~fast].copy()
 
--- клиенты с закрытиями НЕ-ФУ в августе (исключим)
-IF OBJECT_ID('tempdb..#bad_nonfu_aug') IS NOT NULL DROP TABLE #bad_nonfu_aug;
-SELECT DISTINCT t.cli_id
-INTO #bad_nonfu_aug
-FROM alm.ALM.balance_rest_all t WITH (NOLOCK)
-WHERE t.section_name IN (N'Срочные',N'Срочные ')
-  AND (t.TSEGMENTNAME IS NULL OR t.TSEGMENTNAME IN (N'Розничный бизнес'))
-  AND t.block_name = N'Привлечение ФЛ'
-  AND t.od_flag = 1
-  AND t.cur = '810'
-  AND t.dt_close >= @CloseFrom AND t.dt_close < DATEADD(DAY,1,@CloseTo)
-  AND t.PROD_NAME_res NOT IN (N'Надёжный прайм',N'Надёжный VIP',N'Надёжный премиум',
-                              N'Надёжный промо',N'Надёжный старт',N'Надёжный Т2',
-                              N'Надёжный Мегафон',N'Надёжный процент',N'Надёжный');
-CREATE UNIQUE CLUSTERED INDEX IX_bad_cli ON #bad_nonfu_aug(cli_id);
+# Фильтр по окну когорты для поиска ПЕРВОГО ФУ-вклада
+df['is_fu'] = df['PROD_NAME'].isin(FU_PRODUCTS)
 
-/* SEED: только ФУ на 31.07, и все они закрываются 1–11.08, без НЕ-ФУ закрытий */
-IF OBJECT_ID('tempdb..#seed31') IS NOT NULL DROP TABLE #seed31;
-SELECT
-    d.cli_id,
-    vol_deposits_close31 = SUM(CASE WHEN d.is_fu=1 THEN d.vol31 ELSE 0 END),
-    vol_ns31 = ISNULL(n.vol_ns31,0)
-INTO #seed31
-FROM #j31_dep d
-LEFT JOIN #ns31 n ON n.cli_id = d.cli_id
-LEFT JOIN #bad_nonfu_aug b ON b.cli_id = d.cli_id
-GROUP BY d.cli_id, n.vol_ns31, b.cli_id
-HAVING
-    SUM(CASE WHEN d.is_fu=0 THEN 1 ELSE 0 END) = 0         -- на 31.07 нет НЕ-ФУ вкладов
-AND SUM(CASE WHEN d.is_fu=1 THEN 1 ELSE 0 END) > 0         -- есть ФУ-вклады
-AND SUM(CASE WHEN d.is_fu=1 AND d.dt_close >= @CloseFrom AND d.dt_close < DATEADD(DAY,1,@CloseTo) THEN 1 ELSE 0 END)
-    = SUM(CASE WHEN d.is_fu=1 THEN 1 ELSE 0 END)           -- все ФУ закрываются в окне
-AND b.cli_id IS NULL;                                      -- нет НЕ-ФУ закрытий в августе
-CREATE UNIQUE CLUSTERED INDEX IX_seed_cli ON #seed31(cli_id);
+# Первый ФУ-вклад по клиенту в окне [COHORT_FROM, COHORT_TO]
+first_fu = (
+    df.loc[df['is_fu'] & (df['DT_OPEN'] >= COHORT_FROM) & (df['DT_OPEN'] <= COHORT_TO)]
+      .sort_values(['CLI_ID','DT_OPEN'])
+      .groupby('CLI_ID', as_index=True)
+      .first()[['DT_OPEN']]
+)
 
-/* ===== 2) 12.08: открытия вкладов (01–12.08) + НС объём ===== */
-IF OBJECT_ID('tempdb..#dep1208') IS NOT NULL DROP TABLE #dep1208;
-SELECT
-    t.cli_id,
-    dep_open_fu_flag   = MAX(CASE WHEN t.section_name IN (N'Срочные',N'Срочные ')
-                                   AND t.PROD_NAME_res IN (N'Надёжный прайм',N'Надёжный VIP',N'Надёжный премиум',
-                                                           N'Надёжный промо',N'Надёжный старт',N'Надёжный Т2',
-                                                           N'Надёжный Мегафон',N'Надёжный процент',N'Надёжный')
-                                   AND t.dt_open >= @CloseFrom AND t.dt_open < DATEADD(DAY,1,@ChkDate)
-                                  THEN 1 ELSE 0 END),
-    dep_open_bank_flag = MAX(CASE WHEN t.section_name IN (N'Срочные',N'Срочные ')
-                                   AND t.PROD_NAME_res NOT IN (N'Надёжный прайм',N'Надёжный VIP',N'Надёжный премиум',
-                                                               N'Надёжный промо',N'Надёжный старт',N'Надёжный Т2',
-                                                               N'Надёжный Мегафон',N'Надёжный процент',N'Надёжный')
-                                   AND t.dt_open >= @CloseFrom AND t.dt_open < DATEADD(DAY,1,@ChkDate)
-                                  THEN 1 ELSE 0 END),
-    vol_dep_fu_1208    = SUM(CASE WHEN t.section_name IN (N'Срочные',N'Срочные ')
-                                   AND t.PROD_NAME_res IN (N'Надёжный прайм',N'Надёжный VIP',N'Надёжный премиум',
-                                                           N'Надёжный промо',N'Надёжный старт',N'Надёжный Т2',
-                                                           N'Надёжный Мегафон',N'Надёжный процент',N'Надёжный')
-                                   AND t.dt_open >= @CloseFrom AND t.dt_open < DATEADD(DAY,1,@ChkDate)
-                                   AND t.out_rub>0
-                                  THEN CONVERT(decimal(19,2),t.out_rub) ELSE 0 END),
-    vol_dep_bank_1208  = SUM(CASE WHEN t.section_name IN (N'Срочные',N'Срочные ')
-                                   AND t.PROD_NAME_res NOT IN (N'Надёжный прайм',N'Надёжный VIP',N'Надёжный премиум',
-                                                               N'Надёжный промо',N'Надёжный старт',N'Надёжный Т2',
-                                                               N'Надёжный Мегафон',N'Надёжный процент',N'Надёжный')
-                                   AND t.dt_open >= @CloseFrom AND t.dt_open < DATEADD(DAY,1,@ChkDate)
-                                   AND t.out_rub>0
-                                  THEN CONVERT(decimal(19,2),t.out_rub) ELSE 0 END)
-INTO #dep1208
-FROM alm.ALM.balance_rest_all t WITH (NOLOCK)
-JOIN #seed31 s ON s.cli_id = t.cli_id
-WHERE t.dt_rep = @ChkDate
-  AND t.block_name = N'Привлечение ФЛ'
-  AND t.od_flag = 1
-  AND t.cur = '810'
-  AND t.out_rub IS NOT NULL
-  AND (t.TSEGMENTNAME IS NULL OR t.TSEGMENTNAME IN (N'Розничный бизнес'))
-GROUP BY t.cli_id;
-CREATE UNIQUE CLUSTERED INDEX IX_dep1208_cli ON #dep1208(cli_id);
+# Снимок на SNAP_DATE для всех клиентов (суммы по ФУ и не‑ФУ)
+live_all = df.loc[
+    (df['DT_OPEN'] <= SNAP_DATE) &
+    (df['OUT_RUB'].fillna(0) >= MIN_BAL_RUB) &
+    (df['DT_CLOSE'].isna() | (df['DT_CLOSE'] > SNAP_DATE))
+].copy()
 
-IF OBJECT_ID('tempdb..#ns1208') IS NOT NULL DROP TABLE #ns1208;
-SELECT t.cli_id,
-       vol_ns_1208 = SUM(CASE WHEN t.out_rub>0 THEN CONVERT(decimal(19,2),t.out_rub) ELSE 0 END)
-INTO #ns1208
-FROM alm.ALM.balance_rest_all t WITH (NOLOCK)
-JOIN #seed31 s ON s.cli_id = t.cli_id
-WHERE t.dt_rep = @ChkDate
-  AND t.block_name = N'Привлечение ФЛ'
-  AND t.od_flag = 1
-  AND t.cur = '810'
-  AND t.out_rub IS NOT NULL
-  AND t.section_name IN (N'Накопительный счёт',N'Накопительный счёт ')
-  AND (t.TSEGMENTNAME IS NULL OR t.TSEGMENTNAME IN (N'Розничный бизнес'))
-GROUP BY t.cli_id;
-CREATE UNIQUE CLUSTERED INDEX IX_ns1208_cli ON #ns1208(cli_id);
+live_all['vol_fu'] = live_all['OUT_RUB'].where(live_all['is_fu'], 0)
+live_all['vol_nb'] = live_all['OUT_RUB'].where(~live_all['is_fu'], 0)
 
-/* ===================== ПРИНТЫ ===================== */
+g_all = (live_all.groupby('CLI_ID', as_index=True)
+                .agg(vol_fu=('vol_fu','sum'), vol_nb=('vol_nb','sum')))
 
--- 1) Клиенты, у кого закрываются вклады: кол-во, объём вкладов (31.07), объём НС (31.07)
-SELECT
-  'SEED: 31.07 только ФУ (все закрытия 01–11.08)' AS label,
-  COUNT(*)                                    AS clients_cnt,
-  SUM(s.vol_deposits_close31)                 AS deposits_volume_31_close,
-  SUM(ISNULL(s.vol_ns31,0))                   AS ns_volume_31
-FROM #seed31 s
-OPTION (RECOMPILE);
+# Помощник для сводки по подмножеству клиентов
+def snapshot_for_cli(cli_ids):
+    if not cli_ids:
+        cols = ['Клиентов','Баланс ФУ','Баланс Банк']
+        return pd.DataFrame([[0,0.0,0.0],[0,0.0,0.0],[0,0.0,0.0],[0,0.0,0.0]],
+                            columns=cols,
+                            index=['только ФУ','только Банк','ФУ + Банк','ИТОГО'])
+    g = g_all.loc[g_all.index.isin(cli_ids)].copy()
+    def agg(mask):
+        sub = g.loc[mask]
+        return (len(sub), float(sub['vol_fu'].sum()), float(sub['vol_nb'].sum()))
+    rows = [
+        agg((g['vol_fu'] > 0) & (g['vol_nb'] == 0)),   # только ФУ
+        agg((g['vol_fu'] == 0) & (g['vol_nb'] > 0)),   # только Банк
+        agg((g['vol_fu'] > 0) & (g['vol_nb'] > 0)),    # ФУ + Банк
+    ]
+    # ИТОГО
+    total = (len(g), float(g['vol_fu'].sum()), float(g['vol_nb'].sum()))
+    rows.append(total)
+    return pd.DataFrame(rows,
+                        columns=['Клиентов','Баланс ФУ','Баланс Банк'],
+                        index=['только ФУ','только Банк','ФУ + Банк','ИТОГО'])
 
--- 2) 12.08: открыли ТОЛЬКО БАНК — клиенты, объём вкладов, объём НС
-SELECT
-  'OPEN 01–12.08: только Банк' AS label,
-  COUNT(*)                     AS clients_cnt,
-  SUM(d.vol_dep_bank_1208)     AS deposits_volume_1208,
-  SUM(ISNULL(n.vol_ns_1208,0)) AS ns_volume_1208
-FROM #dep1208 d
-LEFT JOIN #ns1208 n ON n.cli_id = d.cli_id
-WHERE d.dep_open_bank_flag=1 AND d.dep_open_fu_flag=0
-OPTION (RECOMPILE);
+# Список месяцев: 2024-01 ... 2025-08
+months = pd.period_range(start=COHORT_FROM.to_period('M'),
+                         end=COHORT_TO.to_period('M'), freq='M')
 
--- 3) 12.08: открыли ТОЛЬКО ФУ — клиенты, объём вкладов, объём НС
-SELECT
-  'OPEN 01–12.08: только ФУ'   AS label,
-  COUNT(*)                     AS clients_cnt,
-  SUM(d.vol_dep_fu_1208)       AS deposits_volume_1208,
-  SUM(ISNULL(n.vol_ns_1208,0)) AS ns_volume_1208
-FROM #dep1208 d
-LEFT JOIN #ns1208 n ON n.cli_id = d.cli_id
-WHERE d.dep_open_fu_flag=1 AND d.dep_open_bank_flag=0
-OPTION (RECOMPILE);
+monthly_snapshots = {}   # dict[Period('YYYY-MM', 'M')] = DataFrame
 
--- 4) 12.08: открыли ФУ И БАНК — клиенты, общий объём вкладов, объём НС
-SELECT
-  'OPEN 01–12.08: ФУ и Банк'   AS label,
-  COUNT(*)                     AS clients_cnt,
-  SUM(d.vol_dep_fu_1208 + d.vol_dep_bank_1208) AS deposits_volume_1208,
-  SUM(ISNULL(n.vol_ns_1208,0)) AS ns_volume_1208
-FROM #dep1208 d
-LEFT JOIN #ns1208 n ON n.cli_id = d.cli_id
-WHERE d.dep_open_fu_flag=1 AND d.dep_open_bank_flag=1
-OPTION (RECOMPILE);
+print(f'\n=== Снимок активов на {SNAP_DATE.date()} ===')
+for p in months:
+    month_start = pd.Timestamp(p.start_time.date())
+    month_end   = pd.Timestamp(p.end_time.date())
 
--- 5) 12.08: НЕ открывали вклады, но НС вырос — клиенты, НС был/стал, изменение
-SELECT
-  'NO DEPOSIT OPENS 01–12.08, BUT NS INCREASED' AS label,
-  COUNT(*)                                      AS clients_cnt,
-  SUM(ISNULL(s.vol_ns31,0))                     AS ns_volume_was_31,
-  SUM(ISNULL(n.vol_ns_1208,0))                  AS ns_volume_now_1208,
-  SUM(ISNULL(n.vol_ns_1208,0) - ISNULL(s.vol_ns31,0)) AS ns_change
-FROM #seed31 s
-LEFT JOIN #dep1208 d ON d.cli_id = s.cli_id
-LEFT JOIN #ns1208 n ON n.cli_id = s.cli_id
-WHERE ISNULL(d.dep_open_fu_flag,0)=0 AND ISNULL(d.dep_open_bank_flag,0)=0
-  AND ISNULL(n.vol_ns_1208,0) > ISNULL(s.vol_ns31,0)
-OPTION (RECOMPILE);
+    # Когорты клиентов, у кого ПЕРВЫЙ ФУ-вклад открыт в этом месяце
+    mask = (first_fu['DT_OPEN'] >= month_start) & (first_fu['DT_OPEN'] <= month_end)
+    cli_ids = set(first_fu.index[mask])
 
--- 6) Остальные «ушли»: не открывали вклады и НС не вырос (≤ 0) — только количество
-SELECT
-  'LEFT: no deposit opens & NS not increased' AS label,
-  COUNT(*)                                    AS clients_cnt
-FROM #seed31 s
-LEFT JOIN #dep1208 d ON d.cli_id = s.cli_id
-LEFT JOIN #ns1208 n ON n.cli_id = s.cli_id
-WHERE ISNULL(d.dep_open_fu_flag,0)=0 AND ISNULL(d.dep_open_bank_flag,0)=0
-  AND ISNULL(n.vol_ns_1208,0) <= ISNULL(s.vol_ns31,0)
-OPTION (RECOMPILE);
+    # Заголовок
+    print(f'\nНовые ФУ-клиенты {p.strftime("%Y-%m")}: {len(cli_ids):,}')
+
+    # Табличка статуса на SNAP_DATE
+    snap_df = snapshot_for_cli(cli_ids)
+    monthly_snapshots[p] = snap_df
+    print(snap_df)
