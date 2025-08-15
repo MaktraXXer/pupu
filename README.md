@@ -1,142 +1,306 @@
-import pandas as pd
+Отлично, давай сделаем это «под ключ».
 
-# ===== НАСТРОЙКИ =====
-FU_PRODUCTS = {
-    'Надёжный','Надёжный VIP','Надёжный премиум',
-    'Надёжный промо','Надёжный старт',
-    'Надёжный T2','Надёжный Мегафон'
-}
-MIN_BAL_RUB = 1.0
-COHORT_FROM = pd.Timestamp('2024-01-01')
-SNAP_DATE   = pd.Timestamp('2025-08-12')
-COHORT_TO   = SNAP_DATE
+⸻
 
-# ===== ДАННЫЕ =====
-df = df_sql.copy()
+1) SQL: создаём схему и таблицу в ALM_TEST
 
-# Нормализуем даты и колонки
-for c in ['DT_OPEN','DT_CLOSE','DT_CLOSE_PLAN']:
-    if c in df.columns:
-        df[c] = pd.to_datetime(df[c], errors='coerce')
+Запусти этот скрипт в SSMS под контекстом ALM_TEST:
 
-# Страховка: если нет BALANCE_RUB, используем OUT_RUB (лучше иметь в SQL оба явно)
-if 'BALANCE_RUB' not in df.columns and 'OUT_RUB' in df.columns:
-    df['BALANCE_RUB'] = df['OUT_RUB']
+USE [ALM_TEST];
+GO
 
-# OUT_RUB на дату снепшота — для ясности переименуем
-df['OUT_RUB_SNAP'] = df['OUT_RUB']  # saldo на SNAP_DATE
+-- 1. Схема markets (если ещё нет)
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'markets')
+    EXEC ('CREATE SCHEMA markets');
+GO
 
-# Уберём быстро закрытые (<= 2 суток)
-fast = df['DT_CLOSE'].notna() & ((df['DT_CLOSE'] - df['DT_OPEN']).dt.days <= 2)
-df = df[~fast].copy()
+-- 2. Таблица с нужными полями + load_dt и дефолтами
+IF OBJECT_ID(N'markets.prod_term_rates', N'U') IS NULL
+BEGIN
+    CREATE TABLE markets.prod_term_rates
+    (
+        id             bigint IDENTITY(1,1) NOT NULL CONSTRAINT PK_markets_prod_term_rates PRIMARY KEY,
+        PROD_NAME      nvarchar(255)        NOT NULL,
+        PROD_ID        int                  NOT NULL,
+        TERMDAYS_FROM  int                  NULL,
+        TERMDAYS_TO    int                  NULL,
+        DT_FROM        date                 NOT NULL,
+        DT_TO          date                 NOT NULL 
+            CONSTRAINT DF_markets_prod_term_rates_DT_TO DEFAULT ('4444-01-01'),
+        PERCRATE       decimal(9,6)         NOT NULL,
+        load_dt        datetime             NOT NULL 
+            CONSTRAINT DF_markets_prod_term_rates_load_dt DEFAULT (GETDATE())
+    );
 
-# ФУ-флаг
-df['is_fu'] = df['PROD_NAME'].isin(FU_PRODUCTS)
+    -- При желании: полезный индекс под поиск по продукту/срокам
+    CREATE INDEX IX_markets_prod_term_rates_prod
+        ON markets.prod_term_rates (PROD_ID, DT_FROM, DT_TO);
+END
+GO
 
-# ===== КОГОРТА: первый ФУ-вклад клиента в окне =====
-first_fu = (
-    df.loc[df['is_fu'] & (df['DT_OPEN'] >= COHORT_FROM) & (df['DT_OPEN'] <= COHORT_TO)]
-      .sort_values(['CLI_ID','DT_OPEN'])
-      .groupby('CLI_ID', as_index=True)
-      .first()[['DT_OPEN']]
-)
+Поля таблицы на 1:1 соответствуют вашим колонкам в Excel:
+PROD_NAME, PROD_ID, TERMDAYS_FROM, TERMDAYS_TO, DT_FROM, DT_TO, PERCRATE (+ load_dt с дефолтом).
+Дефолт для DT_TO = '4444-01-01', для load_dt = GETDATE() — добавлены, как просили.
 
-# ===== ЖИВЫ на SNAP_DATE по плановой дате закрытия =====
-alive_mask = (
-    (df['DT_OPEN'] <= SNAP_DATE) &
-    (df['DT_CLOSE_PLAN'].isna() | (df['DT_CLOSE_PLAN'] > SNAP_DATE))
-)
+⸻
 
-# ===== СВОДКА "статус на дату" (ТОЛЬКО живые, OUT_RUB_SNAP) =====
-live = df.loc[
-    alive_mask &
-    (df['OUT_RUB_SNAP'].fillna(0) >= MIN_BAL_RUB)
-].copy()
+2) VBA-макрос: разовая загрузка диапазона A1:G2998 из активного листа в SQL
 
-live['vol_fu_snap'] = live['OUT_RUB_SNAP'].where(live['is_fu'], 0.0)
-live['vol_nb_snap'] = live['OUT_RUB_SNAP'].where(~live['is_fu'], 0.0)
+Вставь код в модуль VBA (Alt+F11 → Insert → Module) и запусти процедуру Load_ProdRates_FromSheet.
 
-g_all_snap = (live.groupby('CLI_ID', as_index=True)
-                    .agg(vol_fu=('vol_fu_snap','sum'),
-                         vol_nb=('vol_nb_snap','sum')))
+Макрос:
+	•	использует параметризованные запросы (без проблем с форматами дат/десятичной запятой),
+	•	автоматически берёт заголовки из A1:G1 (проверяет подписи),
+	•	парсит даты как истинные даты Excel или как текст формата ДД.ММ.ГГГГ,
+	•	выполняет всё в транзакции для скорости и целостности,
+	•	даёт счётчик загруженных строк.
 
-def snapshot_for_cli(cli_ids):
-    """Статус на SNAP_DATE по когорте: только живые, объёмы из OUT_RUB_SNAP."""
-    if not cli_ids:
-        return pd.DataFrame([[0,0.0,0.0]]*4,
-                            columns=['Клиентов','Баланс ФУ','Баланс Банк'],
-                            index=['только ФУ','только Банк','ФУ + Банк','ИТОГО'])
-    g = g_all_snap.loc[g_all_snap.index.isin(cli_ids)].copy()
+Option Explicit
 
-    def agg(mask):
-        sub = g.loc[mask]
-        return (len(sub), float(sub['vol_fu'].sum()), float(sub['vol_nb'].sum()))
+' ==========================
+' ADO константы (чтобы не ставить Reference)
+' ==========================
+Private Const adCmdText As Long = 1
+Private Const adParamInput As Long = 1
+Private Const adVarWChar As Long = 202
+Private Const adInteger As Long = 3
+Private Const adDBDate As Long = 133
+Private Const adDecimal As Long = 14
 
-    rows = [
-        agg((g['vol_fu'] > 0) & (g['vol_nb'] == 0)),   # только ФУ
-        agg((g['vol_fu'] == 0) & (g['vol_nb'] > 0)),   # только Банк
-        agg((g['vol_fu'] > 0) & (g['vol_nb'] > 0)),    # ФУ + Банк
-    ]
-    total = (len(g), float(g['vol_fu'].sum()), float(g['vol_nb'].sum()))
-    rows.append(total)
+Sub Load_ProdRates_FromSheet()
+    Dim cn As Object ' ADODB.Connection
+    Dim cmd As Object ' ADODB.Command
+    Dim rng As Range, dataRng As Range
+    Dim r As Long, firstDataRow As Long, lastRow As Long
+    Dim rowsInserted As Long
+    Dim ws As Worksheet
+    Dim hdr As Variant
 
-    return pd.DataFrame(rows,
-                        columns=['Клиентов','Баланс ФУ','Баланс Банк'],
-                        index=['только ФУ','только Банк','ФУ + Банк','ИТОГО'])
+    On Error GoTo EH
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+    Application.StatusBar = "Подготовка к загрузке…"
 
-# ===== "Вошли в месяц": сколько клиентов + объём ФУ по BALANCE_RUB (договорам, открыт. в месяце) =====
-def entered_fu_volume_by_balance(cli_ids, month_start, month_end):
-    """
-    Объём ФУ когорты для строки 'Новые ФУ-клиенты YYYY-MM':
-    суммируем BALANCE_RUB по ФУ-договорам, ОТКРЫТЫМ в этом месяце, у клиентов когорты.
-    BALANCE_RUB — остаток на последний день жизни/последний живой (как ты и хочешь).
-    """
-    if not cli_ids:
-        return 0.0
-    sub = df.loc[
-        (df['CLI_ID'].isin(cli_ids)) &
-        (df['is_fu']) &
-        (df['DT_OPEN'] >= month_start) & (df['DT_OPEN'] <= month_end)
-    ]
-    return float(sub['BALANCE_RUB'].fillna(0.0).sum())
+    ' 1) Диапазон данных: A1:G… на активном листе
+    Set ws = ActiveSheet
+    Set rng = ws.Range("A1").CurrentRegion
+    ' Проверка, что минимум 2 строки (заголовок + 1 строка данных)
+    If rng.Rows.Count < 2 Or rng.Columns.Count < 7 Then
+        Err.Raise vbObjectError + 1, , "Не найден валидный диапазон с заголовком в A1:G?."
+    End If
+    ' Строго ожидаемые заголовки
+    hdr = Array("PROD_NAME", "PROD_ID", "TERMDAYS_FROM", "TERMDAYS_TO", "DT_FROM", "DT_TO", "PERCRATE")
+    Dim i As Long
+    For i = 0 To 6
+        If UCase$(Trim$(CStr(rng.Cells(1, i + 1).Value))) <> hdr(i) Then
+            Err.Raise vbObjectError + 2, , _
+                "Ожидался заголовок """ & hdr(i) & """ в колонке " & ColLetter(i + 1) & _
+                ", а получено: """ & CStr(rng.Cells(1, i + 1).Value) & """"
+        End If
+    Next i
 
-# ===== Месяцы и экспорт =====
-months = pd.period_range(start=COHORT_FROM.to_period('M'),
-                         end=COHORT_TO.to_period('M'), freq='M')
+    firstDataRow = rng.Row + 1
+    lastRow = rng.Row + rng.Rows.Count - 1
+    Set dataRng = ws.Range(ws.Cells(firstDataRow, rng.Column), ws.Cells(lastRow, rng.Column + 6))
 
-export_rows = []
-columns = ['Заголовок/Категория', 'Клиентов', 'Баланс ФУ', 'Баланс Банк']
+    ' 2) Подключение
+    Set cn = CreateObject("ADODB.Connection")
+    cn.ConnectionString = _
+        "Provider=SQLOLEDB;Data Source=trading-db.ahml1.ru;Initial Catalog=ALM_TEST;Integrated Security=SSPI;"
+    cn.Open
 
-for p in months:
-    month_start = pd.Timestamp(p.start_time.date())
-    month_end   = pd.Timestamp(p.end_time.date())
+    ' 3) Команда INSERT с параметрами
+    Set cmd = CreateObject("ADODB.Command")
+    Set cmd.ActiveConnection = cn
+    cmd.CommandType = adCmdText
+    cmd.CommandText = _
+        "INSERT INTO markets.prod_term_rates " & _
+        " (PROD_NAME, PROD_ID, TERMDAYS_FROM, TERMDAYS_TO, DT_FROM, DT_TO, PERCRATE) " & _
+        "VALUES (?, ?, ?, ?, ?, ?, ?);"
+    cmd.Prepared = True
 
-    # Когорты: клиенты, чей ПЕРВЫЙ ФУ-вклад открыт в этом месяце
-    mask = (first_fu['DT_OPEN'] >= month_start) & (first_fu['DT_OPEN'] <= month_end)
-    cohort_cli = set(first_fu.index[mask])
+    ' 3.1) Параметры в нужном порядке и типах
+    ' 1 PROD_NAME
+    cmd.Parameters.Append Param(adVarWChar, 255)
+    ' 2 PROD_ID
+    cmd.Parameters.Append Param(adInteger, 0)
+    ' 3 TERMDAYS_FROM
+    cmd.Parameters.Append Param(adInteger, 0)
+    ' 4 TERMDAYS_TO
+    cmd.Parameters.Append Param(adInteger, 0)
+    ' 5 DT_FROM
+    cmd.Parameters.Append Param(adDBDate, 0)
+    ' 6 DT_TO
+    cmd.Parameters.Append Param(adDBDate, 0)
+    ' 7 PERCRATE (decimal(9,6))
+    cmd.Parameters.Append ParamDecimal(9, 6)
 
-    # --- ШАПКА: "вошли" (без фильтра на живых)
-    entered_cnt = len(cohort_cli)
-    entered_fu_vol = entered_fu_volume_by_balance(cohort_cli, month_start, month_end)
-    export_rows.append([f'Новые ФУ-клиенты {p.strftime("%Y-%m")}', entered_cnt, entered_fu_vol, ''])
+    ' 4) Транзакция
+    cn.BeginTrans
+    rowsInserted = 0
 
-    # --- ЖИВЫ на SNAP_DATE из этой когорты
-    alive_cli = set(df.loc[alive_mask & df['CLI_ID'].isin(cohort_cli), 'CLI_ID'].unique())
+    ' 5) Цикл по строкам
+    Dim prodName As String
+    Dim prodId As Variant, tdFrom As Variant, tdTo As Variant
+    Dim dtFrom As Variant, dtTo As Variant
+    Dim perc As Variant
 
-    # Табличка статуса на дату (OUT_RUB_SNAP)
-    snap_df = snapshot_for_cli(alive_cli)
-    for idx, row in snap_df.iterrows():
-        export_rows.append([
-            idx,
-            int(row['Клиентов']),
-            float(row['Баланс ФУ']),
-            float(row['Баланс Банк']),
-        ])
+    For r = 1 To dataRng.Rows.Count
+        ' Считываем ячейки (относительно dataRng)
+        prodName = Trim$(CStr(dataRng.Cells(r, 1).Value))
+        prodId = NzToNull(dataRng.Cells(r, 2).Value)
+        tdFrom = NzToNull(dataRng.Cells(r, 3).Value)
+        tdTo = NzToNull(dataRng.Cells(r, 4).Value)
+        dtFrom = ParseDateCell(dataRng.Cells(r, 5))
+        dtTo = ParseDateCell(dataRng.Cells(r, 6))
+        perc = NzToNull(dataRng.Cells(r, 7).Value)
 
-    # Разделитель: две пустые строки
-    export_rows.extend([['','','',''], ['','','','']])
+        ' Обязательные поля проверки
+        If Len(prodName) = 0 Then Err.Raise vbObjectError + 10, , "Пустой PROD_NAME в строке " & (firstDataRow + r - 1)
+        If IsNull(prodId) Then Err.Raise vbObjectError + 11, , "Пустой PROD_ID в строке " & (firstDataRow + r - 1)
+        If IsNull(dtFrom) Then Err.Raise vbObjectError + 12, , "Пустая/некорректная DT_FROM в строке " & (firstDataRow + r - 1)
+        If IsNull(dtTo) Then
+            ' Если DT_TO пустой — оставим NULL -> сработает дефолт на уровне БД только если колонка исключена из INSERT.
+            ' Но мы вставляем явно, поэтому подставим "4444-01-01" как дата.
+            dtTo = DateSerial(4444, 1, 1)
+        End If
+        If IsNull(perc) Then Err.Raise vbObjectError + 13, , "Пустой PERCRATE в строке " & (firstDataRow + r - 1)
 
-# В Excel
-export_df = pd.DataFrame(export_rows, columns=columns)
-export_df.to_excel('monthly_fu_clients.xlsx', index=False)
-print("Готово: monthly_fu_clients.xlsx")
+        ' Заполняем параметры
+        cmd.Parameters(0).Value = prodName                            ' PROD_NAME
+        cmd.Parameters(1).Value = CLng(prodId)                        ' PROD_ID
+        cmd.Parameters(2).Value = IIf(IsNull(tdFrom), Null, CLng(tdFrom)) ' TERMDAYS_FROM
+        cmd.Parameters(3).Value = IIf(IsNull(tdTo), Null, CLng(tdTo))     ' TERMDAYS_TO
+        cmd.Parameters(4).Value = CDate(dtFrom)                       ' DT_FROM
+        cmd.Parameters(5).Value = CDate(dtTo)                         ' DT_TO
+        cmd.Parameters(6).Value = CDbl(perc)                          ' PERCRATE
+
+        cmd.Execute , , adCmdText
+        rowsInserted = rowsInserted + 1
+
+        If (rowsInserted Mod 500) = 0 Then
+            Application.StatusBar = "Загружено строк: " & rowsInserted & "…"
+            DoEvents
+        End If
+    Next r
+
+    cn.CommitTrans
+
+    Application.StatusBar = False
+    Application.EnableEvents = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+
+    MsgBox "Готово. Загружено записей: " & rowsInserted, vbInformation
+    Exit Sub
+
+EH:
+    On Error Resume Next
+    If Not cn Is Nothing Then
+        If cn.State = 1 Then cn.RollbackTrans
+        cn.Close
+    End If
+    Application.StatusBar = False
+    Application.EnableEvents = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    MsgBox "Ошибка #" & Err.Number & ": " & Err.Description, vbCritical
+End Sub
+
+' --------- Вспомогательные ---------
+
+Private Function Param(ByVal adoType As Long, ByVal size As Long) As Object
+    Dim p As Object
+    Set p = CreateObject("ADODB.Parameter")
+    p.Type = adoType
+    If size > 0 Then p.Size = size
+    p.Direction = adParamInput
+    Set Param = p
+End Function
+
+Private Function ParamDecimal(ByVal precision As Byte, ByVal scale As Byte) As Object
+    Dim p As Object
+    Set p = CreateObject("ADODB.Parameter")
+    p.Type = adDecimal
+    p.Precision = precision
+    p.NumericScale = scale
+    p.Direction = adParamInput
+    Set ParamDecimal = p
+End Function
+
+Private Function NzToNull(v As Variant) As Variant
+    If IsError(v) Then
+        NzToNull = Null
+    ElseIf IsEmpty(v) Then
+        NzToNull = Null
+    ElseIf Trim$(CStr(v)) = "" Then
+        NzToNull = Null
+    Else
+        NzToNull = v
+    End If
+End Function
+
+' Парсит дату: принимает как настоящую дату Excel, так и текст "ДД.ММ.ГГГГ"
+Private Function ParseDateCell(c As Range) As Variant
+    Dim t As String, parts() As String
+    If IsDate(c.Value) Then
+        ParseDateCell = CDate(c.Value)
+        Exit Function
+    End If
+    t = Trim$(CStr(c.Text))
+    If t = "" Then
+        ParseDateCell = Null
+        Exit Function
+    End If
+    t = Replace(t, "/", ".")
+    parts = Split(t, ".")
+    If UBound(parts) = 2 Then
+        If IsNumeric(parts(0)) And IsNumeric(parts(1)) And IsNumeric(parts(2)) Then
+            ParseDateCell = DateSerial(CInt(parts(2)), CInt(parts(1)), CInt(parts(0)))
+            Exit Function
+        End If
+    End If
+    If IsDate(t) Then
+        ParseDateCell = CDate(t)
+    Else
+        ParseDateCell = Null
+    End If
+End Function
+
+Private Function ColLetter(ByVal colNum As Long) As String
+    Dim s As String
+    Do While colNum > 0
+        s = Chr$(((colNum - 1) Mod 26) + 65) & s
+        colNum = (colNum - 1) \ 26
+    Loop
+    ColLetter = s
+End Function
+
+Примечания по макросу
+	•	Если в DT_TO ячейка пуста — макрос сам подставит 4444-01-01 (чтобы поведение соответствовало дефолту в БД).
+	•	PERCRATE загружается как десятичное число (например 0.048 для 4.8%). Никаких замен запятой/точки делать не нужно — используется параметр.
+	•	Все вставки идут в транзакции — быстро и атомарно. Прогресс — каждые 500 строк.
+
+⸻
+
+3) Как запустить
+	1.	Выполни T-SQL из пункта (1) в SSMS под ALM_TEST. Убедись, что у твоей учётки есть права на создание схемы и таблицы.
+	2.	В Excel:
+	•	Открой файл со строками в диапазоне A1:G…, в первой строке обязательно должны быть заголовки:
+PROD_NAME | PROD_ID | TERMDAYS_FROM | TERMDAYS_TO | DT_FROM | DT_TO | PERCRATE.
+	•	Сохрани как .xlsm (книга с макросами).
+	3.	Нажми Alt+F11 → Insert → Module, вставь весь VBA-код из пункта (2).
+	4.	При необходимости поправь строку подключения в макросе (сервер/БД):
+
+"Provider=SQLOLEDB;Data Source=trading-db.ahml1.ru;Initial Catalog=ALM_TEST;Integrated Security=SSPI;"
+
+
+	5.	Вернись в Excel → Alt+F8 → выбери Load_ProdRates_FromSheet → Run.
+По завершении увидишь сообщение «Готово. Загружено записей: N».
+
+⸻
+
+Готов продолжить
+
+Когда будешь готов — обсудим «универсальный» макрос для периодической/инкрементальной загрузки (например, с авто-закрытием предыдущих интервалов, upsert по ключу PROD_ID + DT_FROM + TERMDAYS_* и т. п.).
