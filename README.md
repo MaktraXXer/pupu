@@ -1,204 +1,281 @@
-Option Explicit
+Отлично, сделал два отдельных хранилища и две процедуры-загрузчики:
+A) «исключаем продукты из списка» (без учёта PERCRATE),
+B) «берём только продукты из списка» (с добавлением PERCRATE к rate_con по правилам сопоставления).
 
-Sub Load_ProdRates_Raw()
-    ' ---- Локальные ADO константы (чтобы не подключать библиотеку) ----
-    Const adCmdText As Long = 1
-    Const adParamInput As Long = 1
-    Const adVarWChar As Long = 202
-    Const adInteger As Long = 3
-    Const adDBDate As Long = 133
-    Const adNumeric As Long = 131
+Ничего лишнего — структура и логика максимально близки к вашей, фильтры и расчёты встроены прямо в агрегации без тяжёлых JOIN’ов. Если хотите — можно оставить имена/схемы как есть, я задал очевидные.
 
-    Dim ws As Worksheet
-    Dim firstRow As Long, lastRow As Long, r As Long
-    Dim cn As Object, cmd As Object
-    Dim rowsInserted As Long
+⸻
 
-    Dim vName As String
-    Dim vProdId As Variant, vTdFrom As Variant, vTdTo As Variant
-    Dim vDtFrom As Variant, vDtTo As Variant
-    Dim vRate As Variant
-    Dim s As String, parts As Variant
+1) Таблица под вариант A (исключаем PROD_ID из списка)
 
-    On Error GoTo EH
-    Application.ScreenUpdating = False
-    Application.Calculation = xlCalculationManual
-    Application.EnableEvents = False
-    Application.StatusBar = "Подготовка…"
+USE [ALM_TEST];
+GO
 
-    ' ----- Данные на активном листе, диапазон A1:G2998 -----
-    Set ws = ActiveSheet
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
 
-    ' Проверка заголовков
-    If UCase$(Trim$(CStr(ws.Cells(1, 1).Value))) <> "PROD_NAME" _
-    Or UCase$(Trim$(CStr(ws.Cells(1, 2).Value))) <> "PROD_ID" _
-    Or UCase$(Trim$(CStr(ws.Cells(1, 3).Value))) <> "TERMDAYS_FROM" _
-    Or UCase$(Trim$(CStr(ws.Cells(1, 4).Value))) <> "TERMDAYS_TO" _
-    Or UCase$(Trim$(CStr(ws.Cells(1, 5).Value))) <> "DT_FROM" _
-    Or UCase$(Trim$(CStr(ws.Cells(1, 6).Value))) <> "DT_TO" _
-    Or UCase$(Trim$(CStr(ws.Cells(1, 7).Value))) <> "PERCRATE" Then
-        Err.Raise vbObjectError + 100, , "Неверные заголовки в строке 1 (ожидаются: PROD_NAME, PROD_ID, TERMDAYS_FROM, TERMDAYS_TO, DT_FROM, DT_TO, PERCRATE)."
-    End If
+CREATE TABLE [mail].[balance_metrics_td_excl](
+    [dt_rep]        date            NOT NULL,
+    [data_scope]    nvarchar(10)    NOT NULL,
+    [out_rub_total] decimal(19,2)   NULL,
+    [term_day]      numeric(18,2)   NULL,
+    [rate_con]      numeric(18,6)   NULL,
+    [load_dttm]     datetime2(3)    NOT NULL CONSTRAINT [DF_bmtd_excl_load_dttm] DEFAULT (sysutcdatetime()),
+    [deal_term_day] numeric(18,2)   NULL,
+    CONSTRAINT [PK_balance_metrics_td_excl] PRIMARY KEY CLUSTERED ([dt_rep],[data_scope])
+) ON [PRIMARY];
+GO
 
-    firstRow = 2
-    lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
-    If lastRow < firstRow Then
-        MsgBox "Нет данных для загрузки.", vbInformation
-        GoTo Cleanup
-    End If
-    If lastRow > 2998 Then lastRow = 2998 ' жёстная граница, как просили
+2) Таблица под вариант B (берём только PROD_ID из списка и учитываем PERCRATE)
 
-    ' ----- Подключение -----
-    Set cn = CreateObject("ADODB.Connection")
-    cn.ConnectionString = "Provider=SQLOLEDB;Data Source=trading-db.ahml1.ru;Initial Catalog=ALM_TEST;Integrated Security=SSPI;"
-    cn.Open
+USE [ALM_TEST];
+GO
 
-    ' ----- Команда INSERT с параметрами -----
-    Set cmd = CreateObject("ADODB.Command")
-    Set cmd.ActiveConnection = cn
-    cmd.CommandType = adCmdText
-    cmd.CommandText = _
-        "INSERT INTO markets.prod_term_rates " & _
-        " (PROD_NAME, PROD_ID, TERMDAYS_FROM, TERMDAYS_TO, DT_FROM, DT_TO, PERCRATE) " & _
-        "VALUES (?, ?, ?, ?, ?, ?, ?);"
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
 
-    ' Параметры в порядке "?"
-    cmd.Parameters.Append cmd.CreateParameter("p1", adVarWChar, adParamInput, 255) ' PROD_NAME
-    cmd.Parameters.Append cmd.CreateParameter("p2", adInteger, adParamInput)       ' PROD_ID
-    cmd.Parameters.Append cmd.CreateParameter("p3", adInteger, adParamInput)       ' TERMDAYS_FROM
-    cmd.Parameters.Append cmd.CreateParameter("p4", adInteger, adParamInput)       ' TERMDAYS_TO
-    cmd.Parameters.Append cmd.CreateParameter("p5", adDBDate, adParamInput)        ' DT_FROM
-    cmd.Parameters.Append cmd.CreateParameter("p6", adDBDate, adParamInput)        ' DT_TO
-    cmd.Parameters.Append cmd.CreateParameter("p7", adNumeric, adParamInput)       ' PERCRATE
+CREATE TABLE [mail].[balance_metrics_td_only](
+    [dt_rep]        date            NOT NULL,
+    [data_scope]    nvarchar(10)    NOT NULL,
+    [out_rub_total] decimal(19,2)   NULL,
+    [term_day]      numeric(18,2)   NULL,
+    [rate_con]      numeric(18,6)   NULL,
+    [load_dttm]     datetime2(3)    NOT NULL CONSTRAINT [DF_bmtd_only_load_dttm] DEFAULT (sysutcdatetime()),
+    [deal_term_day] numeric(18,2)   NULL,
+    CONSTRAINT [PK_balance_metrics_td_only] PRIMARY KEY CLUSTERED ([dt_rep],[data_scope])
+) ON [PRIMARY];
+GO
 
-    ' Точность для DECIMAL(9,6)
-    cmd.Parameters("p7").Precision = 9
-    cmd.Parameters("p7").NumericScale = 6
 
-    cn.BeginTrans
-    rowsInserted = 0
+⸻
 
-    For r = firstRow To lastRow
-        ' -------- Чтение и валидация без функций-хелперов --------
-        vName = Trim$(CStr(ws.Cells(r, 1).Value))                 ' текст
-        vProdId = ws.Cells(r, 2).Value                            ' число (NOT NULL)
-        vTdFrom = ws.Cells(r, 3).Value                            ' число/пусто
-        vTdTo = ws.Cells(r, 4).Value                              ' число/пусто
-        vDtFrom = Empty
-        vDtTo = Empty
-        vRate = ws.Cells(r, 7).Value                              ' число 0.048
+3) Процедура A: «Исключить продукты из списка»
 
-        ' PROD_NAME обязателен
-        If Len(vName) = 0 Then Err.Raise vbObjectError + 201, , "Пустой PROD_NAME в строке " & r
+— Вся логика как у вас, но добавлен фильтр NOT EXISTS (...) по списку markets.prod_term_rates (только по PROD_ID).
+— Ставка rate_con считается без изменений.
 
-        ' PROD_ID обязателен
-        If IsEmpty(vProdId) Or Trim$(CStr(vProdId)) = "" Then Err.Raise vbObjectError + 202, , "Пустой PROD_ID в строке " & r
-        If Not IsNumeric(vProdId) Then Err.Raise vbObjectError + 203, , "PROD_ID не число в строке " & r
+USE [ALM_TEST];
+GO
 
-        ' TERMDAYS_* могут быть пустыми (NULL)
-        If Not (IsEmpty(vTdFrom) Or Trim$(CStr(vTdFrom)) = "") Then
-            If Not IsNumeric(vTdFrom) Then Err.Raise vbObjectError + 204, , "TERMDAYS_FROM не число в строке " & r
-            vTdFrom = CLng(vTdFrom)
-        Else
-            vTdFrom = Null
-        End If
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
 
-        If Not (IsEmpty(vTdTo) Or Trim$(CStr(vTdTo)) = "") Then
-            If Not IsNumeric(vTdTo) Then Err.Raise vbObjectError + 205, , "TERMDAYS_TO не число в строке " & r
-            vTdTo = CLng(vTdTo)
-        Else
-            vTdTo = Null
-        End If
+CREATE OR ALTER PROCEDURE [mail].[usp_fill_balance_metrics_depo_excl]
+      @DateTo   date = NULL        -- включительно
+    , @DaysBack int  = 21          -- длина окна
+AS
+BEGIN
+    SET NOCOUNT ON;
 
-        ' DT_FROM — дата обязательна
-        If IsDate(ws.Cells(r, 5).Value) Then
-            vDtFrom = CDate(ws.Cells(r, 5).Value)
-        Else
-            s = Trim$(CStr(ws.Cells(r, 5).Text))
-            If s <> "" Then
-                s = Replace(s, "/", ".")
-                parts = Split(s, ".")
-                If UBound(parts) = 2 Then
-                    If IsNumeric(parts(0)) And IsNumeric(parts(1)) And IsNumeric(parts(2)) Then
-                        vDtFrom = DateSerial(CInt(parts(2)), CInt(parts(1)), CInt(parts(0)))
-                    End If
-                End If
-            End If
-        End If
-        If IsEmpty(vDtFrom) Then Err.Raise vbObjectError + 206, , "Пустая/некорректная DT_FROM в строке " & r
+    IF @DateTo IS NULL
+        SET @DateTo = DATEADD(day,-2,CAST(GETDATE() AS date));
+    DECLARE @DateFrom date = DATEADD(day,-@DaysBack+1,@DateTo);
 
-        ' DT_TO — если пусто, подставим 4444-01-01
-        If IsDate(ws.Cells(r, 6).Value) Then
-            vDtTo = CDate(ws.Cells(r, 6).Value)
-        Else
-            s = Trim$(CStr(ws.Cells(r, 6).Text))
-            If s <> "" Then
-                s = Replace(s, "/", ".")
-                parts = Split(s, ".")
-                If UBound(parts) = 2 Then
-                    If IsNumeric(parts(0)) And IsNumeric(parts(1)) And IsNumeric(parts(2)) Then
-                        vDtTo = DateSerial(CInt(parts(2)), CInt(parts(1)), CInt(parts(0)))
-                    End If
-                End If
-            End If
-        End If
-        If IsEmpty(vDtTo) Then vDtTo = DateSerial(4444, 1, 1)
+    ;WITH aggr_all AS (
+        SELECT
+              t.dt_rep
+            , SUM(t.out_rub) AS out_rub_total
+            , SUM(DATEDIFF(day,t.dt_rep,t.dt_close)*t.out_rub) / NULLIF(SUM(t.out_rub),0) AS term_day
+            , SUM(CASE WHEN t.rate_con IS NOT NULL THEN t.rate_con * t.out_rub ELSE 0 END)
+              / NULLIF(SUM(CASE WHEN t.rate_con IS NOT NULL THEN t.out_rub ELSE 0 END),0) AS rate_con
+            , CAST(NULL AS numeric(18,2)) AS deal_term_day
+        FROM  alm.[ALM].[vw_balance_rest_all] t
+        WHERE t.dt_rep BETWEEN @DateFrom AND @DateTo
+          AND t.section_name = N'Срочные'
+          AND t.block_name   = N'Привлечение ФЛ'
+          AND t.od_flag      = 1
+          AND t.cur          = '810'
+          AND NOT EXISTS (
+                SELECT 1
+                FROM [markets].[prod_term_rates] p
+                WHERE p.PROD_ID = t.prod_id
+          )
+        GROUP BY t.dt_rep
+    ),
+    aggr_new AS (
+        SELECT
+              t.dt_rep
+            , SUM(t.out_rub) AS out_rub_total
+            , SUM(DATEDIFF(day,t.dt_rep,t.dt_close)*t.out_rub) / NULLIF(SUM(t.out_rub),0) AS term_day
+            , SUM(CASE WHEN t.rate_con IS NOT NULL THEN t.rate_con * t.out_rub ELSE 0 END)
+              / NULLIF(SUM(CASE WHEN t.rate_con IS NOT NULL THEN t.out_rub ELSE 0 END),0) AS rate_con
+            , SUM(DATEDIFF(day,t.dt_open,t.dt_close)*t.out_rub) / NULLIF(SUM(t.out_rub),0) AS deal_term_day
+        FROM  alm.[ALM].[vw_balance_rest_all] t
+        WHERE t.dt_rep BETWEEN @DateFrom AND @DateTo
+          AND t.dt_open = t.dt_rep
+          AND t.section_name = N'Срочные'
+          AND t.block_name   = N'Привлечение ФЛ'
+          AND t.od_flag      = 1
+          AND t.cur          = '810'
+          AND NOT EXISTS (
+                SELECT 1
+                FROM [markets].[prod_term_rates] p
+                WHERE p.PROD_ID = t.prod_id
+          )
+        GROUP BY t.dt_rep
+    ),
+    cal AS (
+        SELECT TOP (DATEDIFF(day,@DateFrom,@DateTo)+1)
+               DATEADD(day,ROW_NUMBER() OVER (ORDER BY (SELECT 0))-1,@DateFrom) AS dt_rep
+        FROM master..spt_values
+    ),
+    scopes AS (SELECT N'портфель' AS data_scope UNION ALL SELECT N'новые'),
+    frame AS (SELECT c.dt_rep, s.data_scope FROM cal c CROSS JOIN scopes s),
+    src AS (
+        SELECT
+              f.dt_rep
+            , f.data_scope
+            , CASE WHEN f.data_scope=N'портфель' THEN a.out_rub_total ELSE n.out_rub_total END AS out_rub_total
+            , CASE WHEN f.data_scope=N'портфель' THEN a.term_day      ELSE n.term_day      END AS term_day
+            , CASE WHEN f.data_scope=N'портфель' THEN a.rate_con      ELSE n.rate_con      END AS rate_con
+            , CASE WHEN f.data_scope=N'портфель' THEN a.deal_term_day ELSE n.deal_term_day END AS deal_term_day
+        FROM frame f
+        LEFT JOIN aggr_all a ON a.dt_rep = f.dt_rep AND f.data_scope = N'портфель'
+        LEFT JOIN aggr_new n ON n.dt_rep = f.dt_rep AND f.data_scope = N'новые'
+    )
 
-        ' PERCRATE обязателен, число формата 0.048
-        If IsEmpty(vRate) Or Trim$(CStr(vRate)) = "" Then Err.Raise vbObjectError + 207, , "Пустой PERCRATE в строке " & r
-        If Not IsNumeric(vRate) Then Err.Raise vbObjectError + 208, , "PERCRATE не число в строке " & r
-        vRate = CDbl(vRate)
+    MERGE mail.balance_metrics_td_excl AS tgt
+    USING src AS src
+      ON  tgt.dt_rep     = src.dt_rep
+      AND tgt.data_scope = src.data_scope
+    WHEN MATCHED THEN
+        UPDATE SET tgt.out_rub_total = src.out_rub_total,
+                   tgt.term_day      = src.term_day,
+                   tgt.rate_con      = src.rate_con,
+                   tgt.deal_term_day = src.deal_term_day,
+                   tgt.load_dttm     = SYSUTCDATETIME()
+    WHEN NOT MATCHED BY TARGET THEN
+        INSERT (dt_rep, data_scope, out_rub_total, term_day, rate_con, deal_term_day)
+        VALUES (src.dt_rep, src.data_scope, src.out_rub_total, src.term_day, src.rate_con, src.deal_term_day);
+END
+GO
 
-        ' -------- Заполнение параметров и INSERT --------
-        cmd.Parameters("p1").Value = vName
-        cmd.Parameters("p2").Value = CLng(vProdId)
-        If IsNull(vTdFrom) Then
-            cmd.Parameters("p3").Value = Null
-        Else
-            cmd.Parameters("p3").Value = CLng(vTdFrom)
-        End If
-        If IsNull(vTdTo) Then
-            cmd.Parameters("p4").Value = Null
-        Else
-            cmd.Parameters("p4").Value = CLng(vTdTo)
-        End If
-        cmd.Parameters("p5").Value = CDate(vDtFrom)
-        cmd.Parameters("p6").Value = CDate(vDtTo)
-        cmd.Parameters("p7").Value = CDbl(vRate)   ' уже 0.048
 
-        cmd.Execute , , adCmdText
-        rowsInserted = rowsInserted + 1
+⸻
 
-        If (rowsInserted Mod 500) = 0 Then
-            Application.StatusBar = "Загружено строк: " & rowsInserted & "…"
-            DoEvents
-        End If
-    Next r
+4) Процедура B: «Только продукты из списка + PERCRATE»
 
-    cn.CommitTrans
-    Application.StatusBar = False
-    Application.EnableEvents = True
-    Application.Calculation = xlCalculationAutomatic
-    Application.ScreenUpdating = True
+— Берём только депозиты, для которых находится запись в markets.prod_term_rates по правилам:
+p.PROD_ID = t.prod_id и t.dt_open BETWEEN p.DT_FROM AND p.DT_TO
+и DATEDIFF(day,t.dt_open,t.dt_close) BETWEEN p.TERMDAYS_FROM AND p.TERMDAYS_TO.
+— Чтоб не раздувать строки и не плодить дубликаты, берём TOP (1) подходящую запись через CROSS APPLY (самый «свежий» по DT_FROM).
+— В средневзвешенной ставке используем rate_con + PERCRATE (если rate_con IS NULL, позицию не учитываем — как у вас).
 
-    MsgBox "Готово. Загружено записей: " & rowsInserted, vbInformation
-    Exit Sub
+USE [ALM_TEST];
+GO
 
-EH:
-    On Error Resume Next
-    If Not cn Is Nothing Then
-        If cn.State = 1 Then cn.RollbackTrans
-        cn.Close
-    End If
-    Application.StatusBar = False
-    Application.EnableEvents = True
-    Application.Calculation = xlCalculationAutomatic
-    Application.ScreenUpdating = True
-    MsgBox "Ошибка #" & Err.Number & ": " & Err.Description, vbCritical
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
 
-Cleanup:
-    Application.StatusBar = False
-    Application.EnableEvents = True
-    Application.Calculation = xlCalculationAutomatic
-    Application.ScreenUpdating = True
-End Sub
+CREATE OR ALTER PROCEDURE [mail].[usp_fill_balance_metrics_depo_only]
+      @DateTo   date = NULL        -- включительно
+    , @DaysBack int  = 21          -- длина окна
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF @DateTo IS NULL
+        SET @DateTo = DATEADD(day,-2,CAST(GETDATE() AS date));
+    DECLARE @DateFrom date = DATEADD(day,-@DaysBack+1,@DateTo);
+
+    /* общий фильтр и сопоставление правил через CROSS APPLY */
+    ;WITH base AS (
+        SELECT
+              t.*
+            , DATEDIFF(day, t.dt_open, t.dt_close) AS deal_term_days
+        FROM  alm.[ALM].[vw_balance_rest_all] t
+        WHERE t.dt_rep BETWEEN @DateFrom AND @DateTo
+          AND t.section_name = N'Срочные'
+          AND t.block_name   = N'Привлечение ФЛ'
+          AND t.od_flag      = 1
+          AND t.cur          = '810'
+    ),
+    /* портфель */
+    aggr_all AS (
+        SELECT
+              b.dt_rep
+            , SUM(b.out_rub) AS out_rub_total
+            , SUM(DATEDIFF(day,b.dt_rep,b.dt_close)*b.out_rub) / NULLIF(SUM(b.out_rub),0) AS term_day
+            , SUM(CASE WHEN b.rate_con IS NOT NULL THEN (b.rate_con + COALESCE(ap.PERCRATE,0)) * b.out_rub ELSE 0 END)
+              / NULLIF(SUM(CASE WHEN b.rate_con IS NOT NULL THEN b.out_rub ELSE 0 END),0) AS rate_con
+            , CAST(NULL AS numeric(18,2)) AS deal_term_day
+        FROM base b
+        CROSS APPLY (
+            SELECT TOP (1) p.PERCRATE
+            FROM [markets].[prod_term_rates] p
+            WHERE p.PROD_ID = b.prod_id
+              AND b.dt_open BETWEEN p.DT_FROM AND p.DT_TO
+              AND b.deal_term_days BETWEEN p.TERMDAYS_FROM AND p.TERMDAYS_TO
+            ORDER BY p.DT_FROM DESC
+        ) ap
+        GROUP BY b.dt_rep
+    ),
+    /* новые сделки */
+    aggr_new AS (
+        SELECT
+              b.dt_rep
+            , SUM(b.out_rub) AS out_rub_total
+            , SUM(DATEDIFF(day,b.dt_rep,b.dt_close)*b.out_rub) / NULLIF(SUM(b.out_rub),0) AS term_day
+            , SUM(CASE WHEN b.rate_con IS NOT NULL THEN (b.rate_con + COALESCE(ap.PERCRATE,0)) * b.out_rub ELSE 0 END)
+              / NULLIF(SUM(CASE WHEN b.rate_con IS NOT NULL THEN b.out_rub ELSE 0 END),0) AS rate_con
+            , SUM(DATEDIFF(day,b.dt_open,b.dt_close)*b.out_rub) / NULLIF(SUM(b.out_rub),0) AS deal_term_day
+        FROM base b
+        CROSS APPLY (
+            SELECT TOP (1) p.PERCRATE
+            FROM [markets].[prod_term_rates] p
+            WHERE p.PROD_ID = b.prod_id
+              AND b.dt_open BETWEEN p.DT_FROM AND p.DT_TO
+              AND b.deal_term_days BETWEEN p.TERMDAYS_FROM AND p.TERMDAYS_TO
+            ORDER BY p.DT_FROM DESC
+        ) ap
+        WHERE b.dt_open = b.dt_rep
+        GROUP BY b.dt_rep
+    ),
+    cal AS (
+        SELECT TOP (DATEDIFF(day,@DateFrom,@DateTo)+1)
+               DATEADD(day,ROW_NUMBER() OVER (ORDER BY (SELECT 0))-1,@DateFrom) AS dt_rep
+        FROM master..spt_values
+    ),
+    scopes AS (SELECT N'портфель' AS data_scope UNION ALL SELECT N'новые'),
+    frame AS (SELECT c.dt_rep, s.data_scope FROM cal c CROSS JOIN scopes s),
+    src AS (
+        SELECT
+              f.dt_rep
+            , f.data_scope
+            , CASE WHEN f.data_scope=N'портфель' THEN a.out_rub_total ELSE n.out_rub_total END AS out_rub_total
+            , CASE WHEN f.data_scope=N'портфель' THEN a.term_day      ELSE n.term_day      END AS term_day
+            , CASE WHEN f.data_scope=N'портфель' THEN a.rate_con      ELSE n.rate_con      END AS rate_con
+            , CASE WHEN f.data_scope=N'портфель' THEN a.deal_term_day ELSE n.deal_term_day END AS deal_term_day
+        FROM frame f
+        LEFT JOIN aggr_all a ON a.dt_rep = f.dt_rep AND f.data_scope = N'портфель'
+        LEFT JOIN aggr_new n ON n.dt_rep = f.dt_rep AND f.data_scope = N'новые'
+    )
+
+    MERGE mail.balance_metrics_td_only AS tgt
+    USING src AS src
+      ON  tgt.dt_rep     = src.dt_rep
+      AND tgt.data_scope = src.data_scope
+    WHEN MATCHED THEN
+        UPDATE SET tgt.out_rub_total = src.out_rub_total,
+                   tgt.term_day      = src.term_day,
+                   tgt.rate_con      = src.rate_con,
+                   tgt.deal_term_day = src.deal_term_day,
+                   tgt.load_dttm     = SYSUTCDATETIME()
+    WHEN NOT MATCHED BY TARGET THEN
+        INSERT (dt_rep, data_scope, out_rub_total, term_day, rate_con, deal_term_day)
+        VALUES (src.dt_rep, src.data_scope, src.out_rub_total, src.term_day, src.rate_con, src.deal_term_day);
+END
+GO
+
+
+⸻
+
+Если нужно, переименую объекты под ваши конвенции или добавлю индексы (например, по markets.prod_term_rates (PROD_ID, DT_FROM, DT_TO, TERMDAYS_FROM, TERMDAYS_TO) для ускорения CROSS APPLY).
