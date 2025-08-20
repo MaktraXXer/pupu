@@ -5,8 +5,7 @@ GO
 SET QUOTED_IDENTIFIER ON;
 GO
 
-CREATE OR ALTER VIEW [WORK].[vDepositInterestsRate_FL_markets]
-AS
+CREATE OR ALTER VIEW [WORK].[vDepositInterestsRate_FL_markets] AS
 SELECT
     v.[DT_REP],
     v.[CON_ID],
@@ -48,13 +47,11 @@ SELECT
     v.[MonthlyCONV_KRS],
     v.[MonthlyCONV_ForecastKeyRate],
 
-    /* Пересчитанный MonthlyCONV_RATE: monthly -> at the end -> +PERCRATE -> обратно в monthly */
+    /* Быстрый пересчёт: (AtTheEnd_RATE + PERCRATE) -> monthly */
     CAST((
         SELECT [LIQUIDITY].[liq].[fnc_IntRate](
-            -- at-the-end с надбавкой:
-            a.rate_ate_plus,
-            -- обратно по фактической конвенции депозита:
-            v.[CONVENTION], 'monthly',
+            v.[AtTheEnd_RATE] + ap.PERCRATE,  -- at-the-end + надбавка
+            'at the end', 'monthly',          -- источник: at-the-end, цель: monthly
             v.[MATUR], 1
         )
     ) AS decimal(18,8)) AS [MonthlyCONV_RATE],
@@ -69,37 +66,13 @@ SELECT
     v.[TSEGMENTNAME],
     v.[isfloat]
 FROM [WORK].[vDepositInterestsRate_For_FL_only] v WITH (NOLOCK)
-
--- Берём ТОЛЬКО совпавшие строки (CROSS APPLY вместо OUTER APPLY):
 CROSS APPLY (
     SELECT TOP (1) p.PERCRATE
     FROM [ALM_TEST].[markets].[prod_term_rates] p WITH (NOLOCK)
-    WHERE LTRIM(RTRIM(p.PROD_NAME)) = LTRIM(RTRIM(v.PROD_NAME))
+    WHERE p.PROD_NAME = v.PROD_NAME
       AND v.[MATUR]   BETWEEN p.[TERMDAYS_FROM] AND p.[TERMDAYS_TO]
       AND v.[DT_OPEN] BETWEEN p.[DT_FROM]       AND p.[DT_TO]
     ORDER BY p.[DT_FROM] DESC, p.[DT_TO] DESC, p.[TERMDAYS_FROM] DESC
 ) ap
-
--- Считаем один раз промежуточные значения, чтобы не дублировать вызовы UDF:
-CROSS APPLY (
-    /* monthly -> at the end */
-    SELECT 
-      CAST((
-        SELECT [LIQUIDITY].[liq].[fnc_IntRate](
-            v.[MonthlyCONV_RATE],
-            'monthly','at the end',
-            v.[MATUR], 1
-        )
-      ) AS decimal(18,8)) AS rate_ate,
-      /* at-the-end + PERCRATE */
-      CAST((
-        SELECT CAST((
-          SELECT [LIQUIDITY].[liq].[fnc_IntRate](
-              v.[MonthlyCONV_RATE],
-              'monthly','at the end',
-              v.[MATUR], 1
-          )
-        ) AS decimal(18,8)) + ap.PERCRATE
-      ) AS decimal(18,8)) AS rate_ate_plus
-) a;
+WHERE v.[AtTheEnd_RATE] IS NOT NULL;  -- чтобы UDF не получал NULL
 GO
