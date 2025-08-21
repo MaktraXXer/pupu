@@ -1,99 +1,74 @@
 USE [ALM_TEST];
 GO
+DECLARE @asof date = '2025-07-02';
 
-ALTER PROCEDURE [mail].[usp_fill_balance_metrics_depo_excl]
-      @DateTo   date = NULL        -- включительно
-    , @DaysBack int  = 21          -- длина окна
-AS
-BEGIN
-    SET NOCOUNT ON;
+;WITH snap AS (
+    SELECT  dep.*,
+            -- Рассчёт модифицированного ТС на уровне сделки (как в процедуре)
+            CASE 
+                WHEN dep.[CLI_SUBTYPE] = N'ФЛ' THEN 
+                    CASE 
+                        WHEN dep.[MonthlyCONV_ALM_TransfertRate] - (dep.[MonthlyCONV_RATE] + dep.[LIQ_ССВ_Fcast]) >= 0 
+                             THEN dep.[MonthlyCONV_ALM_TransfertRate]
+                        ELSE dep.[MonthlyCONV_RATE] + dep.[LIQ_ССВ_Fcast] + 0.001
+                    END
+                ELSE dep.[MonthlyCONV_ALM_TransfertRate]
+            END AS [MonthlyCONV_TransfertRate_MOD_calc]
+    FROM [WORK].[snap_markets] dep WITH (NOLOCK)
+    WHERE dep.[DT_REP] = (SELECT MAX(DT_REP) FROM [WORK].[DepositInterestsRateSnap] WITH (NOLOCK))
+      AND dep.[DT_OPEN] = @asof                      -- новые сделки на дату
+      AND dep.[CLI_SUBTYPE] = N'ФЛ'
+      AND dep.[MonthlyCONV_ALM_TransfertRate] IS NOT NULL
+      AND dep.[CUR] = 'RUR'
+      AND dep.[LIQ_ФОР] IS NOT NULL
+      AND dep.[MonthlyCONV_RATE] IS NOT NULL
+      AND ISNULL(dep.[IsDomRF],0) = 0
+      AND dep.[RATE] > 0.01
+      AND dep.[MonthlyCONV_RATE] + dep.[ALM_OptionRate]*dep.[IS_OPTION]
+            BETWEEN dep.[MonthlyCONV_ForecastKeyRate] - 0.07 
+                AND dep.[MonthlyCONV_ForecastKeyRate] + 0.07
+      AND ISNULL(dep.[isfloat],0) = 0
+      AND dep.[CLI_ID] <> 3731800
+      AND dep.[DT_OPEN] <> DATEADD(day,-1,dep.[DT_CLOSE_PLAN])
+      AND dep.[MATUR] BETWEEN 91 AND 184            -- 3–6 месяцев
+),
+snap_with_saldo AS (
+    SELECT s.*,
+           sal.OUT_RUB
+    FROM snap s
+    JOIN [LIQUIDITY].[liq].[DepositContract_Saldo] sal WITH (NOLOCK)
+      ON sal.[CON_ID] = s.[CON_ID]
+     AND @asof BETWEEN sal.[DT_FROM] AND sal.[DT_TO]
+    WHERE sal.[OUT_RUB] <> 0
+)
+SELECT TOP (50)
+       w.[CON_ID],
+       w.[CLI_ID],
+       w.[CLI_SHORT_NAME],
+       w.[PROD_NAME],
+       w.[DT_OPEN],
+       w.[DT_CLOSE_PLAN],
+       w.[MATUR],
+       w.[OUT_RUB],
 
-    IF @DateTo IS NULL
-        SET @DateTo = DATEADD(day, -2, CAST(GETDATE() AS date));
-    DECLARE @DateFrom date = DATEADD(day, -@DaysBack + 1, @DateTo);
+       -- Базовые составляющие
+       w.[MonthlyCONV_RATE]                 AS [MonthlyConv_Rate],
+       w.[LIQ_ССВ_Fcast]                    AS [SSV],
+       w.[ALM_OptionRate]                   AS [OptionPrem],
+       w.[MonthlyCONV_ALM_TransfertRate]    AS [MonthlyConv_ALM_TR],
+       w.[MonthlyCONV_ForecastKeyRate]      AS [KeyRate_Monthly],
+       w.[MonthlyCONV_TransfertRate_MOD_calc] AS [MonthlyConv_TR_MOD],
 
-    ;WITH
-    -- 1) Справочник маркет-продуктов по ИМЕНИ (нормализуем пробелы)
-    mp_names AS (
-        SELECT DISTINCT LTRIM(RTRIM(p.PROD_NAME)) AS PROD_NAME
-        FROM ALM_TEST.markets.prod_term_rates p WITH (NOLOCK)
-    ),
-    -- 2) База: срочные, ФЛ, рубли, активные; ИСКЛЮЧАЕМ маркет-продукты по имени; только положительный остаток
-    base AS (
-        SELECT
-              t.*
-            , DATEDIFF(day, t.dt_open, t.dt_close) AS deal_term_days
-        FROM  alm.[ALM].[vw_balance_rest_all] t WITH (NOLOCK)
-        WHERE t.dt_rep BETWEEN @DateFrom AND @DateTo
-          AND t.section_name = N'Срочные'
-          AND t.block_name   = N'Привлечение ФЛ'
-          AND t.od_flag      = 1
-          AND t.cur          = '810'
-          AND t.out_rub IS NOT NULL
-          AND t.out_rub > 0
-          AND NOT EXISTS (
-                SELECT 1
-                FROM mp_names mp
-                WHERE LTRIM(RTRIM(t.prod_name_res)) = mp.PROD_NAME
-          )
-    ),
-    -- 3) Портфель по датам (без надбавок)
-    aggr_all AS (
-        SELECT
-              b.dt_rep
-            , SUM(b.out_rub) AS out_rub_total
-            , SUM(DATEDIFF(day, b.dt_rep, b.dt_close) * b.out_rub) / NULLIF(SUM(b.out_rub), 0) AS term_day
-            , SUM(CASE WHEN b.rate_con IS NOT NULL THEN b.rate_con * b.out_rub ELSE 0 END)
-              / NULLIF(SUM(CASE WHEN b.rate_con IS NOT NULL THEN b.out_rub ELSE 0 END), 0) AS rate_con
-            , CAST(NULL AS numeric(18,2)) AS deal_term_day
-        FROM base b
-        GROUP BY b.dt_rep
-    ),
-    -- 4) Новые сделки (дата открытия = дата отчёта), без надбавок
-    aggr_new AS (
-        SELECT
-              b.dt_rep
-            , SUM(b.out_rub) AS out_rub_total
-            , SUM(DATEDIFF(day, b.dt_rep, b.dt_close) * b.out_rub) / NULLIF(SUM(b.out_rub), 0) AS term_day
-            , SUM(CASE WHEN b.rate_con IS NOT NULL THEN b.rate_con * b.out_rub ELSE 0 END)
-              / NULLIF(SUM(CASE WHEN b.rate_con IS NOT NULL THEN b.out_rub ELSE 0 END), 0) AS rate_con
-            , SUM(DATEDIFF(day, b.dt_open, b.dt_close) * b.out_rub) / NULLIF(SUM(b.out_rub), 0) AS deal_term_day
-        FROM base b
-        WHERE b.dt_open = b.dt_rep
-        GROUP BY b.dt_rep
-    ),
-    -- 5) Календарная рамка и объединение
-    cal AS (
-        SELECT TOP (DATEDIFF(day, @DateFrom, @DateTo) + 1)
-               DATEADD(day, ROW_NUMBER() OVER (ORDER BY (SELECT 0)) - 1, @DateFrom) AS dt_rep
-        FROM master..spt_values
-    ),
-    scopes AS (SELECT N'портфель' AS data_scope UNION ALL SELECT N'новые'),
-    frame AS (SELECT c.dt_rep, s.data_scope FROM cal c CROSS JOIN scopes s),
-    src AS (
-        SELECT
-              f.dt_rep
-            , f.data_scope
-            , CASE WHEN f.data_scope = N'портфель' THEN a.out_rub_total ELSE n.out_rub_total END AS out_rub_total
-            , CASE WHEN f.data_scope = N'портфель' THEN a.term_day      ELSE n.term_day      END AS term_day
-            , CASE WHEN f.data_scope = N'портфель' THEN a.rate_con      ELSE n.rate_con      END AS rate_con
-            , CASE WHEN f.data_scope = N'портфель' THEN a.deal_term_day ELSE n.deal_term_day END AS deal_term_day
-        FROM frame f
-        LEFT JOIN aggr_all a ON a.dt_rep = f.dt_rep AND f.data_scope = N'портфель'
-        LEFT JOIN aggr_new n ON n.dt_rep = f.dt_rep AND f.data_scope = N'новые'
-    )
-    MERGE mail.balance_metrics_td_excl AS tgt
-    USING src AS src
-      ON  tgt.dt_rep     = src.dt_rep
-      AND tgt.data_scope = src.data_scope
-    WHEN MATCHED THEN
-        UPDATE SET tgt.out_rub_total = src.out_rub_total,
-                   tgt.term_day      = src.term_day,
-                   tgt.rate_con      = src.rate_con,
-                   tgt.deal_term_day = src.deal_term_day,
-                   tgt.load_dttm     = SYSUTCDATETIME()
-    WHEN NOT MATCHED BY TARGET THEN
-        INSERT (dt_rep, data_scope, out_rub_total, term_day, rate_con, deal_term_day)
-        VALUES (src.dt_rep, src.data_scope, src.out_rub_total, src.term_day, src.rate_con, src.deal_term_day);
-END
-GO
+       -- Спреды на уровне сделки
+       (w.[MonthlyCONV_TransfertRate_MOD_calc] - w.[MonthlyCONV_ForecastKeyRate]) AS [TS_minus_KS_spread],
+       (w.[MonthlyCONV_RATE] + w.[LIQ_ССВ_Fcast] + w.[ALM_OptionRate] - w.[MonthlyCONV_ForecastKeyRate]) AS [ExtRate_minus_KS_spread],
+
+       -- Вклад сделки в агрегат (для ранжирования драйверов)
+       w.[OUT_RUB] * (w.[MonthlyCONV_TransfertRate_MOD_calc] - w.[MonthlyCONV_ForecastKeyRate]) AS [contrib_TS_KS],
+       w.[OUT_RUB] * (w.[MonthlyCONV_RATE] + w.[LIQ_ССВ_Fcast] + w.[ALM_OptionRate] - w.[MonthlyCONV_ForecastKeyRate]) AS [contrib_Ext_KS],
+
+       -- Диагностика "клемпа" ТС
+       (w.[MonthlyCONV_ALM_TransfertRate] - (w.[MonthlyCONV_RATE] + w.[LIQ_ССВ_Fcast])) AS [TR_minus_ExtRateNoOpt],
+       CASE WHEN (w.[MonthlyCONV_ALM_TransfertRate] - (w.[MonthlyCONV_RATE] + w.[LIQ_ССВ_Fcast])) < 0 THEN 1 ELSE 0 END AS [is_TS_clamped]
+FROM snap_with_saldo w
+ORDER BY [contrib_Ext_KS] DESC, [contrib_TS_KS] DESC;
