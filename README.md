@@ -10,73 +10,52 @@ BEGIN
     DECLARE @DateFrom date = DATEADD(day,-@DaysBack+1,@DateTo);
 
     ;WITH
-    -- 1) Фиксируем список маркет-продуктов по ИМЕНИ (как в сверке)
+    /* 1) Список продуктов маркетплейсов (по имени) */
     mp_names AS (
         SELECT DISTINCT LTRIM(RTRIM(p.PROD_NAME)) AS PROD_NAME
-        FROM ALM_TEST.markets.prod_term_rates p WITH (NOLOCK)
+        FROM [ALM_TEST].[markets].[prod_term_rates] p WITH (NOLOCK)
     ),
-    -- 2) База: только "Срочные / Привлечение ФЛ / cur=810 / активные", только маркет-продукты, и только положительный out_rub
+    /* 2) База: срочные, Привлечение ФЛ, 810; ИСКЛЮЧАЕМ продукты из mp_names */
     base AS (
         SELECT
               t.*
             , DATEDIFF(day, t.dt_open, t.dt_close) AS deal_term_days
         FROM  alm.[ALM].[vw_balance_rest_all] t WITH (NOLOCK)
-        JOIN  mp_names mp
-              ON LTRIM(RTRIM(t.prod_name_res)) = mp.PROD_NAME
+        LEFT JOIN mp_names mp
+               ON LTRIM(RTRIM(t.prod_name_res)) = mp.PROD_NAME
         WHERE t.dt_rep BETWEEN @DateFrom AND @DateTo
           AND t.section_name = N'Срочные'
           AND t.block_name   = N'Привлечение ФЛ'
           AND t.od_flag      = 1
           AND t.cur          = '810'
-          AND t.out_rub IS NOT NULL
-          AND t.out_rub > 0
+          AND mp.PROD_NAME IS NULL          -- ← исключили все «маркет» продукты
     ),
-    -- 3) Портфель (все действующие на дату): надбавка подключается, но строки не отваливаются
+    /* 3) Портфель (без каких-либо надбавок) */
     aggr_all AS (
         SELECT
               b.dt_rep
             , SUM(b.out_rub) AS out_rub_total
-            , SUM(DATEDIFF(day,b.dt_rep,b.dt_close) * b.out_rub) / NULLIF(SUM(b.out_rub),0) AS term_day
-            , SUM(CASE WHEN b.rate_con IS NOT NULL
-                       THEN (b.rate_con + COALESCE(ap.PERCRATE,0)) * b.out_rub
-                       ELSE 0 END)
+            , SUM(DATEDIFF(day,b.dt_rep,b.dt_close)*b.out_rub) / NULLIF(SUM(b.out_rub),0) AS term_day
+            , SUM(CASE WHEN b.rate_con IS NOT NULL THEN b.rate_con * b.out_rub ELSE 0 END)
               / NULLIF(SUM(CASE WHEN b.rate_con IS NOT NULL THEN b.out_rub ELSE 0 END),0) AS rate_con
             , CAST(NULL AS numeric(18,2)) AS deal_term_day
         FROM base b
-        OUTER APPLY (
-            SELECT TOP (1) p.PERCRATE
-            FROM ALM_TEST.markets.prod_term_rates p WITH (NOLOCK)
-            WHERE p.PROD_ID = b.prod_id
-              AND b.deal_term_days BETWEEN p.TERMDAYS_FROM AND p.TERMDAYS_TO
-              AND b.dt_open BETWEEN p.DT_FROM AND p.DT_TO     -- при необходимости можно сменить на b.dt_rep
-            ORDER BY p.DT_FROM DESC, p.DT_TO DESC, p.TERMDAYS_FROM DESC
-        ) ap
         GROUP BY b.dt_rep
     ),
-    -- 4) Новые сделки на дату открытия
+    /* 4) Новые сделки на дату открытия (также без надбавок) */
     aggr_new AS (
         SELECT
               b.dt_rep
             , SUM(b.out_rub) AS out_rub_total
-            , SUM(DATEDIFF(day,b.dt_rep,b.dt_close) * b.out_rub) / NULLIF(SUM(b.out_rub),0) AS term_day
-            , SUM(CASE WHEN b.rate_con IS NOT NULL
-                       THEN (b.rate_con + COALESCE(ap.PERCRATE,0)) * b.out_rub
-                       ELSE 0 END)
+            , SUM(DATEDIFF(day,b.dt_rep,b.dt_close)*b.out_rub) / NULLIF(SUM(b.out_rub),0) AS term_day
+            , SUM(CASE WHEN b.rate_con IS NOT NULL THEN b.rate_con * b.out_rub ELSE 0 END)
               / NULLIF(SUM(CASE WHEN b.rate_con IS NOT NULL THEN b.out_rub ELSE 0 END),0) AS rate_con
-            , SUM(DATEDIFF(day,b.dt_open,b.dt_close) * b.out_rub) / NULLIF(SUM(b.out_rub),0) AS deal_term_day
+            , SUM(DATEDIFF(day,b.dt_open,b.dt_close)*b.out_rub) / NULLIF(SUM(b.out_rub),0) AS deal_term_day
         FROM base b
-        OUTER APPLY (
-            SELECT TOP (1) p.PERCRATE
-            FROM ALM_TEST.markets.prod_term_rates p WITH (NOLOCK)
-            WHERE p.PROD_ID = b.prod_id
-              AND b.deal_term_days BETWEEN p.TERMDAYS_FROM AND p.TERMDAYS_TO
-              AND b.dt_open BETWEEN p.DT_FROM AND p.DT_TO     -- при необходимости можно сменить на b.dt_rep
-            ORDER BY p.DT_FROM DESC, p.DT_TO DESC, p.TERMDAYS_FROM DESC
-        ) ap
         WHERE b.dt_open = b.dt_rep
         GROUP BY b.dt_rep
     ),
-    -- 5) Календарная рамка
+    /* 5) Рамка дат + объединение */
     cal AS (
         SELECT TOP (DATEDIFF(day,@DateFrom,@DateTo)+1)
                DATEADD(day,ROW_NUMBER() OVER (ORDER BY (SELECT 0))-1,@DateFrom) AS dt_rep
@@ -84,7 +63,6 @@ BEGIN
     ),
     scopes AS (SELECT N'портфель' AS data_scope UNION ALL SELECT N'новые'),
     frame AS (SELECT c.dt_rep, s.data_scope FROM cal c CROSS JOIN scopes s),
-    -- 6) Объединяем источники для MERGE
     src AS (
         SELECT
               f.dt_rep
