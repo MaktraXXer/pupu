@@ -1,204 +1,89 @@
-INSERT INTO [ALM_TEST].[WORK].[prolongationAnalysisResult_ISOPTION] (
-    [MonthEnd],
-    [SegmentGrouping],
-    [PROD_NAME],
-    [CurrencyGrouping],
-    [TermBucketGrouping],
-    [BalanceBucketGrouping],
-    [IS_OPTION],
+----------------------------------
+-- A9) Средневзвешенные ставки (OpenWeightedRates)
+----------------------------------
+OpenWeightedRates AS (
+    SELECT
+         MonthEnd,
+         SegmentGrouping,
+         PROD_NAME,
+         CurrencyGrouping,
+         TermBucketGrouping,
+         BalanceBucketGrouping,
+         IS_OPTION,
 
-    -- Opened
-    [OpenedDeals],
-    [Opened_Summ_BalanceRub],
-    [Opened_Count_Prolong],
-    [Opened_Count_NewNoProlong],
-    [Opened_Count_1yProlong],
-    [Opened_Count_2yProlong],
-    [Opened_Count_3yProlong],
-    [Opened_Count_4yProlong],
-    [Opened_Count_5plusProlong],
-    [Opened_Sum_ProlongRub],
-    [Opened_Sum_NewNoProlong],
-    [Opened_Sum_1yProlong_Rub],
-    [Opened_Sum_2yProlong_Rub],
-    [Opened_Sum_3yProlong_Rub],
-    [Opened_Sum_4yProlong_Rub],
-    [Opened_Sum_5plusProlong_Rub],
+         -- Ставки
+         CASE WHEN SUM(Summ_BalanceRub) > 0
+              THEN SUM(Sum_RateWeighted) / SUM(Summ_BalanceRub)
+              ELSE 0 END AS WeightedRate_All,
 
-    [Opened_Dolya_ProlongRub],
-    [Opened_Dolya_ProlongSht],
-    [Opened_Dolya_1yProlongRub],
-    [Opened_Dolya_2yProlongRub],
-    [Opened_Dolya_3yProlongRub],
-    [Opened_Dolya_4yProlongRub],
-    [Opened_Dolya_5plusProlongRub],
+         CASE WHEN SUM(Sum_NewNoProlong) > 0
+              THEN SUM(Sum_RateWeighted_NewNoProlong) / SUM(Sum_NewNoProlong)
+              ELSE 0 END AS WeightedRate_NewNoProlong,
 
-    [Opened_WeightedRate_All],
-    [Opened_WeightedRate_NewNoProlong],
-    [Opened_WeightedRate_AllProlong],
-    [Opened_WeightedRate_Previous],
-    [Opened_WeightedRate_1y],
-    [Opened_WeightedRate_2y],
-    [Opened_WeightedRate_3y],
-    [Opened_WeightedRate_4y],
-    [Opened_WeightedRate_5plus],
+         CASE WHEN SUM(Sum_1yProlong_Rub) > 0
+              THEN SUM(Sum_RateWeighted_1y) / SUM(Sum_1yProlong_Rub)
+              ELSE 0 END AS WeightedRate_1y,
 
-    [Opened_WeightedDiscount_All],
-    [Opened_WeightedDiscount_NewNoProlong],
-    [Opened_WeightedDiscount_AllProlong],
-    [Opened_WeightedDiscount_1y],
-    [Opened_WeightedDiscount_2y],
-    [Opened_WeightedDiscount_3y],
-    [Opened_WeightedDiscount_4y],
-    [Opened_WeightedDiscount_5plus],
+         CASE WHEN SUM(Sum_2yProlong_Rub) > 0
+              THEN SUM(Sum_RateWeighted_2y) / SUM(Sum_2yProlong_Rub)
+              ELSE 0 END AS WeightedRate_2y,
 
-    -- Closed
-    [ClosedDeals],
-    [Summ_ClosedBalanceRub],
-    [Summ_ClosedBalanceRub_int],
+         CASE WHEN SUM(Sum_3yProlong_Rub) > 0
+              THEN SUM(Sum_RateWeighted_3y) / SUM(Sum_3yProlong_Rub)
+              ELSE 0 END AS WeightedRate_3y,
 
-    [Closed_Count_Prolong],
-    [Closed_Count_NewNoProlong],
-    [Closed_Count_1yProlong],
-    [Closed_Count_2yProlong],
-    [Closed_Count_3yProlong],
-    [Closed_Count_4yProlong],
-    [Closed_Count_5plusProlong],
+         CASE WHEN SUM(Sum_4yProlong_Rub) > 0
+              THEN SUM(Sum_RateWeighted_4y) / SUM(Sum_4yProlong_Rub)
+              ELSE 0 END AS WeightedRate_4y,
 
-    [Closed_Sum_ProlongRub],
-    [Closed_Sum_NewNoProlong],
-    [Closed_Sum_1yProlong_Rub],
-    [Closed_Sum_2yProlong_Rub],
-    [Closed_Sum_3yProlong_Rub],
-    [Closed_Sum_4yProlong_Rub],
-    [Closed_Sum_5plusProlong_Rub],
+         CASE WHEN SUM(Sum_5plusProlong_Rub) > 0
+              THEN SUM(Sum_RateWeighted_5plus) / SUM(Sum_5plusProlong_Rub)
+              ELSE 0 END AS WeightedRate_5plus,
 
-    [Closed_Sum_ProlongRub_int],
-    [Closed_Sum_NewNoProlong_int],
-    [Closed_Sum_1yProlong_Rub_int],
-    [Closed_Sum_2yProlong_Rub_int],
-    [Closed_Sum_3yProlong_Rub_int],
-    [Closed_Sum_4yProlong_Rub_int],
-    [Closed_Sum_5plusProlong_Rub_int],
+         CASE WHEN SUM(Sum_ProlongRub) > 0
+              THEN SUM(Sum_RateWeighted_Prolong) / SUM(Sum_ProlongRub)
+              ELSE 0 END AS WeightedRate_AllProlong,
 
-    [Closed_Dolya_ProlongRub],
-    [Closed_Dolya_1yProlongRub],
-    [Closed_Dolya_2yProlongRub],
-    [Closed_Dolya_3yProlongRub],
-    [Closed_Dolya_4yProlongRub],
-    [Closed_Dolya_5plusProlongRub],
+         CASE WHEN SUM(Sum_PreviousBalance) > 0
+              THEN SUM(Sum_PreviousRateWeighted) / SUM(Sum_PreviousBalance)
+              ELSE 0 END AS WeightedRate_Previous,
 
-    [WeightedRate_Closed_Overall],
-    [Closed_WeightedRate_All],
-    [Closed_WeightedRate_NewNoProlong],
-    [Closed_WeightedRate_1y],
-    [Closed_WeightedRate_2y],
-    [Closed_WeightedRate_3y],
-    [Closed_WeightedRate_4y],
-    [Closed_WeightedRate_5plus],
-    [Closed_WeightedRate_AllProlong],
+--------------------------------------------------------------------
+-- Дисконты (исправлено, проверяем именно *_RubD)
+--------------------------------------------------------------------
+         CASE WHEN SUM(Summ_BalanceRubD) > 0
+              THEN SUM(Sum_Discount) / SUM(Summ_BalanceRubD)
+              ELSE 0 END AS WeightedDiscount_All,
 
-    [Dolya_VyhodovRub]
+         CASE WHEN SUM(Sum_NewNoProlongD) > 0
+              THEN SUM(Sum_Discount_NewNoProlong) / SUM(Sum_NewNoProlongD)
+              ELSE 0 END AS WeightedDiscount_NewNoProlong,
+
+         CASE WHEN SUM(Sum_1yProlong_RubD) > 0
+              THEN SUM(Sum_Discount_1y) / SUM(Sum_1yProlong_RubD)
+              ELSE 0 END AS WeightedDiscount_1y,
+
+         CASE WHEN SUM(Sum_2yProlong_RubD) > 0
+              THEN SUM(Sum_Discount_2y) / SUM(Sum_2yProlong_RubD)
+              ELSE 0 END AS WeightedDiscount_2y,
+
+         CASE WHEN SUM(Sum_3yProlong_RubD) > 0
+              THEN SUM(Sum_Discount_3y) / SUM(Sum_3yProlong_RubD)
+              ELSE 0 END AS WeightedDiscount_3y,
+
+         CASE WHEN SUM(Sum_4yProlong_RubD) > 0
+              THEN SUM(Sum_Discount_4y) / SUM(Sum_4yProlong_RubD)
+              ELSE 0 END AS WeightedDiscount_4y,
+
+         CASE WHEN SUM(Sum_5plusProlong_RubD) > 0
+              THEN SUM(Sum_Discount_5plus) / SUM(Sum_5plusProlong_RubD)
+              ELSE 0 END AS WeightedDiscount_5plus,
+
+         CASE WHEN SUM(Sum_ProlongRubD) > 0
+              THEN SUM(Sum_Discount_Prolong) / SUM(Sum_ProlongRubD)
+              ELSE 0 END AS WeightedDiscount_AllProlong
+    FROM OpenAggregated
+    GROUP BY
+         MonthEnd, SegmentGrouping, PROD_NAME, CurrencyGrouping,
+         TermBucketGrouping, BalanceBucketGrouping, IS_OPTION
 )
-SELECT
-    RawMonthEnd,
-    RawSegmentGrouping,
-    RawPROD_NAME,
-    RawCurrencyGrouping,
-    RawTermBucketGrouping,
-    RawBalanceBucketGrouping,
-    RawIS_OPTION,
-
-    -- Opened
-    OpenedDeals,
-    Summ_BalanceRub,
-    Count_Prolong,
-    Count_NewNoProlong,
-    Count_1yProlong,
-    Count_2yProlong,
-    Count_3yProlong,
-    Count_4yProlong,
-    Count_5plusProlong,
-    Sum_ProlongRub,
-    Sum_NewNoProlong,
-    Sum_1yProlong_Rub,
-    Sum_2yProlong_Rub,
-    Sum_3yProlong_Rub,
-    Sum_4yProlong_Rub,
-    Sum_5plusProlong_Rub,
-
-    Dolya_ProlongRub,
-    Dolya_ProlongSht,
-    Dolya_1yProlongRub,
-    Dolya_2yProlongRub,
-    Dolya_3yProlongRub,
-    Dolya_4yProlongRub,
-    Dolya_5plusProlongRub,
-
-    WeightedRate_All,
-    WeightedRate_NewNoProlong,
-    WeightedRate_AllProlong,
-    WeightedRate_Previous,
-    WeightedRate_1y,
-    WeightedRate_2y,
-    WeightedRate_3y,
-    WeightedRate_4y,
-    WeightedRate_5plus,
-
-    WeightedDiscount_All,
-    WeightedDiscount_NewNoProlong,
-    WeightedDiscount_AllProlong,
-    WeightedDiscount_1y,
-    WeightedDiscount_2y,
-    WeightedDiscount_3y,
-    WeightedDiscount_4y,
-    WeightedDiscount_5plus,
-
-    -- Closed
-    ClosedDeals,
-    Summ_ClosedBalanceRub,
-    Summ_ClosedBalanceRub_int,
-
-    Closed_Count_Prolong,
-    Closed_Count_NewNoProlong,
-    Closed_Count_1yProlong,
-    Closed_Count_2yProlong,
-    Closed_Count_3yProlong,
-    Closed_Count_4yProlong,
-    Closed_Count_5plusProlong,
-
-    Closed_Sum_ProlongRub,
-    Closed_Sum_NewNoProlong,
-    Closed_Sum_1yProlong_Rub,
-    Closed_Sum_2yProlong_Rub,
-    Closed_Sum_3yProlong_Rub,
-    Closed_Sum_4yProlong_Rub,
-    Closed_Sum_5plusProlong_Rub,
-
-    Closed_Sum_ProlongRub_int,
-    Closed_Sum_NewNoProlong_int,
-    Closed_Sum_1yProlong_Rub_int,
-    Closed_Sum_2yProlong_Rub_int,
-    Closed_Sum_3yProlong_Rub_int,
-    Closed_Sum_4yProlong_Rub_int,
-    Closed_Sum_5plusProlong_Rub_int,
-
-    Closed_Dolya_ProlongRub,
-    Closed_Dolya_1yProlongRub,
-    Closed_Dolya_2yProlongRub,
-    Closed_Dolya_3yProlongRub,
-    Closed_Dolya_4yProlongRub,
-    Closed_Dolya_5plusProlongRub,
-
-    WeightedRate_Closed_Overall,
-    Closed_WeightedRate_All,
-    Closed_WeightedRate_NewNoProlong,
-    Closed_WeightedRate_1y,
-    Closed_WeightedRate_2y,
-    Closed_WeightedRate_3y,
-    Closed_WeightedRate_4y,
-    Closed_WeightedRate_5plus,
-    Closed_WeightedRate_AllProlong,
-
-    Dolya_VyhodovRub
-FROM FullJoin;
