@@ -1,74 +1,74 @@
-USE [ALM_TEST];
-GO
-DECLARE @asof date = '2025-07-02';
+Отлично, давай я помогу тебе собрать оба запроса — коротко, аккуратно и так, чтобы они реально давали удобные агрегаты для выгрузки в Excel.
 
-;WITH snap AS (
-    SELECT  dep.*,
-            -- Рассчёт модифицированного ТС на уровне сделки (как в процедуре)
-            CASE 
-                WHEN dep.[CLI_SUBTYPE] = N'ФЛ' THEN 
-                    CASE 
-                        WHEN dep.[MonthlyCONV_ALM_TransfertRate] - (dep.[MonthlyCONV_RATE] + dep.[LIQ_ССВ_Fcast]) >= 0 
-                             THEN dep.[MonthlyCONV_ALM_TransfertRate]
-                        ELSE dep.[MonthlyCONV_RATE] + dep.[LIQ_ССВ_Fcast] + 0.001
-                    END
-                ELSE dep.[MonthlyCONV_ALM_TransfertRate]
-            END AS [MonthlyCONV_TransfertRate_MOD_calc]
-    FROM [WORK].[snap_markets] dep WITH (NOLOCK)
-    WHERE dep.[DT_REP] = (SELECT MAX(DT_REP) FROM [WORK].[DepositInterestsRateSnap] WITH (NOLOCK))
-      AND dep.[DT_OPEN] = @asof                      -- новые сделки на дату
-      AND dep.[CLI_SUBTYPE] = N'ФЛ'
-      AND dep.[MonthlyCONV_ALM_TransfertRate] IS NOT NULL
-      AND dep.[CUR] = 'RUR'
-      AND dep.[LIQ_ФОР] IS NOT NULL
-      AND dep.[MonthlyCONV_RATE] IS NOT NULL
-      AND ISNULL(dep.[IsDomRF],0) = 0
-      AND dep.[RATE] > 0.01
-      AND dep.[MonthlyCONV_RATE] + dep.[ALM_OptionRate]*dep.[IS_OPTION]
-            BETWEEN dep.[MonthlyCONV_ForecastKeyRate] - 0.07 
-                AND dep.[MonthlyCONV_ForecastKeyRate] + 0.07
-      AND ISNULL(dep.[isfloat],0) = 0
-      AND dep.[CLI_ID] <> 3731800
-      AND dep.[DT_OPEN] <> DATEADD(day,-1,dep.[DT_CLOSE_PLAN])
-      AND dep.[MATUR] BETWEEN 91 AND 184            -- 3–6 месяцев
-),
-snap_with_saldo AS (
-    SELECT s.*,
-           sal.OUT_RUB
-    FROM snap s
-    JOIN [LIQUIDITY].[liq].[DepositContract_Saldo] sal WITH (NOLOCK)
-      ON sal.[CON_ID] = s.[CON_ID]
-     AND @asof BETWEEN sal.[DT_FROM] AND sal.[DT_TO]
-    WHERE sal.[OUT_RUB] <> 0
-)
-SELECT TOP (50)
-       w.[CON_ID],
-       w.[CLI_ID],
-       w.[CLI_SHORT_NAME],
-       w.[PROD_NAME],
-       w.[DT_OPEN],
-       w.[DT_CLOSE_PLAN],
-       w.[MATUR],
-       w.[OUT_RUB],
+⸻
 
-       -- Базовые составляющие
-       w.[MonthlyCONV_RATE]                 AS [MonthlyConv_Rate],
-       w.[LIQ_ССВ_Fcast]                    AS [SSV],
-       w.[ALM_OptionRate]                   AS [OptionPrem],
-       w.[MonthlyCONV_ALM_TransfertRate]    AS [MonthlyConv_ALM_TR],
-       w.[MonthlyCONV_ForecastKeyRate]      AS [KeyRate_Monthly],
-       w.[MonthlyCONV_TransfertRate_MOD_calc] AS [MonthlyConv_TR_MOD],
+🔹 ЗАДАЧА 1
 
-       -- Спреды на уровне сделки
-       (w.[MonthlyCONV_TransfertRate_MOD_calc] - w.[MonthlyCONV_ForecastKeyRate]) AS [TS_minus_KS_spread],
-       (w.[MonthlyCONV_RATE] + w.[LIQ_ССВ_Fcast] + w.[ALM_OptionRate] - w.[MonthlyCONV_ForecastKeyRate]) AS [ExtRate_minus_KS_spread],
+(остатки и средневзвешенная ставка на нужные даты)
 
-       -- Вклад сделки в агрегат (для ранжирования драйверов)
-       w.[OUT_RUB] * (w.[MonthlyCONV_TransfertRate_MOD_calc] - w.[MonthlyCONV_ForecastKeyRate]) AS [contrib_TS_KS],
-       w.[OUT_RUB] * (w.[MonthlyCONV_RATE] + w.[LIQ_ССВ_Fcast] + w.[ALM_OptionRate] - w.[MonthlyCONV_ForecastKeyRate]) AS [contrib_Ext_KS],
+👉 Нам нужны 4 даты:
+	•	конец прошлого года
+	•	EOMONTH(GETDATE(),-1)-2 (ровно месяц назад минус 2 дня)
+	•	GETDATE()-9
+	•	GETDATE()-2
 
-       -- Диагностика "клемпа" ТС
-       (w.[MonthlyCONV_ALM_TransfertRate] - (w.[MonthlyCONV_RATE] + w.[LIQ_ССВ_Fcast])) AS [TR_minus_ExtRateNoOpt],
-       CASE WHEN (w.[MonthlyCONV_ALM_TransfertRate] - (w.[MonthlyCONV_RATE] + w.[LIQ_ССВ_Fcast])) < 0 THEN 1 ELSE 0 END AS [is_TS_clamped]
-FROM snap_with_saldo w
-ORDER BY [contrib_Ext_KS] DESC, [contrib_TS_KS] DESC;
+SELECT 
+    dt_rep,
+    SUM(out_rub)                           AS total_out_rub,
+    SUM(out_rub * rate_trf)/SUM(out_rub)   AS w_avg_rate
+FROM ALM.VW_Balance_Rest_All WITH (NOLOCK)
+WHERE section_name = 'Прочие'
+  AND TPROD_NAME  = 'Кредит наличными'
+  AND cur         = '810'
+  AND BLOCK_NAME  = 'Кредиты ФЛ'
+  AND od_flag     = 1
+  AND OUT_RUB IS NOT NULL
+  AND dt_rep IN (
+        EOMONTH(DATEADD(YEAR,-1,GETDATE())),        -- конец прошлого года
+        DATEADD(DAY,-2,EOMONTH(GETDATE(),-1)),      -- месяц назад - 2 дня
+        CAST(DATEADD(DAY,-9,GETDATE()) AS date),    -- 9 дней назад
+        CAST(DATEADD(DAY,-2,GETDATE()) AS date)     -- 2 дня назад
+  )
+GROUP BY dt_rep
+ORDER BY dt_rep;
+
+
+⸻
+
+🔹 ЗАДАЧА 2
+
+(новые выдачи за последние 6 дней, dt_open ∈ [getdate()-8 ; getdate()-2])
+
+👉 Нужно:
+	•	средневзвешенный срок (termdays)
+	•	средневзвешенная ставка (rate_con)
+	•	объем в 2 категориях (rate_trf >= 0.15 и <0.15)
+
+SELECT
+    CAST(GETDATE()-2 AS date)                          AS dt_rep,
+    SUM(OUT_RUB)                                       AS total_out_rub,
+    SUM(OUT_RUB * termdays) / NULLIF(SUM(OUT_RUB),0)   AS w_avg_termdays,
+    SUM(OUT_RUB * rate_con) / NULLIF(SUM(OUT_RUB),0)   AS w_avg_rate_con,
+    SUM(CASE WHEN rate_trf >= 0.15 THEN OUT_RUB ELSE 0 END) AS vol_high_trf,
+    SUM(CASE WHEN rate_trf <  0.15 THEN OUT_RUB ELSE 0 END) AS vol_low_trf
+FROM ALM.VW_Balance_Rest_All WITH (NOLOCK)
+WHERE dt_rep      = CAST(GETDATE()-2 AS date)
+  AND section_name = 'Прочие'
+  AND TPROD_NAME   = 'Кредит наличными'
+  AND cur          = '810'
+  AND BLOCK_NAME   = 'Кредиты ФЛ'
+  AND od_flag      = 1
+  AND OUT_RUB IS NOT NULL
+  AND DT_OPEN BETWEEN CAST(GETDATE()-8 AS date) AND CAST(GETDATE()-2 AS date);
+
+
+⸻
+
+✅ Оба запроса теперь:
+	•	короткие, без «1=1» и мусора;
+	•	дают аккуратную агрегированную таблицу (можно вставлять в Excel и обновлять);
+	•	в Задаче 2 сразу есть всё: объём, средневзвешенный срок, ставка и разбивка по категориям.
+
+⸻
+
+Хочешь, я соберу их ещё в одну процедуру, чтобы было прям «одной кнопкой» и Excel всегда тянул оба результата?
