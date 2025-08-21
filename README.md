@@ -1,101 +1,115 @@
-Понял. Делаем так, чтобы:
-	1.	набор PROD_NAME не менялся из-за джоина (сначала отбираем «рыночные» продукты по имени, а не «через APPLY»),
-	2.	надбавка PERCRATE всегда учитывалась, но если ставки для даты не нашли — берём 0 (чтобы строки не выпадали).
+ALTER PROCEDURE [mail].[usp_fill_balance_metrics_depo_only]
+      @DateTo   date = NULL        -- включительно
+    , @DaysBack int  = 21          -- длина окна
+AS
+BEGIN
+    SET NOCOUNT ON;
 
-Ниже — финальная версия витрины с тем же набором колонок. Я заменил CROSS APPLY → OUTER APPLY, добавил явный фильтр по списку рыночных продуктов и COALESCE(ap.PERCRATE,0) в расчёте.
+    IF @DateTo IS NULL
+        SET @DateTo = DATEADD(day,-2,CAST(GETDATE() AS date));
+    DECLARE @DateFrom date = DATEADD(day,-@DaysBack+1,@DateTo);
 
-ALTER VIEW [WORK].[vDepositInterestsRate_FL_markets] AS
-WITH mp AS (
-    -- фиксируем список "рыночных" продуктов по имени, чтобы набор PROD_NAME не зависел от попадания в интервалы
-    SELECT DISTINCT LTRIM(RTRIM(p.PROD_NAME)) AS PROD_NAME
-    FROM [ALM_TEST].[markets].[prod_term_rates] p WITH (NOLOCK)
-)
-SELECT
-    v.[DT_REP],
-    v.[CON_ID],
-    v.[CLI_ID],
-    v.[INN],
-    v.[CLI_SHORT_NAME],
-    v.[IsDomRF],
-    v.[ACC_NO],
-    v.[PROD_TYPE],
-    v.[DT_OPEN],
-    v.[DT_CLOSE],
-    v.[DT_CLOSE_PLAN],
-    v.[MATUR],
-    v.[RATE],
-    v.[BALANCE_CUR],
-    v.[CUR],
-    v.[BALANCE_RUB],
-    v.[CLI_SUBTYPE],
-    v.[Group],
-    v.[CONVENTION],
-    v.[PROD_NAME],
-    v.[IS_PDR],
-    v.[IS_OPTION],
-    v.[IS_FINANCE],
-    v.[IS_FINANCE_LCR],
-    v.[SEG_NAME],
-    v.[LIQ_ФОР],
-    v.[ALM_ФОР],
-    v.[LIQ_ФОР_Fcast],
-    v.[LIQ_ССВ],
-    v.[ALM_ССВ],
-    v.[LIQ_ССВ_Fcast],
-    v.[ALM_LiquidityPrefRate],
-    v.[ALM_OptionRate],
-    v.[MonthlyCONV_RoisFix],
-    v.[MonthlyCONV_LIQ_TransfertRate],
-    v.[MonthlyCONV_ALM_TransfertRate],
-    v.[MonthlyCONV_KBD],
-    v.[MonthlyCONV_KRS],
-    v.[MonthlyCONV_ForecastKeyRate],
+    ;WITH
+    -- 1) Фиксируем список маркет-продуктов по ИМЕНИ (как в сверке)
+    mp_names AS (
+        SELECT DISTINCT LTRIM(RTRIM(p.PROD_NAME)) AS PROD_NAME
+        FROM ALM_TEST.markets.prod_term_rates p WITH (NOLOCK)
+    ),
+    -- 2) База: только "Срочные / Привлечение ФЛ / cur=810 / активные", только маркет-продукты, и только положительный out_rub
+    base AS (
+        SELECT
+              t.*
+            , DATEDIFF(day, t.dt_open, t.dt_close) AS deal_term_days
+        FROM  alm.[ALM].[vw_balance_rest_all] t WITH (NOLOCK)
+        JOIN  mp_names mp
+              ON LTRIM(RTRIM(t.prod_name_res)) = mp.PROD_NAME
+        WHERE t.dt_rep BETWEEN @DateFrom AND @DateTo
+          AND t.section_name = N'Срочные'
+          AND t.block_name   = N'Привлечение ФЛ'
+          AND t.od_flag      = 1
+          AND t.cur          = '810'
+          AND t.out_rub IS NOT NULL
+          AND t.out_rub > 0
+    ),
+    -- 3) Портфель (все действующие на дату): надбавка подключается, но строки не отваливаются
+    aggr_all AS (
+        SELECT
+              b.dt_rep
+            , SUM(b.out_rub) AS out_rub_total
+            , SUM(DATEDIFF(day,b.dt_rep,b.dt_close) * b.out_rub) / NULLIF(SUM(b.out_rub),0) AS term_day
+            , SUM(CASE WHEN b.rate_con IS NOT NULL
+                       THEN (b.rate_con + COALESCE(ap.PERCRATE,0)) * b.out_rub
+                       ELSE 0 END)
+              / NULLIF(SUM(CASE WHEN b.rate_con IS NOT NULL THEN b.out_rub ELSE 0 END),0) AS rate_con
+            , CAST(NULL AS numeric(18,2)) AS deal_term_day
+        FROM base b
+        OUTER APPLY (
+            SELECT TOP (1) p.PERCRATE
+            FROM ALM_TEST.markets.prod_term_rates p WITH (NOLOCK)
+            WHERE p.PROD_ID = b.prod_id
+              AND b.deal_term_days BETWEEN p.TERMDAYS_FROM AND p.TERMDAYS_TO
+              AND b.dt_open BETWEEN p.DT_FROM AND p.DT_TO     -- при необходимости можно сменить на b.dt_rep
+            ORDER BY p.DT_FROM DESC, p.DT_TO DESC, p.TERMDAYS_FROM DESC
+        ) ap
+        GROUP BY b.dt_rep
+    ),
+    -- 4) Новые сделки на дату открытия
+    aggr_new AS (
+        SELECT
+              b.dt_rep
+            , SUM(b.out_rub) AS out_rub_total
+            , SUM(DATEDIFF(day,b.dt_rep,b.dt_close) * b.out_rub) / NULLIF(SUM(b.out_rub),0) AS term_day
+            , SUM(CASE WHEN b.rate_con IS NOT NULL
+                       THEN (b.rate_con + COALESCE(ap.PERCRATE,0)) * b.out_rub
+                       ELSE 0 END)
+              / NULLIF(SUM(CASE WHEN b.rate_con IS NOT NULL THEN b.out_rub ELSE 0 END),0) AS rate_con
+            , SUM(DATEDIFF(day,b.dt_open,b.dt_close) * b.out_rub) / NULLIF(SUM(b.out_rub),0) AS deal_term_day
+        FROM base b
+        OUTER APPLY (
+            SELECT TOP (1) p.PERCRATE
+            FROM ALM_TEST.markets.prod_term_rates p WITH (NOLOCK)
+            WHERE p.PROD_ID = b.prod_id
+              AND b.deal_term_days BETWEEN p.TERMDAYS_FROM AND p.TERMDAYS_TO
+              AND b.dt_open BETWEEN p.DT_FROM AND p.DT_TO     -- при необходимости можно сменить на b.dt_rep
+            ORDER BY p.DT_FROM DESC, p.DT_TO DESC, p.TERMDAYS_FROM DESC
+        ) ap
+        WHERE b.dt_open = b.dt_rep
+        GROUP BY b.dt_rep
+    ),
+    -- 5) Календарная рамка
+    cal AS (
+        SELECT TOP (DATEDIFF(day,@DateFrom,@DateTo)+1)
+               DATEADD(day,ROW_NUMBER() OVER (ORDER BY (SELECT 0))-1,@DateFrom) AS dt_rep
+        FROM master..spt_values
+    ),
+    scopes AS (SELECT N'портфель' AS data_scope UNION ALL SELECT N'новые'),
+    frame AS (SELECT c.dt_rep, s.data_scope FROM cal c CROSS JOIN scopes s),
+    -- 6) Объединяем источники для MERGE
+    src AS (
+        SELECT
+              f.dt_rep
+            , f.data_scope
+            , CASE WHEN f.data_scope=N'портфель' THEN a.out_rub_total ELSE n.out_rub_total END AS out_rub_total
+            , CASE WHEN f.data_scope=N'портфель' THEN a.term_day      ELSE n.term_day      END AS term_day
+            , CASE WHEN f.data_scope=N'портфель' THEN a.rate_con      ELSE n.rate_con      END AS rate_con
+            , CASE WHEN f.data_scope=N'портфель' THEN a.deal_term_day ELSE n.deal_term_day END AS deal_term_day
+        FROM frame f
+        LEFT JOIN aggr_all a ON a.dt_rep = f.dt_rep AND f.data_scope = N'портфель'
+        LEFT JOIN aggr_new n ON n.dt_rep = f.dt_rep AND f.data_scope = N'новые'
+    )
 
-    /* (AtTheEnd_RATE + PERCRATE) -> monthly; PERCRATE по умолчанию 0, чтобы строки не выпадали */
-    CAST((
-        SELECT [LIQUIDITY].[liq].[fnc_IntRate](
-            v.[AtTheEnd_RATE] + COALESCE(ap.PERCRATE, 0.0),
-            'at the end', 'monthly',
-            v.[MATUR], 1
-        )
-    ) AS decimal(18,8)) AS [MonthlyCONV_RATE],
-
-    v.[AtTheEnd_RoisFix],
-    v.[AtTheEnd_LIQ_TransfertRate],
-    v.[AtTheEnd_ALM_TransfertRate],
-    v.[AtTheEnd_KBD],
-    v.[AtTheEnd_KRS],
-    v.[AtTheEnd_ForecastKeyRate],
-    v.[AtTheEnd_RATE],
-    v.[TSEGMENTNAME],
-    v.[isfloat]
-FROM [WORK].[vDepositInterestsRate_For_FL_only] v WITH (NOLOCK)
-JOIN mp ON LTRIM(RTRIM(v.PROD_NAME)) = mp.PROD_NAME
-OUTER APPLY (
-    SELECT TOP (1) p.PERCRATE
-    FROM [ALM_TEST].[markets].[prod_term_rates] p WITH (NOLOCK)
-    WHERE LTRIM(RTRIM(p.PROD_NAME)) = mp.PROD_NAME
-      AND v.[MATUR]   BETWEEN p.[TERMDAYS_FROM] AND p.[TERMDAYS_TO]
-      AND v.[DT_OPEN] BETWEEN p.[DT_FROM]       AND p.[DT_TO]   -- при необходимости можно сменить на v.DT_REP
-    ORDER BY p.[DT_FROM] DESC, p.[DT_TO] DESC, p.[TERMDAYS_FROM] DESC
-) ap
-WHERE v.[AtTheEnd_RATE] IS NOT NULL;
+    MERGE mail.balance_metrics_td_only AS tgt
+    USING src AS src
+      ON  tgt.dt_rep     = src.dt_rep
+      AND tgt.data_scope = src.data_scope
+    WHEN MATCHED THEN
+        UPDATE SET tgt.out_rub_total = src.out_rub_total,
+                   tgt.term_day      = src.term_day,
+                   tgt.rate_con      = src.rate_con,
+                   tgt.deal_term_day = src.deal_term_day,
+                   tgt.load_dttm     = SYSUTCDATETIME()
+    WHEN NOT MATCHED BY TARGET THEN
+        INSERT (dt_rep, data_scope, out_rub_total, term_day, rate_con, deal_term_day)
+        VALUES (src.dt_rep, src.data_scope, src.out_rub_total, src.term_day, src.rate_con, src.deal_term_day);
+END
 GO
-
-Это гарантирует:
-	•	Тот же набор PROD_NAME (все продукты из prod_term_rates, которые есть в исходных данных), включая длинные сроки (550+, 730+, 1100+ и т.д.).
-	•	Надбавка учтена там, где нашлась; где не нашлась — использован 0, поэтому договора не теряются.
-
-Быстрая сверка после EXEC WORK.prc_SaveSnap_Markets:
-
-SELECT COUNT(*), SUM(BALANCE_RUB)
-FROM WORK.snap_markets
-WHERE '2025-07-01' BETWEEN DT_OPEN AND DT_CLOSE
-  AND PROD_NAME IN (SELECT DISTINCT PROD_NAME FROM ALM_TEST.markets.prod_term_rates);
-
-SELECT COUNT(*), SUM(BALANCE_RUB)
-FROM WORK.DepositInterestsRateSnap
-WHERE '2025-07-01' BETWEEN DT_OPEN AND DT_CLOSE
-  AND PROD_NAME IN (SELECT DISTINCT PROD_NAME FROM ALM_TEST.markets.prod_term_rates);
-
-Если захотите привязывать надбавку по дате отчёта (а не по дате открытия), замените условие в OUTER APPLY на v.DT_REP BETWEEN p.DT_FROM AND p.DT_TO.
