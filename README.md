@@ -1,4 +1,3 @@
-
 import pandas as pd
 
 # ===== НАСТРОЙКИ =====
@@ -40,9 +39,7 @@ df['is_target'] = df['PROD_NAME'].isin(TARGET_PRODUCTS)
 df['is_fu']     = (~df['is_target']) & df['PROD_NAME'].isin(FU_PRODUCTS)
 df['is_bank']   = (~df['is_target']) & (~df['is_fu'])
 
-# ——— КОГОРТА: «первый вход = целевой продукт»
-# Берём самый ранний договор клиента в окне [COHORT_FROM; COHORT_TO], НЕ по типу, а по всем продуктам,
-# и оставляем только тех, у кого именно этот первый договор — целевой.
+# ——— КОГОРТА: «первый вход = целевой продукт» в окне [COHORT_FROM; COHORT_TO]
 first_any_in_window = (
     df.loc[(df['DT_OPEN'] >= COHORT_FROM) & (df['DT_OPEN'] <= COHORT_TO)]
       .sort_values(['CLI_ID','DT_OPEN'])
@@ -73,23 +70,25 @@ g_all_snap = (live.groupby('CLI_ID', as_index=True)
                         vol_fu=('vol_fu','sum'),
                         vol_bank=('vol_bank','sum')))
 
-def snapshot_6cats(cli_ids):
+def snapshot_7cats(cli_ids):
     """
-    6 категорий удержания на SNAP_DATE (только по когорте):
-      1) удержаны только на целевом
-      2) удержаны только на банке
-      3) удержаны на ФУ
-      4) удержаны на ФУ и Банке
-      5) удержаны на целевом и ФУ
-      6) удержаны и там, и там, и там
+    7 категорий удержания на SNAP_DATE (только по когорте):
+      1) только Целевой
+      2) только Банк
+      3) только ФУ
+      4) ФУ + Банк
+      5) Целевой + ФУ
+      6) Целевой + Банк
+      7) Целевой + ФУ + Банк
     + ИТОГО
     Возвращает DataFrame: ['Клиентов','Объем Целевые','Объем ФУ','Объем Банк']
     """
     cols = ['Клиентов','Объем Целевые','Объем ФУ','Объем Банк']
+    idx = ['только Целевой','только Банк','только ФУ',
+           'ФУ + Банк','Целевой + ФУ','Целевой + Банк',
+           'Целевой + ФУ + Банк','ИТОГО']
     if not cli_ids:
-        idx = ['только Целевой','только Банк','только ФУ',
-               'ФУ + Банк','Целевой + ФУ','Целевой + ФУ + Банк','ИТОГО']
-        return pd.DataFrame([[0,0.0,0.0,0.0]]*7, columns=cols, index=idx)
+        return pd.DataFrame([[0,0.0,0.0,0.0]]*len(idx), columns=cols, index=idx)
 
     g = g_all_snap.loc[g_all_snap.index.isin(cli_ids)].copy()
     has_t = g['vol_target'] > 0
@@ -111,11 +110,10 @@ def snapshot_6cats(cli_ids):
         agg(~has_t &  has_f & ~has_b),   # только ФУ
         agg(~has_t &  has_f &  has_b),   # ФУ + Банк
         agg( has_t &  has_f & ~has_b),   # Целевой + ФУ
+        agg( has_t & ~has_f &  has_b),   # Целевой + Банк
         agg( has_t &  has_f &  has_b),   # Целевой + ФУ + Банк
         agg( has_t |  has_f |  has_b),   # ИТОГО
     ]
-    idx = ['только Целевой','только Банк','только ФУ',
-           'ФУ + Банк','Целевой + ФУ','Целевой + ФУ + Банк','ИТОГО']
     return pd.DataFrame(rows, columns=cols, index=idx)
 
 def entered_target_volume_by_balance(cli_ids, month_start, month_end):
@@ -150,8 +148,7 @@ for p in months:
     month_end   = pd.Timestamp(p.end_time.date())
     col_name = f"{p.year}, {month_pretty[p.month]}"
 
-    # Кого считаем «вошедшими в месяце»:
-    # из всей когорты (first entry = Target), берём тех, чей первый вход вообще пришёлся на этот месяц.
+    # Вошедшие в месяце (первый вход = Target в этом месяце)
     entered_cli = set(
         first_any_in_window.index[
             first_any_in_window['PROD_NAME'].isin(TARGET_PRODUCTS) &
@@ -163,14 +160,14 @@ for p in months:
     entered_target_vol = entered_target_volume_by_balance(entered_cli, month_start, month_end)
 
     # Удержанные (живые на дату) из entered-клиентов
-    alive_cli = set(g_all_snap.index.intersection(entered_cli))  # удержаны = есть объём в любой корзине
+    alive_cli = set(g_all_snap.index.intersection(entered_cli))
 
-    snap6 = snapshot_6cats(alive_cli)
+    snap7 = snapshot_7cats(alive_cli)
 
     # — Детальный файл
     detail_rows.append([f'Новые клиенты (первый вход = Target) {p.strftime("%Y-%m")}',
                         entered_cnt, entered_target_vol, '', ''])
-    for idx, row in snap6.iterrows():
+    for idx, row in snap7.iterrows():
         detail_rows.append([
             idx, int(row['Клиентов']),
             float(row['Объем Целевые']),
@@ -181,28 +178,37 @@ for p in months:
 
     # — Wide файл
     def pct(part, total): return round(100.0 * part / total, 2) if total else 0.0
+
     monthly_data[col_name] = {
         'Кол-во новых клиентов'                                      : entered_cnt,
         '(объем целевых договоров, открытых этими клиентами в месяце)': entered_target_vol,
 
-        '% удержания ВСЕГО'                   : pct(int(snap6.loc['ИТОГО','Клиентов']), entered_cnt),
-        '% удержаны только на целевом'        : pct(int(snap6.loc['только Целевой','Клиентов']), entered_cnt),
-        '% удержаны только на банке'          : pct(int(snap6.loc['только Банк','Клиентов']), entered_cnt),
-        '% удержаны на ФУ'                    : pct(int(snap6.loc['только ФУ','Клиентов']), entered_cnt),
-        '% удержаны на ФУ и Банке'            : pct(int(snap6.loc['ФУ + Банк','Клиентов']), entered_cnt),
-        '% удержаны на целевом и ФУ'          : pct(int(snap6.loc['Целевой + ФУ','Клиентов']), entered_cnt),
-        '% удержаны и там и там и там'        : pct(int(snap6.loc['Целевой + ФУ + Банк','Клиентов']), entered_cnt),
+        '% удержания ВСЕГО'                   : pct(int(snap7.loc['ИТОГО','Клиентов']), entered_cnt),
 
-        'Объем только Целевой'                : float(snap6.loc['только Целевой','Объем Целевые']),
-        'Объем только Банк'                   : float(snap6.loc['только Банк','Объем Банк']),
-        'Объем только ФУ'                     : float(snap6.loc['только ФУ','Объем ФУ']),
-        'Объем ФУ + Банк (ФУ-часть)'          : float(snap6.loc['ФУ + Банк','Объем ФУ']),
-        'Объем ФУ + Банк (Банк-часть)'        : float(snap6.loc['ФУ + Банк','Объем Банк']),
-        'Объем Целевой + ФУ (Целевой-часть)'  : float(snap6.loc['Целевой + ФУ','Объем Целевые']),
-        'Объем Целевой + ФУ (ФУ-часть)'       : float(snap6.loc['Целевой + ФУ','Объем ФУ']),
-        'Объем Целевой + ФУ + Банк (цел.)'    : float(snap6.loc['Целевой + ФУ + Банк','Объем Целевые']),
-        'Объем Целевой + ФУ + Банк (ФУ)'      : float(snap6.loc['Целевой + ФУ + Банк','Объем ФУ']),
-        'Объем Целевой + ФУ + Банк (банк)'    : float(snap6.loc['Целевой + ФУ + Банк','Объем Банк']),
+        '% удержаны только на целевом'        : pct(int(snap7.loc['только Целевой','Клиентов']), entered_cnt),
+        '% удержаны только на банке'          : pct(int(snap7.loc['только Банк','Клиентов']), entered_cnt),
+        '% удержаны на ФУ'                    : pct(int(snap7.loc['только ФУ','Клиентов']), entered_cnt),
+        '% удержаны на ФУ и Банке'            : pct(int(snap7.loc['ФУ + Банк','Клиентов']), entered_cnt),
+        '% удержаны на целевом и ФУ'          : pct(int(snap7.loc['Целевой + ФУ','Клиентов']), entered_cnt),
+        '% удержаны на целевом и Банке'       : pct(int(snap7.loc['Целевой + Банк','Клиентов']), entered_cnt),
+        '% удержаны и там и там и там'        : pct(int(snap7.loc['Целевой + ФУ + Банк','Клиентов']), entered_cnt),
+
+        'Объем только Целевой'                : float(snap7.loc['только Целевой','Объем Целевые']),
+        'Объем только Банк'                   : float(snap7.loc['только Банк','Объем Банк']),
+        'Объем только ФУ'                     : float(snap7.loc['только ФУ','Объем ФУ']),
+
+        'Объем ФУ + Банк (ФУ-часть)'          : float(snap7.loc['ФУ + Банк','Объем ФУ']),
+        'Объем ФУ + Банк (Банк-часть)'        : float(snap7.loc['ФУ + Банк','Объем Банк']),
+
+        'Объем Целевой + ФУ (Целевой-часть)'  : float(snap7.loc['Целевой + ФУ','Объем Целевые']),
+        'Объем Целевой + ФУ (ФУ-часть)'       : float(snap7.loc['Целевой + ФУ','Объем ФУ']),
+
+        'Объем Целевой + Банк (Целевой-часть)': float(snap7.loc['Целевой + Банк','Объем Целевые']),
+        'Объем Целевой + Банк (Банк-часть)'   : float(snap7.loc['Целевой + Банк','Объем Банк']),
+
+        'Объем Целевой + ФУ + Банк (цел.)'    : float(snap7.loc['Целевой + ФУ + Банк','Объем Целевые']),
+        'Объем Целевой + ФУ + Банк (ФУ)'      : float(snap7.loc['Целевой + ФУ + Банк','Объем ФУ']),
+        'Объем Целевой + ФУ + Банк (банк)'    : float(snap7.loc['Целевой + ФУ + Банк','Объем Банк']),
     }
 
 # ===== Сохранение =====
@@ -218,6 +224,7 @@ row_order = [
     '% удержаны на ФУ',
     '% удержаны на ФУ и Банке',
     '% удержаны на целевом и ФУ',
+    '% удержаны на целевом и Банке',
     '% удержаны и там и там и там',
     'Объем только Целевой',
     'Объем только Банк',
@@ -226,6 +233,8 @@ row_order = [
     'Объем ФУ + Банк (Банк-часть)',
     'Объем Целевой + ФУ (Целевой-часть)',
     'Объем Целевой + ФУ (ФУ-часть)',
+    'Объем Целевой + Банк (Целевой-часть)',
+    'Объем Целевой + Банк (Банк-часть)',
     'Объем Целевой + ФУ + Банк (цел.)',
     'Объем Целевой + ФУ + Банк (ФУ)',
     'Объем Целевой + ФУ + Банк (банк)',
