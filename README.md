@@ -1,6 +1,10 @@
 import pandas as pd
 
-# ===== ПАРАМЕТРЫ (меняй при необходимости) =====
+# ===== НАСТРОЙКИ =====
+TARGET_PRODUCTS = {
+    # заполни своими целевыми продуктами
+    # 'Надёжный процент', 'Надёжный прайм'
+}
 FU_PRODUCTS = {
     'Надёжный','Надёжный VIP','Надёжный премиум',
     'Надёжный промо','Надёжный старт',
@@ -9,120 +13,135 @@ FU_PRODUCTS = {
 MIN_BAL_RUB = 1.0
 COHORT_FROM = pd.Timestamp('2024-01-01')
 SNAP_DATE   = pd.Timestamp('2025-08-12')
-COHORT_TO   = SNAP_DATE  # когорты считаем до месяца снапшота
+COHORT_TO   = SNAP_DATE
 
-DETAIL_XLSX  = f"fu_retention_detail_{SNAP_DATE.date()}.xlsx"
-MONTHLY_XLSX = f"fu_retention_monthly_{SNAP_DATE.date()}.xlsx"
+DETAIL_XLSX  = f"target_firstentry_detail_{SNAP_DATE.date()}.xlsx"
+MONTHLY_XLSX = f"target_firstentry_monthly_{SNAP_DATE.date()}.xlsx"
 
-# ===== ВХОД: df_sql уже существует =====
-df = df_sql.copy()  # НИЧЕГО не грузим из БД
+# ===== ВХОД =====
+df = df_sql.copy()
 
-# Нормализуем даты
+# Даты
 for c in ['DT_OPEN','DT_CLOSE','DT_CLOSE_PLAN']:
     if c in df.columns:
         df[c] = pd.to_datetime(df[c], errors='coerce')
 
-# Страховки по колонкам
+# Страховки колонок
 if 'OUT_RUB' not in df.columns:
-    # если нет OUT_RUB из витрины на дату — пробуем BALANCE_RUB
-    df['OUT_RUB'] = df.get('BALANCE_RUB', pd.Series(0, index=df.index))
-
+    df['OUT_RUB'] = df.get('BALANCE_RUB', pd.Series(0.0, index=df.index))
 if 'BALANCE_RUB' not in df.columns:
-    # для метрики "объем вкладов ФУ, открытых в месяце"
     df['BALANCE_RUB'] = df['OUT_RUB']
 
-# Сальдо на дату снепшота (в витрине OUT_RUB уже соответствует дате, на которую ты делал join)
 df['OUT_RUB_SNAP'] = df['OUT_RUB']
 
-# Уберём быстро закрытые (<= 2 суток)
-if 'DT_CLOSE' in df.columns and 'DT_OPEN' in df.columns:
-    fast = df['DT_CLOSE'].notna() & ((df['DT_CLOSE'] - df['DT_OPEN']).dt.days <= 2)
-    df = df[~fast].copy()
+# Флаги корзин (приоритет Target > FU > Bank-other)
+df['is_target'] = df['PROD_NAME'].isin(TARGET_PRODUCTS)
+df['is_fu']     = (~df['is_target']) & df['PROD_NAME'].isin(FU_PRODUCTS)
+df['is_bank']   = (~df['is_target']) & (~df['is_fu'])
 
-# ФУ-флаг
-df['is_fu'] = df['PROD_NAME'].isin(FU_PRODUCTS)
-
-# ===== КОГОРТА: первый ФУ-вклад клиента в окне [COHORT_FROM; COHORT_TO] =====
-first_fu = (
-    df.loc[df['is_fu'] & (df['DT_OPEN'] >= COHORT_FROM) & (df['DT_OPEN'] <= COHORT_TO)]
+# ——— КОГОРТА: «первый вход = целевой продукт»
+# Берём самый ранний договор клиента в окне [COHORT_FROM; COHORT_TO], НЕ по типу, а по всем продуктам,
+# и оставляем только тех, у кого именно этот первый договор — целевой.
+first_any_in_window = (
+    df.loc[(df['DT_OPEN'] >= COHORT_FROM) & (df['DT_OPEN'] <= COHORT_TO)]
       .sort_values(['CLI_ID','DT_OPEN'])
       .groupby('CLI_ID', as_index=True)
-      .first()[['DT_OPEN']]
+      .first()[['DT_OPEN','PROD_NAME']]
+)
+cohort_cli = set(
+    first_any_in_window.index[
+        first_any_in_window['PROD_NAME'].isin(TARGET_PRODUCTS)
+    ]
 )
 
-# ===== ЖИВЫ НА SNAP_DATE (по плановой дате закрытия) =====
+# ——— ЖИВЫ на SNAP_DATE (по плановой дате закрытия)
 alive_mask = (
     (df['DT_OPEN'] <= SNAP_DATE) &
     (df['DT_CLOSE_PLAN'].isna() | (df['DT_CLOSE_PLAN'] > SNAP_DATE))
 )
+live = df.loc[alive_mask & (df['OUT_RUB_SNAP'].fillna(0) >= MIN_BAL_RUB)].copy()
 
-# Все живые с не‑нулевым остатком на дату
-live = df.loc[
-    alive_mask & (df['OUT_RUB_SNAP'].fillna(0) >= MIN_BAL_RUB)
-].copy()
+# Разложение объёмов по корзинам
+live['vol_target'] = live['OUT_RUB_SNAP'].where(live['is_target'], 0.0)
+live['vol_fu']     = live['OUT_RUB_SNAP'].where(live['is_fu'], 0.0)
+live['vol_bank']   = live['OUT_RUB_SNAP'].where(live['is_bank'], 0.0)
 
-live['vol_fu_snap'] = live['OUT_RUB_SNAP'].where(live['is_fu'], 0.0)
-live['vol_nb_snap'] = live['OUT_RUB_SNAP'].where(~live['is_fu'], 0.0)
-
+# Агрегация по клиенту
 g_all_snap = (live.groupby('CLI_ID', as_index=True)
-                    .agg(vol_fu=('vol_fu_snap','sum'),
-                         vol_nb=('vol_nb_snap','sum')))
+                   .agg(vol_target=('vol_target','sum'),
+                        vol_fu=('vol_fu','sum'),
+                        vol_bank=('vol_bank','sum')))
 
-def snapshot_for_cli(cli_ids):
+def snapshot_6cats(cli_ids):
     """
-    Разбивка по категориям для множества клиентов (по OUT_RUB_SNAP):
-    'только ФУ', 'только Банк', 'ФУ + Банк', 'ИТОГО'
+    6 категорий удержания на SNAP_DATE (только по когорте):
+      1) удержаны только на целевом
+      2) удержаны только на банке
+      3) удержаны на ФУ
+      4) удержаны на ФУ и Банке
+      5) удержаны на целевом и ФУ
+      6) удержаны и там, и там, и там
+    + ИТОГО
+    Возвращает DataFrame: ['Клиентов','Объем Целевые','Объем ФУ','Объем Банк']
     """
+    cols = ['Клиентов','Объем Целевые','Объем ФУ','Объем Банк']
     if not cli_ids:
-        return pd.DataFrame([[0,0.0,0.0]]*4,
-                            columns=['Клиентов','Баланс ФУ','Баланс Банк'],
-                            index=['только ФУ','только Банк','ФУ + Банк','ИТОГО'])
+        idx = ['только Целевой','только Банк','только ФУ',
+               'ФУ + Банк','Целевой + ФУ','Целевой + ФУ + Банк','ИТОГО']
+        return pd.DataFrame([[0,0.0,0.0,0.0]]*7, columns=cols, index=idx)
+
     g = g_all_snap.loc[g_all_snap.index.isin(cli_ids)].copy()
+    has_t = g['vol_target'] > 0
+    has_f = g['vol_fu']     > 0
+    has_b = g['vol_bank']   > 0
 
     def agg(mask):
         sub = g.loc[mask]
-        return (len(sub), float(sub['vol_fu'].sum()), float(sub['vol_nb'].sum()))
+        return [
+            int(len(sub)),
+            float(sub['vol_target'].sum()),
+            float(sub['vol_fu'].sum()),
+            float(sub['vol_bank'].sum()),
+        ]
 
     rows = [
-        agg((g['vol_fu'] > 0) & (g['vol_nb'] == 0)),   # только ФУ
-        agg((g['vol_fu'] == 0) & (g['vol_nb'] > 0)),   # только Банк
-        agg((g['vol_fu'] > 0) & (g['vol_nb'] > 0)),    # ФУ + Банк
+        agg( has_t & ~has_f & ~has_b),   # только Целевой
+        agg(~has_t & ~has_f &  has_b),   # только Банк
+        agg(~has_t &  has_f & ~has_b),   # только ФУ
+        agg(~has_t &  has_f &  has_b),   # ФУ + Банк
+        agg( has_t &  has_f & ~has_b),   # Целевой + ФУ
+        agg( has_t &  has_f &  has_b),   # Целевой + ФУ + Банк
+        agg( has_t |  has_f |  has_b),   # ИТОГО
     ]
-    total = (len(g), float(g['vol_fu'].sum()), float(g['vol_nb'].sum()))
-    rows.append(total)
+    idx = ['только Целевой','только Банк','только ФУ',
+           'ФУ + Банк','Целевой + ФУ','Целевой + ФУ + Банк','ИТОГО']
+    return pd.DataFrame(rows, columns=cols, index=idx)
 
-    return pd.DataFrame(rows,
-                        columns=['Клиентов','Баланс ФУ','Баланс Банк'],
-                        index=['только ФУ','только Банк','ФУ + Банк','ИТОГО'])
-
-def entered_fu_volume_by_balance(cli_ids, month_start, month_end):
+def entered_target_volume_by_balance(cli_ids, month_start, month_end):
     """
-    Объём ФУ-когорты для строки
-    '(объем вкладов ФУ, открытых этими клиентами в месяце)':
-    суммируем BALANCE_RUB по ФУ‑договорам, открытым в этом месяце, у клиентов когорты.
+    Объём вошедших в месяц по ЦЕЛЕВЫМ продуктам (BALANCE_RUB по целевым, открытым в месяце)
+    — только для клиентов когорты.
     """
     if not cli_ids:
         return 0.0
     sub = df.loc[
         (df['CLI_ID'].isin(cli_ids)) &
-        (df['is_fu']) &
+        (df['is_target']) &
         (df['DT_OPEN'] >= month_start) & (df['DT_OPEN'] <= month_end)
     ]
     return float(sub['BALANCE_RUB'].fillna(0.0).sum())
 
-# ===== МЕСЯЧНЫЙ ШЕПТ =====
+# Месяца когорты
 months = pd.period_range(start=COHORT_FROM.to_period('M'),
                          end=COHORT_TO.to_period('M'), freq='M')
+month_pretty = {1:'январь',2:'февраль',3:'март',4:'апрель',5:'май',6:'июнь',
+                7:'июль',8:'август',9:'сентябрь',10:'октябрь',11:'ноябрь',12:'декабрь'}
 
-# Файл 1 (детальный — «как у тебя»)
-export_rows = []
-columns = ['Заголовок/Категория', 'Клиентов', 'Баланс ФУ', 'Баланс Банк']
+# ===== Файл 1: детальный =====
+detail_rows = []
+detail_cols  = ['Заголовок/Категория','Клиентов','Объем Целевые','Объем ФУ','Объем Банк']
 
-# Файл 2 (широкий)
-month_pretty = {
-    1:'январь',2:'февраль',3:'март',4:'апрель',5:'май',6:'июнь',
-    7:'июль',8:'август',9:'сентябрь',10:'октябрь',11:'ноябрь',12:'декабрь'
-}
+# ===== Файл 2: wide =====
 monthly_data = {}
 
 for p in months:
@@ -130,75 +149,85 @@ for p in months:
     month_end   = pd.Timestamp(p.end_time.date())
     col_name = f"{p.year}, {month_pretty[p.month]}"
 
-    # Когорты: клиенты, чей ПЕРВЫЙ ФУ‑вклад открыт в этом месяце
-    mask = (first_fu['DT_OPEN'] >= month_start) & (first_fu['DT_OPEN'] <= month_end)
-    cohort_cli = set(first_fu.index[mask])
+    # Кого считаем «вошедшими в месяце»:
+    # из всей когорты (first entry = Target), берём тех, чей первый вход вообще пришёлся на этот месяц.
+    entered_cli = set(
+        first_any_in_window.index[
+            first_any_in_window['PROD_NAME'].isin(TARGET_PRODUCTS) &
+            (first_any_in_window['DT_OPEN'] >= month_start) &
+            (first_any_in_window['DT_OPEN'] <= month_end)
+        ]
+    )
+    entered_cnt = len(entered_cli)
+    entered_target_vol = entered_target_volume_by_balance(entered_cli, month_start, month_end)
 
-    # Шапка файла 1
-    entered_cnt = len(cohort_cli)
-    entered_fu_vol = entered_fu_volume_by_balance(cohort_cli, month_start, month_end)
-    export_rows.append([f'Новые ФУ-клиенты {p.strftime("%Y-%m")}', entered_cnt, entered_fu_vol, ''])
+    # Удержанные (живые на дату) из entered-клиентов
+    alive_cli = set(g_all_snap.index.intersection(entered_cli))  # удержаны = есть объём в любой корзине
 
-    # Живые из когорты на SNAP_DATE
-    alive_cli = set(df.loc[alive_mask & df['CLI_ID'].isin(cohort_cli), 'CLI_ID'].unique())
+    snap6 = snapshot_6cats(alive_cli)
 
-    # Разбивка на дату
-    snap_df = snapshot_for_cli(alive_cli)
-    for idx, row in snap_df.iterrows():
-        export_rows.append([
-            idx,
-            int(row['Клиентов']),
-            float(row['Баланс ФУ']),
-            float(row['Баланс Банк']),
+    # — Детальный файл
+    detail_rows.append([f'Новые клиенты (первый вход = Target) {p.strftime("%Y-%m")}',
+                        entered_cnt, entered_target_vol, '', ''])
+    for idx, row in snap6.iterrows():
+        detail_rows.append([
+            idx, int(row['Клиентов']),
+            float(row['Объем Целевые']),
+            float(row['Объем ФУ']),
+            float(row['Объем Банк']),
         ])
-    export_rows.extend([['','','',''], ['','','','']])  # разделитель
+    detail_rows.extend([['','','','',''], ['','','','','']])
 
-    # ---- Наполнение файла 2 ----
-    def pct(part, total): return (100.0 * part / total) if total else 0.0
-
-    only_fu   = snap_df.loc['только ФУ']
-    only_bank = snap_df.loc['только Банк']
-    both      = snap_df.loc['ФУ + Банк']
-    total     = snap_df.loc['ИТОГО']
-
-    total_retention_pct = round(pct(int(total['Клиентов']), entered_cnt), 2)
-    fu_retention_pct    = round(pct(int(only_fu['Клиентов']), entered_cnt), 2)
-    bank_retention_pct  = round(pct(int(only_bank['Клиентов']), entered_cnt), 2)
-    both_retention_pct  = round(pct(int(both['Клиентов']), entered_cnt), 2)
-
-    vol_only_fu        = float(only_fu['Баланс ФУ'])
-    vol_only_bank      = float(only_bank['Баланс Банк'])
-    vol_both_fu_part   = float(both['Баланс ФУ'])
-    vol_both_bank_part = float(both['Баланс Банк'])
-
+    # — Wide файл
+    def pct(part, total): return round(100.0 * part / total, 2) if total else 0.0
     monthly_data[col_name] = {
-        'Кол-во новых клиентов'                                        : entered_cnt,
-        '(объем вкладов ФУ, открытых этими клиентами в месяце)'        : entered_fu_vol,
-        '% удержания ВСЕГО'                                            : total_retention_pct,
-        '% удержания на вкладах ФУ'                                    : fu_retention_pct,
-        'Объем на ФУ'                                                  : vol_only_fu,
-        '% удержания на вкладах Банка'                                 : bank_retention_pct,
-        'Объем на вкладах Банка'                                       : vol_only_bank,
-        '% удержания ФУ+Банк'                                          : both_retention_pct,
-        'Объем на вкладах ФУ+Банк, часть на ФУ'                        : vol_both_fu_part,
-        'Объем на вкладах ФУ+Банк, часть на банке'                     : vol_both_bank_part,
+        'Кол-во новых клиентов'                                      : entered_cnt,
+        '(объем целевых договоров, открытых этими клиентами в месяце)': entered_target_vol,
+
+        '% удержания ВСЕГО'                   : pct(int(snap6.loc['ИТОГО','Клиентов']), entered_cnt),
+        '% удержаны только на целевом'        : pct(int(snap6.loc['только Целевой','Клиентов']), entered_cnt),
+        '% удержаны только на банке'          : pct(int(snap6.loc['только Банк','Клиентов']), entered_cnt),
+        '% удержаны на ФУ'                    : pct(int(snap6.loc['только ФУ','Клиентов']), entered_cnt),
+        '% удержаны на ФУ и Банке'            : pct(int(snap6.loc['ФУ + Банк','Клиентов']), entered_cnt),
+        '% удержаны на целевом и ФУ'          : pct(int(snap6.loc['Целевой + ФУ','Клиентов']), entered_cnt),
+        '% удержаны и там и там и там'        : pct(int(snap6.loc['Целевой + ФУ + Банк','Клиентов']), entered_cnt),
+
+        'Объем только Целевой'                : float(snap6.loc['только Целевой','Объем Целевые']),
+        'Объем только Банк'                   : float(snap6.loc['только Банк','Объем Банк']),
+        'Объем только ФУ'                     : float(snap6.loc['только ФУ','Объем ФУ']),
+        'Объем ФУ + Банк (ФУ-часть)'          : float(snap6.loc['ФУ + Банк','Объем ФУ']),
+        'Объем ФУ + Банк (Банк-часть)'        : float(snap6.loc['ФУ + Банк','Объем Банк']),
+        'Объем Целевой + ФУ (Целевой-часть)'  : float(snap6.loc['Целевой + ФУ','Объем Целевые']),
+        'Объем Целевой + ФУ (ФУ-часть)'       : float(snap6.loc['Целевой + ФУ','Объем ФУ']),
+        'Объем Целевой + ФУ + Банк (цел.)'    : float(snap6.loc['Целевой + ФУ + Банк','Объем Целевые']),
+        'Объем Целевой + ФУ + Банк (ФУ)'      : float(snap6.loc['Целевой + ФУ + Банк','Объем ФУ']),
+        'Объем Целевой + ФУ + Банк (банк)'    : float(snap6.loc['Целевой + ФУ + Банк','Объем Банк']),
     }
 
 # ===== Сохранение =====
-detail_df = pd.DataFrame(export_rows, columns=columns)
+detail_df = pd.DataFrame(detail_rows, columns=detail_cols)
 detail_df.to_excel(DETAIL_XLSX, index=False)
 
 row_order = [
     'Кол-во новых клиентов',
-    '(объем вкладов ФУ, открытых этими клиентами в месяце)',
+    '(объем целевых договоров, открытых этими клиентами в месяце)',
     '% удержания ВСЕГО',
-    '% удержания на вкладах ФУ',
-    'Объем на ФУ',
-    '% удержания на вкладах Банка',
-    'Объем на вкладах Банка',
-    '% удержания ФУ+Банк',
-    'Объем на вкладах ФУ+Банк, часть на ФУ',
-    'Объем на вкладах ФУ+Банк, часть на банке',
+    '% удержаны только на целевом',
+    '% удержаны только на банке',
+    '% удержаны на ФУ',
+    '% удержаны на ФУ и Банке',
+    '% удержаны на целевом и ФУ',
+    '% удержаны и там и там и там',
+    'Объем только Целевой',
+    'Объем только Банк',
+    'Объем только ФУ',
+    'Объем ФУ + Банк (ФУ-часть)',
+    'Объем ФУ + Банк (Банк-часть)',
+    'Объем Целевой + ФУ (Целевой-часть)',
+    'Объем Целевой + ФУ (ФУ-часть)',
+    'Объем Целевой + ФУ + Банк (цел.)',
+    'Объем Целевой + ФУ + Банк (ФУ)',
+    'Объем Целевой + ФУ + Банк (банк)',
 ]
 monthly_df = pd.DataFrame.from_dict(monthly_data, orient='columns')
 monthly_df = monthly_df.reindex(row_order)
