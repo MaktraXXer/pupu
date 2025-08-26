@@ -1,30 +1,25 @@
-м/* ПАРАМЕТРЫ */
+/* ПАРАМЕТРЫ */
 DECLARE @DateFrom date = '2025-08-01';
 DECLARE @DateTo   date = CONVERT(date, GETDATE());
 
-/* ОДИН ПРОХОД С АГРЕГАЦИЕЙ */
+/* ОДИН ПРОХОД С АГРЕГАЦИЕЙ — БЕЗ SUBQUERY ВНУТРИ SUM */
 SELECT
     t.dt_rep,
     SUM(t.out_rub) AS out_rub_total,
 
-    /* 1) СВС ЭФФЕКТИВНОЙ СТАВКИ с учётом правила и «белого списка» продуктов */
+    /* 1) СВС эффективной ставки по правилу + «категория 2» только если продукта нет в справочнике */
     SUM(
         CASE
             WHEN t.rate_trf IS NOT NULL AND t.rate_con IS NOT NULL THEN
                 (
                     CASE
                         WHEN t.rate_trf >= t.rate_con + 0.0048
-                            THEN t.rate_trf  -- категория 1
+                            THEN t.rate_trf                               -- кат.1
                         ELSE
-                            /* категория 2 только если продукт НЕ в справочнике prod_term_rates */
                             CASE
-                                WHEN NOT EXISTS (
-                                    SELECT 1
-                                    FROM ALM_TEST.markets.prod_term_rates m WITH (NOLOCK)
-                                    WHERE m.prod_name = t.prod_name_res
-                                )
-                                THEN t.rate_con + 0.0048 + 0.0010   -- применяем надбавку
-                                ELSE t.rate_trf                      -- продукт в справочнике -> НЕ применяем кат.2
+                                WHEN m.prod_name IS NULL                   -- продукта НЕТ в справочнике
+                                    THEN t.rate_con + 0.0048 + 0.0010     -- кат.2
+                                ELSE t.rate_trf                            -- продукт есть -> кат.2 НЕ применяем
                             END
                     END
                 ) * t.out_rub
@@ -34,16 +29,12 @@ SELECT
     / NULLIF(SUM(CASE WHEN t.rate_trf IS NOT NULL AND t.rate_con IS NOT NULL THEN t.out_rub ELSE 0 END), 0)
     AS eff_rate_wavg,
 
-    /* 2) Доля объёма, попавшего в категорию 2 (с учётом условия «НЕ в справочнике»)  */
+    /* 2) Доля объёма в категории 2 (с тем же знаменателем, что и для СВС) */
     SUM(
         CASE
             WHEN t.rate_trf IS NOT NULL AND t.rate_con IS NOT NULL
              AND t.rate_trf <= t.rate_con + 0.0048
-             AND NOT EXISTS (
-                    SELECT 1
-                    FROM ALM_TEST.markets.prod_term_rates m WITH (NOLOCK)
-                    WHERE m.prod_name = t.prod_name_res
-                 )
+             AND m.prod_name IS NULL            -- продукта НЕТ в справочнике
                 THEN t.out_rub
             ELSE 0
         END
@@ -57,6 +48,8 @@ SELECT
     AS rate_trf_wavg_plain
 
 FROM alm.[ALM].[vw_balance_rest_all] AS t WITH (NOLOCK)
+LEFT JOIN (SELECT DISTINCT prod_name FROM ALM_TEST.markets.prod_term_rates) AS m WITH (NOLOCK)
+       ON m.prod_name = t.prod_name_res
 WHERE
     t.dt_rep BETWEEN @DateFrom AND @DateTo
     AND t.dt_open  = t.dt_rep              -- только новые за день
