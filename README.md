@@ -1,24 +1,23 @@
 import numpy as np, pandas as pd, matplotlib.pyplot as plt
 from pathlib import Path
+from datetime import datetime
+import re
 
-# ────────── 1) SELECT_METRIC_ABS — готовим данные из твоих колонок ──────────
+# ────────── 1) SELECT_METRIC_ABS — готовим данные и создаём run-папку ──────────
 def select_metric_abs(excel_file: str | pd.DataFrame,
                       metric_key: str = 'overall',             # 'overall'|'1y'|'2y'|'3y'
                       products: list[str] | None = None,
-                      segments: list[str] | None = None):
+                      segments: list[str] | None = None,
+                      run_name: str | None = None):
     """
     Возвращает:
-        df_subset с колонками:
-          x_abs_pp   — абсолютный дисконт, п.п. (>=0), 1 = 1 п.п.
-          y          — метрика, % (0..100)
-          w          — объём, ₽
-          disc_abs   — исходный дисконт (ожидаем ≤0, доли)
-        cfg         — словарь с названиями полей
-        base_dir    — Path('results/<metric_key>')
-
-    Примечание:
-    base_rate не требуется (мы смотрим абсолютный дисконт), поэтому не считаем.
+      d: DataFrame с колонками x_abs_pp (абс. дисконт, п.п.), y (%), w (₽)
+      cfg: словарь с названиями полей
+      base_dir: Path('results/<metric_key>/<run_xxx>')
     """
+
+    def sanitize(s: str) -> str:
+        return re.sub(r'[^A-Za-z0-9_\-\.]+', '_', s).strip('_')[:64]
 
     # --- чтение + нормализация имён
     df = pd.read_excel(excel_file) if isinstance(excel_file, str) else excel_file.copy()
@@ -26,7 +25,7 @@ def select_metric_abs(excel_file: str | pd.DataFrame,
                   .str.replace(r'\s+', ' ', regex=True)
                   .str.strip())
 
-    # --- промежуточные суммы (строго из доступных полей)
+    # --- промежуточные суммы (ровно из твоих полей)
     if {'Summ_ClosedBalanceRub','Summ_ClosedBalanceRub_int'}.issubset(df.columns):
         df['Closed_Total_with_pct'] = df['Summ_ClosedBalanceRub'].fillna(0) + df['Summ_ClosedBalanceRub_int'].fillna(0)
     if {'Closed_Sum_NewNoProlong','Closed_Sum_NewNoProlong_int'}.issubset(df.columns):
@@ -36,12 +35,12 @@ def select_metric_abs(excel_file: str | pd.DataFrame,
     if {'Closed_Sum_2yProlong_Rub','Closed_Sum_2yProlong_Rub_int'}.issubset(df.columns):
         df['Closed_Sum_2yProlong_with_pct'] = df['Closed_Sum_2yProlong_Rub'].fillna(0) + df['Closed_Sum_2yProlong_Rub_int'].fillna(0)
 
-    # --- конфиг по метрике (диски/ставки/вес берём из твоих полей)
+    # --- конфиг по метрике
     cfg_map = {
         'overall': dict(
             metric    = 'Общая пролонгация',
-            disc      = 'Opened_WeightedDiscount_AllProlong',  # дисконт (доли, ожидаем ≤0)
-            rateprol  = 'Opened_WeightedRate_AllProlong',      # не обязателен для ABS
+            disc      = 'Opened_WeightedDiscount_AllProlong',
+            rateprol  = 'Opened_WeightedRate_AllProlong',
             weight    = 'Opened_Sum_ProlongRub',
             num2      = 'Opened_Sum_ProlongRub',
             den2      = 'Closed_Total_with_pct',
@@ -77,12 +76,8 @@ def select_metric_abs(excel_file: str | pd.DataFrame,
     }
     cfg = cfg_map[metric_key]
 
-    # --- если метрики нет — считаем из num2/den2
+    # --- если метрики нет — считаем
     if cfg['metric'] not in df.columns:
-        need = [cfg['num2'], cfg['den2']]
-        if not all(c in df.columns for c in need):
-            miss = [c for c in need if c not in df.columns]
-            raise KeyError(f"Нет полей для расчёта метрики {cfg['metric']}: {miss}")
         num = df[cfg['num2']].astype(float).fillna(0)
         den = df[cfg['den2']].astype(float).fillna(0)
         df[cfg['metric']] = np.where(den == 0, np.nan, num / den)
@@ -93,7 +88,7 @@ def select_metric_abs(excel_file: str | pd.DataFrame,
     if missing:
         raise KeyError(f"В Excel нет нужных колонок: {missing}")
 
-    # --- фильтры (как раньше)
+    # --- фильтры
     m  = (df.get('TermBucketGrouping','Все бакеты')    != 'Все бакеты') \
        & (df.get('PROD_NAME','Все продукты')           != 'Все продукты') \
        & (df.get('IS_OPTION','0').astype(str)          == '0') \
@@ -109,27 +104,27 @@ def select_metric_abs(excel_file: str | pd.DataFrame,
 
     d = df.loc[m].copy()
 
-    # --- строим x (абс. дисконт, п.п.), y (%), w (₽)
+    # --- x (абс. дисконт в п.п.), y (%), w (₽)
     d['disc_abs'] = d[cfg['disc']].astype(float)
-    # положительный «дисконт» (надбавка) обнуляем, оставляем только снижение
-    d.loc[d['disc_abs'] > 0, 'disc_abs'] = 0.0
+    d.loc[d['disc_abs'] > 0, 'disc_abs'] = 0.0               # надбавки → 0
+    d['x_abs_pp'] = 100.0 * (-d['disc_abs'])                 # 1 = 1 п.п.
+    d['y']        = d[cfg['metric']].astype(float) * 100.0
+    d['w']        = d[cfg['weight']].astype(float)
 
-    # Абсолютный размер дисконта в п.п.: 1 = 1 п.п.
-    # disc_abs хранится в долях (<0), берём модуль и переводим в п.п.
-    d['x_abs_pp'] = 100.0 * (-d['disc_abs'])
-
-    d['y'] = d[cfg['metric']].astype(float) * 100.0  # метрика в %
-    d['w'] = d[cfg['weight']].astype(float)
-
-    # чистка
     d = d[np.isfinite(d['x_abs_pp']) & np.isfinite(d['y']) & np.isfinite(d['w']) & (d['w'] > 0)].copy()
 
-    # добиваем разрезы, если их нет
     for col in ['MonthEnd','SegmentGrouping','PROD_NAME','CurrencyGrouping','TermBucketGrouping','BalanceBucketGrouping']:
         if col not in d.columns:
             d[col] = None
 
-    base_dir = Path('results')/metric_key; base_dir.mkdir(parents=True, exist_ok=True)
+    # --- RUN-папка
+    run_name = sanitize(run_name) if run_name else f"{datetime.now():%Y%m%d_%H%M%S}"
+    base_dir = Path('results') / metric_key / f"run_{run_name}"
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    # сохраняем “сырой” срез запуска на всякий
+    d.to_parquet(base_dir / 'raw_selected.parquet', index=False)
+
     return d, cfg, base_dir
 
 
@@ -139,24 +134,25 @@ def plot_metric_binned_abs(df_subset: pd.DataFrame,
                            base_dir: Path,
                            split_col: str | None = None,
                            bin_size_pp: float = 0.1,        # шаг бина: 0.1 п.п.
-                           min_bin_volume: float = 0.0,      # отсечной порог по объёму
+                           min_bin_volume: float = 0.0,
                            connect_curve: bool = True):
     """
-    На каждой панели:
-      • столбцы (вторичная ось) = объём ₽ в бине
-      • пустые маркеры = среднее y по бину (невзвеш.)
-      • залитые маркеры = средневзвешенное по объёму y_wavg
-      • линия по y_wavg (по центрам бинов)
+    На панели:
+      • bar (ось справа) — объём ₽ в бине
+      • ○ — среднее по бину
+      • ● — средневзвешенное по объёму
+      • линия — по y_wavg
     """
     def safe_name(s: str) -> str:
-        return ''.join(ch for ch in s if ch.isalnum() or ch in ' _-')[:80]
+        return re.sub(r'[^A-Za-z0-9 _\-\.\(\)]', '_', str(s))[:80]
 
     for col in ['x_abs_pp','y','w']:
         if col not in df_subset.columns:
             raise KeyError(f"Нет колонки '{col}'. Передай результат select_metric_abs().")
 
     groups = df_subset.groupby(split_col) if split_col else [(None, df_subset)]
-    subdir  = base_dir / (split_col or 'global_binned_abs'); subdir.mkdir(parents=True, exist_ok=True)
+    subdir = base_dir / (split_col or 'global_binned_abs')
+    subdir.mkdir(parents=True, exist_ok=True)
 
     for gname, gdf in groups:
         if len(gdf) == 0 or gdf['w'].sum() == 0:
@@ -166,21 +162,18 @@ def plot_metric_binned_abs(df_subset: pd.DataFrame,
         y   = gdf['y'].to_numpy()
         w   = gdf['w'].to_numpy()
 
-        # границы бинов по данным
         xmin = float(np.nanmin(xpp)); xmax = float(np.nanmax(xpp))
         lo = np.floor(xmin / bin_size_pp) * bin_size_pp
         hi = np.ceil (xmax / bin_size_pp) * bin_size_pp
         edges = np.arange(lo, hi + bin_size_pp*1.0001, bin_size_pp)
         if len(edges) < 2: edges = np.array([lo, lo + bin_size_pp])
 
-        # бинирование
         idx = np.digitize(xpp, bins=edges, right=False) - 1
         m   = (idx >= 0) & (idx < len(edges)-1)
         xpp, y, w, idx = xpp[m], y[m], w[m], idx[m]
         if len(xpp) == 0:
             continue
 
-        # агрегация по бинам
         df_bins = (pd.DataFrame({'bin': idx, 'x': xpp, 'y': y, 'w': w})
                    .groupby('bin')
                    .apply(lambda d: pd.Series({
@@ -199,7 +192,6 @@ def plot_metric_binned_abs(df_subset: pd.DataFrame,
         if df_bins.empty:
             continue
 
-        # рисуем
         fig, ax1 = plt.subplots(figsize=(9, 6))
         ax2 = ax1.twinx()
 
@@ -220,39 +212,37 @@ def plot_metric_binned_abs(df_subset: pd.DataFrame,
         ax1.axvline(0, lw=.8)
         ax1.set_xlabel('Дисконт (абс., п.п.) — 1 = 1 п.п.')
         ax1.set_ylabel(f"{cfg['title']}, %")
-        ax1.set_title(f"{cfg['title']} — {gname or 'вся выборка'} (шаг бина {bin_size_pp:.1f} п.п.)")
+        title_part = f"{cfg['title']} — {gname or 'вся выборка'} (шаг {bin_size_pp:.1f} п.п.)"
+        ax1.set_title(title_part)
         ax1.grid(True, zorder=0)
         ax1.legend(loc='upper left')
         ax2.legend(loc='upper right')
         plt.tight_layout()
 
-        # имя и сохранение
-        gtitle = cfg['title'] if gname is None else f"{cfg['title']} — {gname}"
-        fname = safe_name(gtitle)
-        fig.savefig((base_dir / (split_col or 'global_binned_abs') / f"{fname}.png"),
-                    dpi=300, bbox_inches='tight')
+        fname = safe_name(f"{cfg['title']}" if gname is None else f"{cfg['title']} — {gname}")
+        fig.savefig(subdir / f"{fname}.png", dpi=300, bbox_inches='tight')
         plt.close(fig)
 
-        # выгрузка таблицы бинов
         out = df_bins[['bin_left','bin_right','bin_center','n','vol','y_mean','y_wavg']].copy()
         out.rename(columns={'y_mean':'Среднее, %','y_wavg':f"{cfg['title']} (ср-взв), %"}, inplace=True)
-        out.to_excel((base_dir / (split_col or 'global_binned_abs') / f"{fname}.xlsx"), index=False)
+        out.to_excel(subdir / f"{fname}.xlsx", index=False)
 
 
 # ────────── 3) пример запуска ──────────
 if __name__ == '__main__':
     df_sel, cfg, root = select_metric_abs(
         'dataprolong.xlsx',
-        metric_key='2y',   # overall / 1y / 2y / 3y
+        metric_key='2y',                            # overall / 1y / 2y / 3y
         products=['Мой дом без опций','Доходный+','ДОМа лучше'],
-        segments=['Розница']
+        segments=['Розница'],
+        run_name=None   # можно передать строку, например 'AB_test_aug'; иначе будет timestamp
     )
 
     # глобально
     plot_metric_binned_abs(df_sel, cfg, base_dir=root, bin_size_pp=0.1)
 
     # по разрезам
-    plot_metric_binned_abs(df_sel, cfg, base_dir=root, split_col='MonthEnd',             bin_size_pp=0.1)
-    plot_metric_binned_abs(df_sel, cfg, base_dir=root, split_col='TermBucketGrouping',   bin_size_pp=0.1)
-    plot_metric_binned_abs(df_sel, cfg, base_dir=root, split_col='PROD_NAME',            bin_size_pp=0.1)
-    plot_metric_binned_abs(df_sel, cfg, base_dir=root, split_col='BalanceBucketGrouping',bin_size_pp=0.1)
+    plot_metric_binned_abs(df_sel, cfg, base_dir=root, split_col='MonthEnd',              bin_size_pp=0.1)
+    plot_metric_binned_abs(df_sel, cfg, base_dir=root, split_col='TermBucketGrouping',    bin_size_pp=0.1)
+    plot_metric_binned_abs(df_sel, cfg, base_dir=root, split_col='PROD_NAME',             bin_size_pp=0.1)
+    plot_metric_binned_abs(df_sel, cfg, base_dir=root, split_col='BalanceBucketGrouping', bin_size_pp=0.1)
