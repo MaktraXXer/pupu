@@ -1,312 +1,1213 @@
-import numpy as np, pandas as pd, matplotlib.pyplot as plt
-from numpy.polynomial.polynomial import polyfit, polyval
-from pathlib import Path
-try:
-    from sklearn.isotonic import IsotonicRegression
-    HAVE_SKLEARN = True
-except ImportError:
-    HAVE_SKLEARN = False
+USE ALM_TEST;
+GO
+SET ANSI_NULLS , QUOTED_IDENTIFIER ON;
+GO
+
+DECLARE @DayWindow int = 3;               -- ±N дней поиска базы
+/*--------------------------------------------------------------------*/
+WITH
+ISOPT AS (
+    SELECT b.CON_ID,
+           CASE WHEN ISNULL(b.OptionRate_TRF,0) < 0 THEN 1 ELSE 0 END AS IS_OPTION
+    FROM   LIQUIDITY.liq.InterestsRateForDeposit b WITH (NOLOCK)
+),
+cteMonths AS ( SELECT CONVERT(date,'2025-05-31') AS MonthEnd ),
+/*--------------------------------------------------------------------*/
+DealsInMonthRates AS (
+    SELECT
+        M.MonthEnd,
+        dc.CON_ID,
+        dc.CLI_ID,
+        dc.SEG_NAME,
+        ISNULL(dc.PROD_NAME,'Без типа')            AS PROD_NAME,
+        dc.CUR,
+        dc.DT_OPEN,
+        dc.DT_CLOSE,
+        dc.BALANCE_RUB,
+        dc.RATE,
+        DATEDIFF(DAY,dc.DT_OPEN,dc.DT_CLOSE_PLAN)  AS MATUR,
+        conv.NEW_CONVENTION_NAME,
+        DATEDIFF(DAY,dc.DT_OPEN,dc.DT_CLOSE)       AS DaysLived,
+        ISNULL(snap.MonthlyCONV_RATE,
+               LIQUIDITY.liq.fnc_IntRate(
+                   (dc.RATE+0.0048)/0.9525,
+                   conv.NEW_CONVENTION_NAME,
+                   'monthly',
+                   DATEDIFF(DAY,dc.DT_OPEN,dc.DT_CLOSE_PLAN),
+                   1) *0.9525 -0.0048)            AS ConvertedRate
+    FROM   cteMonths M
+    JOIN   LIQUIDITY.liq.DepositContract_all dc WITH (NOLOCK)
+           ON dc.DT_OPEN >= DATEADD(DAY,1,EOMONTH(M.MonthEnd,-1))
+          AND dc.DT_OPEN <  DATEADD(DAY,1,M.MonthEnd)
+          AND dc.CLI_SUBTYPE = 'INDIV'
+          AND dc.PROD_NAME  <> 'Эскроу'
+          AND dc.CONVENTION <> 'ON_DEMAND'
+          AND dc.DT_CLOSE_PLAN <> '4444-01-01'
+          AND DATEDIFF(DAY,dc.DT_OPEN,dc.DT_CLOSE) > 10
+    JOIN   LIQUIDITY.liq.man_CONVENTION conv WITH (NOLOCK)
+           ON conv.CONVENTION_NAME = dc.CONVENTION
+    LEFT  JOIN ALM_TEST.WORK.DepositInterestsRateSnap snap WITH (NOLOCK)
+           ON snap.CON_ID = dc.CON_ID
+    WHERE  dc.CON_ID NOT IN (SELECT CON_ID
+                             FROM LIQUIDITY.liq.man_FloatContracts WITH (NOLOCK))
+),
+/*--------------------------------------------------------------------*/
+DealsInMonthBucket AS (
+    SELECT dmr.*,
+           tg.TERM_GROUP             AS TermBucket,
+           bal.BALANCE_GROUP         AS BalanceBucket,
+           CAST(ISNULL(opt.IS_OPTION,0) AS nvarchar) AS IS_OPTION
+    FROM   DealsInMonthRates dmr
+    LEFT  JOIN ALM_TEST.WORK.man_TermGroup tg  WITH (NOLOCK)
+           ON dmr.MATUR BETWEEN tg.TERM_FROM AND tg.TERM_TO
+    LEFT  JOIN ALM_TEST.WORK.man_BalanceGroup bal WITH (NOLOCK)
+           ON dmr.BALANCE_RUB >= bal.BALANCE_FROM
+          AND dmr.BALANCE_RUB <  bal.BALANCE_TO
+    LEFT  JOIN ISOPT opt WITH (NOLOCK)
+           ON opt.CON_ID = dmr.CON_ID
+),
+/*--------------------------------------------------------------------*/
+RecursiveChain AS (
+    SELECT CAST(CON_ID AS bigint) AS StartConId,
+           CAST(CON_ID AS bigint) AS CurrentConId,
+           0 AS Lvl
+    FROM DealsInMonthBucket
+    UNION ALL
+    SELECT rc.StartConId,
+           CAST(p.CON_ID_REL AS bigint),
+           rc.Lvl + 1
+    FROM RecursiveChain rc
+    JOIN ALM.ehd.conrel_prolongations p WITH (NOLOCK)
+           ON p.CON_ID = rc.CurrentConId
+          AND p.CON_REL_TYPE  = 'PREVIOUS'
+    WHERE rc.Lvl < 5
+),
+ChainDepth AS (
+    SELECT StartConId,
+           CASE WHEN MAX(Lvl)>5 THEN 5 ELSE MAX(Lvl) END AS ProlongCount
+    FROM   RecursiveChain
+    GROUP BY StartConId
+),
+FirstProlong AS (
+    SELECT StartConId,
+           MIN(CurrentConId) AS Old1
+    FROM RecursiveChain
+    WHERE Lvl = 1
+    GROUP BY StartConId
+),
+PrevInfo AS (
+    SELECT fp.StartConId,
+           old.BALANCE_RUB AS PrevBalance,
+           LIQUIDITY.liq.fnc_IntRate(
+                 old.RATE,
+                 conv_prev.NEW_CONVENTION_NAME,
+                 'monthly',
+                 DATEDIFF(DAY,old.DT_OPEN,old.DT_CLOSE_PLAN),
+                 1)                            AS PrevConvertedRate
+    FROM FirstProlong fp
+    JOIN LIQUIDITY.liq.DepositContract_all old WITH (NOLOCK)
+           ON old.CON_ID = fp.Old1
+    JOIN LIQUIDITY.liq.man_CONVENTION conv_prev WITH (NOLOCK)
+           ON conv_prev.CONVENTION_NAME = old.CONVENTION
+),
+DealsWithProlong AS (
+    SELECT dmb.*,
+           ISNULL(cd.ProlongCount,0)    AS ProlongCount,
+           ISNULL(pi.PrevBalance,0)     AS PrevBalance,
+           ISNULL(pi.PrevConvertedRate,0) AS PrevConvertedRate
+    FROM DealsInMonthBucket dmb
+    LEFT JOIN ChainDepth cd ON cd.StartConId  = dmb.CON_ID
+    LEFT JOIN PrevInfo  pi ON pi.StartConId   = dmb.CON_ID
+),
+/*--------------------------------------------------------------------*/
+/*  Подготовка для поиска базовой ставки                              */
+/*--------------------------------------------------------------------*/
+BalanceBuckets AS (
+    SELECT BALANCE_GROUP,
+           BALANCE_FROM,
+           BALANCE_TO,
+           ROW_NUMBER() OVER(ORDER BY BALANCE_FROM) AS BucketOrder
+    FROM ALM_TEST.WORK.man_BalanceGroup
+),
+BaseCandidates AS (
+    SELECT dwp.DT_OPEN,
+           dwp.SEG_NAME, dwp.PROD_NAME, dwp.CUR,
+           dwp.TermBucket,
+           bb.BucketOrder,
+           dwp.BalanceBucket,
+           dwp.IS_OPTION,
+           dwp.NEW_CONVENTION_NAME,
+           AVG(dwp.ConvertedRate)       AS BaseRate
+    FROM DealsWithProlong dwp
+    JOIN BalanceBuckets bb ON bb.BALANCE_GROUP = dwp.BalanceBucket
+    WHERE dwp.ProlongCount = 0
+    GROUP BY dwp.DT_OPEN, dwp.SEG_NAME, dwp.PROD_NAME, dwp.CUR,
+             dwp.TermBucket, bb.BucketOrder, dwp.BalanceBucket,
+             dwp.IS_OPTION, dwp.NEW_CONVENTION_NAME
+),
+DealKeys AS (
+    SELECT DISTINCT
+           d.DT_OPEN,
+           d.SEG_NAME,
+           d.PROD_NAME,
+           d.CUR,
+           d.TermBucket,
+           d.IS_OPTION,
+           bb.BucketOrder,
+           bb.BALANCE_TO            AS BucketUpper,
+           d.BalanceBucket,
+           d.NEW_CONVENTION_NAME
+    FROM DealsWithProlong d
+    JOIN BalanceBuckets bb ON bb.BALANCE_GROUP = d.BalanceBucket
+),
+BestBase AS (
+    SELECT dk.*,
+           bc.BaseRate,
+           ROW_NUMBER() OVER (
+                 PARTITION BY dk.DT_OPEN, dk.SEG_NAME, dk.PROD_NAME,
+                              dk.CUR,     dk.TermBucket, dk.IS_OPTION,
+                              dk.NEW_CONVENTION_NAME,    dk.BalanceBucket
+                 ORDER BY
+                     CASE WHEN bc.BaseRate IS NULL THEN 1 ELSE 0 END,
+                     ABS(DATEDIFF(DAY, bc.DT_OPEN, dk.DT_OPEN)),
+                     CASE WHEN dk.BucketUpper<=1500000
+                          THEN dk.BucketOrder - ISNULL(bbSrc.BucketOrder,dk.BucketOrder)
+                          ELSE ISNULL(bbSrc.BucketOrder,dk.BucketOrder) - dk.BucketOrder
+                     END,
+                     CASE WHEN bc.DT_OPEN < dk.DT_OPEN THEN 0 ELSE 1 END
+           ) AS rn
+    FROM DealKeys dk
+    LEFT JOIN BaseCandidates bc
+           ON bc.SEG_NAME            = dk.SEG_NAME
+          AND bc.PROD_NAME           = dk.PROD_NAME
+          AND bc.CUR                 = dk.CUR
+          AND bc.TermBucket          = dk.TermBucket
+          AND bc.IS_OPTION           = dk.IS_OPTION
+          AND bc.NEW_CONVENTION_NAME = dk.NEW_CONVENTION_NAME
+          AND ABS(DATEDIFF(DAY, bc.DT_OPEN, dk.DT_OPEN)) <= @DayWindow
+          AND ( (dk.BucketUpper<=1500000 AND bc.BucketOrder<=dk.BucketOrder)
+             OR  (dk.BucketUpper> 1500000 AND bc.BucketOrder>=dk.BucketOrder) )
+    LEFT JOIN BalanceBuckets bbSrc ON bbSrc.BALANCE_GROUP = bc.BalanceBucket
+),
+DailyBaseRate AS (
+    SELECT * FROM BestBase WHERE rn = 1         -- ровно одна строка
+),
+/*--------------------------------------------------------------------*/
+/*  Финальная таблица с учётом правил                                 */
+/*--------------------------------------------------------------------*/
+DealsWithDiscount AS (
+    SELECT dwp.*,
+           /* --- Правило 1: Prolong = 0 → BaseRate = ConvertedRate --- */
+           CASE WHEN dwp.ProlongCount = 0
+                THEN dwp.ConvertedRate
+                ELSE dbr.BaseRate END           AS BaseRate,
+           /* --- Discount --- */
+           CASE WHEN dwp.ProlongCount = 0
+                THEN 0
+                WHEN dbr.BaseRate IS NULL
+                THEN NULL
+                ELSE dwp.ConvertedRate - dbr.BaseRate END AS Discount
+    FROM DealsWithProlong dwp
+    LEFT JOIN DailyBaseRate dbr
+           ON  dbr.DT_OPEN            = dwp.DT_OPEN
+          AND dbr.SEG_NAME           = dwp.SEG_NAME
+          AND dbr.PROD_NAME          = dwp.PROD_NAME
+          AND dbr.CUR                = dwp.CUR
+          AND dbr.TermBucket         = dwp.TermBucket
+          AND dbr.BalanceBucket      = dwp.BalanceBucket
+          AND dbr.IS_OPTION          = dwp.IS_OPTION
+          AND dbr.NEW_CONVENTION_NAME= dwp.NEW_CONVENTION_NAME
+),
+OpenAggregated_0 AS (
+    SELECT 
+         MonthEnd,
+         CASE 
+           WHEN SEG_NAME = 'Розничный бизнес' THEN N'Розница'
+           WHEN SEG_NAME = 'ДЧБО' THEN N'ЧБО'
+           ELSE N'Без сегментации'
+         END AS SegmentGrouping,
+		 PROD_NAME,
+         CUR AS CurrencyGrouping,
+         TermBucket AS TermBucketGrouping,
+		 BalanceBucket AS BalanceBucketGrouping,
+		 IS_OPTION,
+
+         COUNT(*) AS OpenedDeals,
+         SUM(BALANCE_RUB) AS Summ_BalanceRub,
+
+         -- Количество по каждому уровню пролонгации
+         SUM(CASE WHEN ProlongCount > 0 THEN 1 ELSE 0 END) AS Count_Prolong,
+         SUM(CASE WHEN ProlongCount = 0 THEN 1 ELSE 0 END) AS Count_NewNoProlong,
+         SUM(CASE WHEN ProlongCount = 1 THEN 1 ELSE 0 END) AS Count_1yProlong,
+         SUM(CASE WHEN ProlongCount = 2 THEN 1 ELSE 0 END) AS Count_2yProlong,
+         SUM(CASE WHEN ProlongCount = 3 THEN 1 ELSE 0 END) AS Count_3yProlong,
+         SUM(CASE WHEN ProlongCount = 4 THEN 1 ELSE 0 END) AS Count_4yProlong,
+         SUM(CASE WHEN ProlongCount >= 5 THEN 1 ELSE 0 END) AS Count_5plusProlong,
+
+         -- Суммы по уровням пролонгации
+         SUM(CASE WHEN ProlongCount > 0 THEN BALANCE_RUB ELSE 0 END) AS Sum_ProlongRub,
+         SUM(CASE WHEN ProlongCount = 0 THEN BALANCE_RUB ELSE 0 END) AS Sum_NewNoProlong,
+         SUM(CASE WHEN ProlongCount = 1 THEN BALANCE_RUB ELSE 0 END) AS Sum_1yProlong_Rub,
+         SUM(CASE WHEN ProlongCount = 2 THEN BALANCE_RUB ELSE 0 END) AS Sum_2yProlong_Rub,
+         SUM(CASE WHEN ProlongCount = 3 THEN BALANCE_RUB ELSE 0 END) AS Sum_3yProlong_Rub,
+         SUM(CASE WHEN ProlongCount = 4 THEN BALANCE_RUB ELSE 0 END) AS Sum_4yProlong_Rub,
+         SUM(CASE WHEN ProlongCount >= 5 THEN BALANCE_RUB ELSE 0 END) AS Sum_5plusProlong_Rub,
+		  -- вспомогательные суммы
+		 SUM(CASE WHEN  Discount is not null then BALANCE_RUB ELSE 0 END) AS Summ_BalanceRubD,
+         SUM(CASE WHEN  Discount is not null and ProlongCount > 0 THEN BALANCE_RUB ELSE 0 END) AS Sum_ProlongRubD,
+         SUM(CASE WHEN  Discount is not null and ProlongCount = 0 THEN BALANCE_RUB ELSE 0 END) AS Sum_NewNoProlongD,
+         SUM(CASE WHEN  Discount is not null and ProlongCount = 1 THEN BALANCE_RUB ELSE 0 END) AS Sum_1yProlong_RubD,
+         SUM(CASE WHEN Discount is not null and ProlongCount = 2 THEN BALANCE_RUB ELSE 0 END) AS Sum_2yProlong_RubD,
+         SUM(CASE WHEN Discount is not null and ProlongCount = 3 THEN BALANCE_RUB ELSE 0 END) AS Sum_3yProlong_RubD,
+         SUM(CASE WHEN Discount is not null and ProlongCount = 4 THEN BALANCE_RUB ELSE 0 END) AS Sum_4yProlong_RubD,
+         SUM(CASE WHEN Discount is not null and ProlongCount >= 5 THEN BALANCE_RUB ELSE 0 END) AS Sum_5plusProlong_RubD,
+         -- Суммы взвешенных ставок
+         SUM(BALANCE_RUB * ConvertedRate) AS Sum_RateWeighted,
+         SUM(CASE WHEN ProlongCount = 0 THEN BALANCE_RUB * ConvertedRate ELSE 0 END) AS Sum_RateWeighted_NewNoProlong,
+         SUM(CASE WHEN ProlongCount = 1 THEN BALANCE_RUB * ConvertedRate ELSE 0 END) AS Sum_RateWeighted_1y,
+         SUM(CASE WHEN ProlongCount = 2 THEN BALANCE_RUB * ConvertedRate ELSE 0 END) AS Sum_RateWeighted_2y,
+         SUM(CASE WHEN ProlongCount = 3 THEN BALANCE_RUB * ConvertedRate ELSE 0 END) AS Sum_RateWeighted_3y,
+         SUM(CASE WHEN ProlongCount = 4 THEN BALANCE_RUB * ConvertedRate ELSE 0 END) AS Sum_RateWeighted_4y,
+         SUM(CASE WHEN ProlongCount >= 5 THEN BALANCE_RUB * ConvertedRate ELSE 0 END) AS Sum_RateWeighted_5plus,
+         -- Сумма взвешенных ставок по всем пролонгациям + поля для "предыдущего" вклада
+         SUM(CASE WHEN ProlongCount > 0 THEN BALANCE_RUB * ConvertedRate ELSE 0 END) AS Sum_RateWeighted_Prolong,
+
+		          -- Суммы взвешенных дисконтов
+         SUM(BALANCE_RUB * Discount) AS Sum_Discount,
+         SUM(CASE WHEN ProlongCount = 0 THEN BALANCE_RUB * Discount ELSE 0 END) AS Sum_Discount_NewNoProlong,
+         SUM(CASE WHEN ProlongCount = 1 THEN BALANCE_RUB * Discount ELSE 0 END) AS Sum_Discount_1y,
+         SUM(CASE WHEN ProlongCount = 2 THEN BALANCE_RUB * Discount ELSE 0 END) AS Sum_Discount_2y,
+         SUM(CASE WHEN ProlongCount = 3 THEN BALANCE_RUB * Discount ELSE 0 END) AS Sum_Discount_3y,
+         SUM(CASE WHEN ProlongCount = 4 THEN BALANCE_RUB * Discount ELSE 0 END) AS Sum_Discount_4y,
+         SUM(CASE WHEN ProlongCount >= 5 THEN BALANCE_RUB * Discount ELSE 0 END) AS Sum_Discount_5plus,
+         -- Сумма взвешенных ставок по всем пролонгациям + поля для "предыдущего" вклада
+         SUM(CASE WHEN ProlongCount > 0 THEN BALANCE_RUB * Discount ELSE 0 END) AS Sum_Discount_Prolong,
 
 
-# ────────── 1. SELECT_METRIC ────────────────────────────────────────────
-def select_metric(excel_file : str | pd.DataFrame,
-                  metric_key : str = 'overall',            # 'overall'|'1y'|'2y'|'3y'
-                  products   : list[str] | None = None,
-                  segments   : list[str] | None = None):
-    """
-    Возвращает:
-        df_subset – с колонками   x (discount ≤0),  y (%, 0-100),  w (₽)
-        cfg       – dict {metric, disc, weight, title}
-        base_dir  – Path('results/<metric_key>')
-    """
-    # ---------- чтение ---------------------------------------------------
-    df = pd.read_excel(excel_file) if isinstance(excel_file, str) else excel_file.copy()
 
-    # ---------- расчёт сумм с % -----------------------------------------
-    for l, r, new in [
-        ('Summ_ClosedBalanceRub','Summ_ClosedBalanceRub_int','Closed_Total_with_pct'),
-        ('Closed_Sum_NewNoProlong','Closed_Sum_NewNoProlong_int','Closed_Sum_NewNoProlong_with_pct'),
-        ('Closed_Sum_1yProlong_Rub','Closed_Sum_1yProlong_Rub_int','Closed_Sum_1yProlong_with_pct'),
-        ('Closed_Sum_2yProlong_Rub','Closed_Sum_2yProlong_Rub_int','Closed_Sum_2yProlong_with_pct'),
-    ]:
-        df[new] = df[l].fillna(0) + df[r].fillna(0)
+         SUM(CASE WHEN ProlongCount > 0 THEN PrevBalance ELSE 0 END) AS Sum_PreviousBalance,
+         SUM(CASE WHEN ProlongCount > 0 THEN PrevBalance * PrevConvertedRate ELSE 0 END) AS Sum_PreviousRateWeighted
 
-    safe_div = lambda n,d: np.where(d==0, np.nan, n/d)
-    df['Общая пролонгация']   = safe_div(df['Opened_Sum_ProlongRub'],     df['Closed_Total_with_pct'])
-    df['1-я автопролонгация'] = safe_div(df['Opened_Sum_1yProlong_Rub'],  df['Closed_Sum_NewNoProlong_with_pct'])
-    df['2-я автопролонгация'] = safe_div(df['Opened_Sum_2yProlong_Rub'],  df['Closed_Sum_1yProlong_with_pct'])
-    df['3-я автопролонгация'] = safe_div(df['Opened_Sum_3yProlong_Rub'],  df['Closed_Sum_2yProlong_with_pct'])
-
-    # ---------- конфигурация по ключу -----------------------------------
-    cfg = {
-        'overall': dict(metric='Общая пролонгация',
-                        disc='Opened_WeightedDiscount_AllProlong',
-                        weight='Opened_Sum_ProlongRub',
-                        title='Общая автопролонгация'),
-        '1y':      dict(metric='1-я автопролонгация',
-                        disc='Opened_WeightedDiscount_1y',
-                        weight='Opened_Sum_1yProlong_Rub',
-                        title='1-я автопролонгация'),
-        '2y':      dict(metric='2-я автопролонгация',
-                        disc='Opened_WeightedDiscount_2y',
-                        weight='Opened_Sum_2yProlong_Rub',
-                        title='2-я автопролонгация'),
-        '3y':      dict(metric='3-я автопролонгация',
-                        disc='Opened_WeightedDiscount_3y',
-                        weight='Opened_Sum_3yProlong_Rub',
-                        title='3-я автопролонгация')
-    }[metric_key]
-
-    # ---------- фильтры --------------------------------------------------
-    m  = (df['TermBucketGrouping'] != 'Все бакеты') \
-       & (df['PROD_NAME']          != 'Все продукты') \
-       & (df['IS_OPTION']          == '0') \
-       & (df['BalanceBucketGrouping'] != 'Все бакеты') \
-       & df[cfg['metric']].notna() \
-       & df[cfg['disc']].notna() \
-       & (df[cfg['metric']] <= 1) \
-       & (df[cfg['weight']]  > 0)
-
-    if products: m &= df['PROD_NAME'].isin(products)
-    if segments: m &= df['SegmentGrouping'].isin(segments)
-
-    d = df.loc[m].copy()
-    d['x'] = d[cfg['disc']]
-    d.loc[d['x'] > 0, 'x'] = 0               # обнуляем положительные дисконты
-    d['y'] = d[cfg['metric']]*100            # в проценты
-    d['w'] = d[cfg['weight']]
-
-    base_dir = Path('results')/metric_key; base_dir.mkdir(parents=True, exist_ok=True)
-    return d, cfg, base_dir
-
-
-# ────────── 2. PLOT_METRIC (с гистограммой объёмов) ─────────────────────
-def plot_metric(df_subset: pd.DataFrame,
-                cfg: dict,
-                base_dir: Path,
-                split_col: str | None = None,
-                bins: str | int = 'fd',         # 'fd'|'auto'|int|sequence — бины для гистограммы
-                min_points: int = 5,
-                min_total_weight: float = 0.0):
-    """
-    ▸ Если split_col == None → один файл: histogram(₽) + scatter + 4 кривые (WLS/OLS × old/mono).
-    ▸ Если split_col задан  → для КАЖДОЙ категории отдельные png+xlsx,
-                              + общий scatter по всем категориям.
-    """
-
-    # ---------- утилиты ---------------------------------------------------
-    def safe_name(s: str) -> str:
-        return ''.join(ch for ch in s if ch.isalnum() or ch in ' _-')[:80]
-
-    def r2(y, yh, w):
-        y_bar = np.average(y, weights=w)
-        ss_res = np.sum(w * (y - yh) ** 2)
-        ss_tot = np.sum(w * (y - y_bar) ** 2)
-        return 1 - ss_res / ss_tot if ss_tot else np.nan
-
-    # --- old-family: linear / quadratic / exponential --------------------
-    def fit_three(x, y, w):
-        cand = {}
-        c = polyfit(x, y, 1, w=w);                 cand['linear']    = (c, polyval(x, c))
-        c = polyfit(x, y, 2, w=w);                 cand['quadratic'] = (c, polyval(x, c))
-        if (y > 0).all():
-            c = polyfit(x, np.log(y), 1, w=w);     cand['exponential'] = (c, np.exp(polyval(x, c)))
-        name, (par, pred) = max(cand.items(), key=lambda kv: r2(y, kv[1][1], w))
-        return name, par, pred, r2(y, pred, w)
-
-    # --- monotone pack ----------------------------------------------------
-    def fit_mono(x, y, w):
-        cand = {}
-        c = polyfit(x, y, 1, w=w);  c[1] = abs(c[1]);              cand['lin_neg'] = (c, polyval(x, c))
-        if (y > 0).all():
-            ce = polyfit(x, np.log(y), 1, w=w);  ce[1] = abs(ce[1]); cand['exp_decay'] = (ce, np.exp(polyval(x, ce)))
-            inv = 1 / y; cr = polyfit(x, inv, 1, w=w)
-            a = 1 / cr[1] if cr[1] else None;  b = cr[0] * a if a else None
-            if a and a > 0 and b and b > 0:
-                cand['recip'] = ((a, b), a / (1 + b * x))
-        if HAVE_SKLEARN:
-            iso = IsotonicRegression(increasing=True).fit(x, y, sample_weight=w)
-            cand['isotonic'] = (None, iso.predict(x))
-        name, (par, pred) = max(cand.items(), key=lambda kv: r2(y, kv[1][1], w))
-        return name, par, pred, r2(y, pred, w)
-
-    # --- описание формул --------------------------------------------------
-    def eq_str(name, par, x_raw=None):
-        if name in ('linear', 'lin_neg'):
-            b0, b1 = par; return f"y = {b0:+.3f} + {b1:+.3f}·x"
-        if name == 'quadratic':
-            b0, b1, b2 = par; return f"y = {b0:+.3f} + {b1:+.3f}·x {b2:+.3f}·x²"
-        if name in ('exponential', 'exp_decay'):
-            a = np.exp(par[0]); b = par[1]; return f"y = {a:.3f}·e^({b:+.3f}·x)"
-        if name == 'recip':
-            return "y = a / (1 + b·x)"
-        if name == 'isotonic':
-            y_hat = par
-            idx = np.where(np.diff(y_hat) != 0)[0] + 1
-            kx  = np.concatenate(([x_raw.min()], x_raw[idx], [x_raw.max()]))
-            ky  = np.concatenate(([y_hat[0]],    y_hat[idx], [y_hat[-1]]))
-            pairs = [f"[x={xi:+.2f}; {yi:.0f}]" for xi, yi in zip(kx, ky)]
-            if len(pairs) > 6: pairs = pairs[:3] + ['…'] + pairs[-3:]
-            return " → ".join(pairs)
-        return ""
-
-    # --- бины для гистограммы (по x) -------------------------------------
-    def get_bin_edges(x, bins):
-        if isinstance(bins, (list, tuple, np.ndarray)):
-            edges = np.asarray(bins, float)
-        elif isinstance(bins, str):
-            mode = 'fd' if bins.lower() == 'fd' else 'auto'
-            edges = np.histogram_bin_edges(x, bins=mode)
-        elif isinstance(bins, int):
-            edges = np.histogram_bin_edges(x, bins=bins)
-        else:
-            edges = np.histogram_bin_edges(x, bins='fd')
-        # если все x одинаковые — расширим чуть-чуть, чтобы был видим столбик
-        if len(np.unique(x)) == 1:
-            dx = max(abs(x[0])*0.05, 0.001)
-            edges = np.array([x[0]-dx, x[0]+dx])
-        return edges
-
-    # ---------- подготовка каталогов -------------------------------------
-    groups  = df_subset.groupby(split_col) if split_col else [(None, df_subset)]
-    subdir  = base_dir / (split_col or 'global')
-    subdir.mkdir(parents=True, exist_ok=True)
-
-    # ---------- палитра для общего scatter --------------------------------
-    if split_col:
-        cats = sorted(df_subset[split_col].unique())
-        cmap = plt.cm.get_cmap('tab10', len(cats))
-        color_of = {c: cmap(i) for i, c in enumerate(cats)}
-        markers  = ['o', 's', '^', 'D', 'v', '<', '>', 'P', 'X'] * 10
-        marker_of = {c: markers[i] for i, c in enumerate(cats)}
-
-    # ---------- цикл по категориям (hist + scatter + кривые) --------------
-    for gname, gdf in groups:
-        if len(gdf) < min_points or gdf['w'].sum() <= min_total_weight:
-            continue
-
-        x, y, w  = gdf['x'].values, gdf['y'].values, gdf['w'].values
-        order    = np.argsort(x)
-        sizes    = 20 + 180 * (w / w.max())
-
-        # --- модели ---
-        n_ow, p_ow, y_ow, r_ow = fit_three(x, y, w)
-        n_mw, p_mw, y_mw, r_mw = fit_mono (x, y, w)
-        ones = np.ones_like(w)
-        n_oo, p_oo, y_oo, r_oo = fit_three(x, y, ones)
-        n_mo, p_mo, y_mo, r_mo = fit_mono (x, y, ones)
-
-        # --- бинирование для гистограммы объёмов ---
-        edges = get_bin_edges(x, bins)
-        hist, edges = np.histogram(x, bins=edges, weights=w)
-        centers = 0.5*(edges[:-1] + edges[1:])
-        widths  = np.diff(edges)
-
-        # --- график: ось Y слева для %; справа — для ₽ ---
-        fig, ax = plt.subplots(figsize=(9,6))
-        ax2 = ax.twinx()
-
-        # histogram по правой оси
-        ax2.bar(edges[:-1], hist, width=widths, alpha=0.25, align='edge', label='объём (₽) — гистограмма')
-
-        # scatter + кривые по левой оси
-        sc = ax.scatter(x, y, s=sizes, alpha=0.6, edgecolor='k', lw=0.3, label='точки (bubble = объём ₽)')
-        ax.plot(x[order], y_ow[order], lw=2, label=f'old-WLS  ({n_ow})  R²={r_ow:.2f}')
-        ax.plot(x[order], y_mw[order], lw=2, label=f'mono-WLS ({n_mw}) R²={r_mw:.2f}')
-        ax.plot(x[order], y_oo[order], lw=2, ls='--', label=f'old-OLS  ({n_oo})  R²={r_oo:.2f}')
-        ax.plot(x[order], y_mo[order], lw=2, ls='--', label=f'mono-OLS ({n_mo}) R²={r_mo:.2f}')
-
-        # оформление
-        ax.axvline(0, lw=.8); ax.set_ylim(0, 120)
-        ax.set_xlabel('Discount (п.п.)'); ax.set_ylabel(f"{cfg['title']}, %")
-        ax2.set_ylabel('Объём по дисконту, ₽')
-        ax.set_title(f"{cfg['title']} — {gname or 'вся выборка'}")
-        ax.grid(True)
-
-        # объединённая легенда
-        h1, l1 = ax.get_legend_handles_labels()
-        h2, l2 = ax2.get_legend_handles_labels()
-        ax.legend(h1+h2, l1+l2, bbox_to_anchor=(1.02,1), loc='upper left')
-        plt.subplots_adjust(right=0.78)
-
-        # формулы
-        text_old  = f"old-WLS : {eq_str(n_ow,p_ow,x)}\nold-OLS : {eq_str(n_oo,p_oo,x)}"
-        text_mono = f"mono-WLS: {eq_str(n_mw,y_mw if n_mw=='isotonic' else p_mw,x)}\n" \
-                    f"mono-OLS: {eq_str(n_mo,y_mo if n_mo=='isotonic' else p_mo,x)}"
-        plt.figtext(0.98,0.02,text_old ,ha='right',va='bottom',fontsize=8,
-                    bbox=dict(boxstyle='round,pad=0.3',fc='white',ec='grey',lw=0.5))
-        plt.figtext(0.01,-0.10,text_mono,ha='left' ,va='top'   ,fontsize=9,linespacing=1.2)
-
-        # save
-        fname = safe_name(cfg['title'] if gname is None else f"{cfg['title']} — {gname}")
-        subdir.mkdir(parents=True, exist_ok=True)
-        plt.savefig(subdir / f"{fname}.png", dpi=300, bbox_inches='tight')
-        # данные: raw + hist
-        with pd.ExcelWriter(subdir / f"{fname}.xlsx") as xw:
-            gdf[['x','y','w']].to_excel(xw, index=False, sheet_name='raw')
-            pd.DataFrame({'bin_left':edges[:-1],'bin_right':edges[1:],'center':centers,'volume_rub':hist}).to_excel(
-                xw, index=False, sheet_name='hist'
-            )
-        plt.show(); plt.close()
-
-    # ---------- совокупный raw-scatter (без гистограммы) -----------------
-    if split_col:
-        plt.figure(figsize=(8,6))
-        for cat, d in df_subset.groupby(split_col):
-            plt.scatter(d['x'], d['y'],
-                        s = 20 + 180*(d['w']/df_subset['w'].max()),
-                        color  = color_of[cat],
-                        marker = marker_of[cat],
-                        alpha=.75,
-                        label=str(cat))
-        plt.axvline(0,lw=.8); plt.ylim(0,120)
-        plt.xlabel('Discount (п.п.)'); plt.ylabel(f"{cfg['title']}, %")
-        plt.title(f"{cfg['title']} — scatter по {split_col} (все категории)")
-        plt.grid(True); plt.legend(title=split_col, bbox_to_anchor=(1.02,1), loc='upper left')
-        plt.subplots_adjust(right=0.78)
-
-        fname = safe_name(f"{cfg['title']} — {split_col}-scatter_all")
-        plt.savefig(subdir / f"{fname}.png", dpi=300, bbox_inches='tight')
-        plt.show(); plt.close()
-
-
-
-
-
-
-        точно так же, как раньше — интерфейс не менялся. у plot_metric просто появились необязательные параметры (bins, min_points, min_total_weight). вот готовые примеры вызова:
-
-if __name__ == '__main__':
-    # 1) выбираем метрику и срез данных (как раньше)
-    df_sel, cfg, root = select_metric(
-        'dataprolong.xlsx',
-        metric_key='2y',                            # overall / 1y / 2y / 3y
-        products=['Мой дом без опций','Доходный+','ДОМа лучше'],
-        segments=['Розница']
+    FROM DealsWithDiscount
+    GROUP BY CUBE (
+         MonthEnd,
+         CASE 
+           WHEN SEG_NAME = 'Розничный бизнес' THEN N'Розница'
+           WHEN SEG_NAME = 'ДЧБО' THEN N'ЧБО'
+           ELSE N'Без сегментации'
+         END,
+         CUR,
+		 PROD_NAME,
+         TermBucket,
+		 BalanceBucket,
+		 IS_OPTION
     )
+),
+----------------------------------
+-- A8) Аггрегация по открытым (OpenAggregated)
+----------------------------------
+OpenAggregated AS (
+    SELECT 
+		 ISNULL(MonthEnd, '9999-12-31') AS MonthEnd,
+		 ISNULL(SegmentGrouping, N'Все сегменты') AS SegmentGrouping,
+		 ISNULL(PROD_NAME, N'Все продукты')		 AS PROD_NAME,
+		 ISNULL(CurrencyGrouping, N'Все валюты')  AS CurrencyGrouping,
+		 ISNULL(TermBucketGrouping, N'Все бакеты')AS TermBucketGrouping,
+		 ISNULL(BalanceBucketGrouping, N'Все бакеты')AS BalanceBucketGrouping,
+		 ISNULL(IS_OPTION,N'Все признаки опциональности') as IS_OPTION,
+		 OpenedDeals,
+         Summ_BalanceRub,
+		 Count_Prolong,
+         Count_NewNoProlong,
+         Count_1yProlong,
+         Count_2yProlong,
+         Count_3yProlong,
+         Count_4yProlong,
+         Count_5plusProlong,
+		 Sum_ProlongRub,
+         Sum_NewNoProlong,
+         Sum_1yProlong_Rub,
+         Sum_2yProlong_Rub,
+         Sum_3yProlong_Rub,
+         Sum_4yProlong_Rub,
+         Sum_5plusProlong_Rub,
+		 Summ_BalanceRubD,
+		 Sum_ProlongRubD,
+         Sum_NewNoProlongD,
+         Sum_1yProlong_RubD,
+         Sum_2yProlong_RubD,
+         Sum_3yProlong_RubD,
+         Sum_4yProlong_RubD,
+         Sum_5plusProlong_RubD,
 
-    # 2) рисуем графики
-    # по умолчанию: бины гистограммы — правило Фридмана–Диакониса ('fd')
-    plot_metric(df_sel, cfg, base_dir=root)                                # global
-    plot_metric(df_sel, cfg, base_dir=root, split_col='MonthEnd')
-    plot_metric(df_sel, cfg, base_dir=root, split_col='TermBucketGrouping')
-    plot_metric(df_sel, cfg, base_dir=root, split_col='PROD_NAME')
-    plot_metric(df_sel, cfg, base_dir=root, split_col='BalanceBucketGrouping')
+		 Sum_RateWeighted,
+         Sum_RateWeighted_NewNoProlong,
+         Sum_RateWeighted_1y,
+         Sum_RateWeighted_2y,
+         Sum_RateWeighted_3y,
+         Sum_RateWeighted_4y,
+         Sum_RateWeighted_5plus,
+         Sum_RateWeighted_Prolong,
+		 --------------------------
+		 Sum_Discount,
+		 Sum_Discount_NewNoProlong,
+		 Sum_Discount_1y,
+		 Sum_Discount_2y,
+		 Sum_Discount_3y,
+		 Sum_Discount_4y,
+		 Sum_Discount_5plus,
+		 Sum_Discount_Prolong,
 
-хочешь управлять гистограммой объёмов (по оси X — discount)? задай bins:
+         Sum_PreviousBalance,
+         Sum_PreviousRateWeighted
+    FROM OpenAggregated_0
+    
+),
+----------------------------------
+-- A9) Средневзвешенные ставки (OpenWeightedRates)
+----------------------------------
+OpenWeightedRates AS (
+    SELECT
+         MonthEnd,
+         SegmentGrouping,
+         PROD_NAME,
+         CurrencyGrouping,
+         TermBucketGrouping,
+         BalanceBucketGrouping,
+         IS_OPTION,
 
-# фиксированное число бинов
-plot_metric(df_sel, cfg, base_dir=root, split_col='PROD_NAME', bins=20)
+         -- Ставки
+         CASE WHEN SUM(Summ_BalanceRub) > 0
+              THEN SUM(Sum_RateWeighted) / SUM(Summ_BalanceRub)
+              ELSE 0 END AS WeightedRate_All,
 
-# авто-правило numpy
-plot_metric(df_sel, cfg, base_dir=root, split_col='PROD_NAME', bins='auto')
+         CASE WHEN SUM(Sum_NewNoProlong) > 0
+              THEN SUM(Sum_RateWeighted_NewNoProlong) / SUM(Sum_NewNoProlong)
+              ELSE 0 END AS WeightedRate_NewNoProlong,
 
-# свои ручные границы бинов (например, шаг 0.1 п.п. между -5п.п. и 0)
-custom_edges = np.arange(-5.0, 0.0001, 0.1)  # в п.п., как твои x
-plot_metric(df_sel, cfg, base_dir=root, split_col='PROD_NAME', bins=custom_edges)
+         CASE WHEN SUM(Sum_1yProlong_Rub) > 0
+              THEN SUM(Sum_RateWeighted_1y) / SUM(Sum_1yProlong_Rub)
+              ELSE 0 END AS WeightedRate_1y,
 
-# отсекаем «пустые» группы (мало точек или очень маленький суммарный вес)
-plot_metric(df_sel, cfg, base_dir=root, split_col='TermBucketGrouping',
-            min_points=8, min_total_weight=1e6)
+         CASE WHEN SUM(Sum_2yProlong_Rub) > 0
+              THEN SUM(Sum_RateWeighted_2y) / SUM(Sum_2yProlong_Rub)
+              ELSE 0 END AS WeightedRate_2y,
 
-в остальном — всё как было: сохраняется PNG + XLSX (в папке results/<metric_key>/<split_col or global>/). в xlsx есть лист raw (x,y,w) и лист hist (границы бинов и объёмы).
+         CASE WHEN SUM(Sum_3yProlong_Rub) > 0
+              THEN SUM(Sum_RateWeighted_3y) / SUM(Sum_3yProlong_Rub)
+              ELSE 0 END AS WeightedRate_3y,
+
+         CASE WHEN SUM(Sum_4yProlong_Rub) > 0
+              THEN SUM(Sum_RateWeighted_4y) / SUM(Sum_4yProlong_Rub)
+              ELSE 0 END AS WeightedRate_4y,
+
+         CASE WHEN SUM(Sum_5plusProlong_Rub) > 0
+              THEN SUM(Sum_RateWeighted_5plus) / SUM(Sum_5plusProlong_Rub)
+              ELSE 0 END AS WeightedRate_5plus,
+
+         CASE WHEN SUM(Sum_ProlongRub) > 0
+              THEN SUM(Sum_RateWeighted_Prolong) / SUM(Sum_ProlongRub)
+              ELSE 0 END AS WeightedRate_AllProlong,
+
+         CASE WHEN SUM(Sum_PreviousBalance) > 0
+              THEN SUM(Sum_PreviousRateWeighted) / SUM(Sum_PreviousBalance)
+              ELSE 0 END AS WeightedRate_Previous,
+
+--------------------------------------------------------------------
+-- Дисконты (исправлено, проверяем именно *_RubD)
+--------------------------------------------------------------------
+         CASE WHEN SUM(Summ_BalanceRubD) > 0
+              THEN SUM(Sum_Discount) / SUM(Summ_BalanceRubD)
+              ELSE 0 END AS WeightedDiscount_All,
+
+         CASE WHEN SUM(Sum_NewNoProlongD) > 0
+              THEN SUM(Sum_Discount_NewNoProlong) / SUM(Sum_NewNoProlongD)
+              ELSE 0 END AS WeightedDiscount_NewNoProlong,
+
+         CASE WHEN SUM(Sum_1yProlong_RubD) > 0
+              THEN SUM(Sum_Discount_1y) / SUM(Sum_1yProlong_RubD)
+              ELSE 0 END AS WeightedDiscount_1y,
+
+         CASE WHEN SUM(Sum_2yProlong_RubD) > 0
+              THEN SUM(Sum_Discount_2y) / SUM(Sum_2yProlong_RubD)
+              ELSE 0 END AS WeightedDiscount_2y,
+
+         CASE WHEN SUM(Sum_3yProlong_RubD) > 0
+              THEN SUM(Sum_Discount_3y) / SUM(Sum_3yProlong_RubD)
+              ELSE 0 END AS WeightedDiscount_3y,
+
+         CASE WHEN SUM(Sum_4yProlong_RubD) > 0
+              THEN SUM(Sum_Discount_4y) / SUM(Sum_4yProlong_RubD)
+              ELSE 0 END AS WeightedDiscount_4y,
+
+         CASE WHEN SUM(Sum_5plusProlong_RubD) > 0
+              THEN SUM(Sum_Discount_5plus) / SUM(Sum_5plusProlong_RubD)
+              ELSE 0 END AS WeightedDiscount_5plus,
+
+         CASE WHEN SUM(Sum_ProlongRubD) > 0
+              THEN SUM(Sum_Discount_Prolong) / SUM(Sum_ProlongRubD)
+              ELSE 0 END AS WeightedDiscount_AllProlong
+    FROM OpenAggregated
+    GROUP BY
+         MonthEnd, SegmentGrouping, PROD_NAME, CurrencyGrouping,
+         TermBucketGrouping, BalanceBucketGrouping, IS_OPTION
+),
+-------------------------------------------
+-- B1) Закрытые депозиты (ClosedDealsInMonthRates)
+--     с расчетом ConvertedRate
+-------------------------------------------
+ClosedDealsInMonthRates AS (
+    SELECT
+         M.MonthEnd,
+         CAST(dc.CON_ID AS BIGINT) AS CON_ID,
+         dc.SEG_NAME,
+		 ISNULL(dc.PROD_NAME,'Без типа') as PROD_NAME,
+         dc.CUR,
+         dc.DT_OPEN,
+         dc.DT_CLOSE,
+         dc.BALANCE_RUB,
+         dc.RATE,
+         DATEDIFF(DAY, dc.DT_OPEN, dc.DT_CLOSE_PLAN) AS MATUR,
+         conv.NEW_CONVENTION_NAME,
+         DATEDIFF(DAY, dc.DT_OPEN, dc.DT_CLOSE) AS DaysLived,
+         -- Аналогичная логика конвертации ставки
+		   ISNULL(test.[MonthlyCONV_RATE],LIQUIDITY.liq.fnc_IntRate(
+             (dc.RATE+0.0048)/0.9525,
+             conv.NEW_CONVENTION_NAME,
+             'monthly',
+             DATEDIFF(DAY, dc.DT_OPEN, dc.DT_CLOSE_PLAN),
+             1
+         )*0.9525 -0.0048) AS ConvertedRate
+    FROM cteMonths M
+    JOIN [LIQUIDITY].[liq].[DepositContract_all] dc WITH (NOLOCK)
+         ON dc.DT_CLOSE >= DATEADD(DAY, 1, EOMONTH(M.MonthEnd, -1))
+        AND dc.DT_CLOSE <  DATEADD(DAY, 1, M.MonthEnd)
+        AND dc.CLI_SUBTYPE = 'INDIV'
+        AND dc.PROD_NAME   != 'Эскроу'
+        AND dc.CONVENTION  != 'ON_DEMAND'
+        AND dc.DT_CLOSE_PLAN != '4444-01-01'
+        AND DATEDIFF(DAY, dc.DT_OPEN, dc.DT_CLOSE) > 10
+    JOIN LIQUIDITY.[liq].man_CONVENTION conv WITH (NOLOCK)
+         ON dc.CONVENTION = conv.CONVENTION_NAME
+    left join ALM_TEST.WORK.[DepositInterestsRateSnap] test with (NOLOCK)
+		ON  dc.CON_ID =test.CON_ID
+
+	where CAST(dc.CON_ID AS BIGINT) not in (select CAST(CON_ID AS BIGINT) from [LIQUIDITY].[liq].[man_FloatContracts] with (nolock))
+),
+
+-------------------------------------------
+-- B2) Присоединяем бакеты срочности (ClosedDealsInMonthBucket)
+-------------------------------------------
+ClosedDealsInMonthBucket AS (
+    SELECT
+         cdm.MonthEnd,
+         cdm.CON_ID,
+         cdm.SEG_NAME,
+		 cdm.PROD_NAME,
+         cdm.CUR,
+         cdm.DT_OPEN,
+         cdm.DT_CLOSE,
+         cdm.BALANCE_RUB,
+		 CASE 
+			WHEN cdm.CUR ='RUR' and CAST(isnull(opt.[IS_OPTION],0) as nvarchar) ='0'
+			THEN 
+				CASE
+					when cdm.MATUR=cdm.DaysLived then cdm.BALANCE_RUB*(POWER(1+cdm.ConvertedRate/12,cdm.DaysLived/31)-1)
+					ELSE  cdm.BALANCE_RUB*(POWER(1+0.01/1200,cdm.DaysLived/31)-1)
+			END
+		ELSE 0
+		END as Int_Balance_RUB,
+         cdm.RATE,
+         cdm.ConvertedRate,
+         cdm.MATUR,
+         cdm.DaysLived,
+         tg.TERM_GROUP AS TermBucket,
+		 bal.BALANCE_GROUP AS BalanceBucket,
+		 CAST(isnull(opt.[IS_OPTION],0) as nvarchar) as IS_OPTION
+    FROM ClosedDealsInMonthRates cdm
+    LEFT JOIN [ALM_TEST].[WORK].[man_TermGroup] tg WITH (NOLOCK)
+         ON cdm.MATUR >= tg.TERM_FROM
+        AND cdm.MATUR <= tg.TERM_TO
+	LEFT JOIN [ALM_TEST].[WORK].[man_BalanceGroup] bal
+        ON cdm.BALANCE_RUB >= bal.BALANCE_FROM 
+       AND cdm.BALANCE_RUB < bal.BALANCE_TO
+	LEFT JOIN ISOPT opt WITH (NOLOCK)
+		ON cdm.CON_ID =opt.CON_ID
+),
+
+-------------------------------------------
+-- B3) (по желанию) Рекурсивная логика для
+--     вычисления ProlongCount (0..5) для закрытых
+-------------------------------------------
+ClosedRecursiveChain AS (
+    SELECT
+         CAST(dmb.CON_ID AS BIGINT) AS StartConId,
+         CAST(dmb.CON_ID AS BIGINT) AS CurrentConId,
+         0 AS Lvl
+    FROM ClosedDealsInMonthBucket dmb
+
+    UNION ALL
+
+    SELECT
+         rc.StartConId,
+         CAST(p.CON_ID_REL AS BIGINT) AS CurrentConId,
+         rc.Lvl + 1 AS Lvl
+    FROM ClosedRecursiveChain rc
+    JOIN [ALM].[ehd].[conrel_prolongations] p WITH (NOLOCK)
+         ON p.CON_ID = rc.CurrentConId
+        AND p.CON_REL_TYPE = 'PREVIOUS'
+    WHERE rc.Lvl < 5
+),
+
+ClosedChainDepth AS (
+    SELECT
+         rc.StartConId,
+         CASE WHEN MAX(rc.Lvl) > 5 THEN 5 ELSE MAX(rc.Lvl) END AS ProlongCount
+    FROM ClosedRecursiveChain rc
+    GROUP BY rc.StartConId
+),
+
+-------------------------------------------
+-- B4) Собираем данные (ClosedDealsWithProlong),
+--     но нам НЕ НУЖНО info по предыдущему вкладу
+-------------------------------------------
+ClosedDealsWithProlong AS (
+    SELECT
+         dmb.MonthEnd,
+         dmb.CON_ID,
+         dmb.SEG_NAME,
+		 dmb.PROD_NAME,
+         dmb.CUR,
+         dmb.DT_OPEN,
+         dmb.DT_CLOSE,
+         dmb.BALANCE_RUB,
+		 dmb.Int_Balance_RUB,
+         dmb.RATE,
+         dmb.MATUR,
+         dmb.ConvertedRate,
+         dmb.TermBucket,
+         dmb.DaysLived,
+		 dmb.BalanceBucket,
+		 dmb.IS_OPTION,
+         ISNULL(cd.ProlongCount, 0) AS ProlongCount
+    FROM ClosedDealsInMonthBucket dmb
+    LEFT JOIN ClosedChainDepth cd
+           ON cd.StartConId = dmb.CON_ID
+),
+
+-------------------------------------------
+-- B5) Агрегация по закрытым (ClosedAggregated)
+--     с учетом ProlongCount (0..5)
+-------------------------------------------
+ClosedAggregated_0 AS (
+    SELECT
+         MonthEnd,
+         CASE
+           WHEN SEG_NAME = 'Розничный бизнес' THEN N'Розница'
+           WHEN SEG_NAME = 'ДЧБО' THEN N'ЧБО'
+           ELSE N'Без сегментации'
+         END AS SegmentGrouping,
+		 PROD_NAME,
+         CUR AS CurrencyGrouping,
+         TermBucket AS TermBucketGrouping,
+		 BalanceBucket AS BalanceBucketGrouping,
+		 IS_OPTION,
+         COUNT(*) AS ClosedDeals,
+         SUM(BALANCE_RUB) AS Summ_ClosedBalanceRub,
+		 SUM(Int_Balance_RUB) As Summ_ClosedBalanceRub_int,
+
+         -- Аналогично: считаем количество сделок, суммы в разрезе
+         SUM(CASE WHEN ProlongCount > 0 THEN 1 ELSE 0 END) AS Closed_Count_Prolong,
+         SUM(CASE WHEN ProlongCount = 0 THEN 1 ELSE 0 END) AS Closed_Count_NewNoProlong,
+         SUM(CASE WHEN ProlongCount = 1 THEN 1 ELSE 0 END) AS Closed_Count_1yProlong,
+         SUM(CASE WHEN ProlongCount = 2 THEN 1 ELSE 0 END) AS Closed_Count_2yProlong,
+         SUM(CASE WHEN ProlongCount = 3 THEN 1 ELSE 0 END) AS Closed_Count_3yProlong,
+         SUM(CASE WHEN ProlongCount = 4 THEN 1 ELSE 0 END) AS Closed_Count_4yProlong,
+         SUM(CASE WHEN ProlongCount >= 5 THEN 1 ELSE 0 END) AS Closed_Count_5plusProlong,
+
+         SUM(CASE WHEN ProlongCount > 0 THEN BALANCE_RUB ELSE 0 END) AS Closed_Sum_ProlongRub,
+         SUM(CASE WHEN ProlongCount = 0 THEN BALANCE_RUB ELSE 0 END) AS Closed_Sum_NewNoProlong,
+         SUM(CASE WHEN ProlongCount = 1 THEN BALANCE_RUB ELSE 0 END) AS Closed_Sum_1yProlong_Rub,
+         SUM(CASE WHEN ProlongCount = 2 THEN BALANCE_RUB ELSE 0 END) AS Closed_Sum_2yProlong_Rub,
+         SUM(CASE WHEN ProlongCount = 3 THEN BALANCE_RUB ELSE 0 END) AS Closed_Sum_3yProlong_Rub,
+         SUM(CASE WHEN ProlongCount = 4 THEN BALANCE_RUB ELSE 0 END) AS Closed_Sum_4yProlong_Rub,
+         SUM(CASE WHEN ProlongCount >= 5 THEN BALANCE_RUB ELSE 0 END) AS Closed_Sum_5plusProlong_Rub,
+
+		 -- ПРОЦЕНТЫ
+		 SUM(CASE WHEN ProlongCount > 0 THEN Int_Balance_RUB ELSE 0 END) AS Closed_Sum_ProlongRub_int,
+         SUM(CASE WHEN ProlongCount = 0 THEN Int_Balance_RUB ELSE 0 END) AS Closed_Sum_NewNoProlong_int,
+         SUM(CASE WHEN ProlongCount = 1 THEN Int_Balance_RUB ELSE 0 END) AS Closed_Sum_1yProlong_Rub_int,
+         SUM(CASE WHEN ProlongCount = 2 THEN Int_Balance_RUB ELSE 0 END) AS Closed_Sum_2yProlong_Rub_int,
+         SUM(CASE WHEN ProlongCount = 3 THEN Int_Balance_RUB ELSE 0 END) AS Closed_Sum_3yProlong_Rub_int,
+         SUM(CASE WHEN ProlongCount = 4 THEN Int_Balance_RUB ELSE 0 END) AS Closed_Sum_4yProlong_Rub_int,
+         SUM(CASE WHEN ProlongCount >= 5 THEN Int_Balance_RUB ELSE 0 END) AS Closed_Sum_5plusProlong_Rub_int,
+
+         -- Взвешенная сумма
+         SUM(BALANCE_RUB * ConvertedRate) AS Closed_Sum_RateWeighted,
+		 sum(CASE WHEN ProlongCount > 0 THEN BALANCE_RUB * ConvertedRate ELSE 0 END) AS Closed_Sum_RateWeighted_allProlong,
+         SUM(CASE WHEN ProlongCount = 0 THEN BALANCE_RUB * ConvertedRate ELSE 0 END) AS Closed_Sum_RateWeighted_NewNoProlong,
+         SUM(CASE WHEN ProlongCount = 1 THEN BALANCE_RUB * ConvertedRate ELSE 0 END) AS Closed_Sum_RateWeighted_1y,
+         SUM(CASE WHEN ProlongCount = 2 THEN BALANCE_RUB * ConvertedRate ELSE 0 END) AS Closed_Sum_RateWeighted_2y,
+         SUM(CASE WHEN ProlongCount = 3 THEN BALANCE_RUB * ConvertedRate ELSE 0 END) AS Closed_Sum_RateWeighted_3y,
+         SUM(CASE WHEN ProlongCount = 4 THEN BALANCE_RUB * ConvertedRate ELSE 0 END) AS Closed_Sum_RateWeighted_4y,
+         SUM(CASE WHEN ProlongCount >= 5 THEN BALANCE_RUB * ConvertedRate ELSE 0 END) AS Closed_Sum_RateWeighted_5plus
+
+    FROM ClosedDealsWithProlong
+    GROUP BY CUBE (
+         MonthEnd,
+         CASE
+           WHEN SEG_NAME = 'Розничный бизнес' THEN N'Розница'
+           WHEN SEG_NAME = 'ДЧБО' THEN N'ЧБО'
+           ELSE N'Без сегментации'
+         END,
+         CUR,
+		 PROD_NAME,
+         TermBucket,
+		 BalanceBucket,
+		 IS_OPTION
+    )
+),
+-------------------------------------------
+-- B5) Агрегация по закрытым (ClosedAggregated)
+--     с учетом ProlongCount (0..5)
+-------------------------------------------
+ClosedAggregated AS (
+    SELECT
+         ISNULL(MonthEnd, '9999-12-31') AS MonthEnd,
+		 ISNULL(SegmentGrouping, N'Все сегменты') AS SegmentGrouping,
+		 ISNULL(PROD_NAME, N'Все продукты')		 AS PROD_NAME,
+		 ISNULL(CurrencyGrouping, N'Все валюты')  AS CurrencyGrouping,
+		 ISNULL(TermBucketGrouping, N'Все бакеты')AS TermBucketGrouping,
+		 ISNULL(BalanceBucketGrouping, N'Все бакеты')AS BalanceBucketGrouping,
+		 ISNULL(IS_OPTION,N'Все признаки опциональности') as IS_OPTION,
+         ClosedDeals,
+         Summ_ClosedBalanceRub,
+		 Summ_ClosedBalanceRub_int,
+         -- Аналогично: считаем количество сделок, суммы в разрезе
+         Closed_Count_Prolong,
+         Closed_Count_NewNoProlong,
+         Closed_Count_1yProlong,
+         Closed_Count_2yProlong,
+         Closed_Count_3yProlong,
+         Closed_Count_4yProlong,
+         Closed_Count_5plusProlong,
+
+         Closed_Sum_ProlongRub,
+         Closed_Sum_NewNoProlong,
+         Closed_Sum_1yProlong_Rub,
+         Closed_Sum_2yProlong_Rub,
+         Closed_Sum_3yProlong_Rub,
+         Closed_Sum_4yProlong_Rub,
+         Closed_Sum_5plusProlong_Rub,
+
+		 Closed_Sum_ProlongRub_int,
+         Closed_Sum_NewNoProlong_int,
+         Closed_Sum_1yProlong_Rub_int,
+         Closed_Sum_2yProlong_Rub_int,
+         Closed_Sum_3yProlong_Rub_int,
+         Closed_Sum_4yProlong_Rub_int,
+         Closed_Sum_5plusProlong_Rub_int,
+
+
+         -- Взвешенная сумма
+         Closed_Sum_RateWeighted,
+		 Closed_Sum_RateWeighted_allProlong,
+         Closed_Sum_RateWeighted_NewNoProlong,
+         Closed_Sum_RateWeighted_1y,
+         Closed_Sum_RateWeighted_2y,
+         Closed_Sum_RateWeighted_3y,
+         Closed_Sum_RateWeighted_4y,
+         Closed_Sum_RateWeighted_5plus
+
+    FROM ClosedAggregated_0
+),
+
+-------------------------------------------
+-- B6) Средневзвешенные ставки (ClosedWeightedRates)
+--     по уровню пролонгации (0..5)
+-------------------------------------------
+ClosedWeightedRates AS (
+    SELECT
+         MonthEnd,
+         SegmentGrouping,
+		 PROD_NAME,
+         CurrencyGrouping,
+         TermBucketGrouping,
+		 BalanceBucketGrouping,
+		 IS_OPTION,
+
+         -- Общая
+         CASE WHEN SUM(Summ_ClosedBalanceRub) > 0
+              THEN SUM(Closed_Sum_RateWeighted) / SUM(Summ_ClosedBalanceRub)
+              ELSE 0 END AS Closed_WeightedRate_All,
+
+         -- Только новые без пролонгации
+         CASE WHEN SUM(Closed_Sum_NewNoProlong) > 0
+              THEN SUM(Closed_Sum_RateWeighted_NewNoProlong) / SUM(Closed_Sum_NewNoProlong)
+              ELSE 0 END AS Closed_WeightedRate_NewNoProlong,
+
+         -- Детальные 1..5+
+         CASE WHEN SUM(Closed_Sum_1yProlong_Rub) > 0
+              THEN SUM(Closed_Sum_RateWeighted_1y) / SUM(Closed_Sum_1yProlong_Rub)
+              ELSE 0 END AS Closed_WeightedRate_1y,
+
+         CASE WHEN SUM(Closed_Sum_2yProlong_Rub) > 0
+              THEN SUM(Closed_Sum_RateWeighted_2y) / SUM(Closed_Sum_2yProlong_Rub)
+              ELSE 0 END AS Closed_WeightedRate_2y,
+
+         CASE WHEN SUM(Closed_Sum_3yProlong_Rub) > 0
+              THEN SUM(Closed_Sum_RateWeighted_3y) / SUM(Closed_Sum_3yProlong_Rub)
+              ELSE 0 END AS Closed_WeightedRate_3y,
+
+         CASE WHEN SUM(Closed_Sum_4yProlong_Rub) > 0
+              THEN SUM(Closed_Sum_RateWeighted_4y) / SUM(Closed_Sum_4yProlong_Rub)
+              ELSE 0 END AS Closed_WeightedRate_4y,
+
+         CASE WHEN SUM(Closed_Sum_5plusProlong_Rub) > 0
+              THEN SUM(Closed_Sum_RateWeighted_5plus) / SUM(Closed_Sum_5plusProlong_Rub)
+              ELSE 0 END AS Closed_WeightedRate_5plus,
+
+         -- Все пролонгированные
+         CASE WHEN SUM(Closed_Sum_ProlongRub) > 0
+              THEN SUM(Closed_Sum_RateWeighted_allProlong) / SUM(Closed_Sum_ProlongRub)
+              ELSE 0 END AS Closed_WeightedRate_AllProlong
+    FROM ClosedAggregated
+    GROUP BY 
+         MonthEnd,
+         SegmentGrouping,
+		 PROD_NAME,
+         CurrencyGrouping,
+         TermBucketGrouping,
+		 BalanceBucketGrouping,
+		 is_OPTION
+),
+------------------------------------------
+-- Финальный Шаг: объединяем все CTE
+-- (OpenAggregated, OpenWeightedRates,
+--  ClosedAggregated, ClosedWeightedRates)
+-- через FULL OUTER JOIN, а затем
+-- делаем GROUP BY, чтобы "слить" дубли
+------------------------------------------
+FullJoin AS
+(
+    SELECT
+        --------------------------------
+        -- Ключи "Raw*" для дальнейшей группировки
+        --------------------------------
+        COALESCE(o.MonthEnd, ow.MonthEnd, c.MonthEnd, cw.MonthEnd) AS RawMonthEnd,
+        COALESCE(o.SegmentGrouping, ow.SegmentGrouping, c.SegmentGrouping, cw.SegmentGrouping) AS RawSegmentGrouping,
+		COALESCE(o.PROD_NAME,ow.PROD_NAME,c.PROD_NAME,cw.PROD_NAME) AS RawPROD_NAME,
+        COALESCE(o.CurrencyGrouping, ow.CurrencyGrouping, c.CurrencyGrouping, cw.CurrencyGrouping) AS RawCurrencyGrouping,
+        COALESCE(o.TermBucketGrouping, ow.TermBucketGrouping, c.TermBucketGrouping, cw.TermBucketGrouping) AS RawTermBucketGrouping,
+		COALESCE(o.BalanceBucketGrouping,ow.BalanceBucketGrouping,c.BalanceBucketGrouping,cw.BalanceBucketGrouping) AS RawBalanceBucketGrouping,
+		COALESCE(o.IS_OPTION, ow.IS_OPTION,c.IS_OPTION,cw.IS_OPTION) AS RawIS_OPTION,
+        --------------------------------
+        -- Поля по ОТКРЫТЫМ ВКЛАДАМ
+        --------------------------------
+        o.OpenedDeals,
+        o.Summ_BalanceRub,
+
+        o.Count_Prolong,
+        o.Count_NewNoProlong,
+        o.Count_1yProlong,
+        o.Count_2yProlong,
+        o.Count_3yProlong,
+        o.Count_4yProlong,
+        o.Count_5plusProlong,
+
+        o.Sum_ProlongRub,
+        o.Sum_NewNoProlong,
+        o.Sum_1yProlong_Rub,
+        o.Sum_2yProlong_Rub,
+        o.Sum_3yProlong_Rub,
+        o.Sum_4yProlong_Rub,
+        o.Sum_5plusProlong_Rub,
+
+        -- Доли открытых (считаем "на лету")
+        CASE WHEN ISNULL(o.Summ_BalanceRub, 0) > 0
+             THEN 1.0 * o.Sum_ProlongRub / o.Summ_BalanceRub
+             ELSE 0
+        END AS Dolya_ProlongRub,
+
+        CASE WHEN ISNULL(o.OpenedDeals, 0) > 0
+             THEN 1.0 * o.Count_Prolong / o.OpenedDeals
+             ELSE 0
+        END AS Dolya_ProlongSht,
+
+        CASE WHEN ISNULL(o.Summ_BalanceRub, 0) > 0
+             THEN 1.0 * o.Sum_1yProlong_Rub / o.Summ_BalanceRub
+             ELSE 0
+        END AS Dolya_1yProlongRub,
+
+        CASE WHEN ISNULL(o.Summ_BalanceRub, 0) > 0
+             THEN 1.0 * o.Sum_2yProlong_Rub / o.Summ_BalanceRub
+             ELSE 0
+        END AS Dolya_2yProlongRub,
+
+        CASE WHEN ISNULL(o.Summ_BalanceRub, 0) > 0
+             THEN 1.0 * o.Sum_3yProlong_Rub / o.Summ_BalanceRub
+             ELSE 0
+        END AS Dolya_3yProlongRub,
+
+        CASE WHEN ISNULL(o.Summ_BalanceRub, 0) > 0
+             THEN 1.0 * o.Sum_4yProlong_Rub / o.Summ_BalanceRub
+             ELSE 0
+        END AS Dolya_4yProlongRub,
+
+        CASE WHEN ISNULL(o.Summ_BalanceRub, 0) > 0
+             THEN 1.0 * o.Sum_5plusProlong_Rub / o.Summ_BalanceRub
+             ELSE 0
+        END AS Dolya_5plusProlongRub,
+
+        --------------------------------
+        -- Ставки (OpenWeightedRates)
+        --------------------------------
+        ow.WeightedRate_All,
+        ow.WeightedRate_NewNoProlong,
+        ow.WeightedRate_AllProlong,
+        ow.WeightedRate_Previous,
+
+        ow.WeightedRate_1y,
+        ow.WeightedRate_2y,
+        ow.WeightedRate_3y,
+        ow.WeightedRate_4y,
+        ow.WeightedRate_5plus,
+
+		ow.WeightedDiscount_All,
+		ow.WeightedDiscount_NewNoProlong,
+		ow.WeightedDiscount_AllProlong,
+		ow.WeightedDiscount_1y,
+		ow.WeightedDiscount_2y,
+		ow.WeightedDiscount_3y,
+		ow.WeightedDiscount_4y,
+		ow.WeightedDiscount_5plus,
+        --------------------------------
+        -- Поля по ЗАКРЫТЫМ ВКЛАДАМ
+        --------------------------------
+        c.ClosedDeals,
+        c.Summ_ClosedBalanceRub,
+		c.Summ_ClosedBalanceRub_int,
+
+        -- "Закрытая" детализация по пролонгациям
+        c.Closed_Count_Prolong,
+        c.Closed_Count_NewNoProlong,
+        c.Closed_Count_1yProlong,
+        c.Closed_Count_2yProlong,
+        c.Closed_Count_3yProlong,
+        c.Closed_Count_4yProlong,
+        c.Closed_Count_5plusProlong,
+
+        c.Closed_Sum_ProlongRub,
+        c.Closed_Sum_NewNoProlong,
+        c.Closed_Sum_1yProlong_Rub,
+        c.Closed_Sum_2yProlong_Rub,
+        c.Closed_Sum_3yProlong_Rub,
+        c.Closed_Sum_4yProlong_Rub,
+        c.Closed_Sum_5plusProlong_Rub,
+
+		c.Closed_Sum_ProlongRub_int,
+        c.Closed_Sum_NewNoProlong_int,
+        c.Closed_Sum_1yProlong_Rub_int,
+        c.Closed_Sum_2yProlong_Rub_int,
+        c.Closed_Sum_3yProlong_Rub_int,
+        c.Closed_Sum_4yProlong_Rub_int,
+        c.Closed_Sum_5plusProlong_Rub_int,
+
+        -- Доли закрытых (на лету)
+        CASE WHEN ISNULL(c.Summ_ClosedBalanceRub, 0) > 0
+             THEN 1.0 * c.Closed_Sum_ProlongRub / c.Summ_ClosedBalanceRub
+             ELSE 0
+        END AS Closed_Dolya_ProlongRub,
+
+        -- Добавляем доли по 1..5+ для закрытых:
+        CASE WHEN ISNULL(c.Summ_ClosedBalanceRub, 0) > 0
+             THEN 1.0 * c.Closed_Sum_1yProlong_Rub / c.Summ_ClosedBalanceRub
+             ELSE 0
+        END AS Closed_Dolya_1yProlongRub,
+
+        CASE WHEN ISNULL(c.Summ_ClosedBalanceRub, 0) > 0
+             THEN 1.0 * c.Closed_Sum_2yProlong_Rub / c.Summ_ClosedBalanceRub
+             ELSE 0
+        END AS Closed_Dolya_2yProlongRub,
+
+        CASE WHEN ISNULL(c.Summ_ClosedBalanceRub, 0) > 0
+             THEN 1.0 * c.Closed_Sum_3yProlong_Rub / c.Summ_ClosedBalanceRub
+             ELSE 0
+        END AS Closed_Dolya_3yProlongRub,
+
+        CASE WHEN ISNULL(c.Summ_ClosedBalanceRub, 0) > 0
+             THEN 1.0 * c.Closed_Sum_4yProlong_Rub / c.Summ_ClosedBalanceRub
+             ELSE 0
+        END AS Closed_Dolya_4yProlongRub,
+
+        CASE WHEN ISNULL(c.Summ_ClosedBalanceRub, 0) > 0
+             THEN 1.0 * c.Closed_Sum_5plusProlong_Rub / c.Summ_ClosedBalanceRub
+             ELSE 0
+        END AS Closed_Dolya_5plusProlongRub,
+
+        --------------------------------
+        -- Взвешенная ставка закрытых "в целом"
+        --------------------------------
+        CASE WHEN ISNULL(c.Summ_ClosedBalanceRub, 0) > 0
+             THEN 1.0 * c.Closed_Sum_RateWeighted / c.Summ_ClosedBalanceRub
+             ELSE 0
+        END AS WeightedRate_Closed_Overall,
+
+        --------------------------------
+        -- Ставки (ClosedWeightedRates)
+        --------------------------------
+        cw.Closed_WeightedRate_All,
+        cw.Closed_WeightedRate_NewNoProlong,
+        cw.Closed_WeightedRate_1y,
+        cw.Closed_WeightedRate_2y,
+        cw.Closed_WeightedRate_3y,
+        cw.Closed_WeightedRate_4y,
+        cw.Closed_WeightedRate_5plus,
+        cw.Closed_WeightedRate_AllProlong,
+
+        --------------------------------
+        -- Доля выходов
+        --------------------------------
+        CASE WHEN ISNULL(o.Summ_BalanceRub, 0) > 0
+             THEN 1.0 * c.Summ_ClosedBalanceRub / o.Summ_BalanceRub
+             ELSE 0
+        END AS Dolya_VyhodovRub
+
+    FROM OpenAggregated o
+    FULL OUTER JOIN OpenWeightedRates ow
+        ON  o.MonthEnd           = ow.MonthEnd
+       AND o.SegmentGrouping     = ow.SegmentGrouping
+	   AND o.PROD_NAME			 = ow.PROD_NAME
+       AND o.CurrencyGrouping    = ow.CurrencyGrouping
+       AND o.TermBucketGrouping  = ow.TermBucketGrouping
+	   AND o.BalanceBucketGrouping = ow.BalanceBucketGrouping
+	   AND o.IS_OPTION =ow.IS_OPTION
+
+    FULL OUTER JOIN ClosedAggregated c
+        ON  COALESCE(o.MonthEnd, ow.MonthEnd)          = c.MonthEnd
+       AND COALESCE(o.SegmentGrouping, ow.SegmentGrouping) = c.SegmentGrouping
+	   AND COALESCE(o.PROD_NAME, ow.PROD_NAME) = c.PROD_NAME
+       AND COALESCE(o.CurrencyGrouping, ow.CurrencyGrouping) = c.CurrencyGrouping
+       AND COALESCE(o.TermBucketGrouping, ow.TermBucketGrouping) = c.TermBucketGrouping
+	   AND COALESCE(o.BalanceBucketGrouping,ow.BalanceBucketGrouping) = c.BalanceBucketGrouping
+	   AND COALESCE(o.IS_OPTION,ow.IS_OPTION)=c.IS_OPTION
+    FULL OUTER JOIN ClosedWeightedRates cw
+        ON  c.MonthEnd           = cw.MonthEnd
+       AND c.SegmentGrouping     = cw.SegmentGrouping
+	   AND c.PROD_NAME			 = cw.PROD_NAME
+       AND c.CurrencyGrouping    = cw.CurrencyGrouping
+       AND c.TermBucketGrouping  = cw.TermBucketGrouping
+	   AND c.BalanceBucketGrouping = cw.BalanceBucketGrouping
+	   AND c.IS_OPTION = cw.IS_OPTION
+)
+INSERT INTO [ALM_TEST].[WORK].[prolongationAnalysisResult_ISOPTION] (
+    [MonthEnd],
+    [SegmentGrouping],
+    [PROD_NAME],
+    [CurrencyGrouping],
+    [TermBucketGrouping],
+    [BalanceBucketGrouping],
+    [IS_OPTION],
+
+    -- Opened
+    [OpenedDeals],
+    [Opened_Summ_BalanceRub],
+    [Opened_Count_Prolong],
+    [Opened_Count_NewNoProlong],
+    [Opened_Count_1yProlong],
+    [Opened_Count_2yProlong],
+    [Opened_Count_3yProlong],
+    [Opened_Count_4yProlong],
+    [Opened_Count_5plusProlong],
+    [Opened_Sum_ProlongRub],
+    [Opened_Sum_NewNoProlong],
+    [Opened_Sum_1yProlong_Rub],
+    [Opened_Sum_2yProlong_Rub],
+    [Opened_Sum_3yProlong_Rub],
+    [Opened_Sum_4yProlong_Rub],
+    [Opened_Sum_5plusProlong_Rub],
+
+    [Opened_Dolya_ProlongRub],
+    [Opened_Dolya_ProlongSht],
+    [Opened_Dolya_1yProlongRub],
+    [Opened_Dolya_2yProlongRub],
+    [Opened_Dolya_3yProlongRub],
+    [Opened_Dolya_4yProlongRub],
+    [Opened_Dolya_5plusProlongRub],
+
+    [Opened_WeightedRate_All],
+    [Opened_WeightedRate_NewNoProlong],
+    [Opened_WeightedRate_AllProlong],
+    [Opened_WeightedRate_Previous],
+    [Opened_WeightedRate_1y],
+    [Opened_WeightedRate_2y],
+    [Opened_WeightedRate_3y],
+    [Opened_WeightedRate_4y],
+    [Opened_WeightedRate_5plus],
+
+    [Opened_WeightedDiscount_All],
+    [Opened_WeightedDiscount_NewNoProlong],
+    [Opened_WeightedDiscount_AllProlong],
+    [Opened_WeightedDiscount_1y],
+    [Opened_WeightedDiscount_2y],
+    [Opened_WeightedDiscount_3y],
+    [Opened_WeightedDiscount_4y],
+    [Opened_WeightedDiscount_5plus],
+
+    -- Closed
+    [ClosedDeals],
+    [Summ_ClosedBalanceRub],
+    [Summ_ClosedBalanceRub_int],
+
+    [Closed_Count_Prolong],
+    [Closed_Count_NewNoProlong],
+    [Closed_Count_1yProlong],
+    [Closed_Count_2yProlong],
+    [Closed_Count_3yProlong],
+    [Closed_Count_4yProlong],
+    [Closed_Count_5plusProlong],
+
+    [Closed_Sum_ProlongRub],
+    [Closed_Sum_NewNoProlong],
+    [Closed_Sum_1yProlong_Rub],
+    [Closed_Sum_2yProlong_Rub],
+    [Closed_Sum_3yProlong_Rub],
+    [Closed_Sum_4yProlong_Rub],
+    [Closed_Sum_5plusProlong_Rub],
+
+    [Closed_Sum_ProlongRub_int],
+    [Closed_Sum_NewNoProlong_int],
+    [Closed_Sum_1yProlong_Rub_int],
+    [Closed_Sum_2yProlong_Rub_int],
+    [Closed_Sum_3yProlong_Rub_int],
+    [Closed_Sum_4yProlong_Rub_int],
+    [Closed_Sum_5plusProlong_Rub_int],
+
+    [Closed_Dolya_ProlongRub],
+    [Closed_Dolya_1yProlongRub],
+    [Closed_Dolya_2yProlongRub],
+    [Closed_Dolya_3yProlongRub],
+    [Closed_Dolya_4yProlongRub],
+    [Closed_Dolya_5plusProlongRub],
+
+    [WeightedRate_Closed_Overall],
+    [Closed_WeightedRate_All],
+    [Closed_WeightedRate_NewNoProlong],
+    [Closed_WeightedRate_1y],
+    [Closed_WeightedRate_2y],
+    [Closed_WeightedRate_3y],
+    [Closed_WeightedRate_4y],
+    [Closed_WeightedRate_5plus],
+    [Closed_WeightedRate_AllProlong],
+
+    [Dolya_VyhodovRub]
+)
+SELECT
+    RawMonthEnd,
+    RawSegmentGrouping,
+    RawPROD_NAME,
+    RawCurrencyGrouping,
+    RawTermBucketGrouping,
+    RawBalanceBucketGrouping,
+    RawIS_OPTION,
+
+    -- Opened
+    OpenedDeals,
+    Summ_BalanceRub,
+    Count_Prolong,
+    Count_NewNoProlong,
+    Count_1yProlong,
+    Count_2yProlong,
+    Count_3yProlong,
+    Count_4yProlong,
+    Count_5plusProlong,
+    Sum_ProlongRub,
+    Sum_NewNoProlong,
+    Sum_1yProlong_Rub,
+    Sum_2yProlong_Rub,
+    Sum_3yProlong_Rub,
+    Sum_4yProlong_Rub,
+    Sum_5plusProlong_Rub,
+
+    Dolya_ProlongRub,
+    Dolya_ProlongSht,
+    Dolya_1yProlongRub,
+    Dolya_2yProlongRub,
+    Dolya_3yProlongRub,
+    Dolya_4yProlongRub,
+    Dolya_5plusProlongRub,
+
+    WeightedRate_All,
+    WeightedRate_NewNoProlong,
+    WeightedRate_AllProlong,
+    WeightedRate_Previous,
+    WeightedRate_1y,
+    WeightedRate_2y,
+    WeightedRate_3y,
+    WeightedRate_4y,
+    WeightedRate_5plus,
+
+    WeightedDiscount_All,
+    WeightedDiscount_NewNoProlong,
+    WeightedDiscount_AllProlong,
+    WeightedDiscount_1y,
+    WeightedDiscount_2y,
+    WeightedDiscount_3y,
+    WeightedDiscount_4y,
+    WeightedDiscount_5plus,
+
+    -- Closed
+    ClosedDeals,
+    Summ_ClosedBalanceRub,
+    Summ_ClosedBalanceRub_int,
+
+    Closed_Count_Prolong,
+    Closed_Count_NewNoProlong,
+    Closed_Count_1yProlong,
+    Closed_Count_2yProlong,
+    Closed_Count_3yProlong,
+    Closed_Count_4yProlong,
+    Closed_Count_5plusProlong,
+
+    Closed_Sum_ProlongRub,
+    Closed_Sum_NewNoProlong,
+    Closed_Sum_1yProlong_Rub,
+    Closed_Sum_2yProlong_Rub,
+    Closed_Sum_3yProlong_Rub,
+    Closed_Sum_4yProlong_Rub,
+    Closed_Sum_5plusProlong_Rub,
+
+    Closed_Sum_ProlongRub_int,
+    Closed_Sum_NewNoProlong_int,
+    Closed_Sum_1yProlong_Rub_int,
+    Closed_Sum_2yProlong_Rub_int,
+    Closed_Sum_3yProlong_Rub_int,
+    Closed_Sum_4yProlong_Rub_int,
+    Closed_Sum_5plusProlong_Rub_int,
+
+    Closed_Dolya_ProlongRub,
+    Closed_Dolya_1yProlongRub,
+    Closed_Dolya_2yProlongRub,
+    Closed_Dolya_3yProlongRub,
+    Closed_Dolya_4yProlongRub,
+    Closed_Dolya_5plusProlongRub,
+
+    WeightedRate_Closed_Overall,
+    Closed_WeightedRate_All,
+    Closed_WeightedRate_NewNoProlong,
+    Closed_WeightedRate_1y,
+    Closed_WeightedRate_2y,
+    Closed_WeightedRate_3y,
+    Closed_WeightedRate_4y,
+    Closed_WeightedRate_5plus,
+    Closed_WeightedRate_AllProlong,
+
+    Dolya_VyhodovRub
+FROM FullJoin;
+
+Msg 8134, Level 16, State 1, Line 8
+Обнаружена ошибка: деление на ноль.
+Выполнение данной инструкции было прервано.
+Внимание! Значение NULL исключено в агрегатных или других операциях SET.
+
+Completion time: 2025-08-21T08:31:56.7178927+03:00
