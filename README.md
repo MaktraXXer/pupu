@@ -1,3 +1,9 @@
+поймал — это из-за того, что в df_subset не оказалось колонки y. Такое бывает, если:
+	•	вы передали в plot_metric_binned не результат select_metric, а «сырой» датафрейм, или
+	•	в Excel есть лишние пробелы/невидимые символы в именах столбцов.
+
+Я сделал функцию устойчивой: нормализую имена колонок и, если y (и др.) не найдены, восстанавливаю их прямо в plot_metric_binned из исходных полей. Ниже — замените у себя обе функции этими версиями (интерфейс и вызовы остаются те же).
+
 import numpy as np, pandas as pd, matplotlib.pyplot as plt
 from numpy.polynomial.polynomial import polyfit, polyval
 from pathlib import Path
@@ -23,13 +29,12 @@ def select_metric(excel_file : str | pd.DataFrame,
             base_rate  — базовая ставка (в долях), восстановлена как rate_prolong - disc_abs
         cfg       – dict c полями: {metric, disc, ratecol, weight, title}
         base_dir  – Path('results/<metric_key>')
-    Примечание:
-        Базовая ставка восстанавливается ТОЛЬКО как:
-            base_rate = rate_prolong - discount_abs   (discount_abs ≤ 0)
-        Никакие «previous» поля НЕ используются.
     """
-    # ---------- чтение ---------------------------------------------------
+    # ---------- чтение + нормализация имён колонок -----------------------
     df = pd.read_excel(excel_file) if isinstance(excel_file, str) else excel_file.copy()
+    df.columns = (df.columns.astype(str)
+                  .str.replace(r'\s+', ' ', regex=True)
+                  .str.strip())
 
     # ---------- расчёт сумм с % (как раньше) -----------------------------
     for l, r, new in [
@@ -38,13 +43,18 @@ def select_metric(excel_file : str | pd.DataFrame,
         ('Closed_Sum_1yProlong_Rub','Closed_Sum_1yProlong_Rub_int','Closed_Sum_1yProlong_with_pct'),
         ('Closed_Sum_2yProlong_Rub','Closed_Sum_2yProlong_Rub_int','Closed_Sum_2yProlong_with_pct'),
     ]:
-        df[new] = df[l].fillna(0) + df[r].fillna(0)
+        if l in df.columns and r in df.columns:
+            df[new] = df[l].fillna(0) + df[r].fillna(0)
 
     safe_div = lambda n,d: np.where(d==0, np.nan, n/d)
-    df['Общая пролонгация']   = safe_div(df['Opened_Sum_ProlongRub'],     df['Closed_Total_with_pct'])
-    df['1-я автопролонгация'] = safe_div(df['Opened_Sum_1yProlong_Rub'],  df['Closed_Sum_NewNoProlong_with_pct'])
-    df['2-я автопролонгация'] = safe_div(df['Opened_Sum_2yProlong_Rub'],  df['Closed_Sum_1yProlong_with_pct'])
-    df['3-я автопролонгация'] = safe_div(df['Opened_Sum_3yProlong_Rub'],  df['Closed_Sum_2yProlong_with_pct'])
+    if {'Opened_Sum_ProlongRub','Closed_Total_with_pct'}.issubset(df.columns):
+        df['Общая пролонгация']   = safe_div(df['Opened_Sum_ProlongRub'],     df['Closed_Total_with_pct'])
+    if {'Opened_Sum_1yProlong_Rub','Closed_Sum_NewNoProlong_with_pct'}.issubset(df.columns):
+        df['1-я автопролонгация'] = safe_div(df['Opened_Sum_1yProlong_Rub'],  df['Closed_Sum_NewNoProlong_with_pct'])
+    if {'Opened_Sum_2yProlong_Rub','Closed_Sum_1yProlong_with_pct'}.issubset(df.columns):
+        df['2-я автопролонгация'] = safe_div(df['Opened_Sum_2yProlong_Rub'],  df['Closed_Sum_1yProlong_with_pct'])
+    if {'Opened_Sum_3yProlong_Rub','Closed_Sum_2yProlong_with_pct'}.issubset(df.columns):
+        df['3-я автопролонгация'] = safe_div(df['Opened_Sum_3yProlong_Rub'],  df['Closed_Sum_2yProlong_with_pct'])
 
     # ---------- конфигурация по ключу ------------------------------------
     cfg_map = {
@@ -72,46 +82,44 @@ def select_metric(excel_file : str | pd.DataFrame,
     cfg = cfg_map[metric_key]
 
     # ---------- фильтры ---------------------------------------------------
-    m  = (df['TermBucketGrouping']    != 'Все бакеты') \
-       & (df['PROD_NAME']             != 'Все продукты') \
-       & (df['IS_OPTION']             == '0') \
-       & (df['BalanceBucketGrouping'] != 'Все бакеты') \
+    def col_ok(c): return c in df.columns
+    required = [cfg['metric'], cfg['disc'], cfg['ratecol'], cfg['weight']]
+    missing  = [c for c in required if not col_ok(c)]
+    if missing:
+        raise KeyError(f"В Excel нет нужных колонок: {missing}")
+
+    m  = (df.get('TermBucketGrouping','Все бакеты')    != 'Все бакеты') \
+       & (df.get('PROD_NAME','Все продукты')           != 'Все продукты') \
+       & (df.get('IS_OPTION','0').astype(str)          == '0') \
+       & (df.get('BalanceBucketGrouping','Все бакеты') != 'Все бакеты') \
        & df[cfg['metric']].notna() \
        & df[cfg['disc']].notna() \
        & df[cfg['ratecol']].notna() \
        & (df[cfg['metric']] <= 1) \
        & (df[cfg['weight']]  > 0)
 
-    if products: m &= df['PROD_NAME'].isin(products)
-    if segments: m &= df['SegmentGrouping'].isin(segments)
+    if products and 'PROD_NAME' in df.columns:
+        m &= df['PROD_NAME'].isin(products)
+    if segments and 'SegmentGrouping' in df.columns:
+        m &= df['SegmentGrouping'].isin(segments)
 
     d = df.loc[m].copy()
 
     # --- поля модели: дисконт, базовая ставка, относит. дисконт ----------
-    d['disc_abs']  = d[cfg['disc']].astype(float)                # ожидаем ≤ 0
-    d.loc[d['disc_abs'] > 0, 'disc_abs'] = 0.0                   # на всякий случай
+    d['disc_abs']     = d[cfg['disc']].astype(float)                # ожидаем ≤ 0
+    d.loc[d['disc_abs'] > 0, 'disc_abs'] = 0.0
     d['rate_prolong'] = d[cfg['ratecol']].astype(float)
-
-    # базовая ставка: rate_prolong - disc_abs (disc_abs ≤ 0 ⇒ базовая ≥ пролонг.)
-    d['base_rate'] = d['rate_prolong'] - d['disc_abs']
+    d['base_rate']    = d['rate_prolong'] - d['disc_abs']
     d.loc[(~np.isfinite(d['base_rate'])) | (d['base_rate'] <= 0), 'base_rate'] = np.nan
+    d['x_rel']        = (-d['disc_abs']) / d['base_rate']           # доли
+    d['x_rel_pct']    = d['x_rel'] * 100.0
+    d['y']            = d[cfg['metric']].astype(float) * 100.0      # %
+    d['w']            = d[cfg['weight']].astype(float)
 
-    # относит. дисконт (в долях) и в процентах для оси X
-    d['x_rel']     = (-d['disc_abs']) / d['base_rate']           # ≥0
-    d['x_rel_pct'] = d['x_rel'] * 100.0
-
-    # метрика Y и вес W
-    d['y'] = d[cfg['metric']].astype(float) * 100.0              # в %
-    d['w'] = d[cfg['weight']].astype(float)
-
-    # чистим
     d = d[np.isfinite(d['x_rel_pct']) & np.isfinite(d['y']) & np.isfinite(d['w']) & (d['w'] > 0)]
 
-    # колонки, которые пригодятся для разрезов:
-    keep_cols = [
-        'MonthEnd','SegmentGrouping','PROD_NAME','CurrencyGrouping','TermBucketGrouping','BalanceBucketGrouping'
-    ]
-    for col in keep_cols:
+    # полезные колонки для разрезов
+    for col in ['MonthEnd','SegmentGrouping','PROD_NAME','CurrencyGrouping','TermBucketGrouping','BalanceBucketGrouping']:
         if col not in d.columns:
             d[col] = None
 
@@ -119,65 +127,89 @@ def select_metric(excel_file : str | pd.DataFrame,
     return d, cfg, base_dir
 
 
-# ────────── 2) BIN + PLOT — новая логика бинов и графиков ───────────────
+# ────────── 2) BIN + PLOT — с автодополнением недостающих колонок ───────
 def plot_metric_binned(df_subset: pd.DataFrame,
                        cfg: dict,
                        base_dir: Path,
                        split_col: str | None = None,
-                       bin_size_pct: float = 0.1,           # шаг бина на X: 0.1% по умолчанию
-                       min_bin_volume: float = 0.0,          # отсечь бины с объёмом ниже порога
-                       connect_curve: bool = True):          # соединять точки бинов линией
+                       bin_size_pct: float = 0.1,
+                       min_bin_volume: float = 0.0,
+                       connect_curve: bool = True):
     """
-    Для каждой категории (или целиком):
-      • Строит бины по X = относит. дисконт в процентах (1 = 1%).
-      • По каждому бину считает:
-          - sum объёма (₽)  → для гистограммы на правой оси
-          - средневзвешенный y (по w) → точка бина
-      • «Кривая» — просто ломаная по точкам бинов (optionally).
+    Если 'y'/'x_rel_pct'/'w' нет в df_subset (передали «сырой» df) —
+    пытаемся восстановить из cfg['metric']/['disc']/['ratecol']/['weight'].
+    """
+    def normalize_cols(df):
+        df = df.copy()
+        df.columns = (df.columns.astype(str)
+                      .str.replace(r'\s+', ' ', regex=True)
+                      .str.strip())
+        return df
 
-    На диск сохранит PNG и XLSX с агрегированными по бинам данными.
-    """
+    def ensure_needed_cols(df, cfg):
+        d = normalize_cols(df)
+        # y
+        if 'y' not in d.columns:
+            if cfg['metric'] in d.columns:
+                d['y'] = d[cfg['metric']].astype(float) * 100.0
+            else:
+                raise KeyError(f"Нет 'y' и нет колонки метрики {cfg['metric']}")
+        # w
+        if 'w' not in d.columns:
+            if cfg['weight'] in d.columns:
+                d['w'] = d[cfg['weight']].astype(float)
+            else:
+                raise KeyError(f"Нет 'w' и нет колонки веса {cfg['weight']}")
+        # x_rel_pct
+        if 'x_rel_pct' not in d.columns:
+            need = [cfg['disc'], cfg['ratecol']]
+            if all(c in d.columns for c in need):
+                d['disc_abs']     = d[cfg['disc']].astype(float)
+                d.loc[d['disc_abs'] > 0, 'disc_abs'] = 0.0
+                d['rate_prolong'] = d[cfg['ratecol']].astype(float)
+                d['base_rate']    = d['rate_prolong'] - d['disc_abs']
+                d.loc[(~np.isfinite(d['base_rate'])) | (d['base_rate'] <= 0), 'base_rate'] = np.nan
+                d['x_rel_pct']    = 100.0 * (-d['disc_abs']) / d['base_rate']
+            else:
+                raise KeyError(f"Нет 'x_rel_pct' и нет полей для расчёта: {need}")
+        # очистка
+        d = d[np.isfinite(d['x_rel_pct']) & np.isfinite(d['y']) & np.isfinite(d['w']) & (d['w'] > 0)]
+        return d
+
     def safe_name(s: str) -> str:
         return ''.join(ch for ch in s if ch.isalnum() or ch in ' _-')[:80]
 
     def make_bins(x_pct: np.ndarray, step: float):
-        if len(x_pct) == 0:
-            return np.array([0, step])
+        if len(x_pct) == 0: return np.array([0, step])
         xmin = np.nanmin(x_pct); xmax = np.nanmax(x_pct)
-        if not np.isfinite(xmin) or not np.isfinite(xmax):
-            return np.array([0, step])
+        if not np.isfinite(xmin) or not np.isfinite(xmax): return np.array([0, step])
         lo = np.floor(xmin / step) * step
         hi = np.ceil (xmax / step) * step
-        # гарантированно включим правую границу
         edges = np.arange(lo, hi + step*1.0001, step)
-        # защита от вырожденности
-        if len(edges) < 2:
-            edges = np.array([lo, lo + step])
+        if len(edges) < 2: edges = np.array([lo, lo + step])
         return edges
 
-    # группировка
+    df_subset = ensure_needed_cols(df_subset, cfg)
+
     groups = df_subset.groupby(split_col) if split_col else [(None, df_subset)]
     subdir  = base_dir / (split_col or 'global_binned')
     subdir.mkdir(parents=True, exist_ok=True)
 
     for gname, gdf in groups:
-        if len(gdf) < 5 or gdf['w'].sum() == 0:
+        if len(gdf) < 1 or gdf['w'].sum() == 0:
             continue
 
         x_pct = gdf['x_rel_pct'].to_numpy()
         y     = gdf['y'].to_numpy()
         w     = gdf['w'].to_numpy()
 
-        # --- бины
         edges = make_bins(x_pct, bin_size_pct)
-        idx   = np.digitize(x_pct, bins=edges, right=False) - 1  # bin index
-        # оставим только точки, попавшие в валидные интервалы
+        idx   = np.digitize(x_pct, bins=edges, right=False) - 1
         m = (idx >= 0) & (idx < len(edges)-1)
         x_pct, y, w, idx = x_pct[m], y[m], w[m], idx[m]
         if len(x_pct) == 0:
             continue
 
-        # агрегаты по бинам
         df_bins = (pd.DataFrame({'bin': idx, 'x': x_pct, 'y': y, 'w': w})
                    .groupby('bin')
                    .apply(lambda d: pd.Series({
@@ -190,35 +222,29 @@ def plot_metric_binned(df_subset: pd.DataFrame,
                    }))
                    .reset_index(drop=True))
 
-        # порог по объёму, если задан
         if min_bin_volume > 0:
             df_bins = df_bins[df_bins['vol'] >= min_bin_volume]
-
         if df_bins.empty:
             continue
 
-        # --- Рисуем
         fig, ax1 = plt.subplots(figsize=(9, 6))
-
-        # гистограмма объёмов (правый Y)
         ax2 = ax1.twinx()
         widths = df_bins['bin_right'] - df_bins['bin_left']
         ax2.bar(df_bins['bin_left'], df_bins['vol'],
                 width=widths, align='edge', alpha=0.35, edgecolor='none', label='Объём (₽)')
         ax2.set_ylabel('Объём (₽)')
 
-        # точки и (опц.) ломаная по средневзвешенным y
-        ax1.scatter(df_bins['bin_center'], df_bins['y'],
-                    s=30, alpha=0.9, label='Наблюдения (сквозь бины)', zorder=3, facecolors='none', edgecolors='k')
-        ax1.scatter(df_bins['bin_center'], df_bins['y_wavg'],
-                    s=45, alpha=0.9, label='Средневзвешенно по бину', zorder=4)
+        ax1.scatter(df_bins['bin_center'], df_bins['y'], s=30, alpha=0.9,
+                    label='Точки бина (невзвеш.)', zorder=3, facecolors='none', edgecolors='k')
+        ax1.scatter(df_bins['bin_center'], df_bins['y_wavg'], s=45, alpha=0.95,
+                    label='Средневзвешенно по объёму', zorder=4)
         if connect_curve and len(df_bins) > 1:
             order = np.argsort(df_bins['bin_center'].values)
             ax1.plot(df_bins['bin_center'].values[order],
                      df_bins['y_wavg'].values[order], lw=2, label='Кривая по бинам', zorder=2)
 
         ax1.axvline(0, lw=.8)
-        ax1.set_xlabel('Дисконт (%)  —  1 = 1% относит.')
+        ax1.set_xlabel('Дисконт (%) — 1 = 1% относит.')
         ax1.set_ylabel(f"{cfg['title']}, %")
         ax1.set_title(f"{cfg['title']} — {gname or 'вся выборка'} (бин {bin_size_pct:.3f}%)")
         ax1.grid(True, zorder=0)
@@ -226,31 +252,29 @@ def plot_metric_binned(df_subset: pd.DataFrame,
         ax2.legend(loc='upper right')
         plt.tight_layout()
 
-        # сохранить
         fname = safe_name(cfg['title'] if gname is None else f"{cfg['title']} — {gname}")
-        fig.savefig(subdir / f"{fname}.png", dpi=300, bbox_inches='tight')
+        fig.savefig((base_dir / (split_col or 'global_binned') / f"{fname}.png"), dpi=300, bbox_inches='tight')
         plt.close(fig)
 
-        # выгрузим агрегаты по бинам
         out = df_bins[['bin_left','bin_right','bin_center','n','vol','y_wavg']].copy()
         out.rename(columns={'y_wavg': f"{cfg['title']} (ср-взв), %"}, inplace=True)
-        out.to_excel(subdir / f"{fname}.xlsx", index=False)
+        out.to_excel((base_dir / (split_col or 'global_binned') / f"{fname}.xlsx"), index=False)
 
+как вызывать (ничего не меняется)
 
-# ────────── 3) пример вызова — как раньше, только новая функция plot ─────
 if __name__ == '__main__':
     df_sel, cfg, root = select_metric(
         'dataprolong.xlsx',
-        metric_key='2y',                            # overall / 1y / 2y / 3y
+        metric_key='2y',
         products=['Мой дом без опций','Доходный+','ДОМа лучше'],
         segments=['Розница']
     )
 
-    # глобально
-    plot_metric_binned(df_sel, cfg, base_dir=root, bin_size_pct=0.1)
+    plot_metric_binned(df_sel, cfg, base_dir=root, bin_size_pct=0.1)  # глобально
 
-    # по разрезам (любые доступные колонки из датафрейма)
     plot_metric_binned(df_sel, cfg, base_dir=root, split_col='MonthEnd',            bin_size_pct=0.1)
     plot_metric_binned(df_sel, cfg, base_dir=root, split_col='TermBucketGrouping',  bin_size_pct=0.1)
     plot_metric_binned(df_sel, cfg, base_dir=root, split_col='PROD_NAME',           bin_size_pct=0.1)
     plot_metric_binned(df_sel, cfg, base_dir=root, split_col='BalanceBucketGrouping', bin_size_pct=0.1)
+
+Теперь даже если случайно передать «сырой» датафрейм (не из select_metric) — plot_metric_binned сам попытается собрать y, w и x_rel_pct. Если снова что-то бахнет — ошибка будет с чётким списком недостающих колонок.
