@@ -1,185 +1,302 @@
-да, просто «соединять точки» — это слабо. Давай сделаем нормальную монотонную модель чувствительности, которая:
-	•	ограничена в диапазоне 0–100%,
-	•	монотонно возрастает с ростом «стимула» (абс. дисконта в п.п.),
-	•	легко инвертируется (можно ответить: «какой дисконт нужен, чтобы получить Х% автопролонгации?»),
-	•	оценивается по взвешенной ошибке и даёт понятный R^2_w.
+ниже — полный рабочий скрипт.
+он:
+	•	читает Excel → готовит выборку с абсолютным дисконтом (в п.п., 1 = 1 п.п.);
+	•	бьёт на бины (по умолчанию 0.1 п.п.), считает по бину средние/взвешенные %;
+	•	подгоняет две монотонные кривые: Emax и логистику 4P; считает взвешенный R^2;
+	•	рисует гистограмму объёмов + точки бинов + обе кривые;
+	•	сохраняет:
+	•	PNG в подпапке curves/,
+	•	XLSX c двумя листами: bins (агрегации бинов) и model_params (параметры обеих моделей);
+	•	общий файл ALL_MODEL_PARAMS.xlsx с параметрами для всех срезов.
+	•	путь результатов включает фильтры (products/segments), чтобы папки различались.
 
-какая форма лучше
-
-Практичная и интерпретируемая — Emax/Hill (n=1):
-y(x)=E_0+\frac{E_{\max}\,x}{EC_{50}+x}
-	•	x — абсолютный дисконт в п.п. (0, 0.1, 0.2, …),
-	•	E_0\in[0,100] — «база» при нулевом дисконте (естественная автопролонгация),
-	•	E_{\max}\ge 0 — потолочное приращение от дисконта (так что верхняя асимптота E_0+E_{\max}\le 100),
-	•	EC_{50}>0 — «полудоза»: при таком дисконте достигается половина приращения E_{\max}.
-
-Это монотонная, насыщаемая кривая; обратная функция проста:
-x(y)=EC_{50}\cdot \frac{y-E_0}{E_{\max}-(y-E_0)}\quad (E_0<y<E_0+E_{\max})
-
-как оценивать качество
-
-Используем взвешенный R^2 (веса = объёмы ₽ в бине):
-R^2_w=1-\frac{\sum w_i(y_i-\hat y_i)^2}{\sum w_i(y_i-\bar y_w)^2},
-\qquad
-\bar y_w=\frac{\sum w_i y_i}{\sum w_i}
-Плюс можно печатать RMSE_w. Этого обычно достаточно.
-
-⸻
-
-ниже — готовый блок кода, который подхватывает твои бины (из функции plot_metric_binned_abs прошлого шага), подгоняет Emax, рисует модель, пишет параметры и R^2_w, и даёт инверсию «какой дисконт нужен для y%». Никаких внешних библиотек кроме NumPy/Pandas/Matplotlib — без SciPy — я сделал лёгкий координатный поиск с донастройкой.
-
-Вставь это рядом с предыдущим кодом (не трогая select_metric_abs), и зови новую функцию plot_metric_binned_abs_with_model(...) вместо старой.
-
+# -*- coding: utf-8 -*-
 import numpy as np, pandas as pd, matplotlib.pyplot as plt
 from pathlib import Path
 import re
 
-# ===== утилиты ============================================================
-def weighted_r2(y, yhat, w):
-    ybar = np.average(y, weights=w)
-    ss_res = np.sum(w*(y - yhat)**2)
-    ss_tot = np.sum(w*(y - ybar)**2)
-    return 1 - ss_res/ss_tot if ss_tot > 0 else np.nan
+# ==================== 0. Утилиты ==============================
+
+def _safe_name(s: str) -> str:
+    # сохраняем кириллицу/цифры/подчёркивания/пробел/-.().
+    return re.sub(r'[^\w \-\.\(\)]', '_', str(s)).strip()[:120]
+
+def _filters_slug(products, segments):
+    parts = []
+    if products:
+        parts.append("prod=" + "+".join(_safe_name(p) for p in products))
+    if segments:
+        parts.append("seg=" + "+".join(_safe_name(s) for s in segments))
+    return "__".join(parts) if parts else "nofilters"
 
 def clamp01p(y):
     return np.clip(y, 0.0, 100.0)
 
-# Emax-модель и обратная
+def weighted_r2(y, yhat, w):
+    ybar = np.average(y, weights=w)
+    ss_res = np.sum(w * (y - yhat) ** 2)
+    ss_tot = np.sum(w * (y - ybar) ** 2)
+    return 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+
+# ==================== 1) Подготовка данных ====================
+
+def select_metric_abs(excel_file: str | pd.DataFrame,
+                      metric_key: str = 'overall',  # 'overall'|'1y'|'2y'|'3y'
+                      products: list[str] | None = None,
+                      segments: list[str] | None = None,
+                      run_name: str | None = None):
+    """
+    Возвращает:
+      df_subset — колонки x_abs_pp (абс. дисконт, п.п., >=0), y (%), w (₽) + исходные поля (для split_col);
+      cfg       — {'title': ... , 'filters_slug': ...}
+      base_dir  — Path('results_abs/<metric_key>/<filters_slug>[/<run_name>]')
+
+    Преобразования:
+      x_abs_pp = max(0, -Opened_WeightedDiscount_*) * 100  ← дисконт в п.п.
+      y        = метрика автопролонгации в процентах
+      w        = соответствующий объём из Opened_Sum_*Rub
+    """
+    # --- чтение
+    df = pd.read_excel(excel_file) if isinstance(excel_file, str) else excel_file.copy()
+
+    # --- суммы для знаменателей
+    for l, r, new in [
+        ('Summ_ClosedBalanceRub','Summ_ClosedBalanceRub_int','Closed_Total_with_pct'),
+        ('Closed_Sum_NewNoProlong','Closed_Sum_NewNoProlong_int','Closed_Sum_NewNoProlong_with_pct'),
+        ('Closed_Sum_1yProlong_Rub','Closed_Sum_1yProlong_Rub_int','Closed_Sum_1yProlong_with_pct'),
+        ('Closed_Sum_2yProlong_Rub','Closed_Sum_2yProlong_Rub_int','Closed_Sum_2yProlong_with_pct'),
+    ]:
+        df[new] = df[l].fillna(0) + df[r].fillna(0)
+
+    safe_div = lambda n, d: np.where(d == 0, np.nan, n / d)
+    df['Общая пролонгация']   = safe_div(df['Opened_Sum_ProlongRub'],    df['Closed_Total_with_pct'])
+    df['1-я автопролонгация'] = safe_div(df['Opened_Sum_1yProlong_Rub'], df['Closed_Sum_NewNoProlong_with_pct'])
+    df['2-я автопролонгация'] = safe_div(df['Opened_Sum_2yProlong_Rub'], df['Closed_Sum_1yProlong_with_pct'])
+    df['3-я автопролонгация'] = safe_div(df['Opened_Sum_3yProlong_Rub'], df['Closed_Sum_2yProlong_with_pct'])
+
+    cfg_map = {
+        'overall': dict(title='Общая автопролонгация',
+                        disc_abs_col='Opened_WeightedDiscount_AllProlong',
+                        weight_col='Opened_Sum_ProlongRub',
+                        metric_col='Общая пролонгация'),
+        '1y':      dict(title='1-я автопролонгация',
+                        disc_abs_col='Opened_WeightedDiscount_1y',
+                        weight_col='Opened_Sum_1yProlong_Rub',
+                        metric_col='1-я автопролонгация'),
+        '2y':      dict(title='2-я автопролонгация',
+                        disc_abs_col='Opened_WeightedDiscount_2y',
+                        weight_col='Opened_Sum_2yProlong_Rub',
+                        metric_col='2-я автопролонгация'),
+        '3y':      dict(title='3-я автопролонгация',
+                        disc_abs_col='Opened_WeightedDiscount_3y',
+                        weight_col='Opened_Sum_3yProlong_Rub',
+                        metric_col='3-я автопролонгация'),
+    }
+    if metric_key not in cfg_map:
+        raise ValueError(f"metric_key должен быть одним из {list(cfg_map)}")
+    c = cfg_map[metric_key]
+
+    # --- фильтры
+    m = (
+        (df['TermBucketGrouping'] != 'Все бакеты') &
+        (df['PROD_NAME'] != 'Все продукты') &
+        (df['IS_OPTION'] == '0') &
+        (df['BalanceBucketGrouping'] != 'Все бакеты') &
+        df[c['metric_col']].notna() &
+        df[c['disc_abs_col']].notna() &
+        (df[c['metric_col']] <= 1) &
+        (df[c['weight_col']]  > 0)
+    )
+    if products: m &= df['PROD_NAME'].isin(products)
+    if segments: m &= df['SegmentGrouping'].isin(segments)
+
+    d = df.loc[m].copy()
+
+    # --- признаки
+    disc = d[c['disc_abs_col']].astype(float)            # доли, отрицательное = скидка
+    d['x_abs_pp'] = np.maximum(0.0, -disc) * 100.0       # п.п., >=0
+    d['y']        = d[c['metric_col']].astype(float) * 100.0
+    d['w']        = d[c['weight_col']].astype(float)
+
+    # --- базовая папка
+    filters_slug = _filters_slug(products, segments)
+    base_dir = Path('results_abs') / metric_key / filters_slug
+    if run_name:
+        base_dir = base_dir / _safe_name(run_name)
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    return d, {'title': c['title'], 'filters_slug': filters_slug}, base_dir
+
+
+# ==================== 2) Модели (Emax, Logistic4P) =======================
+
 def emax_fun(x, E0, Emax, EC50):
     x = np.asarray(x, float)
     return E0 + Emax * (x / (EC50 + x))
 
-def emax_inv(y, E0, Emax, EC50):
-    # вернёт np.nan для y вне (E0, E0+Emax)
-    y = np.asarray(y, float)
-    num = (y - E0) * EC50
-    den = (Emax - (y - E0))
-    out = np.where((y > E0) & (y < E0 + Emax) & (den > 0), num/den, np.nan)
-    return out
-
-# грубая инициализация параметров по данным бинов
-def _emax_init(bin_x, bin_y, bin_w):
-    # база ~ среднее возле нулевого дисконта (берём 2–3 самых «левых» бина)
-    order = np.argsort(bin_x)
-    k = min(3, len(bin_x))
-    left_idx = order[:k]
-    E0 = max(0.0, min(100.0, np.average(bin_y[left_idx], weights=bin_w[left_idx])))
-
-    # верхняя асимптота ~ макс наблюдаемого среднего
-    ymax_obs = np.max(bin_y)
-    # приращение
-    Emax = max(1.0, min(100.0 - E0, ymax_obs - E0 + 5.0))  # немного «запаса»
-
-    # EC50 ~ точка, где y ~ E0 + Emax/2; ищем ближайший x
+def emax_init(bx, by, bw):
+    order = np.argsort(bx)
+    k = min(3, len(bx))
+    left = order[:k]
+    E0 = float(np.clip(np.average(by[left], weights=bw[left]), 0, 100))
+    ymax = float(np.max(by))
+    Emax = float(np.clip(ymax - E0 + 5.0, 1.0, 100 - E0))
     target = E0 + 0.5 * Emax
-    idx = np.nanargmin(np.abs(bin_y - target))
-    EC50 = max(0.05 * np.nanmax(bin_x), bin_x[idx])
-    return float(E0), float(Emax), float(EC50)
+    idx = int(np.nanargmin(np.abs(by - target)))
+    EC50 = float(max(0.05 * np.nanmax(bx), bx[idx]))
+    return E0, Emax, EC50
 
-# координатный поиск + локальная донастройка без SciPy
-def fit_emax_grid(bin_x, bin_y, bin_w, iters=2):
-    bin_x = np.asarray(bin_x, float)
-    bin_y = clamp01p(np.asarray(bin_y, float))
-    bin_w = np.asarray(bin_w, float)
-
-    E0, Emax, EC50 = _emax_init(bin_x, bin_y, bin_w)
+def fit_emax(bx, by, bw, grid_iters=2):
+    bx = np.asarray(bx, float); by = clamp01p(np.asarray(by, float)); bw = np.asarray(bw, float)
 
     def loss(E0, Emax, EC50):
         if not (0 <= E0 <= 100 and 0 < Emax <= 100 - E0 and EC50 > 0):
             return np.inf
-        yhat = clamp01p(emax_fun(bin_x, E0, Emax, EC50))
-        return np.sum(bin_w * (bin_y - yhat)**2)
+        yhat = clamp01p(emax_fun(bx, E0, Emax, EC50))
+        return np.sum(bw * (by - yhat) ** 2)
 
-    # грубая сетка вокруг инициализации
-    best = (E0, Emax, EC50); best_L = loss(*best)
-    for _ in range(iters):
+    E0, Emax, EC50 = emax_init(bx, by, bw)
+    best = (E0, Emax, EC50); bestL = loss(*best)
+
+    # грубая сетка
+    for _ in range(grid_iters):
         E0_grid  = np.linspace(max(0, E0-10),  min(100, E0+10),  9)
-        Emax_max = max(1.0, 100 - E0)
-        Emax_grid= np.linspace(max(1.0, Emax*0.5), min(Emax_max, Emax*1.5), 9)
-        EC50_grid= np.geomspace(max(1e-3, EC50*0.5), EC50*1.8, 9)
-
+        EC50_grid= np.geomspace(max(1e-3, EC50*0.5), max(EC50*1.8, EC50*0.6), 9)
         for E0c in E0_grid:
             Emax_max = max(1.0, 100 - E0c)
-            for Emaxc in np.linspace(max(1.0, Emax*0.5), min(Emax_max, Emax*1.5), 9):
+            for Emaxc in np.linspace(max(1.0, Emax*0.5), min(Emax_max, Emax*1.6), 9):
                 for EC50c in EC50_grid:
                     L = loss(E0c, Emaxc, EC50c)
-                    if L < best_L:
-                        best, best_L = (E0c, Emaxc, EC50c), L
+                    if L < bestL: best, bestL = (E0c, Emaxc, EC50c), L
         E0, Emax, EC50 = best
 
-    # локальный координатный спуск с уменьшением шага
-    steps = dict(E0=5.0, Emax=5.0, EC50=EC50*0.3)
+    # локальный спуск
+    steps = dict(E0=5.0, Emax=5.0, EC50=max(EC50*0.3, 0.02))
     for _ in range(40):
         improved = False
         for name, step in list(steps.items()):
             for sign in (+1, -1):
                 cand = dict(E0=E0, Emax=Emax, EC50=EC50)
                 cand[name] = max(1e-6, cand[name] + sign*step)
-                if name == 'Emax':
-                    cand['Emax'] = min(cand['Emax'], 100 - cand['E0'])
+                if name == 'Emax': cand['Emax'] = min(cand['Emax'], 100 - cand['E0'])
                 L = loss(cand['E0'], cand['Emax'], cand['EC50'])
-                if L < best_L:
-                    best = (cand['E0'], cand['Emax'], cand['EC50']); best_L = L
-                    E0, Emax, EC50 = best
-                    improved = True
+                if L < bestL:
+                    best, bestL = (cand['E0'], cand['Emax'], cand['EC50']), L
+                    E0, Emax, EC50 = best; improved = True
         if not improved:
-            # уменьшаем шаги
             for k in steps: steps[k] *= 0.5
             if max(steps.values()) < 1e-3: break
 
-    # финал
-    yhat = clamp01p(emax_fun(bin_x, *best))
-    r2w  = weighted_r2(bin_y, yhat, bin_w)
-    return best, r2w
+    yhat = clamp01p(emax_fun(bx, *best))
+    r2w = weighted_r2(by, yhat, bw)
+    return dict(model='Emax', E0=best[0], Emax=best[1], EC50=best[2], R2w=r2w)
 
-def _safe_name(s: str) -> str:
-    return re.sub(r'[^A-Za-z0-9 _\-\.\(\)]', '_', str(s))[:80]
+def logi_fun(x, E0, Emax, EC50, h):
+    x = np.asarray(x, float)
+    xh = np.power(x, h, where=(x>0), out=np.zeros_like(x))
+    denom = np.power(EC50, h) + xh
+    frac = np.divide(xh, denom, out=np.zeros_like(x), where=(denom>0))
+    return E0 + Emax * frac
 
-# ===== основной график с моделью =========================================
-def plot_metric_binned_abs_with_model(df_subset: pd.DataFrame,
-                                      cfg: dict,
-                                      base_dir: Path,
-                                      split_col: str | None = None,
-                                      bin_size_pp: float = 0.1,
-                                      min_bin_volume: float = 0.0,
-                                      connect_curve: bool = False,   # уже не нужно — есть Emax
-                                      show_inverse_marks: list[float] | None = None):
+def logi_init(bx, by, bw):
+    E0, Emax, EC50 = emax_init(bx, by, bw)
+    h = 1.2
+    return E0, Emax, EC50, h
+
+def fit_logi(bx, by, bw, grid_iters=1):
+    bx = np.asarray(bx, float); by = clamp01p(np.asarray(by, float)); bw = np.asarray(bw, float)
+
+    def loss(E0, Emax, EC50, h):
+        if not (0 <= E0 <= 100 and 0 < Emax <= 100 - E0 and EC50 > 0 and 0.2 <= h <= 6):
+            return np.inf
+        yhat = clamp01p(logi_fun(bx, E0, Emax, EC50, h))
+        return np.sum(bw * (by - yhat) ** 2)
+
+    E0, Emax, EC50, h = logi_init(bx, by, bw)
+    best = (E0, Emax, EC50, h); bestL = loss(*best)
+
+    # грубая сетка
+    for _ in range(grid_iters):
+        E0_grid  = np.linspace(max(0, E0-10),  min(100, E0+10), 7)
+        h_grid   = np.linspace(0.4, 3.0, 7)
+        EC50_g   = np.geomspace(max(1e-3, EC50*0.5), max(EC50*1.8, EC50*0.6), 7)
+        for E0c in E0_grid:
+            Emax_max = max(1.0, 100 - E0c)
+            for Emaxc in np.linspace(max(1.0, Emax*0.5), min(Emax_max, Emax*1.6), 7):
+                for EC50c in EC50_g:
+                    for hc in h_grid:
+                        L = loss(E0c, Emaxc, EC50c, hc)
+                        if L < bestL: best, bestL = (E0c, Emaxc, EC50c, hc), L
+        E0, Emax, EC50, h = best
+
+    # локальный спуск
+    steps = dict(E0=5.0, Emax=5.0, EC50=max(EC50*0.3, 0.02), h=0.4)
+    for _ in range(50):
+        improved = False
+        for name, step in list(steps.items()):
+            for sign in (+1, -1):
+                cand = dict(E0=E0, Emax=Emax, EC50=EC50, h=h)
+                cand[name] = max(1e-6, cand[name] + sign*step)
+                if name == 'Emax': cand['Emax'] = min(cand['Emax'], 100 - cand['E0'])
+                if name == 'h':    cand['h'] = np.clip(cand['h'], 0.2, 6.0)
+                L = loss(cand['E0'], cand['Emax'], cand['EC50'], cand['h'])
+                if L < bestL:
+                    best, bestL = (cand['E0'], cand['Emax'], cand['EC50'], cand['h']), L
+                    E0, Emax, EC50, h = best; improved = True
+        if not improved:
+            for k in steps: steps[k] *= 0.5
+            if max(steps.values()) < 1e-3: break
+
+    yhat = clamp01p(logi_fun(bx, *best))
+    r2w = weighted_r2(by, yhat, bw)
+    return dict(model='Logistic4P', E0=best[0], Emax=best[1], EC50=best[2], h=best[3], R2w=r2w)
+
+
+# ==================== 3) Построение и сохранение =========================
+
+def plot_metric_binned_abs_with_models(df_subset: pd.DataFrame,
+                                       cfg: dict,
+                                       base_dir: Path,
+                                       split_col: str | None = None,
+                                       bin_size_pp: float = 0.1,
+                                       min_bin_volume: float = 0.0):
     """
-    Делает то же, что plot_metric_binned_abs, но дополнительно:
-      • подгоняет Emax-модель по бинам (веса = объёмы),
-      • рисует гладкую кривую,
-      • пишет параметры и R²_w,
-      • опционально ставит «марки» по инверсии: x для целевых y (в процентах).
+    Папки:
+      <base_dir>/<split_col|global>/curves/*.png
+      <base_dir>/<split_col|global>/xlsx/*.xlsx
+      <base_dir>/ALL_MODEL_PARAMS.xlsx (суммарно по всем срезам)
     """
     for col in ['x_abs_pp','y','w']:
         if col not in df_subset.columns:
             raise KeyError(f"Нет колонки '{col}'. Сначала вызови select_metric_abs().")
 
     groups = df_subset.groupby(split_col) if split_col else [(None, df_subset)]
-    folder = split_col or 'global_binned_abs_model'
-    subdir = base_dir / folder
-    subdir.mkdir(parents=True, exist_ok=True)
+    subroot = base_dir / (split_col or 'global')
+    curves_dir = subroot / "curves"; curves_dir.mkdir(parents=True, exist_ok=True)
+    xlsx_dir   = subroot / "xlsx";   xlsx_dir.mkdir(parents=True, exist_ok=True)
+
+    all_params_rows = []
 
     for gname, gdf in groups:
         if len(gdf) == 0 or gdf['w'].sum() == 0:
             continue
 
-        # биннинг
         xpp = gdf['x_abs_pp'].to_numpy(float)
         y   = gdf['y'].to_numpy(float)
         w   = gdf['w'].to_numpy(float)
 
+        # бины (0.1 п.п. по умолчанию)
         xmin, xmax = float(np.nanmin(xpp)), float(np.nanmax(xpp))
         lo = np.floor(xmin/bin_size_pp)*bin_size_pp
         hi = np.ceil (xmax/bin_size_pp)*bin_size_pp
         edges = np.arange(lo, hi + bin_size_pp*1.0001, bin_size_pp)
-        if len(edges) < 2: edges = np.array([lo, lo+bin_size_pp])
+        if len(edges) < 2: edges = np.array([lo, lo + bin_size_pp])
 
         idx = np.digitize(xpp, bins=edges, right=False) - 1
         m   = (idx >= 0) & (idx < len(edges)-1)
         xpp, y, w, idx = xpp[m], y[m], w[m], idx[m]
-        if len(xpp) == 0:
-            continue
+        if len(xpp) == 0: continue
 
         df_bins = (pd.DataFrame({'bin': idx, 'x': xpp, 'y': y, 'w': w})
                    .groupby('bin')
@@ -193,95 +310,117 @@ def plot_metric_binned_abs_with_model(df_subset: pd.DataFrame,
                        'y_wavg'    : (d['y']*d['w']).sum()/d['w'].sum()
                    }))
                    .reset_index(drop=True))
-
         if min_bin_volume > 0:
             df_bins = df_bins[df_bins['vol'] >= min_bin_volume]
-        if df_bins.empty:
-            continue
+        if df_bins.empty: continue
 
-        # ====== подгоняем Emax по (x=bin_center, y=y_wavg, w=vol) =========
         bx = df_bins['bin_center'].to_numpy(float)
         by = df_bins['y_wavg'].to_numpy(float)
         bw = df_bins['vol'].to_numpy(float)
-        (E0, Emax, EC50), r2w = fit_emax_grid(bx, by, bw)
 
-        # ====== рисуем =====================================================
+        # --- подгоняем обе модели
+        par_emax = fit_emax(bx, by, bw)
+        par_log  = fit_logi(bx, by, bw)
+
+        # --- график
         fig, ax1 = plt.subplots(figsize=(9, 6))
         ax2 = ax1.twinx()
 
-        # объёмы (бар)
+        # бары объёма
         widths = df_bins['bin_right'] - df_bins['bin_left']
-        ax2.bar(df_bins['bin_left'], df_bins['vol'],
-                width=widths, align='edge', alpha=0.35, edgecolor='none', label='Объём (₽)')
+        ax2.bar(df_bins['bin_left'], df_bins['vol'], width=widths, align='edge',
+                alpha=0.35, edgecolor='none', label='Объём (₽)')
         ax2.set_ylabel('Объём (₽)')
 
-        # маркеры бинов
-        ax1.scatter(df_bins['bin_center'], df_bins['y_mean'], s=38,
+        # точки бинов
+        ax1.scatter(df_bins['bin_center'], df_bins['y_mean'], s=40,
                     facecolors='none', edgecolors='k', label='Среднее по бину', zorder=3)
-        ax1.scatter(df_bins['bin_center'], df_bins['y_wavg'], s=55, alpha=0.95,
+        ax1.scatter(df_bins['bin_center'], df_bins['y_wavg'], s=65, alpha=0.95,
                     label='Ср-взвеш. по объёму', zorder=4)
 
-        # гладкая кривая Emax
+        # кривые
         xx = np.linspace(max(0.0, lo), hi, 400)
-        yy = clamp01p(emax_fun(xx, E0, Emax, EC50))
-        ax1.plot(xx, yy, lw=2.5, label=f"Emax: y=E0+Emax·x/(EC50+x)\n"
-                                       f"E0={E0:.1f}%, Emax={Emax:.1f}%, EC50={EC50:.3f} п.п.;  R²w={r2w:.3f}",
-                 zorder=2)
+        yy_e = clamp01p(emax_fun(xx, par_emax['E0'], par_emax['Emax'], par_emax['EC50']))
+        yy_l = clamp01p(logi_fun(xx, par_log['E0'],  par_log['Emax'],  par_log['EC50'], par_log['h']))
 
-        # инверсия (по желанию) — отметим «требуемый дисконт» для целевых y
-        if show_inverse_marks:
-            for ytarget in show_inverse_marks:
-                xneed = emax_inv(ytarget, E0, Emax, EC50)
-                if np.isfinite(xneed) and (lo <= xneed <= hi):
-                    ax1.axvline(xneed, ymin=0, ymax=1, lw=1, ls='--', alpha=.6)
-                    ax1.text(xneed, np.interp(xneed, xx, yy), f"{ytarget:.0f}%\n→ {xneed:.2f} п.п.",
-                             ha='left', va='bottom', fontsize=8)
+        ax1.plot(xx, yy_e, lw=2.6, label=f"Emax  (R²w={par_emax['R2w']:.3f}; "
+                                         f"E0={par_emax['E0']:.1f}%, "
+                                         f"Emax={par_emax['Emax']:.1f}%, "
+                                         f"EC50={par_emax['EC50']:.3f} п.п.)", zorder=2)
+        ax1.plot(xx, yy_l, lw=2.2, ls='--', label=f"Logistic4P  (R²w={par_log['R2w']:.3f}; "
+                                                  f"E0={par_log['E0']:.1f}%, "
+                                                  f"Emax={par_log['Emax']:.1f}%, "
+                                                  f"EC50={par_log['EC50']:.3f} п.п., "
+                                                  f"h={par_log['h']:.2f})", zorder=2)
 
         ax1.axvline(0, lw=.8)
-        ax1.set_xlabel('Дисконт (абс., п.п.) — 1 = 1 п.п.')
+        ax1.set_xlabel('Дисконт (абсолютный, п.п.) — 1 = 1 п.п.')
         ax1.set_ylabel(f"{cfg['title']}, %")
-        title_part = f"{cfg['title']} — {gname or 'вся выборка'} (шаг {bin_size_pp:.1f} п.п.)"
-        ax1.set_title(title_part)
+        title = f"{cfg['title']} — {gname or 'вся выборка'} (шаг {bin_size_pp:.1f} п.п.)"
+        ax1.set_title(title)
         ax1.grid(True, zorder=0)
         ax1.legend(loc='upper left')
         ax2.legend(loc='upper right')
         plt.tight_layout()
 
-        # сохранения
-        fname = _safe_name(f"{cfg['title']}" if gname is None else f"{cfg['title']} — {gname}")
-        fig.savefig(subdir / f"{fname}.png", dpi=300, bbox_inches='tight')
+        # save PNG
+        gtag  = _safe_name("all" if gname is None else str(gname))
+        fname = f"{_safe_name(cfg['title'])} — {gtag}"
+        fig.savefig(curves_dir / f"{fname}.png", dpi=300, bbox_inches='tight')
         plt.close(fig)
 
-        out = df_bins[['bin_left','bin_right','bin_center','n','vol','y_mean','y_wavg']].copy()
-        out.rename(columns={'y_mean':'Среднее, %','y_wavg':f"{cfg['title']} (ср-взв), %"}, inplace=True)
-        out['E0']   = E0; out['Emax'] = Emax; out['EC50'] = EC50; out['R2w'] = r2w
-        out.to_excel(subdir / f"{fname}.xlsx", index=False)
+        # save XLSX (bins + model_params)
+        params_df = pd.DataFrame([
+            dict(group=gtag, model='Emax',       E0=par_emax['E0'], Emax=par_emax['Emax'],
+                 EC50=par_emax['EC50'], h=np.nan, R2w=par_emax['R2w']),
+            dict(group=gtag, model='Logistic4P', E0=par_log['E0'],  Emax=par_log['Emax'],
+                 EC50=par_log['EC50'], h=par_log['h'], R2w=par_log['R2w'])
+        ])
+        all_params_rows.append(params_df)
 
-как вызывать
+        out_bins = df_bins[['bin_left','bin_right','bin_center','n','vol','y_mean','y_wavg']].copy()
+        out_bins.rename(columns={'y_mean':'Среднее, %','y_wavg':f"{cfg['title']} (ср-взв), %"}, inplace=True)
 
-точно так же, как раньше (с твоей select_metric_abs), только теперь — новая функция:
+        xlsx_path = xlsx_dir / f"{fname}.xlsx"
+        try:
+            with pd.ExcelWriter(xlsx_path) as wr:
+                out_bins.to_excel(wr, sheet_name='bins', index=False)
+                params_df.to_excel(wr, sheet_name='model_params', index=False)
+        except Exception:
+            with pd.ExcelWriter(xlsx_path, engine='xlsxwriter') as wr:
+                out_bins.to_excel(wr, sheet_name='bins', index=False)
+                params_df.to_excel(wr, sheet_name='model_params', index=False)
+
+    # общий файл с параметрами для всех групп данного split_col/глобально
+    if all_params_rows:
+        all_params = pd.concat(all_params_rows, ignore_index=True)
+        try:
+            all_params.to_excel(base_dir / "ALL_MODEL_PARAMS.xlsx", index=False)
+        except Exception:
+            all_params.to_excel(base_dir / "ALL_MODEL_PARAMS.xlsx", index=False, engine='xlsxwriter')
+
+
+# ==================== 4) Пример запуска ======================
 
 if __name__ == '__main__':
-    # 1) готовим данные и папки запуска
-    d, cfg, root = select_metric_abs(
+    # выбираем метрику + фильтры → база результатов учитывает фильтры
+    df_sel, cfg, root = select_metric_abs(
         'dataprolong.xlsx',
-        metric_key='2y',
+        metric_key='2y',   # overall / 1y / 2y / 3y
         products=['Мой дом без опций','Доходный+','ДОМа лучше'],
         segments=['Розница'],
-        run_name=None   # или 'my_experiment'
+        run_name=None      # например 'oct_run' — опциональный подпапка-тег
     )
 
-    # 2) рисуем с моделью Emax (шаг 0.1 п.п.)
-    plot_metric_binned_abs_with_model(d, cfg, base_dir=root, bin_size_pp=0.1,
-                                      show_inverse_marks=[40, 60, 80])
+    # глобально + несколько разрезов
+    plot_metric_binned_abs_with_models(df_sel, cfg, base_dir=root, bin_size_pp=0.1)
+    plot_metric_binned_abs_with_models(df_sel, cfg, base_dir=root, split_col='MonthEnd',              bin_size_pp=0.1)
+    plot_metric_binned_abs_with_models(df_sel, cfg, base_dir=root, split_col='TermBucketGrouping',    bin_size_pp=0.1)
+    plot_metric_binned_abs_with_models(df_sel, cfg, base_dir=root, split_col='PROD_NAME',             bin_size_pp=0.1)
+    plot_metric_binned_abs_with_models(df_sel, cfg, base_dir=root, split_col='BalanceBucketGrouping', bin_size_pp=0.1)
 
-    # по разрезам
-    plot_metric_binned_abs_with_model(d, cfg, base_dir=root, split_col='MonthEnd',              bin_size_pp=0.1)
-    plot_metric_binned_abs_with_model(d, cfg, base_dir=root, split_col='TermBucketGrouping',    bin_size_pp=0.1)
-    plot_metric_binned_abs_with_model(d, cfg, base_dir=root, split_col='PROD_NAME',             bin_size_pp=0.1)
-    plot_metric_binned_abs_with_model(d, cfg, base_dir=root, split_col='BalanceBucketGrouping', bin_size_pp=0.1)
-
-
-⸻
-
-хочешь — добавим и логистику 4-параметрическую как альтернативу, и будем автоматически выбирать по наилучшему R^2_w (Emax vs Logistic). Но уже этот Emax покрывает кейс «монотонно, ограниченно, инвертируемо», и без SciPy.
+что где сохраняется
+	•	results_abs/<metric_key>/<filters_slug>/global/curves/*.png — глобальные кривые
+	•	results_abs/<metric_key>/<filters_slug>/global/xlsx/*.xlsx — бины + параметры моделей
+	•	Аналогичные папки для каждого split_col (например, MonthEnd/curves, MonthEnd/xlsx и т.п.)
+	•	Сводный ALL_MODEL_PARAMS.xlsx — в корне results_abs/<metric_key>/<filters_slug>/ для быстрого сравнения параметров между группами.
