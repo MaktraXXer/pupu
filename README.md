@@ -9,10 +9,8 @@ def _safe_name(s: str) -> str:
 
 def _filters_slug(products, segments):
     parts = []
-    if products:
-        parts.append("prod=" + "+".join(_safe_name(p) for p in products))
-    if segments:
-        parts.append("seg=" + "+".join(_safe_name(s) for s in segments))
+    if products: parts.append("prod=" + "+".join(_safe_name(p) for p in products))
+    if segments: parts.append("seg=" + "+".join(_safe_name(s) for s in segments))
     return "__".join(parts) if parts else "nofilters"
 
 def clamp01p(y):  # → [0..100]
@@ -24,6 +22,12 @@ def weighted_r2(y, yhat, w):
     ss_tot = np.sum(w * (y - ybar)**2)
     return 1 - ss_res/ss_tot if ss_tot > 0 else np.nan
 
+def unweighted_r2(y, yhat):
+    ybar = np.mean(y)
+    ss_res = np.sum((y - yhat)**2)
+    ss_tot = np.sum((y - ybar)**2)
+    return 1 - ss_res/ss_tot if ss_tot > 0 else np.nan
+
 # ───────────── 1) загрузка и подготовка (АБСОЛЮТНЫЙ дисконт, %) ─────────────
 def select_metric_abs(excel_file: str | pd.DataFrame,
                       metric_key: str = 'overall',  # 'overall'|'1y'|'2y'|'3y'
@@ -32,17 +36,13 @@ def select_metric_abs(excel_file: str | pd.DataFrame,
                       run_name: str | None = None):
     """
     Возвращает:
-      df_subset — колонки:
-         x_abs_pct  (абсолютный дисконт в %, 1=1%)
-         y          (метрика автопролонгации, %)
-         w          (вес = ₽)
-         + несколько служебных колонок из исходника
-      cfg       — {'title', 'filters_slug'}
+      df_subset — колонки: x_abs_pct(дисконт, %), y(%, метрика), w(₽)
+      cfg       — {'title','filters_slug'}
       base_dir  — Path('results_abs_binned_models/<metric>/<filters>[/run]')
     """
     df = pd.read_excel(excel_file) if isinstance(excel_file, str) else excel_file.copy()
 
-    # знаменатели (как в твоём исходнике)
+    # знаменатели (как в твоём коде)
     for l, r, new in [
         ('Summ_ClosedBalanceRub','Summ_ClosedBalanceRub_int','Closed_Total_with_pct'),
         ('Closed_Sum_NewNoProlong','Closed_Sum_NewNoProlong_int','Closed_Sum_NewNoProlong_with_pct'),
@@ -99,7 +99,7 @@ def select_metric_abs(excel_file: str | pd.DataFrame,
 
     d = df.loc[m].copy()
 
-    # Абсолютный дисконт → в проценты (1 = 1%)
+    # Абсолютный дисконт → проценты (1 = 1%)
     disc_abs = d[c['disc_abs_col']].astype(float)
     d['x_abs_pct'] = np.abs(disc_abs) * 100.0
     d['y']         = d[c['metric_col']].astype(float) * 100.0
@@ -117,57 +117,60 @@ def select_metric_abs(excel_file: str | pd.DataFrame,
 
 # ───────────── 2) WLS utilities + модели ─────────────
 def _wls(X, y, w):
-    # решаем (X' W X) b = X' W y
     W = np.sqrt(w)[:, None]
     Xw = X * W
     yw = y * W.ravel()
     beta, *_ = np.linalg.lstsq(Xw, yw, rcond=None)
     return beta
 
+def _pack(model, params, yhat, y, w, predict_fn):
+    return {
+        'model': model,
+        'params': params,
+        'R2w': weighted_r2(y, yhat, w),
+        'R2':  unweighted_r2(y, yhat),
+        'predict': predict_fn
+    }
+
 def fit_linear(bx, by, bw):
     X = np.column_stack([np.ones_like(bx), bx])
     b = _wls(X, by, bw)
     yhat = X @ b
-    return {'model':'linear', 'params':{'a':b[0], 'b':b[1]}, 'R2w': weighted_r2(by, yhat, bw),
-            'predict': lambda x: (np.column_stack([np.ones_like(x), x]) @ b)}
+    return _pack('linear', {'a':b[0], 'b':b[1]}, yhat, by, bw,
+                 lambda x: (np.column_stack([np.ones_like(x), x]) @ b))
 
 def fit_quadratic(bx, by, bw):
     X = np.column_stack([np.ones_like(bx), bx, bx**2])
     b = _wls(X, by, bw)
     yhat = X @ b
-    return {'model':'quadratic', 'params':{'a':b[0], 'b':b[1], 'c':b[2]}, 'R2w': weighted_r2(by, yhat, bw),
-            'predict': lambda x: (np.column_stack([np.ones_like(x), x, x**2]) @ b)}
+    return _pack('quadratic', {'a':b[0], 'b':b[1], 'c':b[2]}, yhat, by, bw,
+                 lambda x: (np.column_stack([np.ones_like(x), x, x**2]) @ b))
 
 def fit_log1p(bx, by, bw):
-    z = np.log1p(bx)  # ln(1+x)
+    z = np.log1p(bx)
     X = np.column_stack([np.ones_like(z), z])
     b = _wls(X, by, bw)
     yhat = X @ b
-    return {'model':'log1p', 'params':{'a':b[0], 'b':b[1]}, 'R2w': weighted_r2(by, yhat, bw),
-            'predict': lambda x: (np.column_stack([np.ones_like(x), np.log1p(x)]) @ b)}
+    return _pack('log1p', {'a':b[0], 'b':b[1]}, yhat, by, bw,
+                 lambda x: (np.column_stack([np.ones_like(x), np.log1p(x)]) @ b))
 
 def fit_exp_sat(bx, by, bw):
-    # y = a + b*(1 - exp(-c x)), грид по c; a,b — WLS
     x = bx
     best = None
-    # сетка c адаптивно к масштабу X
     xmax = max(1e-3, np.max(x))
-    grid = np.logspace(-3, 1, 60) / max(1.0, xmax/10)  # слегка нормируем
+    grid = np.logspace(-3, 1, 60) / max(1.0, xmax/10)
     for c in grid:
         f = 1.0 - np.exp(-c*x)
         X = np.column_stack([np.ones_like(f), f])
         b = _wls(X, by, bw)
-        # монотонность: b>=0
-        if b[1] < 0:
-            b[1] = 0.0
+        if b[1] < 0: b[1] = 0.0
         yhat = X @ b
-        R2w = weighted_r2(by, yhat, bw)
-        if (best is None) or (R2w > best['R2w']):
-            best = {'model':'exp_sat', 'params':{'a':b[0], 'b':b[1], 'c':c}, 'R2w': R2w,
-                    'predict': lambda xx, bb=b, cc=c: (np.column_stack([np.ones_like(xx), 1-np.exp(-cc*xx)]) @ bb)}
+        cand = _pack('exp_sat', {'a':b[0], 'b':b[1], 'c':c}, yhat, by, bw,
+                     lambda xx, bb=b, cc=c: (np.column_stack([np.ones_like(xx), 1-np.exp(-cc*xx)]) @ bb))
+        if (best is None) or (cand['R2w'] > best['R2w']):
+            best = cand
     return best
 
-# Emax / Logistic4P (как раньше), но аккуратно подаём на бины
 def emax_fun(x, E0, Emax, EC50):
     x = np.asarray(x, float); return E0 + Emax * (x / (EC50 + x))
 
@@ -193,9 +196,9 @@ def fit_emax(bx, by, bw):
                     L=loss(E0c,Emaxc,EC50c)
                     if L<bestL: best,bestL=(E0c,Emaxc,EC50c),L
         E0,Emax,EC50=best
-    yhat = clamp01p(emax_fun(bx,*best)); R2w = weighted_r2(by,yhat,bw)
-    return {'model':'Emax','params':{'E0':best[0],'Emax':best[1],'EC50':best[2]},'R2w':R2w,
-            'predict': lambda x: clamp01p(emax_fun(x,*best))}
+    yhat = clamp01p(emax_fun(bx,*best))
+    return _pack('Emax', {'E0':best[0],'Emax':best[1],'EC50':best[2]}, yhat, by, bw,
+                 lambda x: clamp01p(emax_fun(x,*best)))
 
 def logi_fun(x,E0,Emax,EC50,h):
     x=np.asarray(x,float); xh=np.power(x,h,where=(x>0),out=np.zeros_like(x))
@@ -215,14 +218,13 @@ def fit_logi(bx,by,bw):
                 for hc in np.linspace(0.4,3.0,7):
                     L=loss(E0c,Emaxc,EC50c,hc)
                     if L<bestL: best,bestL=(E0c,Emaxc,EC50c,hc),L
-    yhat=clamp01p(logi_fun(bx,*best)); R2w=weighted_r2(by,yhat,bw)
-    return {'model':'Logistic4P','params':{'E0':best[0],'Emax':best[1],'EC50':best[2],'h':best[3]},
-            'R2w':R2w,'predict': lambda x: clamp01p(logi_fun(x,*best))}
+    yhat=clamp01p(logi_fun(bx,*best))
+    return _pack('Logistic4P', {'E0':best[0],'Emax':best[1],'EC50':best[2],'h':best[3]},
+                 yhat, by, bw, lambda x: clamp01p(logi_fun(x,*best)))
 
-# набор кандидатов
 CANDIDATES = [fit_linear, fit_quadratic, fit_log1p, fit_exp_sat, fit_emax, fit_logi]
 
-# ───────────── 3) бининг → выбор 2 лучших моделей → графики/Excel ─────────────
+# ───────────── 3) бининг → выбор 2 лучших → графики/Excel ─────────────
 def plot_metric_binned_abs_with_models(df_subset: pd.DataFrame,
                                        cfg: dict,
                                        base_dir: Path,
@@ -230,9 +232,9 @@ def plot_metric_binned_abs_with_models(df_subset: pd.DataFrame,
                                        bin_size_pct: float = 0.1,
                                        min_bin_volume: float = 0.0):
     """
-    Бининг по |дисконт| (в %, шаг bin_size_pct). Фиты ТОЛЬКО по точкам (bin_center, y_wavg).
-    На графике: гистограмма объёма, точки (среднее и ср-взв), 2 лучшие модели по R²w.
-    Excel: raw / bins / grid_pred / model_params. R² считается взвешенно по объёмам бинов.
+    Бининг по |дисконт| (в %, шаг bin_size_pct). Фит ТОЛЬКО по точкам (bin_center, y_wavg).
+    На графике: гистограмма объёма, точки (среднее и ср-взв), 2 лучшие модели (по R²w).
+    Легенда и Excel содержат оба R²: взвешенный и без весов.
     """
     for col in ['x_abs_pct','y','w']:
         if col not in df_subset.columns:
@@ -264,7 +266,7 @@ def plot_metric_binned_abs_with_models(df_subset: pd.DataFrame,
         idx = np.digitize(x, bins=edges, right=False) - 1
         m   = (idx >= 0) & (idx < len(edges)-1)
         x, y, w, idx = x[m], y[m], w[m], idx[m]
-        if len(x)==0: 
+        if len(x)==0:
             continue
 
         tmp = pd.DataFrame({'bin': idx, 'x': x, 'y': y, 'w': w})
@@ -283,20 +285,19 @@ def plot_metric_binned_abs_with_models(df_subset: pd.DataFrame,
 
         if min_bin_volume > 0:
             bins = bins[bins['vol'] >= min_bin_volume]
-        if bins.empty: 
+        if bins.empty:
             continue
 
         bx = bins['bin_center'].to_numpy(float)
         by = bins['y_wavg'].to_numpy(float)
         bw = bins['vol'].to_numpy(float)
 
-        # фит всех кандидатов, выбор 2 лучших
+        # фит всех кандидатов, выбор 2 лучших по R²w
         fits = []
         for fitter in CANDIDATES:
             try:
                 res = fitter(bx, by, bw)
-                # защитим предиктор от NaN
-                _ = res['predict'](np.array([0.0,1.0]))
+                _ = res['predict'](np.array([0.0,1.0]))  # sanity
                 fits.append(res)
             except Exception:
                 continue
@@ -322,12 +323,11 @@ def plot_metric_binned_abs_with_models(df_subset: pd.DataFrame,
 
         xx = np.linspace(0.0, edges[-1], 400)
         yy1 = clamp01p(best['predict'](xx))
-        ax1.plot(xx, yy1, lw=2.8, label=f"{best['model']} (R²w={best['R2w']:.3f})", zorder=2)
+        ax1.plot(xx, yy1, lw=2.8, label=f"{best['model']} (R²w={best['R2w']:.3f}; R²={best['R2']:.3f})", zorder=2)
         if second:
             yy2 = clamp01p(second['predict'](xx))
-            ax1.plot(xx, yy2, lw=2.2, ls='--', label=f"{second['model']} (R²w={second['R2w']:.3f})", zorder=2)
+            ax1.plot(xx, yy2, lw=2.2, ls='--', label=f"{second['model']} (R²w={second['R2w']:.3f}; R²={second['R2']:.3f})", zorder=2)
 
-        # подписи формул
         def fmt_params(model, params):
             if model=='linear':
                 return f"y = a + b·x; a={params['a']:.2f}, b={params['b']:.3f}"
@@ -343,10 +343,12 @@ def plot_metric_binned_abs_with_models(df_subset: pd.DataFrame,
                 return f"y = E0 + Emax·x^h/(EC50^h+x^h); E0={params['E0']:.1f}, Emax={params['Emax']:.1f}, EC50={params['EC50']:.3f}, h={params['h']:.2f}"
             return str(params)
 
-        ax1.text(0.01, -0.22, f"{best['model']}: {fmt_params(best['model'], best['params'])}",
+        ax1.text(0.01, -0.22, f"{best['model']}: {fmt_params(best['model'], best['params'])}\n"
+                              f"R²w={best['R2w']:.3f}; R²={best['R2']:.3f}",
                  transform=ax1.transAxes, ha='left', va='top', fontsize=9)
         if second:
-            ax1.text(0.99, -0.22, f"{second['model']}: {fmt_params(second['model'], second['params'])}",
+            ax1.text(0.99, -0.22, f"{second['model']}: {fmt_params(second['model'], second['params'])}\n"
+                                  f"R²w={second['R2w']:.3f}; R²={second['R2']:.3f}",
                      transform=ax1.transAxes, ha='right', va='top', fontsize=9)
 
         ax1.axvline(0, lw=.8)
@@ -370,9 +372,9 @@ def plot_metric_binned_abs_with_models(df_subset: pd.DataFrame,
         if second:
             grid[f"{second['model']}_y_%"] = yy2
 
-        params_rows = [dict(group=tag, model=best['model'], R2w=best['R2w'], **best['params'])]
+        params_rows = [dict(group=tag, model=best['model'], R2w=best['R2w'], R2=best['R2'], **best['params'])]
         if second:
-            params_rows.append(dict(group=tag, model=second['model'], R2w=second['R2w'], **second['params']))
+            params_rows.append(dict(group=tag, model=second['model'], R2w=second['R2w'], R2=second['R2'], **second['params']))
         params_df = pd.DataFrame(params_rows)
         all_params.append(params_df)
 
