@@ -1,6 +1,6 @@
 Option Explicit
 
-Sub BatchFill_Fast()
+Sub BatchFill_Safe()
     Const SHEET_SVOD As String = "СВОД"
     Const SHEET_LOGIC As String = "ЛОГИКА_РАСЧЕТОВ"
     Const SHEET_DATA As String = "ТАБЛИЦА"
@@ -17,13 +17,14 @@ Sub BatchFill_Fast()
     Dim calcMode As XlCalculation
     Dim arrAC As Variant, arrJ As Variant, arrAA As Variant, arrB As Variant
     Dim outArr() As Variant
+    Dim vC2 As Variant, vC3 As Variant, flagAA As Variant, txtB As String
 
     On Error GoTo Fatal
 
     Set wb = ThisWorkbook
     Set wsSvod = wb.Worksheets(SHEET_SVOD)
     Set wsLogic = wb.Worksheets(SHEET_LOGIC)
-    Set wsData  = wb.Worksheets(SHEET_DATA)
+    Set wsData = wb.Worksheets(SHEET_DATA)
 
     lastRow = wsData.Cells(wsData.Rows.Count, "A").End(xlUp).Row
     If lastRow < 2 Then Exit Sub
@@ -44,16 +45,15 @@ Sub BatchFill_Fast()
     calcMode = Application.Calculation
     Application.Calculation = xlCalculationManual
     Application.Cursor = xlWait
-    Application.StatusBar = "Старт…"
+
+    Application.CalculateFullRebuild
 
     For i = 1 To n
         On Error GoTo RowSoft
-        Dim vC2 As Variant, vC3 As Variant, flagAA As Variant, txtB As String
 
         vC2 = arrAC(i, 1)
         flagAA = arrAA(i, 1)
         txtB = UCase$(Trim$(CStr(arrB(i, 1))))
-
         If (flagAA = 1) Or (txtB = "MIN_BAL") Then
             vC3 = 30
         Else
@@ -63,7 +63,10 @@ Sub BatchFill_Fast()
         wsSvod.Range("C2").Value = vC2
         wsSvod.Range("C3").Value = vC3
 
-        wsSvod.Calculate
+        wb.Calculate
+        Do While Application.CalculationState <> xlDone
+            DoEvents
+        Loop
 
         res = wsSvod.Range("C35").Value
         If IsError(res) Or LenB(res) = 0 Then
@@ -72,7 +75,7 @@ Sub BatchFill_Fast()
             outArr(i, 1) = res
         End If
 
-        If (i Mod 200 = 0) Or (i = n) Then
+        If (i Mod 200 = 0) Then
             Application.StatusBar = "Обработка: " & i & " / " & n
             DoEvents
         End If
