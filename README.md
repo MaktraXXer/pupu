@@ -17,6 +17,7 @@ Sub BatchFillC2C3_AndGrabC35()
     Dim calcMode As XlCalculation
     Dim vC2 As Variant, vC3 As Variant
     Dim condAA As Variant, condB As String
+    Dim t0 As Double, done As Long, pct As Double
 
     On Error GoTo FatalError
 
@@ -26,15 +27,24 @@ Sub BatchFillC2C3_AndGrabC35()
     Set wsData = wb.Worksheets(SHEET_DATA)
 
     lastRow = wsData.Cells(wsData.Rows.Count, "A").End(xlUp).Row
-    If lastRow < 2 Then Exit Sub
+    If lastRow < 2 Then
+        MsgBox "Нет строк для обработки.", vbInformation
+        Exit Sub
+    End If
 
     oldC2 = wsSvod.Range("C2").Value
     oldC3 = wsSvod.Range("C3").Value
 
     Application.ScreenUpdating = False
     Application.EnableEvents = False
+    Application.DisplayAlerts = False
     calcMode = Application.Calculation
     Application.Calculation = xlCalculationManual
+    Application.Cursor = xlWait
+
+    t0 = Timer
+    MsgBox "Старт пакетного расчёта: строки 2–" & lastRow & ".", vbInformation
+    Application.StatusBar = "Запуск…"
 
     For r = 2 To lastRow
         On Error GoTo RowSoftError
@@ -68,18 +78,32 @@ RowSoftError:
         Err.Clear
 
 NextRow:
-        DoEvents
+        done = r - 1
+        If (r Mod 25 = 0) Or r = lastRow Then
+            pct = (done / (lastRow - 1)) * 100
+            Application.StatusBar = "Обработка: " & done & " из " & (lastRow - 1) & " (" & Format(pct, "0.0") & "%)…"
+        End If
     Next r
 
     wsSvod.Range("C2").Value = oldC2
     wsSvod.Range("C3").Value = oldC3
 
+    Application.StatusBar = "Готово. Обработано " & (lastRow - 1) & " строк за " & Format(Timer - t0, "0.0") & " сек."
+    MsgBox "Готово: " & (lastRow - 1) & " строк." & vbCrLf & _
+           "Время: " & Format(Timer - t0, "0.0") & " сек.", vbInformation
+
 Cleanup:
     Application.Calculation = calcMode
+    Application.DisplayAlerts = True
     Application.EnableEvents = True
     Application.ScreenUpdating = True
+    Application.Cursor = xlDefault
+    Application.StatusBar = False
     Exit Sub
 
 FatalError:
+    wsSvod.Range("C2").Value = oldC2
+    wsSvod.Range("C3").Value = oldC3
+    MsgBox "Критическая ошибка: " & Err.Description, vbCritical
     Resume Cleanup
 End Sub
