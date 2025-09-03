@@ -1,36 +1,39 @@
 Option Explicit
 
-Sub BatchFillC2C3_AndGrabC35()
+Sub BatchFill_Fast()
     Const SHEET_SVOD As String = "СВОД"
     Const SHEET_LOGIC As String = "ЛОГИКА_РАСЧЕТОВ"
     Const SHEET_DATA As String = "ТАБЛИЦА"
-    Const COL_INPUT_C2 As Long = 29
+    Const COL_AC As Long = 29
     Const COL_J As Long = 10
-    Const COL_FLAG_AA As Long = 27
+    Const COL_AA As Long = 27
     Const COL_B As Long = 2
-    Const COL_OUTPUT As Long = 32
+    Const COL_AF As Long = 32
 
     Dim wb As Workbook
     Dim wsSvod As Worksheet, wsLogic As Worksheet, wsData As Worksheet
-    Dim lastRow As Long, r As Long
+    Dim lastRow As Long, n As Long, i As Long
     Dim oldC2 As Variant, oldC3 As Variant, res As Variant
     Dim calcMode As XlCalculation
-    Dim vC2 As Variant, vC3 As Variant
-    Dim condAA As Variant, condB As String
-    Dim t0 As Double, done As Long, pct As Double
+    Dim arrAC As Variant, arrJ As Variant, arrAA As Variant, arrB As Variant
+    Dim outArr() As Variant
 
-    On Error GoTo FatalError
+    On Error GoTo Fatal
 
     Set wb = ThisWorkbook
     Set wsSvod = wb.Worksheets(SHEET_SVOD)
     Set wsLogic = wb.Worksheets(SHEET_LOGIC)
-    Set wsData = wb.Worksheets(SHEET_DATA)
+    Set wsData  = wb.Worksheets(SHEET_DATA)
 
     lastRow = wsData.Cells(wsData.Rows.Count, "A").End(xlUp).Row
-    If lastRow < 2 Then
-        MsgBox "Нет строк для обработки.", vbInformation
-        Exit Sub
-    End If
+    If lastRow < 2 Then Exit Sub
+    n = lastRow - 1
+
+    arrAC = wsData.Range(wsData.Cells(2, COL_AC), wsData.Cells(lastRow, COL_AC)).Value
+    arrJ  = wsData.Range(wsData.Cells(2, COL_J),  wsData.Cells(lastRow, COL_J)).Value
+    arrAA = wsData.Range(wsData.Cells(2, COL_AA), wsData.Cells(lastRow, COL_AA)).Value
+    arrB  = wsData.Range(wsData.Cells(2, COL_B),  wsData.Cells(lastRow, COL_B)).Value
+    ReDim outArr(1 To n, 1 To 1)
 
     oldC2 = wsSvod.Range("C2").Value
     oldC3 = wsSvod.Range("C3").Value
@@ -41,69 +44,62 @@ Sub BatchFillC2C3_AndGrabC35()
     calcMode = Application.Calculation
     Application.Calculation = xlCalculationManual
     Application.Cursor = xlWait
+    Application.StatusBar = "Старт…"
 
-    t0 = Timer
-    MsgBox "Старт пакетного расчёта: строки 2–" & lastRow & ".", vbInformation
-    Application.StatusBar = "Запуск…"
+    For i = 1 To n
+        On Error GoTo RowSoft
+        Dim vC2 As Variant, vC3 As Variant, flagAA As Variant, txtB As String
 
-    For r = 2 To lastRow
-        On Error GoTo RowSoftError
+        vC2 = arrAC(i, 1)
+        flagAA = arrAA(i, 1)
+        txtB = UCase$(Trim$(CStr(arrB(i, 1))))
 
-        vC2 = wsData.Cells(r, COL_INPUT_C2).Value
-        condAA = wsData.Cells(r, COL_FLAG_AA).Value
-        condB = UCase$(Trim$(CStr(wsData.Cells(r, COL_B).Value)))
-
-        If (condAA = 1) Or (condB = "MIN_BAL") Then
+        If (flagAA = 1) Or (txtB = "MIN_BAL") Then
             vC3 = 30
         Else
-            vC3 = wsData.Cells(r, COL_J).Value
+            vC3 = arrJ(i, 1)
         End If
 
         wsSvod.Range("C2").Value = vC2
         wsSvod.Range("C3").Value = vC3
 
-        Application.CalculateFull
+        wsSvod.Calculate
 
         res = wsSvod.Range("C35").Value
         If IsError(res) Or LenB(res) = 0 Then
-            wsData.Cells(r, COL_OUTPUT).ClearContents
+            outArr(i, 1) = Empty
         Else
-            wsData.Cells(r, COL_OUTPUT).Value = res
+            outArr(i, 1) = res
         End If
 
-        GoTo NextRow
+        If (i Mod 200 = 0) Or (i = n) Then
+            Application.StatusBar = "Обработка: " & i & " / " & n
+            DoEvents
+        End If
+        GoTo NextI
 
-RowSoftError:
-        wsData.Cells(r, COL_OUTPUT).ClearContents
+RowSoft:
+        outArr(i, 1) = Empty
         Err.Clear
+NextI:
+    Next i
 
-NextRow:
-        done = r - 1
-        If (r Mod 25 = 0) Or r = lastRow Then
-            pct = (done / (lastRow - 1)) * 100
-            Application.StatusBar = "Обработка: " & done & " из " & (lastRow - 1) & " (" & Format(pct, "0.0") & "%)…"
-        End If
-    Next r
+    wsData.Range(wsData.Cells(2, COL_AF), wsData.Cells(lastRow, COL_AF)).Value = outArr
 
     wsSvod.Range("C2").Value = oldC2
     wsSvod.Range("C3").Value = oldC3
 
-    Application.StatusBar = "Готово. Обработано " & (lastRow - 1) & " строк за " & Format(Timer - t0, "0.0") & " сек."
-    MsgBox "Готово: " & (lastRow - 1) & " строк." & vbCrLf & _
-           "Время: " & Format(Timer - t0, "0.0") & " сек.", vbInformation
-
-Cleanup:
+Done:
+    Application.StatusBar = False
+    Application.Cursor = xlDefault
     Application.Calculation = calcMode
     Application.DisplayAlerts = True
     Application.EnableEvents = True
     Application.ScreenUpdating = True
-    Application.Cursor = xlDefault
-    Application.StatusBar = False
     Exit Sub
 
-FatalError:
+Fatal:
     wsSvod.Range("C2").Value = oldC2
     wsSvod.Range("C3").Value = oldC3
-    MsgBox "Критическая ошибка: " & Err.Description, vbCritical
-    Resume Cleanup
+    Resume Done
 End Sub
