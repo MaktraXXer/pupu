@@ -113,4 +113,4 @@ Fatal:
     wsSvod.Range("C2").Value2 = oldC2
     wsSvod.Range("C3").Value2 = oldC3
     Resume Done
-End Sub****
+End Sub
