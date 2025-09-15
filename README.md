@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Монолит парсинга ставок:
-— Новый формат: лист «Свод» (B–L), валютные блоки «ФЛ ...», заголовок «Срок» в строке +1, банки начиная со строки +2.
-— Старый формат: «Безопциональный ...», «ФЛ ...», «Срок», до «Накопительный счет».
+— Новый формат: лист «Свод» (ЖЁСТКО: колонки B..L), валютные блоки «ФЛ ...».
+— Старый формат: «Безопциональный» → «ФЛ ...» → «Срок ...» → до «Накопительный счет».
 — Выход: DataFrame с колонками Date, Bank, Currency, Term(дни), Rate(доля).
 — Дополнительно: «ТОП-10 Средняя ставка» по bank_list.
 — Аппенд в существующий Excel на лист Data.
@@ -19,10 +19,7 @@ from openpyxl import load_workbook
 # ============== УТИЛИТЫ ==============
 
 def standardize_term(term: str) -> int | None:
-    """
-    Нормируем срок в дни (int).
-    Поддерживает: "2 мес.", "1,5 года", "3 года", "180", "365".
-    """
+    """Нормируем срок в дни (int). Поддерживает: '2 мес.', '1,5 года', '3 года', '180', '365'."""
     if term is None:
         return None
     s = str(term).lower().strip().replace(",", ".")
@@ -49,10 +46,7 @@ def standardize_term(term: str) -> int | None:
 
 
 def _normalize_rate(cell) -> float | None:
-    """
-    Приводим ставку к доле (0.163 == 16.3%).
-    Понимает и строки "16,3%" / "16.3%".
-    """
+    """Приводим ставку к доле (0.163 == 16.3%). Понимает '16,3%' / '16.3%' / 0.163."""
     if cell is None or (isinstance(cell, float) and pd.isna(cell)):
         return None
 
@@ -74,16 +68,14 @@ def _normalize_rate(cell) -> float | None:
             except Exception:
                 return None
 
-    # Если это похоже на проценты в «целых» (16.3), переведём в долю
+    # если похоже на проценты в «целых» (16.3) — переведём в долю
     if val > 1.5:
         val = val / 100.0
     return val
 
 
 def _clean_bank_name(name: str) -> str:
-    """
-    Чистим название банка: убираем скобки/AS IS/TO BE, нормализуем Т-Банк.
-    """
+    """Чистим название банка: убираем скобки/AS IS/TO BE, нормализуем Т-Банк."""
     s = re.sub(r"\s*\(.*?\)\s*$", "", str(name)).strip()
     s = s.replace("AS IS", "").replace("TO BE", "").strip()
     s = re.sub(r"\s{2,}", " ", s)
@@ -93,18 +85,14 @@ def _clean_bank_name(name: str) -> str:
 
 
 def _is_skip_bank_row(b: str) -> bool:
-    """
-    Служебные строки листа «Свод», которые не являются банками.
-    """
+    """Служебные строки листа «Свод», которые не являются банками."""
     s = str(b).lower()
     keywords = ["средн", "макс", "тс", "накопительный счет"]
     return any(k in s for k in keywords)
 
 
 def _currency_from_cell(text: str) -> str | None:
-    """
-    Извлекаем валюту из 'ФЛ ...' целиком (например, 'ФЛ китайский юань' -> 'Китайский юань').
-    """
+    """Извлекаем валюту из 'ФЛ ...' (напр., 'ФЛ китайский юань' -> 'Китайский юань')."""
     if not isinstance(text, str):
         return None
     m = re.search(r"фл\s+(.+)", text, flags=re.IGNORECASE)
@@ -113,14 +101,14 @@ def _currency_from_cell(text: str) -> str | None:
     return None
 
 
-def _terms_from_header_row(row_vals, start_col: int = 2) -> dict[int, int]:
+def _terms_from_header_row(row_vals, start_col: int = 2, end_col: int = 12) -> dict[int, int]:
     """
     Построить mapping {номер_колонки(1-based) -> срок_в_днях}
-    для строки заголовка «Срок ... 2 мес ... 3 мес ... 1 год ...».
+    СТРОГО в диапазоне [start_col .. end_col] (B..L).
     """
     mapping = {}
-    # row_vals — список значений по колонкам 1..N (мы подаём уже 1-based)
-    for c_idx in range(start_col, len(row_vals) + 1):
+    end_col = min(end_col, len(row_vals))
+    for c_idx in range(start_col, end_col + 1):
         val = row_vals[c_idx - 1]
         if val is None:
             continue
@@ -135,6 +123,10 @@ def _terms_from_header_row(row_vals, start_col: int = 2) -> dict[int, int]:
 
 # ============== НОВЫЙ ФОРМАТ: ЛИСТ «Свод» ==============
 
+# ЖЁСТКИЕ ГРАНИЦЫ ДЛЯ «Свод»: только B..L
+SVOD_COL_MIN = 2  # B
+SVOD_COL_MAX = 12 # L
+
 def _find_svod_sheet_name(xlsx_path: str) -> str | None:
     wb = load_workbook(xlsx_path, read_only=True, data_only=True)
     for nm in wb.sheetnames:
@@ -146,8 +138,8 @@ def _find_svod_sheet_name(xlsx_path: str) -> str | None:
 def parse_svod_sheet(xlsx_path: str, bank_list: list[str] | None = None) -> pd.DataFrame:
     """
     Разбор листа «Свод».
-    Блоки валют помечены строками вида «ФЛ рубли», «ФЛ китайский юань», ...
-    Сразу фильтруем служебные строки (Среднее/Макс/ТС).
+    ВАЖНО: ставки берём ТОЛЬКО из колонок B..L (SVOD_COL_MIN..SVOD_COL_MAX).
+    Любые правые блоки (Z..AJ, 'С пополнением и снятием' и т.п.) игнорируем.
     """
     svod_name = _find_svod_sheet_name(xlsx_path)
     if not svod_name:
@@ -156,7 +148,7 @@ def parse_svod_sheet(xlsx_path: str, bank_list: list[str] | None = None) -> pd.D
     df = pd.read_excel(xlsx_path, sheet_name=svod_name, header=None)
     nrows, ncols = df.shape
 
-    # Найдём якоря валют в колонке B (index=1)
+    # Найти якоря валют в колонке B
     currency_rows: list[tuple[int, str]] = []
     for r in range(1, nrows + 1):
         val = df.iat[r - 1, 1]
@@ -178,13 +170,13 @@ def parse_svod_sheet(xlsx_path: str, bank_list: list[str] | None = None) -> pd.D
         if idx + 1 < len(currency_rows):
             data_end = min(data_end, currency_rows[idx + 1][0] - 1)
 
-        # Считываем заголовок сроков целиком (1-based индексация по столбцам)
+        # Заголовок сроков: читаем всю строку, но маппим ТОЛЬКО B..L
         header_vals = [df.iat[header_r - 1, c - 1] for c in range(1, ncols + 1)]
-        terms_map = _terms_from_header_row(header_vals, start_col=2)  # B..L
+        terms_map = _terms_from_header_row(header_vals, start_col=SVOD_COL_MIN, end_col=SVOD_COL_MAX)
         if not terms_map:
             continue
 
-        # Данные по банкам
+        # Данные по банкам: ставки берём тоже строго из B..L
         for r in range(data_start, data_end + 1):
             bank_cell = df.iat[r - 1, 1]  # колонка B
             if bank_cell is None or str(bank_cell).strip() == "":
@@ -195,12 +187,12 @@ def parse_svod_sheet(xlsx_path: str, bank_list: list[str] | None = None) -> pd.D
             bank = _clean_bank_name(bank_cell)
 
             for c_idx, term_days in terms_map.items():
-                rate_cell = df.iat[r - 1, c_idx - 1]
+                rate_cell = df.iat[r - 1, c_idx - 1]  # c_idx ограничен B..L
                 rate = _normalize_rate(rate_cell)
                 if rate is None:
                     continue
 
-                # Спец-правило для ТБанк (месячная капитализация -> эфф. ставка на срок)
+                # Спец-правило для ТБанк
                 if bank == "ТБанк":
                     EAR = (1 + rate / 12) ** 12 - 1
                     ER_term = (1 + EAR) ** (term_days / 365) - 1
@@ -217,7 +209,7 @@ def parse_svod_sheet(xlsx_path: str, bank_list: list[str] | None = None) -> pd.D
     if data_df.empty:
         return data_df
 
-    # Добавим среднюю по заданному списку банков
+    # Добавляем среднюю по заданному списку банков
     if bank_list:
         avg_rates = (
             data_df[data_df["Bank"].isin(bank_list)]
@@ -308,16 +300,14 @@ def extract_currency_tables_old(xlsx_path: str, sheet_name=0) -> dict:
 
 
 def process_currency_tables_old(currency_tables: dict) -> pd.DataFrame:
-    """
-    Преобразование результата старого парсера в плоский DataFrame.
-    """
+    """Преобразование результата старого парсера в плоский DataFrame."""
     rows = []
     for currency, info in currency_tables.items():
         terms_days = [standardize_term(t) for t in info["terms"]]
         data_df = info["data"]
         term_indices = info["term_indices"]
 
-        # Грубая эвристика: где колонка с названием банка
+        # грубая эвристика: какая колонка с названием банка
         bank_col = 0
         for i in range(min(10, len(data_df))):
             vals = data_df.iloc[i].fillna("").astype(str).str.strip().tolist()
@@ -365,7 +355,7 @@ def process_currency_tables_old(currency_tables: dict) -> pd.DataFrame:
 
 def extract_deposit_rates_from_file(file_path: str, bank_list=None) -> pd.DataFrame:
     """
-    Универсальный вход: сначала пытаемся распарсить новый «Свод»,
+    Универсальный вход: сначала пытаемся распарсить новый «Свод» (строго B..L),
     если не получилось — пробуем старый формат.
     """
     # Дата из имени файла
@@ -384,13 +374,12 @@ def extract_deposit_rates_from_file(file_path: str, bank_list=None) -> pd.DataFr
     parts = []
 
     # Новый формат: «Свод»
+    parsed_new = False
     try:
         df_new = parse_svod_sheet(file_path, bank_list=bank_list)
         if not df_new.empty:
             parts.append(df_new)
             parsed_new = True
-        else:
-            parsed_new = False
     except Exception:
         parsed_new = False
 
@@ -410,11 +399,11 @@ def extract_deposit_rates_from_file(file_path: str, bank_list=None) -> pd.DataFr
 
     data = pd.concat(parts, ignore_index=True)
 
-    # Приклеим дату, если распознали
+    # приклеим дату, если распознали
     if date_val is not None:
         data.insert(0, "Date", date_val)
 
-    # На всякий случай удалим дубликаты
+    # удалим дубликаты
     subset_cols = [c for c in ["Date", "Bank", "Currency", "Term", "Rate"] if c in data.columns]
     data = data.drop_duplicates(subset=subset_cols)
 
@@ -424,9 +413,7 @@ def extract_deposit_rates_from_file(file_path: str, bank_list=None) -> pd.DataFr
 # ============== ОБРАБОТКА ПАПКИ / СОХРАНЕНИЕ ==============
 
 def process_folder(folder_path: str, bank_list=None, ask_user: bool = True) -> pd.DataFrame:
-    """
-    Обходит все .xlsx/.xls в папке и опционально спрашивает подтверждение (y/n) на включение.
-    """
+    """Обходит все .xlsx/.xls в папке и (опц.) спрашивает подтверждение (y/n) на включение."""
     all_data = []
     for filename in os.listdir(folder_path):
         if not (filename.lower().endswith(".xlsx") or filename.lower().endswith(".xls")):
@@ -493,7 +480,7 @@ def append_data_to_existing_excel(data_df: pd.DataFrame, excel_file_path: str, s
 # ============== ПАРАМЕТРЫ ЗАПУСКА (ПРИМЕР) ==============
 
 if __name__ == "__main__":
-    # Папка с новыми файлами (изменить на свою)
+    # Папка с новыми файлами
     for_new_files_folder_path = r"V:\DILING\Карнаухова\Вклады\Марк М\папка для загрузки новых отчетов"
 
     # Банки для средней "ТОП-10 Средняя ставка" (можно менять)
@@ -502,14 +489,10 @@ if __name__ == "__main__":
     # Файл-приёмник, где есть лист Data (колонки: Date, Bank, Currency, Term, Rate)
     output_path = r"V:\DILING\Карнаухова\Вклады\Марк М\ТОП-10 VS ДОМ 18.08.2025.xlsx"
 
-    # Если хочешь без подтверждений при обходе папки — поставь ask_user=False
+    # Без подтверждений — ask_user=False
     new_data_df = process_folder(for_new_files_folder_path, bank_list=bank_list, ask_user=True)
 
     if not new_data_df.empty:
-        # Либо сразу сохраняем в новый файл:
-        # save_data_to_excel(new_data_df, r"V:\...\parsed_output.xlsx")
-
-        # Либо аппендим в существующий Excel на лист Data:
         append_data_to_existing_excel(new_data_df, output_path, sheet_name="Data")
     else:
         print("Нет новых данных к добавлению.")
