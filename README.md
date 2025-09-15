@@ -14,7 +14,7 @@ BEGIN
     BEGIN TRY
         BEGIN TRAN;
 
-        /* ---------- 1) Источник ключевой ---------- */
+        -- 1) Ключевая ставка (5 лет назад, TERM <= 365)
         DROP TABLE IF EXISTS #keyrate;
         SELECT
             DT_REP,
@@ -26,7 +26,7 @@ BEGIN
         WHERE DT_REP >= DATEADD(DAY, -365*5, CAST(GETDATE() AS date))
           AND TERM   <= 365;
 
-        /* ---------- 2) Источник депозитов ---------- */
+        -- 2) Депозиты (-5, +5 лет), без ФЛ
         DROP TABLE IF EXISTS #deposit;
         SELECT *
         INTO #deposit
@@ -37,7 +37,7 @@ BEGIN
               'NO_FL')
         WHERE CLI_SHORT_NAME <> N'ФЛ';
 
-        /* ---------- 3) Пересборка целевой таблицы ---------- */
+        -- 3) Целевая таблица: пересоздание и заливка
         IF OBJECT_ID('liq.DepositKeyrateSpread','U') IS NOT NULL
             DROP TABLE liq.DepositKeyrateSpread;
 
@@ -70,23 +70,6 @@ BEGIN
         LEFT JOIN LIQUIDITY.liq.man_CONVENTION conv WITH (NOLOCK)
                ON conv.CONVENTION_NAME = dps.CONVENTION;
 
-        /* ---------- 4) Индексы (минимальный набор) ---------- */
-        -- Подправь поля при необходимости, если их нет в dps.*
-        BEGIN TRY
-            CREATE CLUSTERED INDEX CX_DepositKeyrateSpread_dt
-                ON liq.DepositKeyrateSpread (dt_open, dt_close_plan);
-        END TRY BEGIN CATCH END CATCH;
-
-        BEGIN TRY
-            CREATE INDEX IX_DepositKeyrateSpread_prod
-                ON liq.DepositKeyrateSpread (PROD_NAME);
-        END TRY BEGIN CATCH END CATCH;
-
-        BEGIN TRY
-            CREATE INDEX IX_DepositKeyrateSpread_cli
-                ON liq.DepositKeyrateSpread (CLI_ID);
-        END TRY BEGIN CATCH END CATCH;
-
         COMMIT TRAN;
     END TRY
     BEGIN CATCH
@@ -105,7 +88,10 @@ BEGIN
 END
 GO
 
--- Запуск:
+-- Запуск
 EXEC liq.prc_Rebuild_DepositKeyrateSpread;
--- Проверка:
-SELECT TOP (100) * FROM liq.DepositKeyrateSpread ORDER BY dt_open DESC;
+
+-- Быстрая проверка
+SELECT TOP (50) *
+FROM liq.DepositKeyrateSpread
+ORDER BY dt_open DESC;
