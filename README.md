@@ -1,17 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 scurves.py — расчёт S-кривых (constrained/unconstrained), сохранение таблиц и графиков.
-Новое:
-1) Каждый график — в своей папке (говорящие названия).
-2) Внутри каждой папки — Excel с данными, которые попали на график.
-3) Доп. папка excel/ с Excel-файлами всех итоговых таблиц (CSV сохраняются как раньше).
 
-Структура результатов:
+Изменения:
+1) Во всех графиках: unconstrained — СПЛОШНАЯ линия; constrained — ПУНКТИР.
+2) В full-графиках удалены точки наблюдений.
+3) В full/ и h_{h}/ добавлены варианты без constrained-кривой.
+4) В h_{h}/ добавлен вариант без constrained-кривой и без точек.
+5) Для каждого варианта графика сохраняется Excel только с теми данными, что реально попали на график.
+
+Структура результатов (фрагмент):
 <folder_path>/<timestamp>/
-  CPR_fitted.csv
-  coefs.csv
-  CPR_fitted_unconstrained.csv
-  coefs_unconstrained.csv
   excel/
     coefs.xlsx
     coefs_unconstrained.xlsx
@@ -24,14 +23,22 @@ scurves.py — расчёт S-кривых (constrained/unconstrained), сохр
         scurves_auto.png
         scurves_data.xlsx
       full/
-        full.png
+        full.png                 # без точек
         full_auto.png
         full_data.xlsx
+        full_noconst.png         # без constrained
+        full_noconst_auto.png
+        full_noconst_data.xlsx
       h_1/
         h_1.png
         h_1_auto.png
         h_1_data.xlsx
-      h_2/ ...
+        h_1_noconst.png
+        h_1_noconst_auto.png
+        h_1_noconst_data.xlsx
+        h_1_noconst_nopoints.png
+        h_1_noconst_nopoints_auto.png
+        h_1_noconst_nopoints_data.xlsx
 """
 
 import os
@@ -60,7 +67,7 @@ class scurves:
         self.hist_bins = hist_bins
         self.compare_coefs_path = compare_coefs_path
 
-        # Эталонные коэффициенты (для сравнения)
+        # Эталонные коэффициенты
         self.compare_coefs = pd.DataFrame()
         if compare_coefs_path and os.path.exists(compare_coefs_path):
             cmp = (
@@ -69,7 +76,6 @@ class scurves:
                 else pd.read_csv(compare_coefs_path)
             )
             cmp.rename(columns=lambda c: str(c).strip(), inplace=True)
-            # поддержим Beta{i} и b{i}
             for i in range(7):
                 if f'Beta{i}' in cmp.columns and f'b{i}' not in cmp.columns:
                     cmp.rename(columns={f'Beta{i}': f'b{i}'}, inplace=True)
@@ -89,11 +95,10 @@ class scurves:
         self.periods = []
         self.CPR_fitted = pd.DataFrame()
         self.coefs = pd.DataFrame()
-        # Unconstrained
         self.CPR_fitted_unconstrained = pd.DataFrame()
         self.coefs_unconstrained = pd.DataFrame()
 
-    # ---------- Вспомогательные утилиты ----------
+    # ---------- Утилиты ----------
     @staticmethod
     def _ensure_dir(path: str):
         os.makedirs(path, exist_ok=True)
@@ -101,18 +106,12 @@ class scurves:
 
     @staticmethod
     def _to_excel(path: str, sheets: dict):
-        """
-        sheets: dict{name -> DataFrame}
-        """
         with pd.ExcelWriter(path, engine='openpyxl') as writer:
             for name, df in sheets.items():
                 if isinstance(df, pd.DataFrame):
                     df.to_excel(writer, sheet_name=str(name)[:31], index=False)
 
     def _compute_compare_curves(self, date, xgrid):
-        """
-        Возвращает dict {LoanAge -> np.array(y)} для эталонных коэффициентов на дату.
-        """
         res = {}
         if self.compare_coefs.empty:
             return res
@@ -132,13 +131,12 @@ class scurves:
             res[h] = f(b, xgrid)
         return res
 
-    # ---------- Загрузка новых данных ----------
+    # ---------- Загрузка ----------
     def check_new(self):
         if not os.path.exists(self.source_excel_path):
             raise FileNotFoundError(self.source_excel_path)
         df = pd.read_excel(self.source_excel_path)
         df['Date'] = pd.to_datetime(df['Date'])
-        # Совместимость с альтернативными именами
         if 'TotalDebtBln' not in df.columns and 'PartialCPR' in df.columns:
             df.rename(columns={'PartialCPR': 'TotalDebtBln'}, inplace=True)
         if 'TotalDebtBln' not in df.columns:
@@ -153,7 +151,7 @@ class scurves:
             print('Excel пуст – нечего считать')
             return
 
-        # Расчёты
+        # Расчёт
         self.CPR_fitted, self.coefs = self._scurve_by_tenor(self.new_data)
         self.CPR_fitted_unconstrained, self.coefs_unconstrained = \
             self._scurve_by_tenor_unconstrained(self.new_data)
@@ -164,7 +162,7 @@ class scurves:
         plots_root = self._ensure_dir(os.path.join(out_dir, 'plots'))
         excel_root = self._ensure_dir(os.path.join(out_dir, 'excel'))
 
-        # Сохранение итоговых таблиц (CSV — как раньше)
+        # Итоговые таблицы (CSV + Excel)
         self.CPR_fitted.to_csv(os.path.join(out_dir, 'CPR_fitted.csv'), index=False)
         self.coefs.to_csv(os.path.join(out_dir, 'coefs.csv'), index=False)
         self.CPR_fitted_unconstrained.to_csv(
@@ -172,9 +170,7 @@ class scurves:
         self.coefs_unconstrained.to_csv(
             os.path.join(out_dir, 'coefs_unconstrained.csv'), index=False)
 
-        # И новые Excel-выгрузки (по требованию)
-        self._to_excel(os.path.join(excel_root, 'coefs.xlsx'),
-                       {'coefs': self.coefs})
+        self._to_excel(os.path.join(excel_root, 'coefs.xlsx'), {'coefs': self.coefs})
         self._to_excel(os.path.join(excel_root, 'coefs_unconstrained.xlsx'),
                        {'coefs_unconstrained': self.coefs_unconstrained})
         self._to_excel(os.path.join(excel_root, 'CPR_fitted.xlsx'),
@@ -182,14 +178,14 @@ class scurves:
         self._to_excel(os.path.join(excel_root, 'CPR_fitted_unconstrained.xlsx'),
                        {'CPR_fitted_unconstrained': self.CPR_fitted_unconstrained})
 
-        # Графики + данные в соответствующих папках
+        # Графики
         self._plot_everything(
             data_all=self.new_data,
             output_dir=out_dir,
             plots_root=plots_root
         )
 
-    # ---------- Построение графиков и сохранение данных ----------
+    # ---------- Построение графиков ----------
     def _plot_everything(self, data_all: pd.DataFrame, output_dir: str, plots_root: str):
         loanages = sorted(data_all['LoanAge'].unique())
         cmap = plt.cm.get_cmap('tab10', len(loanages))
@@ -199,7 +195,6 @@ class scurves:
         if has_un:
             CPR_un = self.CPR_fitted_unconstrained.copy()
 
-        # подготовка гистограмм (одинаковые бины для всех)
         x_min, x_max = data_all['Incentive'].min(), data_all['Incentive'].max()
         bins = (np.arange(x_min, x_max + float(self.hist_bins), float(self.hist_bins))
                 if isinstance(self.hist_bins, (float, int))
@@ -237,14 +232,19 @@ class scurves:
                 fig, ax = plt.subplots(figsize=(7, 4))
                 for col in cur.columns:
                     h = int(col.split('_')[-1])
-                    ax.plot(cur.index, cur[col], lw=2, color=colors[h], label=f'constr S, h={h}')
+                    # UNCONSTRAINED — solid
                     if has_un and f'CPR_fitted_{h}' in cur_un.columns:
                         ax.plot(cur_un.index, cur_un[f'CPR_fitted_{h}'],
-                                ls=':', lw=1.5, alpha=0.7, color=colors[h],
-                                label=f'unconstr S, h={h}')
+                                lw=2, color=colors[h], label=f'unconstr S, h={h}')
+                    # CONSTRAINED — dashed
+                    ax.plot(cur.index, cur[col],
+                            ls='--', lw=1.8, alpha=0.9, color=colors[h],
+                            label=f'constr S, h={h}')
+                    # compare
                     if h in compare_map:
-                        ax.plot(xgrid, compare_map[h], ls='--', lw=1.8, alpha=0.55,
-                                color=colors[h], label=f'compare h={h}')
+                        ax.plot(xgrid, compare_map[h],
+                                ls='-.', lw=1.8, alpha=0.6, color=colors[h],
+                                label=f'compare h={h}')
                 ax.grid(ls='--', alpha=0.3)
                 ax.set(xlabel='Incentive, п.п.', ylabel='CPR_fitted, % год.',
                        xlim=(x_min, x_max),
@@ -256,51 +256,48 @@ class scurves:
                 fig.savefig(out_png, dpi=300)
                 plt.close(fig)
 
-                # Данные для Excel
-                df_constr = cur.copy()
-                df_constr.reset_index(inplace=True)
-                df_constr.rename(columns={'Incentive': 'xgrid'}, inplace=True)
-                # unconstrained
-                frames = {'constrained': df_constr}
+                # Excel: только те слои, что на графике
+                frames = {}
                 if has_un and not cur_un.empty:
-                    df_un = cur_un.copy().reset_index().rename(columns={'Incentive': 'xgrid'})
-                    # переименуем колонки для явности
-                    df_un = df_un.rename(columns={c: f'unconstr_{c}' for c in df_un.columns if c != 'xgrid'})
-                    frames['unconstrained'] = df_un
-                # compare
+                    frames['unconstrained'] = (cur_un.copy()
+                                               .reset_index()
+                                               .rename(columns={'Incentive': 'xgrid'}))
+                frames['constrained'] = (cur.copy()
+                                         .reset_index()
+                                         .rename(columns={'Incentive': 'xgrid'}))
                 if compare_map:
                     df_cmp = pd.DataFrame({'xgrid': xgrid})
                     for h, y in compare_map.items():
                         df_cmp[f'compare_CPR_fitted_{h}'] = y
                     frames['compare'] = df_cmp
-
                 self._to_excel(os.path.join(folder, 'scurves_data.xlsx'), frames)
 
-            # ===== 2) Full graph (кривые + точки + stacked debt) =====
-            def plot_full(auto=False):
+            # ===== 2) Full graph (кривые + stacked debt) — БЕЗ ТОЧЕК =====
+            def _plot_full_variant(auto=False, include_constr=True, suffix=''):
                 folder = self._ensure_dir(os.path.join(date_dir, 'full'))
                 fig, axL = plt.subplots(figsize=(10, 6))
                 for col in cur.columns:
                     h = int(col.split('_')[-1])
-                    axL.plot(cur.index, cur[col], lw=2, color=colors[h], label=f'constr S, h={h}')
+                    # UNCONSTRAINED — solid
                     if has_un and f'CPR_fitted_{h}' in cur_un.columns:
                         axL.plot(cur_un.index, cur_un[f'CPR_fitted_{h}'],
-                                 ls=':', lw=1.5, alpha=0.7, color=colors[h], label=f'unconstr S, h={h}')
+                                 lw=2, color=colors[h], label=f'unconstr S, h={h}')
+                    # CONSTRAINED — dashed (опционально)
+                    if include_constr:
+                        axL.plot(cur.index, cur[col],
+                                 ls='--', lw=1.8, alpha=0.9, color=colors[h],
+                                 label=f'constr S, h={h}')
+                    # compare
                     if h in compare_map:
-                        axL.plot(xgrid, compare_map[h], ls='--', lw=1.8, alpha=0.55,
-                                 color=colors[h], label=f'compare h={h}')
-                m_dt = data_all['Date'] == dt
-                for h, grp in data_all[m_dt].groupby('LoanAge'):
-                    axL.scatter(grp['Incentive'], grp['CPR'], s=25,
-                                color=colors[h], alpha=0.8, edgecolors='none',
-                                label=f'CPR, h={h}')
+                        axL.plot(xgrid, compare_map[h],
+                                 ls='-.', lw=1.8, alpha=0.6, color=colors[h],
+                                 label=f'compare h={h}')
                 axL.set(xlabel='Incentive, п.п.', ylabel='CPR, % год.')
                 axL.grid(ls='--', alpha=0.3)
                 axL.set_xlim(x_min, x_max)
 
                 axR = axL.twinx()
                 bottom = np.zeros_like(hist_all[loanages[0]][1], dtype=float)
-                # Соберём таблицу гистограмм для Excel
                 hist_df = pd.DataFrame({'bin_center': hist_all[loanages[0]][0]})
                 for h in loanages:
                     centers, hv = hist_all[h]
@@ -311,64 +308,74 @@ class scurves:
                     bottom = bottom + hv
                 hist_df['stacked_debt_total'] = bottom
 
-                ymax_cpr = max(cur.max().max(), data_all.loc[m_dt, 'CPR'].max())
+                ymax_cpr = max(cur.max().max(), (cur_un.max().max() if has_un and not cur_un.empty else 0))
                 ymax_debt = bottom.max()
                 axL.set_ylim(0, (ymax_cpr * 1.05) if auto else 0.45)
                 axR.set_ylim(0, (ymax_debt * 1.1) if auto else max_debt_global * 1.1)
                 axR.set_ylabel('TotalDebtBln, млрд руб.')
 
-                # Легенда объединённая
                 hdl, lbl = [], []
                 for ax in (axL, axR):
                     h_, l_ = ax.get_legend_handles_labels()
                     hdl += h_; lbl += l_
                 axL.legend(hdl, lbl, ncol=4, fontsize=7, framealpha=0.8)
                 lab = '_auto' if auto else ''
-                axL.set_title(f'Full graph {lab} {pd.Timestamp(dt):%Y-%m-%d}')
+                title_tag = 'full' + suffix + lab
+                axL.set_title(f'{title_tag} {pd.Timestamp(dt):%Y-%m-%d}')
                 fig.tight_layout()
-                out_png = os.path.join(folder, f'full{lab}.png')
+                out_png = os.path.join(folder, f'{title_tag}.png')
                 fig.savefig(out_png, dpi=300)
                 plt.close(fig)
 
-                # Данные для Excel
-                df_constr = cur.copy().reset_index().rename(columns={'Incentive': 'xgrid'})
-                frames = {'fitted_constrained': df_constr}
-
+                # Excel: только слои, что на графике
+                frames = {}
                 if has_un and not cur_un.empty:
-                    df_un = cur_un.copy().reset_index().rename(columns={'Incentive': 'xgrid'})
-                    frames['fitted_unconstrained'] = df_un
-
+                    frames['fitted_unconstrained'] = (cur_un.copy()
+                                                      .reset_index()
+                                                      .rename(columns={'Incentive': 'xgrid'}))
+                if include_constr:
+                    frames['fitted_constrained'] = (cur.copy()
+                                                    .reset_index()
+                                                    .rename(columns={'Incentive': 'xgrid'}))
                 if compare_map:
                     df_cmp = pd.DataFrame({'xgrid': xgrid})
                     for h, y in compare_map.items():
                         df_cmp[f'compare_CPR_fitted_{h}'] = y
                     frames['fitted_compare'] = df_cmp
-
-                # точки-скаттер
-                frames['scatter_points'] = data_all[m_dt][['Date', 'LoanAge', 'Incentive', 'CPR', 'TotalDebtBln']].copy()
-                # гистограмма
                 frames['histogram'] = hist_df
+                fname = 'full_data.xlsx' if include_constr else 'full_noconst_data.xlsx'
+                self._to_excel(os.path.join(folder, fname), frames)
 
-                self._to_excel(os.path.join(folder, 'full_data.xlsx'), frames)
+            def plot_full(auto=False):
+                _plot_full_variant(auto=auto, include_constr=True, suffix='')
+                _plot_full_variant(auto=auto, include_constr=False, suffix='_noconst')
 
             # ===== 3) По каждому LoanAge =====
-            def plot_one(h, auto=False):
+            def _plot_one_variant(h, auto=False, include_constr=True, include_points=True, suffix=''):
                 folder = self._ensure_dir(os.path.join(date_dir, f'h_{h}'))
 
                 centers, hv = hist_all[h]
                 grp_h = data_all[(data_all['Date'] == dt) & (data_all['LoanAge'] == h)]
 
                 fig, axL = plt.subplots(figsize=(7, 4))
-                axL.plot(cur.index, cur[f'CPR_fitted_{h}'], lw=2, color=colors[h], label='constr S-curve')
+                # UNCONSTRAINED — solid
                 if has_un and f'CPR_fitted_{h}' in cur_un.columns:
                     axL.plot(cur_un.index, cur_un[f'CPR_fitted_{h}'],
-                             ls=':', lw=1.5, alpha=0.7, color=colors[h], label='unconstr S-curve')
+                             lw=2, color=colors[h], label='unconstr S-curve')
+                # CONSTRAINED — dashed (опционально)
+                if include_constr:
+                    axL.plot(cur.index, cur[f'CPR_fitted_{h}'],
+                             ls='--', lw=1.8, alpha=0.9, color=colors[h], label='constr S-curve')
+                # compare
                 if h in compare_map:
-                    axL.plot(xgrid, compare_map[h], ls='--', lw=1.8, alpha=0.55,
-                             color=colors[h], label='compare')
+                    axL.plot(xgrid, compare_map[h],
+                             ls='-.', lw=1.8, alpha=0.6, color=colors[h], label='compare')
 
-                axL.scatter(grp_h['Incentive'], grp_h['CPR'], s=25,
-                            color=colors[h], alpha=0.8, edgecolors='none', label='CPR фактич.')
+                # точки (опционально)
+                if include_points:
+                    axL.scatter(grp_h['Incentive'], grp_h['CPR'], s=25,
+                                color=colors[h], alpha=0.8, edgecolors='none', label='CPR фактич.')
+
                 axR = axL.twinx()
                 axR.bar(centers, hv, width=(centers[1] - centers[0]) * 0.9,
                         color=colors[h], alpha=0.25, edgecolor='none', label='Debt')
@@ -376,32 +383,53 @@ class scurves:
                 axL.set(xlabel='Incentive, п.п.', ylabel='CPR, % год.')
                 axR.set_ylabel('TotalDebtBln, млрд руб.')
                 axL.set_xlim(x_min, x_max)
-                ymax_c = max(cur[f'CPR_fitted_{h}'].max(), grp_h['CPR'].max() if len(grp_h) else 0)
+                ymax_c = 0
+                if has_un and f'CPR_fitted_{h}' in cur_un.columns:
+                    ymax_c = max(ymax_c, cur_un[f'CPR_fitted_{h}'].max())
+                if include_constr:
+                    ymax_c = max(ymax_c, cur[f'CPR_fitted_{h}'].max())
+                if include_points and len(grp_h):
+                    ymax_c = max(ymax_c, grp_h['CPR'].max())
                 axL.set_ylim(0, (ymax_c * 1.05) if auto else 0.45)
                 axR.set_ylim(0, (hv.max() * 1.1) if auto else max_debt_global * 1.1)
                 axL.legend(fontsize=7)
                 axR.legend(fontsize=7, loc='upper right')
                 lab = '_auto' if auto else ''
-                axL.set_title(f'date={pd.Timestamp(dt):%Y-%m-%d} h={h}{lab}')
+                title_tag = f'h_{h}{suffix}{lab}'
+                axL.set_title(f'date={pd.Timestamp(dt):%Y-%m-%d} {title_tag}')
                 fig.tight_layout()
-                out_png = os.path.join(folder, f'h_{h}{lab}.png')
+                out_png = os.path.join(folder, f'{title_tag}.png')
                 fig.savefig(out_png, dpi=300)
                 plt.close(fig)
 
-                # Данные для Excel
+                # Excel: только слои, что на графике
                 frames = {}
-                df_constr = pd.DataFrame({'xgrid': cur.index, f'CPR_fitted_{h}': cur[f'CPR_fitted_{h}'].values})
-                frames['fitted_constrained'] = df_constr
                 if has_un and f'CPR_fitted_{h}' in cur_un.columns:
                     frames['fitted_unconstrained'] = pd.DataFrame(
                         {'xgrid': cur_un.index, f'CPR_fitted_{h}': cur_un[f'CPR_fitted_{h}'].values}
                     )
+                if include_constr:
+                    frames['fitted_constrained'] = pd.DataFrame(
+                        {'xgrid': cur.index, f'CPR_fitted_{h}': cur[f'CPR_fitted_{h}'].values}
+                    )
                 if h in compare_map:
                     frames['fitted_compare'] = pd.DataFrame({'xgrid': xgrid, f'CPR_fitted_{h}': compare_map[h]})
-                # точки и гистограмма
-                frames['points'] = grp_h[['Date', 'LoanAge', 'Incentive', 'CPR', 'TotalDebtBln']].copy()
                 frames['histogram'] = pd.DataFrame({'bin_center': centers, 'debt': hv})
-                self._to_excel(os.path.join(folder, f'h_{h}_data.xlsx'), frames)
+                if include_points and len(grp_h):
+                    frames['points'] = grp_h[['Date', 'LoanAge', 'Incentive', 'CPR', 'TotalDebtBln']].copy()
+
+                fname = (f'h_{h}_data.xlsx' if include_constr and include_points else
+                         f'h_{h}_noconst_data.xlsx' if (not include_constr and include_points) else
+                         f'h_{h}_noconst_nopoints_data.xlsx')
+                self._to_excel(os.path.join(folder, fname), frames)
+
+            def plot_one(h, auto=False):
+                # стандарт: с constrained и с точками
+                _plot_one_variant(h, auto=auto, include_constr=True, include_points=True, suffix='')
+                # без constrained
+                _plot_one_variant(h, auto=auto, include_constr=False, include_points=True, suffix='_noconst')
+                # без constrained и без точек
+                _plot_one_variant(h, auto=auto, include_constr=False, include_points=False, suffix='_noconst_nopoints')
 
             # Рисуем и сохраняем
             plot_lines(False)
@@ -414,9 +442,6 @@ class scurves:
 
     # ---------- Внутренние расчёты ----------
     def _scurve_by_tenor(self, data: pd.DataFrame):
-        """
-        Расчёт S-кривых и β-коэффициентов для каждого Date/LoanAge (constrained).
-        """
         data = data.copy()
         data['Date'] = pd.to_datetime(data['Date'])
 
@@ -514,7 +539,6 @@ class scurves:
             rep = dfp.groupby('LoanAge')['TotalDebtBln'].sum().idxmax()
             tenors = sorted(dfp['LoanAge'].unique())
 
-            # base = most represented tenor
             aux = dfp[dfp['LoanAge'] == rep]
             inp = {
                 'Incentive': aux['Incentive'],
@@ -528,7 +552,6 @@ class scurves:
             coefs_main = r['coefs']
             coefs_list.append([dt, rep, *coefs_main])
 
-            # LoanAge < rep («up»)
             prev = coefs_main
             for t in sorted([t for t in tenors if t < rep], reverse=True):
                 aux = dfp[dfp['LoanAge'] == t]
@@ -545,7 +568,6 @@ class scurves:
                 cpr_dt[f'CPR_fitted_{t}'] = r['s_curve']
                 coefs_list.append([dt, t, *prev])
 
-            # LoanAge > rep («down»)
             prev = coefs_main
             for t in sorted([t for t in tenors if t > rep]):
                 aux = dfp[dfp['LoanAge'] == t]
@@ -575,9 +597,6 @@ class scurves:
         return CPR_fitted_full, coefs_full
 
     def _scurve_by_tenor_unconstrained(self, data: pd.DataFrame):
-        """
-        Как _scurve_by_tenor, но без NonlinearConstraint.
-        """
         df = data.copy()
         df['Date'] = pd.to_datetime(df['Date'])
 
@@ -625,7 +644,6 @@ class scurves:
             rep = dft.groupby('LoanAge')['TotalDebtBln'].sum().idxmax()
             tenors = sorted(dft['LoanAge'].unique())
 
-            # base
             aux = dft[dft['LoanAge'] == rep]
             inp = {
                 'Incentive': aux['Incentive'],
@@ -637,7 +655,6 @@ class scurves:
             prev = r['coefs']
             coef_list.append([dt, rep, *prev])
 
-            # up
             for t in sorted([t for t in tenors if t < rep], reverse=True):
                 aux = dft[dft['LoanAge'] == t]
                 inp = {'Incentive': aux['Incentive'], 'CPR': aux['CPR'], 'TotalDebtBln': aux['TotalDebtBln']}
@@ -646,7 +663,6 @@ class scurves:
                 cpr_dt[f'CPR_fitted_{t}'] = r['s_curve']
                 coef_list.append([dt, t, *prev])
 
-            # down
             prev = coef_list[0][2:]
             for t in sorted([t for t in tenors if t > rep]):
                 aux = dft[dft['LoanAge'] == t]
@@ -667,7 +683,7 @@ class scurves:
         CPR_un_full = CPR_un_full.rename_axis('Incentive').reset_index()
         return CPR_un_full, coefs_un_full
 
-    # ---------- Утилита записи параметров в общий Excel ----------
+    # ---------- Запись параметров в общий Excel ----------
     def update_excel(self, file_path='SCurvesParameters.xlsx', truncate=False):
         if self.coefs.empty:
             print('coefs пуст – нечего писать')
