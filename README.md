@@ -1,10 +1,10 @@
--- === ПАРАМЕТРЫ ===
-DECLARE @dt_feb  date = '2025-02-28';
-DECLARE @dt_apr  date = '2025-04-01';
+-- === ПАРАМЕТРЫ снапшотов ДЛЯ ОКТЯБРЯ-2024 ===
+DECLARE @dt_prev date = '2024-09-30';  -- конец сентября
+DECLARE @dt_curr date = '2024-10-31';  -- конец октября
 
 WITH
--- 1) Что было на 28.02.2025 (кандидаты на выход)
-feb AS (
+-- 1) Срез на @dt_prev — кандидаты на "вышли в октябре"
+prev_m AS (
     SELECT
           t.cli_id
         , t.con_id
@@ -12,26 +12,25 @@ feb AS (
         , t.termdays
         , t.out_rub
     FROM alm.[ALM].[vw_balance_rest_all] t
-    WHERE t.dt_rep = @dt_feb
+    WHERE t.dt_rep = @dt_prev
       AND t.section_name = N'Срочные'
       AND t.block_name   = N'Привлечение ФЛ'
       AND t.od_flag      = 1
       AND t.cur          = '810'
       AND ISNULL(t.out_rubm, 0) > 0
 ),
--- 2) Что есть на 01.04.2025 (для anti-join)
-apr AS (
-    SELECT DISTINCT
-          t.con_id
+-- 2) Срез на @dt_curr — для anti-join
+curr_m AS (
+    SELECT DISTINCT t.con_id
     FROM alm.[ALM].[vw_balance_rest_all] t
-    WHERE t.dt_rep = @dt_apr
+    WHERE t.dt_rep = @dt_curr
       AND t.section_name = N'Срочные'
       AND t.block_name   = N'Привлечение ФЛ'
       AND t.od_flag      = 1
       AND t.cur          = '810'
       AND ISNULL(t.out_rubm, 0) > 0
 ),
--- 3) Вышедшие за март (были 28.02, исчезли к 01.04)
+-- 3) Вышедшие за октябрь: были в prev_m, пропали к curr_m
 exited AS (
     SELECT
           CASE
@@ -51,12 +50,11 @@ exited AS (
           END AS [Бакет срочности],
           NULLIF(LTRIM(RTRIM(TSEGMENTNAME)), N'') AS [Сегмент],
           out_rub
-    FROM feb f
-    LEFT JOIN apr a
-      ON a.con_id = f.con_id
-    WHERE a.con_id IS NULL  -- пропал к 01.04 → вышел в марте
+    FROM prev_m p
+    LEFT JOIN curr_m c ON c.con_id = p.con_id
+    WHERE c.con_id IS NULL
 ),
--- 4) Агрегация по бакету и сегменту
+-- 4) Аггр по сегментам
 agg_seg AS (
     SELECT
           [Бакет срочности],
@@ -65,7 +63,7 @@ agg_seg AS (
     FROM exited
     GROUP BY [Бакет срочности], COALESCE([Сегмент], N'Неопределён')
 ),
--- 5) Итоги по бакету (сумма по всем сегментам)
+-- 5) Итоги «Итого» по бакету
 agg_total AS (
     SELECT
           [Бакет срочности],
@@ -74,13 +72,11 @@ agg_total AS (
     FROM exited
     GROUP BY [Бакет срочности]
 ),
--- 6) Объединяем
 unioned AS (
     SELECT * FROM agg_seg
     UNION ALL
     SELECT * FROM agg_total
 ),
--- 7) Доля внутри сегмента
 with_share AS (
     SELECT
           [Бакет срочности],
@@ -94,8 +90,8 @@ with_share AS (
 SELECT
       [Бакет срочности],
       [Сегмент],
-      out_rub_total                                      AS [Объём выхода],
-      CAST(share_in_segment * 100.0 AS decimal(18,2))    AS [Доля бакета внутри сегмента, %]
+      out_rub_total                                   AS [Объём выхода],
+      CAST(share_in_segment * 100.0 AS decimal(18,2)) AS [Доля бакета внутри сегмента, %]
 FROM with_share
 ORDER BY
       CASE WHEN [Сегмент] = N'Итого' THEN 2 ELSE 1 END,
