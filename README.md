@@ -1,21 +1,16 @@
 -- === ПАРАМЕТРЫ ===
-DECLARE @dt_feb   date = '2025-02-28';
-DECLARE @dt_apr   date = '2025-04-01';
-DECLARE @m_start  date = '2025-03-01';
-DECLARE @m_end_ex date = '2025-04-01';  -- полуинтервал [01.03, 01.04)
+DECLARE @dt_feb  date = '2025-02-28';
+DECLARE @dt_apr  date = '2025-04-01';
 
 WITH
--- 1) Срез на 28.02.2025 — что было (кандидаты на "вышли")
+-- 1) Что было на 28.02.2025 (кандидаты на выход)
 feb AS (
     SELECT
           t.cli_id
         , t.con_id
         , t.TSEGMENTNAME
         , t.termdays
-        , t.dt_open
-        , t.dt_close_plan         -- если есть в витрине
-        , t.out_rub               -- объём на 28.02 (будем считать его "выходом")
-        , t.out_rubm
+        , t.out_rub
     FROM alm.[ALM].[vw_balance_rest_all] t
     WHERE t.dt_rep = @dt_feb
       AND t.section_name = N'Срочные'
@@ -24,7 +19,7 @@ feb AS (
       AND t.cur          = '810'
       AND ISNULL(t.out_rubm, 0) > 0
 ),
--- 2) Срез на 01.04.2025 — чем "закрыли март" (для anti-join)
+-- 2) Что есть на 01.04.2025 (для anti-join)
 apr AS (
     SELECT DISTINCT
           t.con_id
@@ -36,28 +31,8 @@ apr AS (
       AND t.cur          = '810'
       AND ISNULL(t.out_rubm, 0) > 0
 ),
--- 3) Договоры, которые были 28.02, но исчезли к 01.04 → вышли в марте
-exited_raw AS (
-    SELECT
-          f.cli_id
-        , f.con_id
-        , f.TSEGMENTNAME
-        , f.termdays
-        , f.dt_open
-        , f.dt_close_plan
-        , f.out_rub
-        , CASE
-            WHEN f.dt_close_plan >= @m_start AND f.dt_close_plan < @m_end_ex
-                 THEN N'По плану'      -- плановая дата в марте
-            ELSE N'Досрочно'           -- план не в марте, а факт исчезновения — в марте
-          END AS close_type
-    FROM feb f
-    LEFT JOIN apr a
-      ON a.con_id = f.con_id
-    WHERE a.con_id IS NULL  -- не найдено 01.04 => закрыт в марте
-),
--- 4) Приводим к бакетам
-exited_buckets AS (
+-- 3) Вышедшие за март (были 28.02, исчезли к 01.04)
+exited AS (
     SELECT
           CASE
               WHEN (termdays>=28  AND termdays<=33 ) THEN 31
@@ -75,46 +50,42 @@ exited_buckets AS (
               ELSE termdays
           END AS [Бакет срочности],
           NULLIF(LTRIM(RTRIM(TSEGMENTNAME)), N'') AS [Сегмент],
-          close_type,
           out_rub
-    FROM exited_raw
+    FROM feb f
+    LEFT JOIN apr a
+      ON a.con_id = f.con_id
+    WHERE a.con_id IS NULL  -- пропал к 01.04 → вышел в марте
 ),
--- 5) Агрегация по бакетам/сегментам/типу закрытия
+-- 4) Агрегация по бакету и сегменту
 agg_seg AS (
     SELECT
           [Бакет срочности],
           COALESCE([Сегмент], N'Неопределён') AS [Сегмент],
-          close_type,
-          SUM(out_rub) AS out_rub_total,
-          COUNT_BIG(*) AS deals_cnt
-    FROM exited_buckets
-    GROUP BY [Бакет срочности], COALESCE([Сегмент], N'Неопределён'), close_type
-),
--- 6) Итоги по сегментам (без разбиения на тип закрытия) — как в прошлой таблице
-agg_seg_tot AS (
-    SELECT
-          [Бакет срочности],
-          COALESCE([Сегмент], N'Неопределён') AS [Сегмент],
-          N'Итого'::nvarchar(20) AS close_type,
-          SUM(out_rub) AS out_rub_total,
-          SUM(deals_cnt) AS deals_cnt
-    FROM exited_buckets
+          SUM(out_rub) AS out_rub_total
+    FROM exited
     GROUP BY [Бакет срочности], COALESCE([Сегмент], N'Неопределён')
 ),
--- 7) Объединяем (деталь по типу + итоги)
+-- 5) Итоги по бакету (сумма по всем сегментам)
+agg_total AS (
+    SELECT
+          [Бакет срочности],
+          N'Итого' AS [Сегмент],
+          SUM(out_rub) AS out_rub_total
+    FROM exited
+    GROUP BY [Бакет срочности]
+),
+-- 6) Объединяем
 unioned AS (
     SELECT * FROM agg_seg
     UNION ALL
-    SELECT * FROM agg_seg_tot
+    SELECT * FROM agg_total
 ),
--- 8) Доля внутри сегмента (включая «Итого»)
+-- 7) Доля внутри сегмента
 with_share AS (
     SELECT
           [Бакет срочности],
           [Сегмент],
-          close_type,
           out_rub_total,
-          deals_cnt,
           CAST(out_rub_total * 1.0
                / NULLIF(SUM(out_rub_total) OVER (PARTITION BY [Сегмент]), 0)
                AS decimal(18,6)) AS share_in_segment
@@ -123,15 +94,10 @@ with_share AS (
 SELECT
       [Бакет срочности],
       [Сегмент],
-      close_type               AS [Тип закрытия],       -- По плану / Досрочно / Итого
-      out_rub_total            AS [Объём выхода],
-      deals_cnt                AS [Кол-во договоров],
-      CAST(share_in_segment * 100.0 AS decimal(18,2)) AS [Доля внутри сегмента, %],
-      CONCAT(REPLACE(STR(CAST(share_in_segment * 100.0 AS decimal(18,2)), 6, 2), ' ', ''), N'%') AS [Доля (формат)]
+      out_rub_total                                      AS [Объём выхода],
+      CAST(share_in_segment * 100.0 AS decimal(18,2))    AS [Доля бакета внутри сегмента, %]
 FROM with_share
 ORDER BY
       CASE WHEN [Сегмент] = N'Итого' THEN 2 ELSE 1 END,
       [Сегмент],
-      CASE
-          WHEN close_type = N'Итого' THEN 2 ELSE 1 END,
       CASE WHEN [Бакет срочности] IS NULL THEN -1 ELSE [Бакет срочности] END;
