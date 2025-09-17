@@ -1,86 +1,140 @@
--- === Параметры ===
-DECLARE @win_start  date = '2024-08-19';   -- включительно
-DECLARE @win_end_ex date = '2024-09-16';   -- полуинтервал (до 16.09)
-DECLARE @dt_rep     date = '2024-09-30';   -- интересует объём на 30 сентября
+CREATE OR ALTER PROCEDURE liq.prc_Refresh_DepositKeyrateSpread
+    @KeyrateLookbackYears INT = 5,   -- сколько лет назад брать ключ/кривые
+    @DepositLookbackYears INT = 1,   -- сколько лет назад брать депозиты
+    @DepositForwardYears  INT = 1,   -- сколько лет вперёд (по плану) брать депозиты
+    @RebuildTarget        BIT = 0    -- 1 = дропнуть и пересоздать целевую таблицу
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
 
-WITH base_0930 AS (
-    SELECT
-          t.cli_id
-        , t.con_id
-        , t.TSEGMENTNAME
-        , t.termdays
-        , t.dt_open
-        , t.out_rub
-    FROM alm.[ALM].[vw_balance_rest_all] t
-    WHERE t.dt_rep       = @dt_rep
-      AND t.section_name = N'Срочные'
-      AND t.block_name   = N'Привлечение ФЛ'
-      AND t.od_flag      = 1
-      AND t.cur          = '810'
-      AND ISNULL(t.is_floatrate,0) = 0
-      AND ISNULL(t.out_rub,0) > 0
-),
-filtered AS (
-    SELECT
-        CASE
-            WHEN (termdays>=28  AND termdays<=33 ) THEN 31
-            WHEN (termdays>=60  AND termdays<=70 ) THEN 61
-            WHEN (termdays>=85  AND termdays<=110) THEN 91
-            WHEN (termdays>=119 AND termdays<=140) THEN 124
-            WHEN (termdays>=175 AND termdays<=200) THEN 181
-            WHEN (termdays>=245 AND termdays<=290) THEN 274
-            WHEN (termdays>=340 AND termdays<=405) THEN 365
-            WHEN (termdays>=540 AND termdays<=621) THEN 550
-            WHEN (termdays>=720 AND termdays<=763) THEN 750
-            WHEN (termdays>=1090 AND termdays<=1140) THEN 1100
-            WHEN (termdays>=1450 AND termdays<=1475) THEN 1460
-            WHEN (termdays>=1795 AND termdays<=1830) THEN 1825
-            ELSE termdays
-        END AS [Бакет срочности],
-        NULLIF(LTRIM(RTRIM(TSEGMENTNAME)), N'') AS [Сегмент],
-        out_rub
-    FROM base_0930
-    WHERE dt_open >= @win_start
-      AND dt_open <  @win_end_ex
-),
-agg_seg AS (
-    SELECT
-          [Бакет срочности],
-          COALESCE([Сегмент], N'Неопределён') AS [Сегмент],
-          SUM(out_rub) AS out_rub_total
-    FROM filtered
-    GROUP BY [Бакет срочности], COALESCE([Сегмент], N'Неопределён')
-),
-agg_total AS (
-    SELECT
-          [Бакет срочности],
-          N'Итого' AS [Сегмент],
-          SUM(out_rub) AS out_rub_total
-    FROM filtered
-    GROUP BY [Бакет срочности]
-),
-unioned AS (
-    SELECT * FROM agg_seg
-    UNION ALL
-    SELECT * FROM agg_total
-),
-with_share AS (
-    SELECT
-          [Бакет срочности],
-          [Сегмент],
-          out_rub_total,
-          CAST(out_rub_total * 1.0
-               / NULLIF(SUM(out_rub_total) OVER (PARTITION BY [Сегмент]), 0)
-               AS decimal(18,6)) AS share_in_segment
-    FROM unioned
-)
-SELECT
-      [Бакет срочности],
-      [Сегмент],
-      out_rub_total                                   AS [Объём на 30.09],
-      CAST(share_in_segment * 100.0 AS decimal(18,2)) AS [Доля бакета внутри сегмента, %]
-FROM with_share
-ORDER BY
-      CASE WHEN [Сегмент] = N'Итого' THEN 2 ELSE 1 END,
-      [Сегмент],
-      CASE WHEN [Бакет срочности] IS NULL THEN -1 ELSE [Бакет срочности] END;
+    BEGIN TRY
+        /* — опционально пересоздаём целевую таблицу */
+        IF @RebuildTarget = 1 AND OBJECT_ID('liq.DepositKeyrateSpread','U') IS NOT NULL
+            DROP TABLE liq.DepositKeyrateSpread;
+
+        /* === 1) temp: ключевая ставка (до 365 дней срок), за @KeyrateLookbackYears === */
+        IF OBJECT_ID('tempdb..#keyrate') IS NOT NULL DROP TABLE #keyrate;
+        SELECT
+            DT_REP,
+            TERM,
+            KEY_RATE,
+            AVG_KEY_RATE
+        INTO #keyrate
+        FROM ALM.info.VW_ForecastKEY_everyday WITH (NOLOCK)
+        WHERE DT_REP >= DATEADD(YEAR, -@KeyrateLookbackYears, CAST(GETDATE() AS date))
+          AND TERM   <= 365;
+
+        /* === 2) temp: депозиты (окно: -@DepositLookbackYears ... +@DepositForwardYears), без ФЛ === */
+        IF OBJECT_ID('tempdb..#deposit') IS NOT NULL DROP TABLE #deposit;
+        SELECT *
+        INTO #deposit
+        FROM LIQUIDITY.liq.fnc_DepositContract_new (
+                0,
+                DATEADD(YEAR, -@DepositLookbackYears, CAST(GETDATE() AS date)),
+                DATEADD(YEAR,  @DepositForwardYears,  CAST(GETDATE() AS date)),
+                'NO_FL'
+        )
+        WHERE CLI_SHORT_NAME <> N'ФЛ';
+
+        /* === 3) расчёты: MATUR, ставки, спреды === */
+        WITH d AS (
+            SELECT
+                dps.*,
+                CASE WHEN dps.DT_CLOSE_PLAN = '4444-01-01' THEN 1
+                     ELSE DATEDIFF(DAY, dps.DT_OPEN, dps.DT_CLOSE_PLAN)
+                END AS MATUR
+            FROM #deposit dps
+        ),
+        base AS (
+            SELECT
+                d.*,
+                man.IS_PDR,
+
+                /* помесячная ставка по депозиту с учётом конвенции */
+                LIQUIDITY.liq.fnc_IntRate(
+                    d.RATE,
+                    ISNULL(conv.NEW_CONVENTION_NAME, d.CONVENTION),
+                    'monthly',
+                    d.MATUR,
+                    1
+                ) AS Rate_Monthly,
+
+                /* трансфертная ставка: годовая → помесячная (конвенция — AT_THE_END), на (1 - fc.rate) */
+                CAST(
+                    LIQUIDITY.liq.fnc_IntRate(
+                        trf.Rate,
+                        'AT_THE_END',     -- это конвенция начисления
+                        'monthly',
+                        trf.Term,
+                        1
+                    ) AS DECIMAL(18,8)
+                ) * (1 - fc.rate) AS MonthlyCONV_LIQ_TransfertRate,
+
+                kr.KEY_RATE,
+                kr.AVG_KEY_RATE AS MonthlyKeyRate,
+
+                /* спред депозита к усреднённой «месячной» ключевой */
+                LIQUIDITY.liq.fnc_IntRate(
+                    d.RATE,
+                    ISNULL(conv.NEW_CONVENTION_NAME, d.CONVENTION),
+                    'monthly',
+                    d.MATUR,
+                    1
+                ) - kr.AVG_KEY_RATE AS Spread2KeyRate
+            FROM d
+            LEFT JOIN LIQUIDITY.liq.man_PROD_NAME_OPTIONLIAB man
+                   ON d.PROD_NAME = man.PROD_NAME
+            LEFT JOIN #keyrate kr
+                   ON d.MATUR   = kr.TERM
+                  AND d.DT_OPEN = kr.DT_REP
+            LEFT JOIN [ALM].[info].[VW_FORrates_controlling] fc
+                   ON fc.CurName = 'RUR'
+                  AND d.DT_OPEN BETWEEN fc.dt_from AND DATEADD(DAY, -1, fc.dateNext)
+            LEFT JOIN [ALM].[info].[VW_TransfertRates_everyday_settled_interpolated] trf
+                   ON d.DT_OPEN   = trf.[Date]
+                  AND d.MATUR     = trf.[Term]
+                  AND trf.[Type]  = 'BaseFixed'
+                  AND trf.[Currency] = 'RUB'
+            LEFT JOIN LIQUIDITY.liq.man_CONVENTION conv WITH (NOLOCK)
+                   ON conv.CONVENTION_NAME = d.CONVENTION
+        )
+
+        /* === 4) целевая таблица: создаём при первом запуске или очищаем и вставляем === */
+        IF OBJECT_ID('liq.DepositKeyrateSpread','U') IS NULL
+        BEGIN
+            SELECT b.*
+            INTO liq.DepositKeyrateSpread
+            FROM base b;
+
+            /* (необязательно) индексы — под свои частые фильтры:
+            CREATE INDEX IX_DepositKeyrateSpread_DT_OPEN ON liq.DepositKeyrateSpread(DT_OPEN);
+            CREATE INDEX IX_DepositKeyrateSpread_PROD ON liq.DepositKeyrateSpread(PROD_NAME);
+            */
+        END
+        ELSE
+        BEGIN
+            TRUNCATE TABLE liq.DepositKeyrateSpread;
+
+            INSERT INTO liq.DepositKeyrateSpread
+            SELECT b.* FROM base b;
+        END
+
+        /* Возврат количества вставленных строк */
+        SELECT COUNT(*) AS rows_loaded
+        FROM liq.DepositKeyrateSpread;
+    END TRY
+    BEGIN CATCH
+        DECLARE @ErrMsg NVARCHAR(4000) = ERROR_MESSAGE(),
+                @ErrNum INT = ERROR_NUMBER(),
+                @ErrSev INT = ERROR_SEVERITY(),
+                @ErrSta INT = ERROR_STATE(),
+                @ErrLin INT = ERROR_LINE(),
+                @ErrProc SYSNAME = ERROR_PROCEDURE();
+
+        RAISERROR(N'[liq.prc_Refresh_DepositKeyrateSpread] %s | Num=%d Sev=%d Sta=%d Line=%d Proc=%s',
+                  @ErrSev, 1,
+                  @ErrMsg, @ErrNum, @ErrSev, @ErrSta, @ErrLin, @ErrProc);
+    END CATCH
+END;
+GO
