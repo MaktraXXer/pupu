@@ -1,19 +1,14 @@
-CREATE OR ALTER PROCEDURE liq.prc_Refresh_DepositKeyrateSpread
-    @KeyrateLookbackYears INT = 5,   -- сколько лет назад брать ключ/кривые
-    @DepositLookbackYears INT = 1,   -- сколько лет назад брать депозиты
-    @DepositForwardYears  INT = 1,   -- сколько лет вперёд (по плану) брать депозиты
-    @RebuildTarget        BIT = 0    -- 1 = дропнуть и пересоздать целевую таблицу
+CREATE OR ALTER PROCEDURE liq.prc_Rebuild_DepositKeyrateSpread
+    @KeyrateLookbackYears INT = 5,  -- лет назад по ключевой
+    @DepositLookbackYears INT = 1,  -- депозиты: сколько лет назад
+    @DepositForwardYears  INT = 1   -- депозиты: сколько лет вперёд (по плану)
 AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
 
     BEGIN TRY
-        /* — опционально пересоздаём целевую таблицу */
-        IF @RebuildTarget = 1 AND OBJECT_ID('liq.DepositKeyrateSpread','U') IS NOT NULL
-            DROP TABLE liq.DepositKeyrateSpread;
-
-        /* === 1) temp: ключевая ставка (до 365 дней срок), за @KeyrateLookbackYears === */
+        /* === 1) temp: ключевая ставка (TERM <= 365) === */
         IF OBJECT_ID('tempdb..#keyrate') IS NOT NULL DROP TABLE #keyrate;
         SELECT
             DT_REP,
@@ -25,7 +20,7 @@ BEGIN
         WHERE DT_REP >= DATEADD(YEAR, -@KeyrateLookbackYears, CAST(GETDATE() AS date))
           AND TERM   <= 365;
 
-        /* === 2) temp: депозиты (окно: -@DepositLookbackYears ... +@DepositForwardYears), без ФЛ === */
+        /* === 2) temp: депозиты (окно -@DepositLookbackYears … +@DepositForwardYears), без ФЛ === */
         IF OBJECT_ID('tempdb..#deposit') IS NOT NULL DROP TABLE #deposit;
         SELECT *
         INTO #deposit
@@ -60,11 +55,11 @@ BEGIN
                     1
                 ) AS Rate_Monthly,
 
-                /* трансфертная ставка: годовая → помесячная (конвенция — AT_THE_END), на (1 - fc.rate) */
+                /* трансфертная ставка: годовая → помесячная (конвенция начисления) */
                 CAST(
                     LIQUIDITY.liq.fnc_IntRate(
                         trf.Rate,
-                        'AT_THE_END',     -- это конвенция начисления
+                        'AT_THE_END',     -- конвенция; при необходимости поставь свою
                         'monthly',
                         trf.Term,
                         1
@@ -86,53 +81,47 @@ BEGIN
             LEFT JOIN LIQUIDITY.liq.man_PROD_NAME_OPTIONLIAB man
                    ON d.PROD_NAME = man.PROD_NAME
             LEFT JOIN #keyrate kr
-                   ON d.MATUR   = kr.TERM
-                  AND d.DT_OPEN = kr.DT_REP
+                   ON (d.MATUR = kr.TERM)
+                  AND (d.DT_OPEN = kr.DT_REP)
             LEFT JOIN [ALM].[info].[VW_FORrates_controlling] fc
-                   ON fc.CurName = 'RUR'
-                  AND d.DT_OPEN BETWEEN fc.dt_from AND DATEADD(DAY, -1, fc.dateNext)
+                   ON (fc.CurName = 'RUR')
+                  AND (d.DT_OPEN BETWEEN fc.dt_from AND DATEADD(DAY, -1, fc.dateNext))
             LEFT JOIN [ALM].[info].[VW_TransfertRates_everyday_settled_interpolated] trf
-                   ON d.DT_OPEN   = trf.[Date]
-                  AND d.MATUR     = trf.[Term]
-                  AND trf.[Type]  = 'BaseFixed'
-                  AND trf.[Currency] = 'RUB'
+                   ON (d.DT_OPEN = trf.[Date])
+                  AND (d.MATUR  = trf.[Term])
+                  AND (trf.[Type] = 'BaseFixed')
+                  AND (trf.[Currency] = 'RUB')
             LEFT JOIN LIQUIDITY.liq.man_CONVENTION conv WITH (NOLOCK)
                    ON conv.CONVENTION_NAME = d.CONVENTION
         )
 
-        /* === 4) целевая таблица: создаём при первом запуске или очищаем и вставляем === */
-        IF OBJECT_ID('liq.DepositKeyrateSpread','U') IS NULL
-        BEGIN
-            SELECT b.*
-            INTO liq.DepositKeyrateSpread
-            FROM base b;
+        /* === 4) целевая таблица: ВСЕГДА дропаем и создаём заново === */
+        IF OBJECT_ID('liq.DepositKeyrateSpread','U') IS NOT NULL
+            DROP TABLE liq.DepositKeyrateSpread;
 
-            /* (необязательно) индексы — под свои частые фильтры:
-            CREATE INDEX IX_DepositKeyrateSpread_DT_OPEN ON liq.DepositKeyrateSpread(DT_OPEN);
-            CREATE INDEX IX_DepositKeyrateSpread_PROD ON liq.DepositKeyrateSpread(PROD_NAME);
-            */
-        END
-        ELSE
-        BEGIN
-            TRUNCATE TABLE liq.DepositKeyrateSpread;
+        SELECT
+            b.*
+        INTO liq.DepositKeyrateSpread
+        FROM base b;
 
-            INSERT INTO liq.DepositKeyrateSpread
-            SELECT b.* FROM base b;
-        END
+        /* при необходимости — индексы (пример):
+        -- CREATE INDEX IX_DepositKeyrateSpread_DT_OPEN ON liq.DepositKeyrateSpread(DT_OPEN);
+        -- CREATE INDEX IX_DepositKeyrateSpread_PROD    ON liq.DepositKeyrateSpread(PROD_NAME);
+        */
 
-        /* Возврат количества вставленных строк */
         SELECT COUNT(*) AS rows_loaded
         FROM liq.DepositKeyrateSpread;
     END TRY
     BEGIN CATCH
-        DECLARE @ErrMsg NVARCHAR(4000) = ERROR_MESSAGE(),
-                @ErrNum INT = ERROR_NUMBER(),
-                @ErrSev INT = ERROR_SEVERITY(),
-                @ErrSta INT = ERROR_STATE(),
-                @ErrLin INT = ERROR_LINE(),
-                @ErrProc SYSNAME = ERROR_PROCEDURE();
+        DECLARE
+            @ErrMsg NVARCHAR(4000) = ERROR_MESSAGE(),
+            @ErrNum INT = ERROR_NUMBER(),
+            @ErrSev INT = ERROR_SEVERITY(),
+            @ErrSta INT = ERROR_STATE(),
+            @ErrLin INT = ERROR_LINE(),
+            @ErrProc SYSNAME = ERROR_PROCEDURE();
 
-        RAISERROR(N'[liq.prc_Refresh_DepositKeyrateSpread] %s | Num=%d Sev=%d Sta=%d Line=%d Proc=%s',
+        RAISERROR(N'[liq.prc_Rebuild_DepositKeyrateSpread] %s | Num=%d Sev=%d Sta=%d Line=%d Proc=%s',
                   @ErrSev, 1,
                   @ErrMsg, @ErrNum, @ErrSev, @ErrSta, @ErrLin, @ErrProc);
     END CATCH
