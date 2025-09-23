@@ -1,70 +1,40 @@
--- 1) Ключевая
-DROP TABLE IF EXISTS #keyrate;
-SELECT DT_REP, TERM, KEY_RATE, AVG_KEY_RATE
-INTO #keyrate
-FROM ALM.info.VW_ForecastKEY_everyday WITH (NOLOCK)
-WHERE DT_REP >= DATEADD(DAY, -365*5, CAST(GETDATE() AS date))
-  AND TERM   <= 365;
+class SCurvesByProduct:
+    ...
+    @staticmethod
+    def _fsname(v):
+        # аккуратно превращаем любое значение в безопасное имя папки
+        s = str(v)
+        return s.replace(os.sep, "_")
 
--- 2) Депозиты
-DROP TABLE IF EXISTS #deposit;
-SELECT *
-INTO #deposit
-FROM LIQUIDITY.liq.fnc_DepositContract_new(
-       0,
-       DATEADD(DAY, -365*5, CAST(GETDATE() AS date)),
-       DATEADD(DAY,  365*5, CAST(GETDATE() AS date)),
-       'NO_FL'
-     )
-WHERE CLI_SHORT_NAME <> N'ФЛ';
+    def run(self):
+        self.load()
 
--- 3) Итог без «лишних» полей
-SELECT
-      dps.*                                      -- только оригинальные поля депозита
-    , man.IS_PDR
-    , Rate_Monthly = LIQUIDITY.liq.fnc_IntRate(
-                        dps.RATE,
-                        ISNULL(conv.NEW_CONVENTION_NAME, norm_conv.norm_convention),
-                        'monthly',
-                        td.term_days,
-                        1
-                      )
-    , Spread2KeyRate = LIQUIDITY.liq.fnc_IntRate(
-                          dps.RATE,
-                          ISNULL(conv.NEW_CONVENTION_NAME, norm_conv.norm_convention),
-                          'monthly',
-                          td.term_days,
-                          1
-                        ) - kr.AVG_KEY_RATE
-    , kr.KEY_RATE
-    , MonthlyKeyRate = kr.AVG_KEY_RATE
-FROM #deposit dps
+        ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        out_root = self._ensure_dir(os.path.join(self.folder_path, ts))
 
--- term_days: если DT_CLOSE_PLAN = '4444-01-01' или NULL -> 1, иначе DATEDIFF
-CROSS APPLY (
-    SELECT term_days = CASE
-                           WHEN dps.DT_CLOSE_PLAN IS NULL
-                             OR CAST(dps.DT_CLOSE_PLAN AS date) = DATEFROMPARTS(4444,1,1)
-                             THEN 1
-                           ELSE DATEDIFF(DAY, dps.DT_OPEN, dps.DT_CLOSE_PLAN)
-                       END
-) td
+        global_xmin = self.data['Incentive'].min()
+        global_xmax = self.data['Incentive'].max()
 
--- нормализованная конвенция для джойна/расчёта, но НЕ выводим её в SELECT
-CROSS APPLY (
-    SELECT norm_convention = CASE
-        WHEN dps.CONVENTION = 'UNDEFINED'
-             THEN CASE WHEN td.term_days <= 365 THEN 'AT_THE_END' ELSE '1M' END
-        ELSE dps.CONVENTION
-    END
-) norm_conv
+        for p in self.products:
+            dfp = self.data[self.data[self.product_col] == p].copy()
+            if dfp.empty:
+                continue
 
-LEFT JOIN LIQUIDITY.liq.man_PROD_NAME_OPTIONLIAB man
-       ON dps.PROD_NAME = man.PROD_NAME
+            # >>> ВАЖНО: приводим имя продукта к строке для путей
+            p_fs = self._fsname(p)
 
-LEFT JOIN LIQUIDITY.liq.man_CONVENTION conv WITH (NOLOCK)
-       ON conv.CONVENTION_NAME = norm_conv.norm_convention
+            prod_root = self._ensure_dir(os.path.join(out_root, p_fs))
+            excel_root = self._ensure_dir(os.path.join(prod_root, 'excel'))
 
-LEFT JOIN #keyrate kr
-       ON kr.TERM   = td.term_days
-      AND kr.DT_REP = CAST(dps.DT_OPEN AS date);
+            CPR_un, coefs_un = self._fit_unconstrained_one_product(dfp)
+            self.cpr_un[p] = CPR_un
+            self.coefs_un[p] = coefs_un
+
+            self._to_excel(os.path.join(excel_root, 'coefs_unconstrained.xlsx'),
+                           {'coefs_unconstrained': coefs_un})
+            self._to_excel(os.path.join(excel_root, 'CPR_fitted_unconstrained.xlsx'),
+                           {'CPR_fitted_unconstrained': CPR_un})
+
+            self._plot_one_product(p, dfp, CPR_un, coefs_un, prod_root, global_xmin, global_xmax)
+
+        self._plot_overlays_between_products(out_root)
