@@ -1,6 +1,6 @@
 DECLARE @dt_rep date = '2025-08-31';
 
-/* ===== 1) Снимок на дату отчёта -> #base ===== */
+/* 1) Снимок на дату отчёта -> #base */
 IF OBJECT_ID('tempdb..#base') IS NOT NULL DROP TABLE #base;
 
 SELECT
@@ -22,29 +22,26 @@ WHERE t.dt_rep       = @dt_rep
   AND t.tprod_name   = N'Депозиты ЮЛ'
   AND t.TSegmentname IN (N'Ипотека', N'Розничный бизнес');
 
--- FIX: без INCLUDE в кластеризованном индексе
-CREATE CLUSTERED INDEX IX_base_seg_close ON #base (TSegmentname, dt_close_d);
-
-/* ===== 2) Границы и календарь без рекурсии ===== */
+/* 2) Границы диапазона дат */
 DECLARE @d_end date;
 SELECT @d_end = MAX(dt_close_d) FROM #base;
--- на случай пустого набора: держим хотя бы @dt_rep
-SET @d_end = ISNULL(@d_end, @dt_rep);
+SET @d_end = ISNULL(@d_end, @dt_rep);  -- если пусто, хотя бы @dt_rep
 
+/* 3) Календарь [@dt_rep .. @d_end] без рекурсии (tally) -> #calendar */
 IF OBJECT_ID('tempdb..#calendar') IS NOT NULL DROP TABLE #calendar;
 
 ;WITH N AS (
-    SELECT TOP (DATEDIFF(DAY, @dt_rep, @d_end) + 1)
+    SELECT TOP (CASE WHEN DATEDIFF(DAY, @dt_rep, @d_end) + 1 >= 1 
+                     THEN DATEDIFF(DAY, @dt_rep, @d_end) + 1 
+                     ELSE 1 END)
            ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1 AS n
     FROM sys.all_objects a CROSS JOIN sys.all_objects b
 )
 SELECT DATEADD(DAY, n, @dt_rep) AS d
 INTO #calendar
-FROM N;  -- FIX: добавлен FROM N
+FROM N;
 
-CREATE CLUSTERED INDEX IX_calendar_d ON #calendar(d);
-
-/* ===== 3) Сегменты и сетка дат ===== */
+/* 4) Сегменты и сетка дат -> #grid */
 IF OBJECT_ID('tempdb..#segments') IS NOT NULL DROP TABLE #segments;
 SELECT DISTINCT TSegmentname INTO #segments FROM #base;
 
@@ -53,9 +50,8 @@ SELECT s.TSegmentname, c.d
 INTO #grid
 FROM #segments s
 CROSS JOIN #calendar c;
-CREATE CLUSTERED INDEX IX_grid_seg_d ON #grid(TSegmentname, d);
 
-/* ===== 4) Закрытия по датам и их кумулятивные суммы ===== */
+/* 5) Выходы по датам (агрегат) и их кумулятивные суммы -> #closings, #closings_cum */
 IF OBJECT_ID('tempdb..#closings') IS NOT NULL DROP TABLE #closings;
 
 SELECT
@@ -70,8 +66,6 @@ INTO #closings
 FROM #base b
 GROUP BY b.dt_close_d, b.TSegmentname;
 
-CREATE CLUSTERED INDEX IX_closings_seg_d ON #closings(TSegmentname, d);
-
 IF OBJECT_ID('tempdb..#closings_cum') IS NOT NULL DROP TABLE #closings_cum;
 
 SELECT
@@ -85,9 +79,7 @@ SELECT
 INTO #closings_cum
 FROM #closings c;
 
-CREATE CLUSTERED INDEX IX_closings_cum_seg_d ON #closings_cum(TSegmentname, d);
-
-/* ===== 5) Начальные итоги на @dt_rep (вес. средние по non-NULL ставкам) ===== */
+/* 6) Начальные итоги на @dt_rep (вес. средние считаем по non-NULL ставкам) -> #init */
 IF OBJECT_ID('tempdb..#init') IS NOT NULL DROP TABLE #init;
 
 SELECT
@@ -101,9 +93,9 @@ INTO #init
 FROM #base b
 GROUP BY b.TSegmentname;
 
-CREATE UNIQUE CLUSTERED INDEX IX_init_seg ON #init(TSegmentname);
-
-/* ===== 6a) РЕЗУЛЬТАТ 1: Амортизация (включая 2025-08-31) ===== */
+/* 7a) РЕЗУЛЬТАТ 1: Амортизация (включая 2025-08-31)
+       live(d) = init – cumulative_closings(<= d).
+       Депозиты с dt_close = d НЕ входят в live на d. */
 SELECT
     g.d                                 AS [date],
     g.TSegmentname                      AS tsegmentname,
@@ -122,6 +114,7 @@ FROM #grid g
 JOIN #init i
   ON i.TSegmentname = g.TSegmentname
 OUTER APPLY (
+    /* Берём «последний» кумулятив на дату d (если закрытий ещё не было — NULL) */
     SELECT TOP (1) *
     FROM #closings_cum x
     WHERE x.TSegmentname = g.TSegmentname
@@ -130,7 +123,8 @@ OUTER APPLY (
 ) AS cc
 ORDER BY g.d, g.TSegmentname;
 
-/* ===== 6b) РЕЗУЛЬТАТ 2: Выходы (включая 2025-08-31) ===== */
+/* 7b) РЕЗУЛЬТАТ 2: Выходы (включая 2025-08-31)
+       Депозиты с dt_close = d ПОПАДАЮТ сюда на d; если выходов нет — NULL. */
 SELECT
     g.d                                 AS [date],
     g.TSegmentname                      AS tsegmentname,
