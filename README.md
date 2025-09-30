@@ -27,9 +27,6 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # --- подключение (как у тебя принято) ---
-ORA_USER = os.getenv("ORA_USER") or 'makhmudov_mark[TREASURY]'
-ORA_PASS = os.getenv("ORA_PASS") or 'Mmakhmudov_mark#1488'
-ORA_DSN  = os.getenv("ORA_DSN")  or 'udwh-db-pr-01/udwh'
 
 # --- список программ по умолчанию ---
 DEFAULT_PROGRAMS = ['Семейная ипотека', 'ИТ ипотека', 'Дальневосточная ипотека']
