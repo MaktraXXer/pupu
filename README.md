@@ -22,13 +22,14 @@ WHERE t.dt_rep       = @dt_rep
   AND t.tprod_name   = N'Депозиты ЮЛ'
   AND t.TSegmentname IN (N'Ипотека', N'Розничный бизнес');
 
--- Индекс под дальнейшие агрегации/апплаи
-CREATE CLUSTERED INDEX IX_base_seg_close ON #base (TSegmentname, dt_close_d) 
-INCLUDE (out_rub, rate_trf, rate_con);
+-- FIX: без INCLUDE в кластеризованном индексе
+CREATE CLUSTERED INDEX IX_base_seg_close ON #base (TSegmentname, dt_close_d);
 
 /* ===== 2) Границы и календарь без рекурсии ===== */
 DECLARE @d_end date;
 SELECT @d_end = MAX(dt_close_d) FROM #base;
+-- на случай пустого набора: держим хотя бы @dt_rep
+SET @d_end = ISNULL(@d_end, @dt_rep);
 
 IF OBJECT_ID('tempdb..#calendar') IS NOT NULL DROP TABLE #calendar;
 
@@ -38,14 +39,15 @@ IF OBJECT_ID('tempdb..#calendar') IS NOT NULL DROP TABLE #calendar;
     FROM sys.all_objects a CROSS JOIN sys.all_objects b
 )
 SELECT DATEADD(DAY, n, @dt_rep) AS d
-INTO #calendar;
+INTO #calendar
+FROM N;  -- FIX: добавлен FROM N
 
 CREATE CLUSTERED INDEX IX_calendar_d ON #calendar(d);
 
 /* ===== 3) Сегменты и сетка дат ===== */
 IF OBJECT_ID('tempdb..#segments') IS NOT NULL DROP TABLE #segments;
 SELECT DISTINCT TSegmentname INTO #segments FROM #base;
--- 2 сегмента → сетка очень маленькая, но индекс всё же поставим
+
 IF OBJECT_ID('tempdb..#grid') IS NOT NULL DROP TABLE #grid;
 SELECT s.TSegmentname, c.d
 INTO #grid
@@ -85,7 +87,7 @@ FROM #closings c;
 
 CREATE CLUSTERED INDEX IX_closings_cum_seg_d ON #closings_cum(TSegmentname, d);
 
-/* ===== 5) Начальные итоги на @dt_rep (вес. ср. только по non-NULL ставкам) ===== */
+/* ===== 5) Начальные итоги на @dt_rep (вес. средние по non-NULL ставкам) ===== */
 IF OBJECT_ID('tempdb..#init') IS NOT NULL DROP TABLE #init;
 
 SELECT
@@ -101,9 +103,7 @@ GROUP BY b.TSegmentname;
 
 CREATE UNIQUE CLUSTERED INDEX IX_init_seg ON #init(TSegmentname);
 
-/* ===== 6a) РЕЗУЛЬТАТ 1: Амортизация (включая 2025-08-31) =====
-   live = init - cumulative_closings(<= d)
-   депозиты с dt_close = d НЕ входят в live на d (правильно) */
+/* ===== 6a) РЕЗУЛЬТАТ 1: Амортизация (включая 2025-08-31) ===== */
 SELECT
     g.d                                 AS [date],
     g.TSegmentname                      AS tsegmentname,
@@ -130,8 +130,7 @@ OUTER APPLY (
 ) AS cc
 ORDER BY g.d, g.TSegmentname;
 
-/* ===== 6b) РЕЗУЛЬТАТ 2: Выходы (включая 2025-08-31) =====
-   депозиты с dt_close = d ПОПАДАЮТ в выходы на d; если выходов нет — NULL */
+/* ===== 6b) РЕЗУЛЬТАТ 2: Выходы (включая 2025-08-31) ===== */
 SELECT
     g.d                                 AS [date],
     g.TSegmentname                      AS tsegmentname,
