@@ -1,157 +1,197 @@
-Ок, делаем максимально просто и «в лоб», без кумулятивов и хитростей — только календарь, кросс-джойн с сегментом и фильтр по dt_close:
-	•	Амортизация: на каждую дату берём все вклады, у которых dt_close_d > эта_дата. Если уже всё вышло — out_rub = 0, ставки NULL.
-	•	Выходы: на каждую дату берём ровно те, у кого dt_close_d = эта_дата. Если в день нет выходов — NULL в значениях.
+# -*- coding: utf-8 -*-
+"""
+cpr_loader_and_runner.py
+Выгрузка «полотна» по льготным программам из cpr_report_new + запуск симуляций по каждой программе.
 
-Я оставил твой фильтр по «Эскроу ФЛ / Розничный бизнес», поменял только календарь (чтобы не создавать лишний день) и расчёт.
+Требует: чтобы в текущем окружении уже была объявлена функция
+run_scurves_cv_and_save(df_raw, n_iter, hist_bin, out_root, lb_rate, ub_rate, random_state)
+(см. твой блок scurves_kn_cv_save.py).
 
-⸻
+Что делает:
+  1) fetch_cpr_report_new_raw(programs=...): тянет сырые данные по заданным AGG_PROD_NAME.
+  2) normalize_cpr_columns(df): приводит регистры/типы и делает ренейм столбцов.
+  3) loop по программам: сабсет df и вызывает run_scurves_cv_and_save(...) в отдельную папку.
+"""
 
-Скрипт 1 — Амортизация (включая 2025-08-31 и финальный нулевой день)
+import os
+import warnings
+from datetime import datetime
+from typing import List, Optional
 
-DECLARE @dt_rep date = '2025-08-31';
+import numpy as np
+import pandas as pd
+import oracledb
 
-IF OBJECT_ID('tempdb..#base') IS NOT NULL DROP TABLE #base;
-IF OBJECT_ID('tempdb..#cal')  IS NOT NULL DROP TABLE #cal;
-IF OBJECT_ID('tempdb..#seg')  IS NOT NULL DROP TABLE #seg;
+# приглушим ворнинги как просил
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
--- 1) Снимок портфеля на дату отчёта (Эскроу ФЛ, Розничный бизнес)
-SELECT
-    t.TSegmentname,
-    CAST(t.dt_close AS date) AS dt_close_d,
-    t.out_rub,
-    t.rate_con,
-    t.rate_trf
-INTO #base
-FROM alm.[ALM].[vw_balance_rest_all] t WITH (NOLOCK)
-WHERE t.dt_rep       = @dt_rep
-  AND t.AP           = N'Пассив'
-  AND t.BLOCK_NAME   = N'Эскроу'
-  AND t.section_name = N'Эскроу без ПФ'
-  AND t.cur          = '810'
-  AND t.acc_role     = N'LIAB'
-  AND t.out_rub      IS NOT NULL
-  AND t.tprod_name   = N'Эскроу ФЛ'
-  AND t.TSegmentname = N'Розничный бизнес'
-  AND t.dt_close     > t.dt_rep;      -- закрытия после даты отчёта
+# --- подключение (как у тебя принято) ---
+ORA_USER = os.getenv("ORA_USER") or 'makhmudov_mark[TREASURY]'
+ORA_PASS = os.getenv("ORA_PASS") or 'Mmakhmudov_mark#1488'
+ORA_DSN  = os.getenv("ORA_DSN")  or 'udwh-db-pr-01/udwh'
 
--- 2) Диапазон дат: от @dt_rep до макс. dt_close (включительно)
-DECLARE @d_end date;
-SELECT @d_end = ISNULL(MAX(dt_close_d), @dt_rep) FROM #base;
+# --- список программ по умолчанию ---
+DEFAULT_PROGRAMS = ['Семейная ипотека', 'ИТ ипотека', 'Дальневосточная ипотека']
 
-;WITH cal AS (
-    SELECT @dt_rep AS d
-    UNION ALL
-    SELECT DATEADD(DAY, 1, d) FROM cal WHERE d < @d_end  -- ВАЖНО: <, чтобы включить @d_end и не перелезть дальше
-)
-SELECT d INTO #cal FROM cal
-OPTION (MAXRECURSION 0);
+# --- маппинг ренейма (регистр исходных колонок может быть любым) ---
+RENAME_MAP_CPR = {
+    "DT_REP": "dt_rep",
+    "CON_ID": "con_id",
+    "AGE_GROUP_ID": "age_group_id",
+    "STIMUL": "stimul",
+    "OD_AFTER_PLAN": "od_after_plan",
+    "PREMAT_PAYMENT": "premat_payment",
+    "CON_RATE": "con_rate",
+    "REFIN_RATE": "refin_rate",
+    "PAYMENT_PERIOD": "payment_period",
+    "AGG_PROD_NAME": "agg_prod_name",
+}
 
--- 3) Сегменты (здесь один, но оставим общий вид)
-SELECT DISTINCT TSegmentname INTO #seg FROM #base;
+def _normalize_cols_upper(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip().upper() for c in df.columns]
+    return df
 
--- 4) Амортизация: живые вклады = те, у кого dt_close_d > дата
-SELECT
-    c.d                                      AS [date],
-    s.TSegmentname                           AS tsegmentname,
-    /* Если уже всё вышло в этот день — сумма будет NULL, приводим к 0 */
-    COALESCE(SUM(CASE WHEN b.dt_close_d > c.d THEN b.out_rub END), 0) AS out_rub,
-    /* Средневзвешенная TRF по живым; если нет живых — NULL */
-    CAST(
-        SUM(CASE WHEN b.dt_close_d > c.d AND b.rate_trf IS NOT NULL THEN b.out_rub * b.rate_trf END)
-        / NULLIF(SUM(CASE WHEN b.dt_close_d > c.d AND b.rate_trf IS NOT NULL THEN b.out_rub END), 0)
-        AS DECIMAL(12,6)
-    ) AS rate_trf_srvz,
-    /* Средневзвешенная CON по живым; если нет живых — NULL */
-    CAST(
-        SUM(CASE WHEN b.dt_close_d > c.d AND b.rate_con IS NOT NULL THEN b.out_rub * b.rate_con END)
-        / NULLIF(SUM(CASE WHEN b.dt_close_d > c.d AND b.rate_con IS NOT NULL THEN b.out_rub END), 0)
-        AS DECIMAL(12,6)
-    ) AS rate_con_srvz
-FROM #cal c
-CROSS JOIN #seg s
-LEFT JOIN #base b
-       ON b.TSegmentname = s.TSegmentname
-GROUP BY c.d, s.TSegmentname
-ORDER BY c.d, s.TSegmentname;
+def normalize_cpr_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Жёстко приводим колонки к ожидаемым именам/типам для дальнейшего пайплайна.
+    """
+    df = _normalize_cols_upper(df)
+    need = set(RENAME_MAP_CPR.keys())
+    miss = [c for c in need if c not in df.columns]
+    if miss:
+        raise KeyError(f"В df не хватает колонок: {miss}")
+    df = df.rename(columns=RENAME_MAP_CPR)
 
-	•	На последнюю дату (@d_end) строка будет: out_rub = 0, ставки NULL — потому что условие b.dt_close_d > c.d уже нигде не выполняется.
+    # типы
+    num_cols = ["od_after_plan", "premat_payment", "con_rate", "refin_rate", "stimul"]
+    for c in num_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["age_group_id"] = pd.to_numeric(df["age_group_id"], errors="coerce").astype("Int64")
+    df["dt_rep"] = pd.to_datetime(df["dt_rep"]).dt.normalize()
+    df["payment_period"] = pd.to_datetime(df["payment_period"]).dt.normalize()
+    df["agg_prod_name"] = df["agg_prod_name"].astype(str).str.strip()
+    return df
 
-⸻
+def fetch_cpr_report_new_raw(programs: Optional[List[str]] = None,
+                             chunks: bool = False,
+                             chunksize: int = 500_000) -> pd.DataFrame:
+    """
+    Тянет полотно по льготным программам из cpr_report_new.
+    Фильтры повторяют твой SQL: stimul IS NOT NULL, rates > 0, и ограничение по AGG_PROD_NAME IN (...)
+    """
+    if not (ORA_USER and ORA_PASS and ORA_DSN):
+        raise RuntimeError("Задайте ORA_USER / ORA_PASS / ORA_DSN")
 
-Скрипт 2 — Выходы (на каждую дату; если нет выходов — NULL)
+    programs = programs or DEFAULT_PROGRAMS
+    if not programs:
+        raise ValueError("Список programs пуст")
 
-DECLARE @dt_rep date = '2025-08-31';
+    # динамически строим список биндов :p0,:p1,...
+    bind_names = [f":p{i}" for i in range(len(programs))]
+    in_clause = ", ".join(bind_names)
 
-IF OBJECT_ID('tempdb..#base') IS NOT NULL DROP TABLE #base;
-IF OBJECT_ID('tempdb..#cal')  IS NOT NULL DROP TABLE #cal;
-IF OBJECT_ID('tempdb..#seg')  IS NOT NULL DROP TABLE #seg;
-IF OBJECT_ID('tempdb..#clos') IS NOT NULL DROP TABLE #clos;
+    sql = f"""
+        SELECT
+            dt_rep,
+            con_id,
+            age_group_id,
+            stimul,
+            od_after_plan,
+            premat_payment,
+            con_rate,
+            refin_rate,
+            payment_period,
+            agg_prod_name
+        FROM cpr_report_new
+        WHERE 1=1
+          AND stimul IS NOT NULL
+          AND refin_rate > 0
+          AND con_rate > 0
+          AND agg_prod_name IN ({in_clause})
+    """
 
--- 1) Снимок (тот же фильтр, что выше)
-SELECT
-    t.TSegmentname,
-    CAST(t.dt_close AS date) AS dt_close_d,
-    t.out_rub,
-    t.rate_con,
-    t.rate_trf
-INTO #base
-FROM alm.[ALM].[vw_balance_rest_all] t WITH (NOLOCK)
-WHERE t.dt_rep       = @dt_rep
-  AND t.AP           = N'Пассив'
-  AND t.BLOCK_NAME   = N'Эскроу'
-  AND t.section_name = N'Эскроу без ПФ'
-  AND t.cur          = '810'
-  AND t.acc_role     = N'LIAB'
-  AND t.out_rub      IS NOT NULL
-  AND t.tprod_name   = N'Эскроу ФЛ'
-  AND t.TSegmentname = N'Розничный бизнес'
-  AND t.dt_close     > t.dt_rep;
+    binds = {f"p{i}": programs[i] for i in range(len(programs))}
 
--- 2) Диапазон и календарь
-DECLARE @d_end date;
-SELECT @d_end = ISNULL(MAX(dt_close_d), @dt_rep) FROM #base;
+    with oracledb.connect(user=ORA_USER, password=ORA_PASS, dsn=ORA_DSN) as conn:
+        if chunks:
+            frames = []
+            for chunk in pd.read_sql(sql, conn, params=binds, chunksize=chunksize):
+                frames.append(chunk)
+            df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        else:
+            df = pd.read_sql(sql, conn, params=binds)
 
-;WITH cal AS (
-    SELECT @dt_rep AS d
-    UNION ALL
-    SELECT DATEADD(DAY, 1, d) FROM cal WHERE d < @d_end
-)
-SELECT d INTO #cal FROM cal
-OPTION (MAXRECURSION 0);
+    # приведение/ренейм
+    df = normalize_cpr_columns(df)
 
--- 3) Сегменты
-SELECT DISTINCT TSegmentname INTO #seg FROM #base;
+    # доп. фильтр как в прошлых пайплайнах: payment_period <> DATE '2025-09-30'
+    df = df[df["payment_period"] != pd.Timestamp("2025-09-30")]
 
--- 4) Агрегат «что закрывается в этот день»
-SELECT
-    b.TSegmentname,
-    b.dt_close_d AS d,
-    SUM(b.out_rub)                                                    AS out_rub,
-    SUM(CASE WHEN b.rate_trf IS NOT NULL THEN b.out_rub * b.rate_trf END) AS trf_num,
-    SUM(CASE WHEN b.rate_trf IS NOT NULL THEN b.out_rub END)              AS trf_den,
-    SUM(CASE WHEN b.rate_con IS NOT NULL THEN b.out_rub * b.rate_con END) AS con_num,
-    SUM(CASE WHEN b.rate_con IS NOT NULL THEN b.out_rub END)              AS con_den
-INTO #clos
-FROM #base b
-GROUP BY b.TSegmentname, b.dt_close_d;
+    # быстрая сводка
+    try:
+        cnt_total = len(df)
+        cnt_by_prog = df.groupby("agg_prod_name")["con_id"].count().sort_values(ascending=False)
+        print(f"Выгружено строк всего: {cnt_total:,}")
+        print("Топ по программам:")
+        print(cnt_by_prog.to_string())
+    except Exception:
+        pass
 
--- 5) Выходы: если в дату нет закрытий — значения NULL (как просили)
-SELECT
-    c.d                               AS [date],
-    s.TSegmentname                    AS tsegmentname,
-    cl.out_rub                        AS out_rub,
-    CAST(cl.trf_num / NULLIF(cl.trf_den, 0) AS DECIMAL(12,6)) AS rate_trf_srvz,
-    CAST(cl.con_num / NULLIF(cl.con_den, 0) AS DECIMAL(12,6)) AS rate_con_srvz
-FROM #cal c
-CROSS JOIN #seg s
-LEFT JOIN #clos cl
-       ON cl.TSegmentname = s.TSegmentname
-      AND cl.d            = c.d
-ORDER BY c.d, s.TSegmentname;
+    return df
 
-Замечания
-	•	В твоём примере было ASDECIMAL(12,6) — там нужен пробел: AS DECIMAL(12,6), я поправил.
-	•	Если #base вдруг пустая, #seg тоже будет пустой → итог пуст. В таком случае можно принудительно задать сегмент (если нужен) или не фильтровать TSegmentname в выборке снимка.
-	•	Если понадобится «Итого по сегментам» (в этом кейсе сегмент один), можно добавить ещё один GROUP BY по дате без сегмента отдельным запросом.
+def _slugify(name: str) -> str:
+    """
+    Безопасное имя папки из произвольной строки (кириллица оставляем, пробелы -> _).
+    """
+    s = str(name).strip()
+    s = s.replace("/", "-").replace("\\", "-").replace(":", "-").replace("*", "-")
+    s = s.replace("?", "-").replace('"', "'").replace("<", "(").replace(">", ")").replace("|", "-")
+    s = "_".join(s.split())
+    return s
 
-Хочешь объединю амортизацию и выходы в один вывод с меткой metric = 'amortization'/'exits'?
+# ============================
+# Точка входа из твоей тетрадки
+# ============================
+
+# 1) вытащим полотно по программам
+programs = ['Семейная ипотека', 'ИТ ипотека', 'Дальневосточная ипотека']  # можешь менять
+df_cpr = fetch_cpr_report_new_raw(programs=programs, chunks=False)
+
+# 2) пробежимся по каждой программе и запустим ТВОЙ уже готовый пайплайн
+base_out_root = r"C:\Users\mi.makhmudov\Desktop\SCurve_results_cpr"  # корневая папка для всех программ
+n_iter = 1000
+hist_bin = 0.25
+lb_rate, ub_rate = -100.0, 40.0
+random_state = 42
+
+results = {}
+for prog in programs:
+    df_prog = df_cpr[df_cpr["agg_prod_name"] == prog].copy()
+    if df_prog.empty:
+        print(f"[WARN] Для программы '{prog}' данных нет — пропускаю.")
+        continue
+
+    # отдельная подпапка под программу
+    out_root_prog = os.path.join(base_out_root, _slugify(prog))
+    print(f"\n=== Запускаю симуляции для: {prog} ===")
+    print(f"Выходная папка: {out_root_prog}")
+
+    # ВАЖНО: run_scurves_cv_and_save ожидает «сырой» df со стандартными колонками,
+    # он внутри сам агрегирует в точки (LoanAge, Incentive, CPR, TotalDebtBln)
+    res = run_scurves_cv_and_save(
+        df_raw=df_prog,
+        n_iter=n_iter,
+        hist_bin=hist_bin,
+        out_root=out_root_prog,
+        lb_rate=lb_rate,
+        ub_rate=ub_rate,
+        random_state=random_state
+    )
+    results[prog] = res
+
+print("\nГотово по всем программам.")
+for prog, res in results.items():
+    if res and "output_dir" in res:
+        print(f"  • {prog}: {res['output_dir']}")
