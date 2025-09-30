@@ -24,29 +24,27 @@ WHERE t.dt_rep       = @dt_rep
 -- 2) Диапазон дат
 DECLARE @d_end date;
 SELECT @d_end = ISNULL(MAX(dt_close_d), @dt_rep) FROM #base;
-DECLARE @days int = DATEDIFF(DAY, @dt_rep, @d_end) + 1;
 
--- 3) Календарь через tally из VALUES (быстро и без системных таблиц)
+-- 3) Календарь рекурсией (@dt_rep..@d_end)
 IF OBJECT_ID('tempdb..#cal') IS NOT NULL DROP TABLE #cal;
-;WITH L0 AS (SELECT 1 v FROM (VALUES(0),(0),(0),(0),(0),(0),(0),(0),(0),(0)) t(v))      -- 10
-,    L1 AS (SELECT 1 v FROM L0 a CROSS JOIN L0 b)                                         -- 100
-,    L2 AS (SELECT 1 v FROM L1 a CROSS JOIN L1 b)                                         -- 10 000
-,    Tally AS (
-      SELECT TOP (@days) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1 AS n
-      FROM L2
+;WITH cal AS (
+    SELECT @dt_rep AS d
+    UNION ALL
+    SELECT DATEADD(DAY, 1, d)
+    FROM cal
+    WHERE d < @d_end
 )
-SELECT DATEADD(DAY, n, @dt_rep) AS d
-INTO #cal
-FROM Tally;
+SELECT d INTO #cal FROM cal
+OPTION (MAXRECURSION 0);
 
--- 4) Сегменты (2 шт.) × календарь
+-- 4) Сегменты × календарь (чтобы были строки на каждый день)
 IF OBJECT_ID('tempdb..#grid') IS NOT NULL DROP TABLE #grid;
 SELECT s.TSegmentname, c.d
 INTO #grid
 FROM (SELECT DISTINCT TSegmentname FROM #base) s
 CROSS JOIN #cal c;
 
--- 5) Выходы по датам (агрегат)
+-- 5) Выходы по датам (дельты закрытий)
 IF OBJECT_ID('tempdb..#closings') IS NOT NULL DROP TABLE #closings;
 SELECT
     b.TSegmentname,
@@ -60,7 +58,7 @@ INTO #closings
 FROM #base b
 GROUP BY b.TSegmentname, b.dt_close_d;
 
--- 6) Начальные суммы на @dt_rep
+-- 6) Начальные суммы/числители/знаменатели на @dt_rep
 IF OBJECT_ID('tempdb..#init') IS NOT NULL DROP TABLE #init;
 SELECT
     b.TSegmentname,
@@ -73,8 +71,7 @@ INTO #init
 FROM #base b
 GROUP BY b.TSegmentname;
 
--- 7) Амортизация: init - cumulative(closing<=d).
---    Без OUTER APPLY: считаем дневные "дельты" закрытий и кумулятивом набегаем по grid.
+-- 7) Амортизация: init − кумулятив закрытий (<= d)
 SELECT
     g.d                                  AS [date],
     g.TSegmentname                        AS tsegmentname,
