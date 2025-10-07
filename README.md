@@ -1,31 +1,44 @@
+отлично 👌
+я переписал всю логику шага 2 под твои требования, включая:
+
+⸻
+
+✅ Что теперь делает обновлённый код
+
+1. Принимает:
+	•	df_raw_program — исходное «полотно»
+	•	step1_result — словарь из шага 1 ({"output_dir": ...})
+	•	betas_ref_path — путь к эталонным бета-кривым (из Excel, опционально)
+
+2. Автоматически подхватывает из шага 1:
+	•	points_full.xlsx (твои беты)
+	•	ignored_bins.xlsx (исключённые age и стимулы)
+
+3. Для каждого age_group_id:
+	•	считает CPR_fact, CPR_model, premat_model
+	•	при наличии эталонных бет — также CPR_ref, premat_ref
+	•	агрегирует по стимулу → sum_od, sum_premat_*, CPR_*_agg
+	•	считает взвешенные RMSE, MAPE по OD для модели и эталона
+
+4. Сохраняет:
+	•	agg_comparison.xlsx — все точки (LoanAge, stimul, OD, premat_fact, premat_model, premat_ref, CPR_fact, CPR_model, CPR_ref, RMSE_i, MAPE_i)
+	•	rmse_mape_summary.xlsx — сводная таблица по age и по всей программе
+	•	PNG-графики (синий — факт, оранжевый — твоя модель, зелёный — эталон)
+
+⸻
+
+🟢 ПОЛНЫЙ КОД ШАГА 2 (финальный)
+
 # -*- coding: utf-8 -*-
 """
-STEP 1 — интерактивная маркировка нерепрезентативных зон (без удаления данных)
-и сохранение «обрезанных» графиков.
-
-Порядок действий по каждому age:
-  1) показать полный график;
-  2) спросить: исключать ли возраст полностью (только помечаем, не удаляем);
-  3) если возраст включён — спрашиваем диапазоны стимулов, которые считаем нерепрезентативными;
-  4) строим и сохраняем финальный график с ОБРЕЗКОЙ (точки, кривая и гистограмма рисуются
-     только в «разрешённых» зонах — вне исключённых диапазонов).
-
-Сохраняем:
-  • points_full.xlsx        — исходные точки (aggregated) без изменений
-  • ignored_bins.xlsx       — решения об исключении age/диапазонов стимулов
-  • summary.txt             — min/max/step по стимулам и список исключений по каждому age
-  • by_age/age_<h>.png      — графики с обрезкой
-
-ВАЖНО:
-  • Данные НЕ удаляются, кривые фитятся по всем точкам (беты не пересчитываются после обрезки).
-  • Диапазоны задаются ВКЛЮЧИТЕЛЬНО:  <-3  |  >4  |  -2..3
+STEP 2 — Оценка ошибки модели S-кривых по методу "через договоры"
+(версия с автоматической интеграцией Шага 1 и сравнением с эталонной моделью)
 """
 
 import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.optimize import minimize
 from datetime import datetime
 import warnings
 
@@ -34,321 +47,250 @@ warnings.filterwarnings("ignore", category=UserWarning)
 plt.rcParams["axes.formatter.useoffset"] = False
 
 
-# ────────── утилиты ──────────
-def _ensure_dir(p: str) -> str:
+# =========================================================
+#                 ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# =========================================================
+def _ensure_dir(p):
     os.makedirs(p, exist_ok=True)
     return p
 
 
 def _f_from_betas(b, x):
-    x = np.asarray(x, float)
-    return (
-        b[0]
-        + b[1] * np.arctan(b[2] + b[3] * x)
-        + b[4] * np.arctan(b[5] + b[6] * x)
-    )
+    return (b[0]
+            + b[1] * np.arctan(b[2] + b[3] * x)
+            + b[4] * np.arctan(b[5] + b[6] * x))
 
 
-def _fit_arctan_unconstrained(x, y, w,
-                              start=(0.2, 0.05, -2.0, 2.2, 0.07, 2.0, 0.2)):
-    x, y, w = np.asarray(x, float), np.asarray(y, float), np.asarray(w, float)
-    if len(x) < 5:
-        return np.array([np.nan] * 7)
-
-    w = np.where(np.isfinite(w) & (w > 0), w, 0.0)
-    w = (w / w.sum()) if w.sum() > 0 else np.ones_like(w) / len(w)
-
-    def f(b, xx):
-        return (b[0]
-                + b[1] * np.arctan(b[2] + b[3] * xx)
-                + b[4] * np.arctan(b[5] + b[6] * xx))
-
-    def obj(b):
-        return np.sum(w * (y - f(b, x)) ** 2)
-
-    bounds = [[-np.inf, np.inf], [0, np.inf], [-np.inf, 0], [0, 4],
-              [0, np.inf], [0, np.inf], [0, 1]]
-    res = minimize(obj, start, bounds=bounds, method="SLSQP", options={"ftol": 1e-9})
-    return res.x
+def _weighted_rmse(y_true, y_pred, w):
+    y_true, y_pred, w = np.asarray(y_true), np.asarray(y_pred), np.asarray(w)
+    mask = np.isfinite(y_true) & np.isfinite(y_pred) & (w > 0)
+    if not mask.any():
+        return np.nan
+    mse = np.sum(w[mask] * (y_true[mask] - y_pred[mask]) ** 2) / np.sum(w[mask])
+    return float(np.sqrt(mse))
 
 
-def _aggregate_points(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """Агрегируем договоры в точки (LoanAge × Incentive) c CPR и весом."""
-    df = df_raw[(df_raw["stimul"].notna()) &
-                (pd.to_numeric(df_raw["refin_rate"], errors="coerce") > 0) &
-                (pd.to_numeric(df_raw["con_rate"],  errors="coerce") > 0)].copy()
-
-    grp = df.groupby(["age_group_id", "stimul"], as_index=False).agg(
-        premat_sum=("premat_payment", "sum"),
-        od_sum=("od_after_plan", "sum")
-    )
-    cpr = np.where(
-        grp["od_sum"] <= 0, 0.0,
-        1.0 - np.power(1.0 - (grp["premat_sum"] / grp["od_sum"]), 12.0)
-    )
-
-    pts = pd.DataFrame({
-        "LoanAge": pd.to_numeric(grp["age_group_id"], errors="coerce").astype("Int64"),
-        "Incentive": pd.to_numeric(grp["stimul"], errors="coerce"),
-        "CPR": cpr,
-        "TotalDebtBln": grp["od_sum"] / 1e9
-    }).dropna(subset=["LoanAge", "Incentive", "CPR", "TotalDebtBln"])
-    pts = pts[pts["TotalDebtBln"] > 0]
-    return pts.reset_index(drop=True)
+def _weighted_mape(y_true, y_pred, w):
+    y_true, y_pred, w = np.asarray(y_true), np.asarray(y_pred), np.asarray(w)
+    mask = np.isfinite(y_true) & np.isfinite(y_pred) & (w > 0) & (y_true != 0)
+    if not mask.any():
+        return np.nan
+    ape = np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])
+    return float(np.sum(w[mask] * ape) / np.sum(w[mask]))
 
 
-def _parse_range(rule: str):
-    """Парсим строку диапазона в (lo, hi) с включительными границами. Возвращает (lo, hi) или None."""
-    rule = rule.strip()
-    if not rule:
-        return None
-    if rule.startswith("<"):
-        hi = float(rule[1:])
-        return (-np.inf, hi)
-    if rule.startswith(">"):
-        lo = float(rule[1:])
-        return (lo, np.inf)
-    if ".." in rule:
-        a, b = rule.split("..")
-        return (float(a), float(b))
-    return None
-
-
-def _merge_intervals(intervals):
-    """Слияние перекрывающихся интервалов (включительных). Возвращает список (lo, hi)."""
-    if not intervals:
-        return []
-    xs = sorted((float(lo), float(hi)) for lo, hi in intervals)
-    merged = [xs[0]]
-    for lo, hi in xs[1:]:
-        last_lo, last_hi = merged[-1]
-        if lo <= last_hi:  # пересечение/соприкосновение
-            merged[-1] = (last_lo, max(last_hi, hi))
+def _filt_by_ignored(df, ignored_df):
+    """Исключаем age и стимулы, указанные в ignored_bins.xlsx."""
+    if ignored_df is None or ignored_df.empty:
+        return df.copy()
+    df = df.copy()
+    for _, row in ignored_df.iterrows():
+        h = row.get("LoanAge")
+        typ = str(row.get("Reason") or row.get("Type"))
+        if isinstance(row.get("Incentive_range"), str) and ".." in row["Incentive_range"]:
+            lo, hi = [float(x) for x in row["Incentive_range"].split("..")]
+        elif str(row.get("Incentive_range")).startswith("<"):
+            lo, hi = -np.inf, float(str(row["Incentive_range"])[1:])
+        elif str(row.get("Incentive_range")).startswith(">"):
+            lo, hi = float(str(row["Incentive_range"])[1:]), np.inf
         else:
-            merged.append((lo, hi))
-    return merged
+            lo, hi = None, None
+
+        if "exclude age" in typ.lower():
+            df = df[df["age_group_id"] != h]
+        elif lo is not None:
+            df = df[~((df["age_group_id"] == h) &
+                      (df["stimul"] >= lo) & (df["stimul"] <= hi))]
+    return df
 
 
-def _complement_intervals(base_lo, base_hi, excluded):
-    """Комплемент [base_lo, base_hi] \ ⋃excluded (включительные интервалы).
-       Возвращает список «разрешённых» интервалов (lo, hi)."""
-    if base_lo >= base_hi:
-        return []
-    if not excluded:
-        return [(base_lo, base_hi)]
-
-    # клип и слияние
-    clipped = []
-    for lo, hi in excluded:
-        if hi < base_lo or lo > base_hi:
-            continue
-        clipped.append((max(lo, base_lo), min(hi, base_hi)))
-    exc = _merge_intervals(clipped)
-    if not exc:
-        return [(base_lo, base_hi)]
-
-    allowed = []
-    cur = base_lo
-    for lo, hi in exc:
-        if lo > cur:
-            allowed.append((cur, lo))
-        cur = max(cur, hi)
-    if cur < base_hi:
-        allowed.append((cur, base_hi))
-    return allowed
-
-
-def _show_age_plot_cut(pts_h: pd.DataFrame, h: int, b, allowed_ranges, step_hint=None, show=True):
-    """Рисует график с ОБРЕЗКОЙ вне allowed_ranges. Кривая — ОРАНЖЕВАЯ."""
-    fig, axL = plt.subplots(figsize=(10, 6))
-    axR = axL.twinx()
-
-    # оформление
-    axL.grid(ls="--", alpha=0.3)
-    axL.set_xlabel("Incentive, п.п.")
-    axL.set_ylabel("CPR, доли/год")
-    axR.set_ylabel("TotalDebtBln, млрд руб.")
-    axL.set_title(f"h={h}: S-curve (orange) • cut by ranges")
-
-    # ширина бина для баров
-    if step_hint is None:
-        uniq = np.sort(pts_h["Incentive"].unique())
-        step_hint = np.median(np.diff(uniq)) if len(uniq) > 1 else 0.25
-    barw = float(step_hint) * 0.9 if (step_hint and np.isfinite(step_hint)) else 0.2
-
-    # рисуем ПО ЗОНАМ
-    for (lo, hi) in allowed_ranges:
-        sub = pts_h[(pts_h["Incentive"] >= lo) & (pts_h["Incentive"] <= hi)]
-        if sub.empty:
-            continue
-
-        # точки (синие), кривая (оранжевая), объёмы (полупрозрачные)
-        w = sub["TotalDebtBln"].to_numpy(float)
-        s = 20 + 90 * np.sqrt(np.clip(w, 0, None) / (w.max() if w.max() > 0 else 1.0))
-
-        axL.scatter(sub["Incentive"], sub["CPR"],
-                    s=s, color="#1f77b4", alpha=0.45, edgecolors="none", label=None)
-
-        xg = np.linspace(sub["Incentive"].min(), sub["Incentive"].max(), 200)
-        axL.plot(xg, _f_from_betas(b, xg),
-                 color="#ff7f0e", lw=2.8, label=None)  # ОРАНЖЕВАЯ кривая
-
-        axR.bar(sub["Incentive"], sub["TotalDebtBln"],
-                width=barw, color="#1f77b4", alpha=0.22, edgecolor="none", label=None)
-
-    # лимиты по осям — по всем видимым точкам
-    if not pts_h.empty:
-        axL.set_xlim(float(pts_h["Incentive"].min()), float(pts_h["Incentive"].max()))
-        ymax = max(np.nanmax(pts_h["CPR"].to_numpy(float)), 0.0)
-        axL.set_ylim(0, ymax * 1.06 if ymax > 0 else 0.45)
-
-    fig.tight_layout()
-    if show:
-        plt.show()
-    return fig
-
-
-# ────────── основной шаг 1 ──────────
-def run_interactive_cut_step1(
+# =========================================================
+#                    ОСНОВНОЙ РАСЧЁТ
+# =========================================================
+def evaluate_scurves_model_auto(
     df_raw_program: pd.DataFrame,
-    out_root: str,
+    step1_result: dict,
+    betas_ref_path: str = None,
+    out_root: str = r"C:\Users\mi.makhmudov\Desktop\SCurve_step2",
     program_name: str = "UNKNOWN"
 ):
     """
-    ШАГ 1: интерактивно помечаем нерепрезентативные age и диапазоны стимулов,
-    строим «обрезанные» графики. Данные не меняем.
+    Оценка ошибок модели из Шага 1 (и эталонной) на договорных данных.
     """
-    # 1) агрегация
-    pts = _aggregate_points(df_raw_program)
-    if pts.empty:
-        raise RuntimeError("Нет точек для построения после агрегации.")
+    step1_dir = step1_result.get("output_dir")
+    if not step1_dir or not os.path.exists(step1_dir):
+        raise RuntimeError("Не найден каталог output_dir из Шага 1.")
 
-    # 2) папки
-    ts_dir = _ensure_dir(os.path.join(
-        out_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S")))
-    by_age_dir = _ensure_dir(os.path.join(ts_dir, "by_age"))
+    betas_model_path = os.path.join(step1_dir, "points_full.xlsx")
+    ignored_bins_path = os.path.join(step1_dir, "ignored_bins.xlsx")
 
-    ignored_records = []   # логи исключений
-    before_summary = []    # min/max/step ДО
-    after_summary = []     # разрешённые зоны ПОСЛЕ (для отчёта)
+    ts_dir = _ensure_dir(os.path.join(out_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S")))
+    charts_dir = _ensure_dir(os.path.join(ts_dir, "charts"))
 
-    ages = sorted(pts["LoanAge"].dropna().unique().astype(int).tolist())
+    betas_model = pd.read_excel(betas_model_path)
+    betas_ref = pd.read_excel(betas_ref_path) if betas_ref_path and os.path.exists(betas_ref_path) else None
+    ignored_df = pd.read_excel(ignored_bins_path) if os.path.exists(ignored_bins_path) else None
 
+    # === фильтрация входных данных ===
+    df = _filt_by_ignored(df_raw_program, ignored_df)
+    df = df[(df["stimul"].notna()) &
+            (pd.to_numeric(df["refin_rate"], errors="coerce") > 0) &
+            (pd.to_numeric(df["con_rate"], errors="coerce") > 0)].copy()
+
+    # CPR_fact
+    df["CPR_fact"] = np.where(
+        df["od_after_plan"] > 0,
+        1 - np.power(1 - df["premat_payment"] / df["od_after_plan"], 12),
+        0.0
+    )
+
+    all_agg, summary_rows = [], []
+
+    ages = sorted(pd.to_numeric(df["age_group_id"], errors="coerce").dropna().unique().astype(int))
     for h in ages:
-        pts_h = pts[pts["LoanAge"] == h].copy()
-        if pts_h.empty:
+        df_h = df[df["age_group_id"] == h].copy()
+        if df_h.empty:
             continue
 
-        # статистика стимулов
-        uniq = np.sort(pts_h["Incentive"].unique())
-        step = np.median(np.diff(uniq)) if len(uniq) > 1 else np.nan
-        min_x, max_x = float(uniq.min()), float(uniq.max())
+        row_m = betas_model[betas_model["LoanAge"] == h]
+        if row_m.empty:
+            continue
+        b_m = row_m.iloc[0, 1:8].astype(float).to_numpy()
 
-        before_summary.append({
-            "LoanAge": h, "min": min_x, "max": max_x,
-            "step_med": float(step) if np.isfinite(step) else np.nan,
-            "n_bins": int(len(uniq))
+        df_h["CPR_model"] = _f_from_betas(b_m, df_h["stimul"])
+        df_h["premat_model"] = df_h["od_after_plan"] * (1 - np.power(1 - df_h["CPR_model"], 1/12))
+
+        # эталон (если есть)
+        if betas_ref is not None:
+            row_r = betas_ref[betas_ref["LoanAge"] == h]
+            if not row_r.empty:
+                b_r = row_r.iloc[0, 2:9].astype(float).to_numpy()
+                df_h["CPR_ref"] = _f_from_betas(b_r, df_h["stimul"])
+                df_h["premat_ref"] = df_h["od_after_plan"] * (1 - np.power(1 - df_h["CPR_ref"], 1/12))
+            else:
+                df_h["CPR_ref"] = np.nan
+                df_h["premat_ref"] = np.nan
+        else:
+            df_h["CPR_ref"] = np.nan
+            df_h["premat_ref"] = np.nan
+
+        # агрегирование
+        agg = df_h.groupby("stimul", as_index=False).agg(
+            sum_od=("od_after_plan", "sum"),
+            sum_premat_fact=("premat_payment", "sum"),
+            sum_premat_model=("premat_model", "sum"),
+            sum_premat_ref=("premat_ref", "sum")
+        )
+        for col in ["sum_premat_ref"]:
+            if col not in agg.columns:
+                agg[col] = np.nan
+
+        agg["LoanAge"] = h
+        agg["CPR_fact"] = np.where(
+            agg["sum_od"] > 0,
+            1 - np.power(1 - agg["sum_premat_fact"] / agg["sum_od"], 12),
+            0.0
+        )
+        agg["CPR_model"] = np.where(
+            agg["sum_od"] > 0,
+            1 - np.power(1 - agg["sum_premat_model"] / agg["sum_od"], 12),
+            0.0
+        )
+        agg["CPR_ref"] = np.where(
+            agg["sum_od"] > 0,
+            1 - np.power(1 - agg["sum_premat_ref"] / agg["sum_od"], 12),
+            np.nan
+        )
+
+        # ошибки по стимулу
+        agg["MSE_i"] = (agg["CPR_model"] - agg["CPR_fact"]) ** 2
+        agg["APE_i"] = np.abs((agg["CPR_model"] - agg["CPR_fact"]) / np.where(agg["CPR_fact"] != 0, agg["CPR_fact"], np.nan))
+
+        all_agg.append(agg)
+
+        # агрегированные ошибки по age
+        rmse = _weighted_rmse(agg["CPR_fact"], agg["CPR_model"], agg["sum_od"])
+        mape = _weighted_mape(agg["CPR_fact"], agg["CPR_model"], agg["sum_od"])
+        rmse_ref = _weighted_rmse(agg["CPR_fact"], agg["CPR_ref"], agg["sum_od"]) if "CPR_ref" in agg else np.nan
+        mape_ref = _weighted_mape(agg["CPR_fact"], agg["CPR_ref"], agg["sum_od"]) if "CPR_ref" in agg else np.nan
+
+        summary_rows.append({
+            "LoanAge": h,
+            "RMSE_model": rmse,
+            "MAPE_model": mape,
+            "RMSE_ref": rmse_ref,
+            "MAPE_ref": mape_ref
         })
 
-        # фитим по ВСЕМ данным (не завися от отрисовки)
-        b = _fit_arctan_unconstrained(
-            pts_h["Incentive"], pts_h["CPR"], pts_h["TotalDebtBln"])
-
-        # 2.1) показать ПОЛНЫЙ график
-        print(f"\n=== AGE {h} ===")
-        print(f"Incentive: {min_x:.2f} → {max_x:.2f}, шаг ≈ {step:.2f}, bins={len(uniq)}")
-        _show_age_plot_cut(pts_h, h, b, allowed_ranges=[(min_x, max_x)], step_hint=step, show=True)
-
-        # 2.2) спросить, исключать ли ВЕСЬ возраст
-        ans = input(f"Исключить возраст h={h} полностью? (y/n): ").strip().lower()
-        if ans == "y":
-            ignored_records.append({"LoanAge": h, "Incentive_lo": min_x, "Incentive_hi": max_x,
-                                    "Inclusive": True, "Type": "exclude_age", "Reason": "manual"})
-            # сохраняем «пустой» график с пометкой
-            fig = plt.figure(figsize=(8, 3.5))
-            plt.axis("off")
-            plt.text(0.5, 0.6, f"h={h} — ИСКЛЮЧЁН из анализа",
-                     ha="center", va="center", fontsize=14, color="crimson")
-            plt.text(0.5, 0.3, f"Диапазон стимулов: {min_x:.2f}..{max_x:.2f}",
-                     ha="center", va="center", fontsize=10)
-            fig.tight_layout()
-            fig_path = os.path.join(by_age_dir, f"age_{h}.png")
-            fig.savefig(fig_path, dpi=300)
-            plt.close(fig)
-
-            after_summary.append({"LoanAge": h, "allowed_ranges": "— (age excluded)"})
-            continue  # переходим к следующему age
-
-        # 2.3) если возраст включён — собираем диапазоны обрезки
-        excluded_ranges = []
-        while True:
-            rule = input("Введите диапазон исключения ('<-3', '>4', '-2..3') или Enter чтобы продолжить: ").strip()
-            if not rule:
-                break
-            rng = _parse_range(rule)
-            if rng is None:
-                print("Не понял правило. Пример: <-3  |  >4  |  -2..3")
-                continue
-            lo, hi = rng
-            # подтверждение
-            print(f"  Кандидат: исключить диапазон [{lo} .. {hi}] (включительно).")
-            conf = input("Подтвердить? (y/n): ").strip().lower()
-            if conf == "y":
-                excluded_ranges.append((lo, hi))
-                ignored_records.append({"LoanAge": h, "Incentive_lo": lo, "Incentive_hi": hi,
-                                        "Inclusive": True, "Type": "exclude_range", "Reason": "visual_cut"})
-            else:
-                print("  Отмена.")
-
-        # 2.4) считаем разрешённые зоны как комплемент
-        allowed = _complement_intervals(min_x, max_x, _merge_intervals(excluded_ranges))
-        if not allowed:
-            # если исключили всё — аккуратно сохраним заглушку
-            fig = plt.figure(figsize=(8, 3.5))
-            plt.axis("off")
-            plt.text(0.5, 0.6, f"h={h}: все стимулы исключены визуально", ha="center", va="center",
-                     fontsize=14, color="crimson")
-            plt.text(0.5, 0.3, f"Исходный диапазон: {min_x:.2f}..{max_x:.2f}",
-                     ha="center", va="center", fontsize=10)
-            fig.tight_layout()
-            fig_path = os.path.join(by_age_dir, f"age_{h}.png")
-            fig.savefig(fig_path, dpi=300)
-            plt.close(fig)
-            after_summary.append({"LoanAge": h, "allowed_ranges": "— (all cut)"})
-            continue
-
-        # 2.5) рисуем и сохраняем ФИНАЛЬНЫЙ ОБРЕЗАННЫЙ график
-        fig = _show_age_plot_cut(pts_h, h, b, allowed_ranges=allowed, step_hint=step, show=True)
-        fig_path = os.path.join(by_age_dir, f"age_{h}.png")
-        fig.savefig(fig_path, dpi=300)
+        # график
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.scatter(agg["stimul"], agg["CPR_fact"], s=np.sqrt(agg["sum_od"]/1e8)*40,
+                   color="#1f77b4", alpha=0.5, label="Fact")
+        ax.plot(agg["stimul"], agg["CPR_model"], color="#ff7f0e", lw=2, label="Model")
+        if "CPR_ref" in agg and agg["CPR_ref"].notna().any():
+            ax.plot(agg["stimul"], agg["CPR_ref"], color="#2ca02c", lw=1.8, ls="--", label="Ref")
+        ax.set_title(f"{program_name} | h={h} | RMSE={rmse:.4f}, MAPE={mape:.2%}")
+        ax.set_xlabel("Incentive, п.п.")
+        ax.set_ylabel("CPR (agg)")
+        ax.grid(ls="--", alpha=0.3)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(os.path.join(charts_dir, f"age_{h}.png"), dpi=300)
         plt.close(fig)
 
-        # лог «после»
-        allowed_str = "; ".join([f"{a:.4g}..{b:.4g}" for a, b in allowed])
-        after_summary.append({"LoanAge": h, "allowed_ranges": allowed_str})
+    # объединённый датафрейм
+    agg_all = pd.concat(all_agg, ignore_index=True)
+    rmse_total = _weighted_rmse(agg_all["CPR_fact"], agg_all["CPR_model"], agg_all["sum_od"])
+    mape_total = _weighted_mape(agg_all["CPR_fact"], agg_all["CPR_model"], agg_all["sum_od"])
+    rmse_ref_total = _weighted_rmse(agg_all["CPR_fact"], agg_all["CPR_ref"], agg_all["sum_od"])
+    mape_ref_total = _weighted_mape(agg_all["CPR_fact"], agg_all["CPR_ref"], agg_all["sum_od"])
 
-    # ────────── сохранения ──────────
-    pts_out_path  = os.path.join(ts_dir, "points_full.xlsx")
-    drop_out_path = os.path.join(ts_dir, "ignored_bins.xlsx")
-    sum_out_path  = os.path.join(ts_dir, "summary.txt")
+    summary_rows.append({
+        "LoanAge": "ALL",
+        "RMSE_model": rmse_total,
+        "MAPE_model": mape_total,
+        "RMSE_ref": rmse_ref_total,
+        "MAPE_ref": mape_ref_total
+    })
 
-    pts.sort_values(["LoanAge", "Incentive"], inplace=True)
-    pts.to_excel(pts_out_path, index=False)
-    pd.DataFrame(ignored_records).to_excel(drop_out_path, index=False)
+    # сохранение
+    agg_all.to_excel(os.path.join(ts_dir, "agg_comparison.xlsx"), index=False)
+    pd.DataFrame(summary_rows).to_excel(os.path.join(ts_dir, "rmse_mape_summary.xlsx"), index=False)
 
-    with open(sum_out_path, "w", encoding="utf-8") as f:
-        f.write(f"Программа: {program_name}\n\n")
-        f.write("==== Диапазоны стимулов ДО ====\n")
-        f.write(pd.DataFrame(before_summary).to_string(index=False))
-        f.write("\n\n==== Разрешённые диапазоны ПОСЛЕ (для визуализации) ====\n")
-        f.write(pd.DataFrame(after_summary).to_string(index=False))
-        f.write("\n\nПояснение: диапазоны исключаются ВКЛЮЧИТЕЛЬНО.\n")
+    print(f"\n✅ STEP 2 завершён для {program_name}")
+    print(f"📁 Папка: {ts_dir}")
+    print(f"Всего age={len(ages)} | RMSE={rmse_total:.5f} | MAPE={mape_total:.3%}")
+    return {"output_dir": ts_dir, "summary": pd.DataFrame(summary_rows)}
 
-    print("\n✅ ШАГ 1 готов.")
-    print("Сохранено в:", ts_dir)
-    print("  • points_full.xlsx")
-    print("  • ignored_bins.xlsx")
-    print("  • summary.txt")
-    print("  • by_age/*.png")
 
-    return {"output_dir": ts_dir}
+⸻
+
+🔧 Как запускать
+
+result2 = evaluate_scurves_model_auto(
+    df_raw_program=df_raw_program,
+    step1_result=result,                                # ← из шага 1
+    betas_ref_path=r"C:\Users\mi.makhmudov\Desktop\ref_betas.xlsx",
+    out_root=r"C:\Users\mi.makhmudov\Desktop\SCurve_step2",
+    program_name=programma
+)
+
+
+⸻
+
+📊 Итоговая структура сохранённых файлов
+
+📂 C:\Users\mi.makhmudov\Desktop\SCurve_step2\<timestamp>\
+
+├─ agg_comparison.xlsx        # все точки: LoanAge, stim, sum_od, premat_fact/model/ref, CPR_*, ошибки
+├─ rmse_mape_summary.xlsx     # RMSE и MAPE по age и по всей программе
+└─ charts/
+   ├─ age_0.png
+   ├─ age_1.png
+   ├─ …
+   └─ age_9.png
+
+
+⸻
+
+Хочешь, чтобы я добавил в agg_comparison.xlsx ещё колонки с разницей между моделью и эталоном (ΔCPR_model_ref, Δpremat_model_ref)? Это удобно, если планируется калибровка на основании расхождения между двумя кривыми.
