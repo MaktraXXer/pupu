@@ -1,32 +1,53 @@
-отлично, согласен полностью.
-давай сделаем чистую модульную версию шага 1 — всё обёрнуто в функцию, параметры задаются явно (пути, имя программы, DataFrame).
-Внутри остаётся интерактивная логика (ввод диапазонов/подтверждения), но весь поток теперь управляется одной функцией run_interactive_filter().
+🔥 Отлично, теперь ясно:
+тебе нужен интерактивный шаг 1 с двумя изменениями:
 
 ⸻
 
-🔹 ШАГ 1 (модульная версия с функцией)
+✅ Что должно быть теперь
+	1.	Фактическая обрезка графика, а не просто подсветка:
+если ты указываешь диапазон, например >3,
+то на финальном графике всё, что правее 3, не показывается вообще —
+ни точки, ни кривая, ни гистограмма.
+Аналогично для <-2 (всё левее — не показываем)
+и для -1..1 (оставляем только вне диапазона).
+➤ То есть, мы отрисовываем кривая+точки только на “разрешённых” зонах,
+исключая визуально нерепрезентативные стимулы.
+Но данные всё равно не удаляются — просто не рисуются.
+	2.	Добавить в summary.txt список исключённых диапазонов для каждого возраста,
+например:
+
+h=1: <-3; >5
+h=2: -1..1
+h=3: нет исключений
+
+
+
+⸻
+
+💾 Ниже — финальный код (v2): «обрезка, не подсветка»
 
 # -*- coding: utf-8 -*-
 """
-STEP 1 (модульная версия).
-Интерактивное построение S-кривых по одной программе с возможностью исключать возраст/диапазоны стимулов.
+STEP 1 — интерактивная фильтрация S-кривых (обрезка нерепрезентативных диапазонов).
+
+Ничего не удаляем из данных.
+Просто отмечаем диапазоны и при отрисовке графика показываем только допустимые зоны.
 """
 
 import os
-import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
-import warnings
 from datetime import datetime
+import warnings
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 plt.rcParams["axes.formatter.useoffset"] = False
 
 
-# ==== базовые утилиты ====
+# ─── Вспомогательные функции ──────────────────────────────────────
 def _ensure_dir(p: str) -> str:
     os.makedirs(p, exist_ok=True)
     return p
@@ -40,11 +61,6 @@ def _f_from_betas(b, x):
     )
 
 
-def _auto_percent_to_fraction(series: pd.Series) -> pd.Series:
-    c = pd.to_numeric(series, errors="coerce")
-    return np.where(c.quantile(0.95) > 1.5, c / 100.0, c)
-
-
 def _fit_arctan_unconstrained(x, y, w,
                               start=(0.2, 0.05, -2.0, 2.2, 0.07, 2.0, 0.2)):
     x, y, w = np.asarray(x, float), np.asarray(y, float), np.asarray(w, float)
@@ -53,20 +69,15 @@ def _fit_arctan_unconstrained(x, y, w,
     w = np.where(np.isfinite(w) & (w > 0), w, 0.0)
     w = (w / w.sum()) if w.sum() > 0 else np.ones_like(w) / len(w)
 
-    def f(b, xx):
-        return (
-            b[0]
-            + b[1] * np.arctan(b[2] + b[3] * xx)
-            + b[4] * np.arctan(b[5] + b[6] * xx)
-        )
+    def f(b, xx): return (b[0]
+                          + b[1] * np.arctan(b[2] + b[3] * xx)
+                          + b[4] * np.arctan(b[5] + b[6] * xx))
 
-    def obj(b):
-        return np.sum(w * (y - f(b, x)) ** 2)
+    def obj(b): return np.sum(w * (y - f(b, x)) ** 2)
 
     bounds = [[-np.inf, np.inf], [0, np.inf], [-np.inf, 0], [0, 4],
               [0, np.inf], [0, np.inf], [0, 1]]
-    res = minimize(obj, start, method="SLSQP",
-                   bounds=bounds, options={"ftol": 1e-9, "maxiter": 2000})
+    res = minimize(obj, start, bounds=bounds, method="SLSQP", options={"ftol": 1e-9})
     return res.x
 
 
@@ -90,53 +101,66 @@ def _aggregate_points(df_raw: pd.DataFrame) -> pd.DataFrame:
         "CPR": cpr,
         "TotalDebtBln": grp["od_sum"] / 1e9
     }).dropna(subset=["LoanAge", "Incentive", "CPR", "TotalDebtBln"])
-
-    pts["CPR"] = _auto_percent_to_fraction(pts["CPR"])
     pts = pts[pts["TotalDebtBln"] > 0]
     return pts.reset_index(drop=True)
 
 
-def _show_age_plot(pts_h: pd.DataFrame, h: int, b=None, highlight_range=None):
+def _filter_outside_ranges(df: pd.DataFrame, h: int, ranges):
+    """Возвращает только точки, которые не попадают в исключённые диапазоны."""
+    if not ranges:
+        return df
+    mask = np.ones(len(df), dtype=bool)
+    for lo, hi in ranges:
+        mask &= ~((df["LoanAge"] == h) &
+                  (df["Incentive"] >= lo) &
+                  (df["Incentive"] <= hi))
+    return df[mask]
+
+
+def _show_age_plot_cut(pts_h: pd.DataFrame, h: int, b, allowed_ranges):
+    """Рисует график с обрезкой данных вне разрешённых зон."""
     fig, axL = plt.subplots(figsize=(9, 5))
     axR = axL.twinx()
 
-    w = pts_h["TotalDebtBln"].to_numpy(float)
-    s = 30 + 100 * np.sqrt(np.clip(w, 0, None) / (w.max() if w.max() > 0 else 1.0))
-    axL.scatter(pts_h["Incentive"], pts_h["CPR"],
-                s=s, alpha=0.4, color="#1f77b4", label="fact")
+    # Разбиваем на зоны, которые не исключены
+    if not allowed_ranges:
+        allowed_ranges = [(-np.inf, np.inf)]
 
-    if b is not None and np.isfinite(b).all():
-        xgrid = np.linspace(pts_h["Incentive"].min(), pts_h["Incentive"].max(), 200)
-        axL.plot(xgrid, _f_from_betas(b, xgrid),
-                 color="orange", lw=2.3, label="S-curve fit")
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd"]
 
-    axR.bar(pts_h["Incentive"], pts_h["TotalDebtBln"],
-            width=0.18, color="#1f77b4", alpha=0.25, label="volume")
+    for idx, (lo, hi) in enumerate(allowed_ranges):
+        sub = pts_h[(pts_h["Incentive"] >= lo) & (pts_h["Incentive"] <= hi)]
+        if sub.empty:
+            continue
 
-    if highlight_range:
-        axL.axvspan(highlight_range[0], highlight_range[1], color="red", alpha=0.12)
+        w = sub["TotalDebtBln"].to_numpy(float)
+        s = 30 + 100 * np.sqrt(np.clip(w, 0, None) / (w.max() if w.max() > 0 else 1.0))
+        axL.scatter(sub["Incentive"], sub["CPR"],
+                    s=s, alpha=0.4, color=colors[idx % len(colors)], label=f"zone {idx+1}")
+
+        xg = np.linspace(sub["Incentive"].min(), sub["Incentive"].max(), 200)
+        axL.plot(xg, _f_from_betas(b, xg),
+                 color=colors[idx % len(colors)], lw=2.3)
+
+        axR.bar(sub["Incentive"], sub["TotalDebtBln"],
+                width=0.18, color=colors[idx % len(colors)], alpha=0.25)
 
     axL.grid(ls="--", alpha=0.3)
     axL.set_xlabel("Incentive, п.п.")
     axL.set_ylabel("CPR, доли/год")
     axR.set_ylabel("TotalDebtBln, млрд руб.")
-    axL.set_title(f"h={h}")
-    axL.legend(loc="upper left")
+    axL.set_title(f"h={h} (обрезанный график)")
     plt.show()
+    return fig
 
 
-# ==== основная функция ====
-def run_interactive_filter(
+# ─── Основная функция ───────────────────────────────────────────────
+def run_interactive_cut(
     df_raw_program: pd.DataFrame,
     out_root: str,
     program_name: str = "UNKNOWN"
 ):
-    """
-    Основная интерактивная процедура:
-    строит S-кривые по age, позволяет исключать возраст/диапазоны стимулов
-    и сохраняет результаты.
-    """
-
+    """Интерактивная обрезка нерепрезентативных диапазонов."""
     pts = _aggregate_points(df_raw_program)
     if pts.empty:
         raise RuntimeError("Нет точек для построения после агрегации.")
@@ -145,16 +169,16 @@ def run_interactive_filter(
         out_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S")))
     by_age_dir = _ensure_dir(os.path.join(ts_dir, "by_age"))
 
-    ignored_records, before_summary, after_summary = [], [], []
+    ignored_records, before_summary = [], []
+    excluded_ranges = {}  # h -> [(lo,hi), ...]
+
     ages = sorted(pts["LoanAge"].dropna().unique().astype(int).tolist())
 
     for h in ages:
         pts_h = pts[pts["LoanAge"] == h].copy()
-        if pts_h.empty:
-            continue
-
         uniq = np.sort(pts_h["Incentive"].unique())
         step = np.median(np.diff(uniq)) if len(uniq) > 1 else np.nan
+
         before_summary.append({
             "LoanAge": h, "min": float(uniq.min()), "max": float(uniq.max()),
             "step_med": float(step) if np.isfinite(step) else np.nan,
@@ -163,28 +187,19 @@ def run_interactive_filter(
 
         b = _fit_arctan_unconstrained(
             pts_h["Incentive"], pts_h["CPR"], pts_h["TotalDebtBln"])
+
         print(f"\n=== AGE {h} ===")
-        print(f"Stimulus диапазон: {uniq.min():.2f} → {uniq.max():.2f}, "
-              f"шаг ≈ {step:.2f}, точек: {len(uniq)}")
-        _show_age_plot(pts_h, h, b=b)
+        print(f"Stimulus диапазон: {uniq.min():.2f} → {uniq.max():.2f}, шаг ≈ {step:.2f}")
+        _show_age_plot_cut(pts_h, h, b, allowed_ranges=[(-np.inf, np.inf)])
 
-        ans = input(f"Исключить возраст h={h} полностью? (y/n): ").strip().lower()
-        if ans == "y":
-            ignored_records.append({"LoanAge": h,
-                                    "Incentive_range": "ALL",
-                                    "Reason": "exclude age"})
-            pts = pts[pts["LoanAge"] != h]
-            continue
+        excluded_ranges[h] = []
 
-        # цикл исключений диапазонов
         while True:
-            rule = input(
-                "Введите диапазон исключения ('<-3', '>4', '-2..3') "
-                "или Enter чтобы перейти дальше: ").strip()
+            rule = input("Введите диапазон исключения ('<-3', '>4', '-2..3') "
+                         "или Enter для продолжения: ").strip()
             if not rule:
                 break
 
-            lo, hi = None, None
             try:
                 if rule.startswith("<"):
                     hi = float(rule[1:]); lo = -np.inf
@@ -198,115 +213,74 @@ def run_interactive_filter(
             except ValueError:
                 print("Ошибка парсинга диапазона"); continue
 
-            _show_age_plot(pts_h, h, b=b, highlight_range=(lo, hi))
-            conf = input("Подтвердить исключение этого диапазона? (y/n): ").strip().lower()
-            if conf != "y":
-                print("Отмена исключения — продолжаем."); continue
+            conf = input("Подтвердить исключение диапазона? (y/n): ").strip().lower()
+            if conf == "y":
+                excluded_ranges[h].append((lo, hi))
+                ignored_records.append({
+                    "LoanAge": h,
+                    "Incentive_range": f"{lo}..{hi}",
+                    "Reason": "cut from visualization"
+                })
+                print(f"Добавлено ограничение: {lo}..{hi}")
+            else:
+                print("Отмена.")
 
-            mask = (pts["LoanAge"] == h) & (pts["Incentive"] >= lo) & (pts["Incentive"] <= hi)
-            cnt_before = (pts["LoanAge"] == h).sum()
-            pts = pts[~mask].copy()
-            cnt_after = (pts["LoanAge"] == h).sum()
-            print(f"Исключено точек: {cnt_before - cnt_after}")
-            ignored_records.append({"LoanAge": h,
-                                    "Incentive_range": f"{lo}..{hi}",
-                                    "Reason": "exclude incentive range"})
-            pts_h = pts[pts["LoanAge"] == h].copy()
-            b = _fit_arctan_unconstrained(
-                pts_h["Incentive"], pts_h["CPR"], pts_h["TotalDebtBln"]) if len(pts_h) >= 3 else None
+        # вычисляем допустимые зоны = всё, что вне исключённых диапазонов
+        all_min, all_max = uniq.min(), uniq.max()
+        allowed = []
+        last = all_min
+        for (lo, hi) in sorted(excluded_ranges[h]):
+            if lo > last:
+                allowed.append((last, lo))
+            last = hi
+        if last < all_max:
+            allowed.append((last, all_max))
 
-        if not pts_h.empty:
-            _show_age_plot(pts_h, h, b=b)
-            fig_path = os.path.join(by_age_dir, f"age_{h}.png")
-            plt.savefig(fig_path, dpi=280)
-            plt.close()
+        # рисуем финальный обрезанный график
+        fig = _show_age_plot_cut(pts_h, h, b, allowed)
+        fig_path = os.path.join(by_age_dir, f"age_{h}.png")
+        fig.savefig(fig_path, dpi=300)
+        plt.close(fig)
 
-        pts_h_after = pts[pts["LoanAge"] == h]
-        if not pts_h_after.empty:
-            uniq2 = np.sort(pts_h_after["Incentive"].unique())
-            step2 = np.median(np.diff(uniq2)) if len(uniq2) > 1 else np.nan
-            after_summary.append({
-                "LoanAge": h, "min": float(uniq2.min()), "max": float(uniq2.max()),
-                "step_med": float(step2) if np.isfinite(step2) else np.nan,
-                "n_bins": int(len(uniq2))
-            })
-        else:
-            after_summary.append({
-                "LoanAge": h, "min": np.nan, "max": np.nan,
-                "step_med": np.nan, "n_bins": 0
-            })
+    # ─── Сохранения ────────────────────────────────────────────
+    pts.to_excel(os.path.join(ts_dir, "points_full.xlsx"), index=False)
+    pd.DataFrame(ignored_records).to_excel(
+        os.path.join(ts_dir, "ignored_bins.xlsx"), index=False)
 
-    # ===== сохранения =====
-    pts_out_path = os.path.join(ts_dir, "points_filtered.xlsx")
-    drop_out_path = os.path.join(ts_dir, "ignored_bins.xlsx")
-    sum_out_path = os.path.join(ts_dir, "summary.txt")
-
-    pts.sort_values(["LoanAge", "Incentive"], inplace=True)
-    pts.to_excel(pts_out_path, index=False)
-    pd.DataFrame(ignored_records).to_excel(drop_out_path, index=False)
-
-    with open(sum_out_path, "w", encoding="utf-8") as f:
+    # summary.txt с диапазонами и исключениями
+    with open(os.path.join(ts_dir, "summary.txt"), "w", encoding="utf-8") as f:
         f.write(f"Программа: {program_name}\n")
-        f.write("==== Диапазоны стимулов ДО ====\n")
+        f.write("==== Диапазоны стимулов (min/max/step) ====\n")
         f.write(pd.DataFrame(before_summary).to_string(index=False))
-        f.write("\n\n==== Диапазоны стимулов ПОСЛЕ ====\n")
-        f.write(pd.DataFrame(after_summary).to_string(index=False))
+        f.write("\n\n==== Исключённые диапазоны ====\n")
+        for h, rngs in excluded_ranges.items():
+            if rngs:
+                lst = "; ".join([f"{a}..{b}" for a, b in rngs])
+            else:
+                lst = "нет исключений"
+            f.write(f"h={h}: {lst}\n")
 
-    print("\n✅ ШАГ 1 завершён.")
-    print("Сохранено в:", ts_dir)
-    print("  • points_filtered.xlsx — итоговые точки")
-    print("  • ignored_bins.xlsx    — исключения")
-    print("  • by_age/*.png         — графики")
-    print("  • summary.txt          — min/max/step до/после")
+    print("\n✅ ШАГ 1 завершён (обрезка).")
+    print(f"Результаты: {ts_dir}")
+    print("  • points_full.xlsx")
+    print("  • ignored_bins.xlsx")
+    print("  • summary.txt — с диапазонами и исключениями")
+    print("  • by_age/*.png — графики с обрезкой")
 
-    return {
-        "pts_filtered": pts,
-        "ignored": pd.DataFrame(ignored_records),
-        "output_dir": ts_dir
-    }
-
-
-# ======== пример вызова ========
-# result = run_interactive_filter(
-#     df_raw_program=df_raw_program,
-#     out_root=r"C:\Users\mi.makhmudov\Desktop\SCurve_step1",
-#     program_name="Семейная ипотека"
-# )
+    return {"output_dir": ts_dir, "excluded_ranges": excluded_ranges}
 
 
 ⸻
 
-💡 Что изменилось:
+🧭 Пример вызова
 
-Было	Стало
-линейный код с кучей глобальных переменных	всё внутри run_interactive_filter()
-переменные pts, program_name, out_root создавались в теле	передаются аргументами
-логика сохранения, резюме, игноров — внутри функции	возвращается словарь с pts_filtered, ignored, output_dir
-можно вызывать несколько раз подряд для разных программ	✅ полностью безопасно и автономно
-
-
-⸻
-
-Запуск теперь простой:
-
-result = run_interactive_filter(
+result = run_interactive_cut(
     df_raw_program=df_raw_program,
     out_root=r"C:\Users\mi.makhmudov\Desktop\SCurve_step1",
     program_name="Семейная ипотека"
 )
 
-После завершения интерактивной сессии у тебя появится папка вроде:
-
-C:\Users\mi.makhmudov\Desktop\SCurve_step1\Семейная ипотека\2025-10-07_15-12-33\
- ├─ points_filtered.xlsx
- ├─ ignored_bins.xlsx
- ├─ summary.txt
- └─ by_age\
-      age_1.png
-      age_2.png
-      ...
-
 
 ⸻
 
-хочешь, чтобы я сразу сделал ШАГ 2 — автоматический запуск run_scurves_cv_and_save() по результатам points_filtered.xlsx (то есть pipeline: фильтрация → автотест → RMSE → сохранения)?
+Хочешь, чтобы я добавил в эту версию автоматическое сохранение GIF-анимации (всё возраста подряд, как “scroll-through” визуализация, чтобы можно было листать поколения подряд)?
