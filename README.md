@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-STEP 4 — Out-of-Time валидация S-кривых по периодам (dt_rep).
+STEP 4 — Out-of-Time валидация S-кривых (одна программа).
 
-Берёт беты из шага 1 (и опц. ref-беты),
-считает фактический и модельный CPR по каждому месяцу (payment_period)
-для одной программы (вся выборка df_raw_program).
-
-CPR = 1 - (1 - premat/od_after_plan) ** 12
+Считает фактический и модельный CPR по месяцам payment_period
+и сравнивает их по RMSE/MAPE. Подписи оси X — 'сентябрь 2025' и т.п.
 """
 
 import os
@@ -16,12 +13,19 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import warnings
+import locale
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 plt.rcParams["axes.formatter.useoffset"] = False
 
+# Пытаемся включить русскую локаль (для названий месяцев)
+try:
+    locale.setlocale(locale.LC_TIME, "ru_RU.UTF-8")
+except:
+    pass  # на Windows часто и так печатает по-русски
 
-# ─── utils ─────────────────────────────────────────────────────────────
+
+# ─── utils ────────────────────────────────────────────────
 def _ensure_dir(p): os.makedirs(p, exist_ok=True); return p
 
 def _f_from_betas(b, x):
@@ -44,7 +48,7 @@ def _load_betas(step1_dir):
     return pd.read_excel(os.path.join(step1_dir, "betas_full.xlsx"))
 
 
-# ─── основной шаг ──────────────────────────────────────────────────────
+# ─── основной шаг ─────────────────────────────────────────
 def run_step4_out_of_time(
     df_raw_program: pd.DataFrame,
     step1_dir: str,
@@ -119,7 +123,10 @@ def run_step4_out_of_time(
     agg["CPR_model"] = np.where(agg["sum_od"]>0, 1 - np.power(1 - agg["sum_premat_model"]/agg["sum_od"], 12), 0.0)
     agg["CPR_ref"]   = np.where(agg["sum_od"]>0, 1 - np.power(1 - agg["sum_premat_ref"]/agg["sum_od"], 12), np.nan)
 
-    # ошибки (по OD-весам между месяцами)
+    # подписи оси X — месяц год
+    agg["month_label"] = agg[payment_col].dt.strftime("%B %Y").str.capitalize()
+
+    # ошибки (взвешенные по OD)
     rmse_m = _weighted_rmse(agg["CPR_fact"], agg["CPR_model"], agg["sum_od"])
     mape_m = _weighted_mape(agg["CPR_fact"], agg["CPR_model"], agg["sum_od"])
     rmse_r = _weighted_rmse(agg["CPR_fact"], agg["CPR_ref"], agg["sum_od"])
@@ -136,17 +143,18 @@ def run_step4_out_of_time(
         "MAPE_ref": mape_r
     }])
 
-    # график CPR факт / модель / ref
+    # график CPR
     fig, ax = plt.subplots(figsize=(9,5))
-    ax.plot(agg[payment_col], agg["CPR_fact"], "-o", label="Fact")
-    ax.plot(agg[payment_col], agg["CPR_model"], "-s", label="Model")
+    ax.plot(agg["month_label"], agg["CPR_fact"], "-o", label="Факт")
+    ax.plot(agg["month_label"], agg["CPR_model"], "-s", label="Модель")
     if agg["CPR_ref"].notna().any():
-        ax.plot(agg[payment_col], agg["CPR_ref"], "--", label="Ref")
-    ax.set_title(f"{program_name} • Out-of-Time ({min_period.date()} — {max_period.date()})")
-    ax.set_xlabel("Период (месяц)")
+        ax.plot(agg["month_label"], agg["CPR_ref"], "--", label="Эталон")
+    ax.set_title(f"{program_name} • Out-of-Time ({min_period:%b %Y} — {max_period:%b %Y})")
+    ax.set_xlabel("Период")
     ax.set_ylabel("CPR, доли/год")
     ax.grid(ls="--", alpha=0.3)
     ax.legend()
+    plt.xticks(rotation=45, ha="right")
     fig.tight_layout()
     fig.savefig(os.path.join(charts_dir, "CPR_trend.png"), dpi=220)
     plt.close(fig)
@@ -161,7 +169,8 @@ def run_step4_out_of_time(
     print(f"• Папка: {out_dir}")
     return {"output_dir": out_dir, "agg": agg, "summary": summary}
 
-# ===== пример =====
+
+# пример
 # res4 = run_step4_out_of_time(
 #     df_raw_program=df_raw_program,
 #     step1_dir=step1_dir,
