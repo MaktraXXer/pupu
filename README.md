@@ -1,53 +1,20 @@
-отлично 💡 — ты сформулировал именно то, что действительно не хватает перед интерактивом шаг 1:
-разведочный анализ (EDA / step 0.5), чтобы увидеть структуру портфеля до фильтров и обрезок.
-
-давай я предложу структурированный step 0.5 — “Exploratory analysis & portfolio structure”,
-который можно запускать сразу после выгрузки (после step 0).
-
-⸻
-
-🔍 Step 0.5 — разведанализ данных (EDA)
-
-Цель:
-понять, как распределены стимулы, возраста и CPR, какие объёмы и доли приходятся на разные сегменты,
-и как это меняется по последним месяцам (payment_period).
-
-⸻
-
-📦 Что скрипт создаёт
-
-1️⃣ Excel-отчёт eda_summary.xlsx, со вкладками:
-
-Sheet	Описание
-overview_by_age_stim	по всем данным: LoanAge × Stimulus с суммами OD_AFTER_PLAN, PREMAT_PAYMENT, CPR, долями
-overview_lastN_periods	то же самое, но для N последних месяцев (по payment_period)
-summary_period_dynamics	динамика распределений: как меняются доли по стимулам и age
-histograms_data	агрегированные данные для графиков распределений CPR, стимулов и объёмов
-
-Каждая таблица включает:
-	•	LoanAge, Stimulus, sum_od, share_od, sum_premat, share_premat,
-CPR, count_con, mean_rate, payment_period (если есть).
-
-⸻
-
-📊 Графики, которые генерируются:
-
-График	Что показывает	Файл
-📈 Stimulus Distribution.png	распределение объёма (OD) по стимулам, общий и в долях	charts/stimulus_dist.png
-📊 AgeGroup Volume.png	вклад возрастных групп в общий OD и Premat	charts/agegroup_volumes.png
-🧩 CPR_Hist.png	распределение CPR по всем сделкам	charts/cpr_hist.png
-🔁 Stimulus_Dynamics.png	сравнение распределения стимулов по последним N месяцам (stacked bars)	charts/stimulus_dynamics.png
-🕒 CPR_Dynamics.png	средний CPR по месяцам (payment_period)	charts/cpr_dynamics.png
-
-
-⸻
-
-⚙️ Логика кода
-
 # -*- coding: utf-8 -*-
 """
-STEP 0.5 — Exploratory Data Analysis before step 1.
-Создаёт Excel + графики распределений по age_group, стимулу, CPR и динамике во времени.
+STEP 0.5 — Exploratory Data Analysis (EDA) перед Step 1.
+
+Что делает:
+  • Биннит стимулы по сетке с заданным шагом (по умолчанию 0.5 п.п.)
+  • Считает агрегаты по (LoanAge × StimBin) на всем горизонте:
+      sum_od, sum_premat, CPR_agg, доли
+  • Строит динамику распределения OD по стимульным бинам помесячно (last N months):
+      помесячные sum_od, доли по бинам, CPR по бинам и общий CPR месяца
+  • Сохраняет Excel и графики (общая гистограмма по стимулам, heatmap по месяцам × бины,
+    объёмы по age, и heatmap CPR по age × бины)
+
+Важно:
+  • CPR везде считается на агрегированных суммах как: 
+      0 если sum_od ≤ 0; иначе 1 - (1 - sum_premat/sum_od)^12
+  • Никаких фильтров исключений (ignored_bins) — это до интерактива, широкая картина.
 """
 
 import os
@@ -61,124 +28,266 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 plt.rcParams["axes.formatter.useoffset"] = False
 
-def _ensure_dir(p): os.makedirs(p, exist_ok=True); return p
 
+# ─────────────────────────────────────────────────────────────
+# Утилиты
+# ─────────────────────────────────────────────────────────────
+def _ensure_dir(p: str) -> str:
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+_RU_MONTHS = {
+    1: "январь", 2: "февраль", 3: "март", 4: "апрель", 5: "май", 6: "июнь",
+    7: "июль", 8: "август", 9: "сентябрь", 10: "октябрь", 11: "ноябрь", 12: "декабрь"
+}
+def _ru_month_label(ts: pd.Timestamp) -> str:
+    m = _RU_MONTHS.get(int(ts.month), ts.strftime("%B")).lower()
+    return f"{m} {int(ts.year)}"
+
+
+def _agg_cpr(sum_premat: float, sum_od: float) -> float:
+    if sum_od is None or sum_od <= 0:
+        return 0.0
+    x = 1.0 - float(sum_premat) / float(sum_od)
+    return float(1.0 - np.power(x, 12.0))
+
+
+def _build_stim_bins(x: pd.Series, bin_width: float):
+    x = pd.to_numeric(x, errors="coerce")
+    lo = np.floor(np.nanmin(x) / bin_width) * bin_width
+    hi = np.ceil(np.nanmax(x) / bin_width) * bin_width
+    # на случай вырожденного диапазона
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        lo, hi = -5.0, 5.0
+    if hi <= lo:
+        hi = lo + bin_width
+    edges = np.arange(lo, hi + bin_width*0.5, bin_width, dtype=float)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    labels = [f"{edges[i]:.2f}..{edges[i+1]:.2f}" for i in range(len(edges)-1)]
+    return edges, centers, labels
+
+
+# ─────────────────────────────────────────────────────────────
+# Основной запуск
+# ─────────────────────────────────────────────────────────────
 def run_step05_exploratory(
     df_raw_program: pd.DataFrame,
     out_root: str = r"C:\Users\mi.makhmudov\Desktop\SCurve_step05",
     program_name: str = "UNKNOWN",
-    last_months: int = 3
+    stim_bin_width: float = 0.5,
+    last_months: int = 6,
+    top_k_bins_for_stack: int = 12  # для наглядных стэков; heatmap строим по всем
 ):
-    out_dir = _ensure_dir(os.path.join(out_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S")))
-    charts_dir = _ensure_dir(os.path.join(out_dir, "charts"))
+    ts_dir = _ensure_dir(os.path.join(out_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S")))
+    charts_dir = _ensure_dir(os.path.join(ts_dir, "charts"))
 
+    # ── нормализация входа ─────────────────────────────
     df = df_raw_program.copy()
-    df["payment_period"] = pd.to_datetime(df["payment_period"])
+    # жёсткие типы
+    for c in ["stimul", "od_after_plan", "premat_payment"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
     df["age_group_id"] = pd.to_numeric(df["age_group_id"], errors="coerce").astype("Int64")
-    df["stimul"] = pd.to_numeric(df["stimul"], errors="coerce")
-    df["od_after_plan"] = pd.to_numeric(df["od_after_plan"], errors="coerce")
-    df["premat_payment"] = pd.to_numeric(df["premat_payment"], errors="coerce")
+    df["payment_period"] = pd.to_datetime(df["payment_period"], errors="coerce").dt.normalize()
+    # минимальные фильтры
+    df = df[(df["stimul"].notna()) & (df["od_after_plan"].notna()) & (df["premat_payment"].notna())]
+    df = df[df["od_after_plan"] >= 0]  # допускаем 0; CPR станет 0
 
-    df = df[df["od_after_plan"]>0]
-    df["CPR"] = 1 - np.power(1 - df["premat_payment"]/df["od_after_plan"], 12)
-    df["CPR"] = df["CPR"].clip(0, 1)
+    # CPR на договоре НЕ считаем — мы работаем только с агрегатами CPR (как в шагах 2/4)
 
-    # === overview by age × stimul ===
-    agg_all = df.groupby(["age_group_id","stimul"], as_index=False).agg(
-        sum_od=("od_after_plan","sum"),
-        sum_premat=("premat_payment","sum"),
-        count_con=("con_id","count")
+    # ── бины по стимулу ────────────────────────────────
+    edges, centers, labels = _build_stim_bins(df["stimul"], stim_bin_width)
+    df["stim_bin"] = pd.cut(df["stimul"], bins=edges, include_lowest=True, right=False, labels=labels)
+
+    # ── 1) Общая матрица по (Age × StimBin) на всех данных ─────────────────
+    agg_all = df.groupby(["age_group_id", "stim_bin"], dropna=False, as_index=False).agg(
+        sum_od=("od_after_plan", "sum"),
+        sum_premat=("premat_payment", "sum"),
+        n_con=("con_id", "count")
     )
-    agg_all["CPR"] = np.where(agg_all["sum_od"]>0,
-                              1 - np.power(1 - agg_all["sum_premat"]/agg_all["sum_od"],12), np.nan)
-    total_od = agg_all["sum_od"].sum()
-    total_premat = agg_all["sum_premat"].sum()
-    agg_all["share_od"] = agg_all["sum_od"]/total_od
-    agg_all["share_premat"] = agg_all["sum_premat"]/total_premat
+    # CPR на агрегатах
+    agg_all["CPR_agg"] = [ _agg_cpr(p, o) for p, o in zip(agg_all["sum_premat"], agg_all["sum_od"]) ]
+    total_od_all = float(agg_all["sum_od"].sum()) if len(agg_all) else 0.0
+    total_premat_all = float(agg_all["sum_premat"].sum()) if len(agg_all) else 0.0
+    agg_all["share_od_all"] = agg_all["sum_od"] / total_od_all if total_od_all > 0 else 0.0
+    agg_all["share_premat_all"] = agg_all["sum_premat"] / total_premat_all if total_premat_all > 0 else 0.0
 
-    # === последние N месяцев ===
-    max_p = df["payment_period"].max()
-    min_p = max_p - relativedelta(months=last_months-1)
-    df_recent = df[df["payment_period"].between(min_p, max_p)]
-    agg_recent = df_recent.groupby(["payment_period","age_group_id","stimul"], as_index=False).agg(
-        sum_od=("od_after_plan","sum"),
-        sum_premat=("premat_payment","sum")
+    # добавим центр и границы бина для удобства
+    # парсим из текста "lo..hi"
+    def _parse_bin_center(lbl: str) -> float:
+        try:
+            a, b = str(lbl).split("..")
+            return (float(a) + float(b)) / 2.0
+        except Exception:
+            return np.nan
+    agg_all["stim_bin_center"] = agg_all["stim_bin"].astype(str).map(_parse_bin_center)
+
+    # ── 2) Динамика распределения OD по стимулам (последние N месяцев) ─────
+    if df["payment_period"].notna().any():
+        max_p = df["payment_period"].max()
+        min_p = max_p - relativedelta(months=last_months-1)
+        df_recent = df[df["payment_period"].between(min_p, max_p)].copy()
+    else:
+        df_recent = df.copy()
+        max_p = pd.NaT
+        min_p = pd.NaT
+
+    # агрегаты (месяц × бин)
+    month_bin = df_recent.groupby(["payment_period", "stim_bin"], dropna=False, as_index=False).agg(
+        sum_od=("od_after_plan", "sum"),
+        sum_premat=("premat_payment", "sum")
     )
-    agg_recent["CPR"] = np.where(agg_recent["sum_od"]>0,
-                                 1 - np.power(1 - agg_recent["sum_premat"]/agg_recent["sum_od"],12), np.nan)
+    month_bin["CPR_agg"] = [ _agg_cpr(p, o) for p, o in zip(month_bin["sum_premat"], month_bin["sum_od"]) ]
 
-    # === динамика по CPR ===
-    dyn = df.groupby("payment_period", as_index=False).agg(
-        CPR_mean=("CPR","mean"),
-        sum_od=("od_after_plan","sum")
+    # добавим внутри-месячные доли по OD
+    month_totals = month_bin.groupby("payment_period", as_index=False)["sum_od"].sum().rename(columns={"sum_od": "sum_od_month"})
+    month_bin = month_bin.merge(month_totals, on="payment_period", how="left")
+    month_bin["share_od_in_month"] = np.where(month_bin["sum_od_month"] > 0, month_bin["sum_od"] / month_bin["sum_od_month"], 0.0)
+
+    # общий CPR по месяцам (на всех стимулах месяца)
+    month_summary = df_recent.groupby("payment_period", as_index=False).agg(
+        sum_od=("od_after_plan", "sum"),
+        sum_premat=("premat_payment", "sum")
     )
+    month_summary["CPR_month"] = [ _agg_cpr(p, o) for p, o in zip(month_summary["sum_premat"], month_summary["sum_od"]) ]
+    month_summary["month_label"] = month_summary["payment_period"].map(_ru_month_label)
 
-    # === сохранение Excel ===
-    with pd.ExcelWriter(os.path.join(out_dir,"eda_summary.xlsx"), engine="openpyxl") as xw:
-        agg_all.to_excel(xw, sheet_name="overview_by_age_stim", index=False)
-        agg_recent.to_excel(xw, sheet_name="overview_lastN_periods", index=False)
-        dyn.to_excel(xw, sheet_name="CPR_dynamics", index=False)
+    # ── 3) Пивоты для heatmap ─────────────────────────
+    # Heatmap распределения OD-долей: строки — месяцы, колонки — бины
+    hm_share = month_bin.pivot_table(index="payment_period", columns="stim_bin", values="share_od_in_month", aggfunc="mean").fillna(0.0)
+    # Для подписи X-оси графиков используем "сентябрь 2025"
+    if hm_share.index.notna().any():
+        idx_labels = [ _ru_month_label(pd.Timestamp(i)) for i in hm_share.index ]
+    else:
+        idx_labels = []
+    # Heatmap CPR по age × stim_bin на всех данных
+    hm_cpr_age = agg_all.pivot_table(index="age_group_id", columns="stim_bin", values="CPR_agg", aggfunc="mean")
 
-    # === графики ===
-    # 1) распределение стимулов по объёму
-    fig, ax = plt.subplots(figsize=(9,5))
-    bins = np.linspace(df["stimul"].min(), df["stimul"].max(), 40)
-    ax.hist(df["stimul"], bins=bins, weights=df["od_after_plan"]/1e9,
-            color="#1f77b4", alpha=0.7, edgecolor="none")
-    ax.set_xlabel("Incentive, п.п."); ax.set_ylabel("Объём, млрд руб")
-    ax.set_title(f"{program_name}: распределение стимулов по объёму (все данные)")
-    fig.tight_layout(); fig.savefig(os.path.join(charts_dir,"stimulus_dist.png"), dpi=220); plt.close(fig)
+    # ── 4) Сохранение Excel ───────────────────────────
+    excel_path = os.path.join(ts_dir, "eda_summary.xlsx")
+    with pd.ExcelWriter(excel_path, engine="openpyxl") as xw:
+        agg_all.sort_values(["age_group_id", "stim_bin"]).to_excel(xw, sheet_name="by_age_stim_bin_all", index=False)
+        month_bin.sort_values(["payment_period", "stim_bin"]).to_excel(xw, sheet_name="by_month_stim_bin", index=False)
+        month_summary.sort_values("payment_period").to_excel(xw, sheet_name="month_summary", index=False)
+        # пивоты как таблицы — удобно для ручного анализа/сводов
+        hm_share.reset_index().to_excel(xw, sheet_name="heatmap_od_share_by_month", index=False)
+        hm_cpr_age.reset_index().to_excel(xw, sheet_name="heatmap_cpr_age_stim", index=False)
 
-    # 2) объёмы по возрастным группам
-    fig, ax = plt.subplots(figsize=(8,5))
-    vol_by_age = agg_all.groupby("age_group_id")[["sum_od","sum_premat"]].sum()/1e9
-    vol_by_age.plot(kind="bar", ax=ax)
-    ax.set_title(f"{program_name}: объёмы OD и Premat по возрастам")
-    ax.set_xlabel("Age group"); ax.set_ylabel("млрд руб")
-    fig.tight_layout(); fig.savefig(os.path.join(charts_dir,"agegroup_volumes.png"), dpi=220); plt.close(fig)
+    # ── 5) Графики ─────────────────────────────────────
 
-    # 3) распределение CPR
-    fig, ax = plt.subplots(figsize=(8,5))
-    ax.hist(df["CPR"], bins=40, color="#ff7f0e", alpha=0.6)
-    ax.set_title(f"{program_name}: распределение CPR по всем договорам")
-    ax.set_xlabel("CPR (доля/год)"); ax.set_ylabel("Количество")
-    fig.tight_layout(); fig.savefig(os.path.join(charts_dir,"cpr_hist.png"), dpi=220); plt.close(fig)
+    # 5.1) Общая гистограмма распределения OD по стимулу (бин 0.5), по всем данным
+    vol_by_bin = agg_all.groupby("stim_bin", as_index=False)["sum_od"].sum()
+    # упорядочим по центрам
+    vol_by_bin["center"] = vol_by_bin["stim_bin"].astype(str).map(_parse_bin_center)
+    vol_by_bin = vol_by_bin.sort_values("center")
 
-    # 4) динамика CPR по месяцам
-    fig, ax = plt.subplots(figsize=(9,5))
-    dyn["month_label"] = dyn["payment_period"].dt.strftime("%B %Y").str.capitalize()
-    ax.plot(dyn["month_label"], dyn["CPR_mean"], "-o", color="#2ca02c")
-    ax.set_title(f"{program_name}: средний CPR по месяцам")
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.bar(vol_by_bin["center"], vol_by_bin["sum_od"]/1e9, width=stim_bin_width*0.9)
+    ax.set_xlabel("Incentive (центр бина), п.п.")
+    ax.set_ylabel("Объём OD, млрд руб.")
+    ax.set_title(f"{program_name}: распределение OD по стимульным бинам (шаг {stim_bin_width})")
     ax.grid(ls="--", alpha=0.3)
-    plt.xticks(rotation=45, ha="right")
-    fig.tight_layout(); fig.savefig(os.path.join(charts_dir,"cpr_dynamics.png"), dpi=220); plt.close(fig)
+    fig.tight_layout()
+    fig.savefig(os.path.join(charts_dir, "stimulus_hist_overall.png"), dpi=240)
+    plt.close(fig)
 
-    print(f"\n✅ STEP 0.5 готово для {program_name}")
-    print(f"• Последние месяцы: {min_p.date()}–{max_p.date()}")
-    print(f"• Папка: {out_dir}")
-    return {"output_dir": out_dir, "agg_all": agg_all, "agg_recent": agg_recent, "dyn": dyn}
+    # 5.2) Heatmap: доля OD внутри месяца по стимульным бинам (последние N мес.)
+    if not hm_share.empty:
+        fig, ax = plt.subplots(figsize=(max(8, 0.5*len(hm_share.columns)), max(5, 0.4*len(hm_share.index))))
+        im = ax.imshow(hm_share.values, aspect="auto", interpolation="nearest")
+        ax.set_xticks(np.arange(hm_share.shape[1]))
+        ax.set_xticklabels([str(c) for c in hm_share.columns], rotation=90)
+        ax.set_yticks(np.arange(hm_share.shape[0]))
+        ax.set_yticklabels(idx_labels)
+        ax.set_title(f"{program_name}: доля OD по стимульным бинам (последние {last_months} мес.)")
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("Доля OD в месяце")
+        fig.tight_layout()
+        fig.savefig(os.path.join(charts_dir, "heatmap_od_share_by_month.png"), dpi=240)
+        plt.close(fig)
 
+    # 5.3) Объёмы OD и Premat по age-группам (всё время)
+    vol_by_age = agg_all.groupby("age_group_id", as_index=False)[["sum_od", "sum_premat"]].sum()
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.bar(vol_by_age["age_group_id"]-0.15, vol_by_age["sum_od"]/1e9, width=0.3, label="OD")
+    ax.bar(vol_by_age["age_group_id"]+0.15, vol_by_age["sum_premat"]/1e9, width=0.3, label="Premat")
+    ax.set_xlabel("LoanAge")
+    ax.set_ylabel("млрд руб.")
+    ax.set_title(f"{program_name}: объёмы OD и Premat по возрастам (всё время)")
+    ax.legend()
+    ax.grid(ls="--", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(charts_dir, "agegroup_volumes.png"), dpi=240)
+    plt.close(fig)
 
-⸻
+    # 5.4) Heatmap CPR по (age × стимульный бин) — всё время
+    if not hm_cpr_age.empty:
+        fig, ax = plt.subplots(figsize=(max(8, 0.5*len(hm_cpr_age.columns)), max(5, 0.5*len(hm_cpr_age.index))))
+        im = ax.imshow(hm_cpr_age.values, aspect="auto", interpolation="nearest")
+        ax.set_xticks(np.arange(hm_cpr_age.shape[1]))
+        ax.set_xticklabels([str(c) for c in hm_cpr_age.columns], rotation=90)
+        ax.set_yticks(np.arange(hm_cpr_age.shape[0]))
+        ax.set_yticklabels([str(i) for i in hm_cpr_age.index])
+        ax.set_title(f"{program_name}: CPR по возрастам и стимулам (агрегировано)")
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("CPR (доля/год)")
+        fig.tight_layout()
+        fig.savefig(os.path.join(charts_dir, "heatmap_cpr_age_stim.png"), dpi=240)
+        plt.close(fig)
 
-📈 Пример вызова
+    # 5.5) (опционально) стэковая диаграмма долей TOP-K бинов по последним N месяцам
+    # выбираем топ-бинов по средней доле, остальные в "Прочее"
+    if not month_bin.empty:
+        mean_share = month_bin.groupby("stim_bin", as_index=False)["share_od_in_month"].mean()
+        mean_share["center"] = mean_share["stim_bin"].astype(str).map(_parse_bin_center)
+        top_bins = mean_share.sort_values(["share_od_in_month", "center"], ascending=[False, True]).head(top_k_bins_for_stack)["stim_bin"].astype(str).tolist()
 
-res05 = run_step05_exploratory(
-    df_raw_program=df_raw_program,
-    out_root=r"C:\Users\mi.makhmudov\Desktop\SCurve_step05",
-    program_name="Семейная ипотека",
-    last_months=4
-)
+        # подготовим таблицу: месяц × бин (доли)
+        stack_tbl = month_bin.pivot_table(index="payment_period", columns="stim_bin", values="share_od_in_month", aggfunc="mean").fillna(0.0)
+        # сложим "прочее"
+        other_col = "Прочее"
+        top_cols = [c for c in stack_tbl.columns.astype(str) if c in top_bins]
+        other_share = stack_tbl.drop(columns=top_cols, errors="ignore").sum(axis=1)
+        stack_plot = pd.concat([stack_tbl[top_cols], other_share.rename(other_col)], axis=1)
+        # порядок колонок — по убыванию средней доли
+        order_cols = list(pd.Series(top_cols + [other_col]).tolist())
 
+        # подписи месяцев
+        stack_plot.index = [ _ru_month_label(pd.Timestamp(i)) for i in stack_plot.index ]
 
-⸻
+        # рисуем
+        fig, ax = plt.subplots(figsize=(max(10, 0.8*len(stack_plot.index)), 6))
+        bottom = np.zeros(len(stack_plot))
+        for col in order_cols:
+            vals = stack_plot[col].values
+            ax.bar(stack_plot.index, vals, bottom=bottom, label=str(col))
+            bottom += vals
 
-💡 Идеи для дальнейших расширений
-	•	добавить heatmap (seaborn.heatmap) по LoanAge × Stimulus — оттенки = объём/доля;
-	•	добавить scatter CPR vs Stimulus (взвешенный размером OD);
-	•	динамика CPR по age_group на одном графике (stacked lines);
-	•	если укажешь compare=True, можно сразу строить «последние N месяцев vs всё время».
+        ax.set_title(f"{program_name}: динамика долей OD по стимулам (TOP-{top_k_bins_for_stack}, последние {last_months} мес.)")
+        ax.set_ylabel("Доля OD в месяце")
+        ax.set_xlabel("Месяц")
+        ax.legend(ncol=min(4, len(order_cols)), fontsize=8, framealpha=0.9, bbox_to_anchor=(0.5, -0.18), loc="upper center")
+        ax.grid(ls="--", alpha=0.3, axis="y")
+        plt.xticks(rotation=45, ha="right")
+        fig.tight_layout()
+        fig.subplots_adjust(bottom=0.25)
+        fig.savefig(os.path.join(charts_dir, "stimulus_share_stacked.png"), dpi=240)
+        plt.close(fig)
 
-⸻
+    # ── Вывод ──────────────────────────────────────────
+    if pd.notna(max_p):
+        print(f"\n✅ STEP 0.5 готово для {program_name}")
+        print(f"• Последние месяцы: {_ru_month_label(min_p)} — {_ru_month_label(max_p)}")
+    else:
+        print(f"\n✅ STEP 0.5 готово для {program_name}")
+        print("• Данных по payment_period либо нет, либо они NaT — динамика построена по доступному подмножеству.")
+    print(f"• Папка: {ts_dir}")
+    print("  - eda_summary.xlsx")
+    print("  - charts/*.png")
 
-Хочешь, я добавлю heatmap с объёмами (LoanAge × Stimulus, цвет = лог(OD)) и/или распределение CPR по age-группам (boxplot)?
+    return {
+        "output_dir": ts_dir,
+        "agg_all": agg_all,
+        "month_bin": month_bin,
+        "month_summary": month_summary
+    }
