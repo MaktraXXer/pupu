@@ -1,16 +1,17 @@
-WITH month_latest AS (
-    SELECT
-        EOMONTH(dt_rep) AS month_end,
-        MAX(dt_rep)     AS dt_rep
-    FROM ALM.ALM.VW_Balance_Rest_All WITH (NOLOCK)
-    WHERE BLOCK_NAME   = N'Привлечение ФЛ'
-      AND SECTION_NAME = N'Срочные'
-      AND dt_rep BETWEEN '2025-06-01' AND '2025-09-30'
-    GROUP BY EOMONTH(dt_rep)
+DECLARE @date_from date = '2025-06-01';
+DECLARE @date_to   date = '2025-08-31';  -- включительно по август
+
+;WITH month_ends AS (
+    -- Ровно концы месяцев между @date_from и @date_to
+    SELECT EOMONTH(@date_from) AS dt_rep
+    UNION ALL
+    SELECT EOMONTH(DATEADD(month, 1, dt_rep))
+    FROM month_ends
+    WHERE dt_rep < EOMONTH(@date_to)
 ),
 base AS (
     SELECT
-        ml.month_end             AS dt_rep,
+        m.dt_rep,
         CASE
             WHEN w.termdays BETWEEN  28 AND  33 THEN  31
             WHEN w.termdays BETWEEN  60 AND  70 THEN  61
@@ -27,17 +28,23 @@ base AS (
             ELSE w.termdays
         END AS term_bucket,
         w.out_rub
-    FROM month_latest ml
+    FROM month_ends m
     JOIN ALM.ALM.VW_Balance_Rest_All w WITH (NOLOCK)
-         ON w.dt_rep = ml.dt_rep
-        AND w.BLOCK_NAME   = N'Привлечение ФЛ'
-        AND w.SECTION_NAME = N'Срочные'
-    WHERE EOMONTH(w.DT_OPEN_fact) = ml.month_end   -- только открытые в этом месяце
+      ON w.dt_rep = m.dt_rep
+     AND w.BLOCK_NAME   = N'Привлечение ФЛ'
+     AND w.SECTION_NAME = N'Срочные'
+    CROSS APPLY (VALUES (
+        DATEADD(day, 1, EOMONTH(m.dt_rep, -1)),      -- month_start
+        DATEADD(day, 1, m.dt_rep)                     -- next_month_start
+    )) b(month_start, next_month_start)
+    WHERE w.DT_OPEN_fact >= b.month_start
+      AND w.DT_OPEN_fact <  b.next_month_start       -- только открытые в этом месяце
 )
 SELECT
-       dt_rep,
-       term_bucket AS [Срок, дн.],
-       SUM(out_rub) AS sum_out_rub
+    dt_rep,                                          -- 2025-06-30, 2025-07-31, 2025-08-31
+    term_bucket AS [Срок, дн.],
+    SUM(out_rub) AS sum_out_rub
 FROM base
 GROUP BY dt_rep, term_bucket
-ORDER BY dt_rep, term_bucket;
+ORDER BY dt_rep, term_bucket
+OPTION (MAXRECURSION 12);
