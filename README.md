@@ -1,3 +1,16 @@
+отлично, ловись переработанный Step 0.5 (EDA) — строго между шагом 0 и шагом 1, с учётом твоих замечаний:
+	•	CPR считается корректно на аггрегатах (ровно как в шагах 2/4):
+CPR = 0, если sum(OD_AFTER_PLAN) ≤ 0; иначе 1 - (1 - sum(PREMAT_PAYMENT)/sum(OD_AFTER_PLAN))^12.
+	•	Стресс по стимулу делаем на фиксированной сетке с шагом 0.5 п.п. (можно изменить).
+	•	Смотрим динамику распределения OD по стимулу во времени (по месяцам), в т.ч. heatmap.
+	•	Никаких prod_name — работаем по одной программе.
+	•	Графики подписывают месяцы как “сентябрь 2025” (без дат).
+
+Скрипт сохраняет 1 Excel с широкими агрегатами и 4–5 понятных графиков.
+
+⸻
+
+
 # -*- coding: utf-8 -*-
 """
 STEP 0.5 — Exploratory Data Analysis (EDA) перед Step 1.
@@ -291,3 +304,26 @@ def run_step05_exploratory(
         "month_bin": month_bin,
         "month_summary": month_summary
     }
+
+что получится на выходе
+
+SCurve_step05/<timestamp>/
+├─ eda_summary.xlsx
+└─ charts/
+   ├─ stimulus_hist_overall.png             ← OD по бинам (шаг 0.5) — все данные
+   ├─ heatmap_od_share_by_month.png         ← месяцы × бины: доля OD
+   ├─ agegroup_volumes.png                  ← OD & Premat по age
+   ├─ heatmap_cpr_age_stim.png              ← age × бины: CPR на агрегатах
+   └─ stimulus_share_stacked.png            ← TOP-K бинов: доли OD по месяцам (стэк)
+
+если захочешь — добавлю альтернативные heatmap’ы (например, объём OD вместо долей; или CPR по месяцам × бины), и любые доп. поля в Excel (например, «доля бина в общем OD за весь горизонт», уже есть share_od_all).
+
+# === STEP 0.5 — разведанализ перед интерактивом ===
+res05 = run_step05_exploratory(
+    df_raw_program = df_raw_program,   # твои исходные договорные данные
+    out_root       = r"C:\Users\mi.makhmudov\Desktop\SCurve_step05",
+    program_name   = "Семейная ипотека",   # любое имя для подписи графиков
+    stim_bin_width = 0.5,   # шаг по стимулу (в п.п.)
+    last_months    = 6,     # сколько последних месяцев взять для динамики
+    top_k_bins_for_stack = 10   # сколько верхних бинов показать в стэковой диаграмме
+)
