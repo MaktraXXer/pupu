@@ -1,14 +1,9 @@
-Да, это “чуть меньшее множество”. Нужно искать **новых клиентов в окне 01–08.10.2025**, но оставить **только тех новых**, у кого **все открытые в этом окне продукты — именно вклады** (т.е. исключить “Накопительный счёт” и “Накопительный счётУльтра”).
-Ключевой момент: для определения «новизны» учитываем **всю историю** (в т.ч. накопительные), а вот **фильтр на вклады** накладываем только внутри окна.
-
-Вот готовый T-SQL:
-
-```sql
 DECLARE @dt_from date = '2025-10-01';
 DECLARE @dt_to   date = '2025-10-08';  -- включительно
+DECLARE @dt_to_next date = DATEADD(day, 1, @dt_to); -- полуинтервал
 
--- === 1) Историческая витринка (без исключения накопительных!), но с вашими прочими фильтрами
-WITH raw_base AS (
+-- ===== 1) Общая витринка с бизнес-фильтрами (без вырезания накопительных!)
+WITH base AS (
     SELECT a.CLI_ID, a.CON_ID, a.PROD_NAME, a.DT_OPEN
     FROM LIQUIDITY.liq.DepositContract_all a WITH (NOLOCK)
     WHERE a.DT_OPEN IS NOT NULL
@@ -20,7 +15,7 @@ WITH raw_base AS (
             FROM LIQUIDITY.liq.DepositContract_all WITH (NOLOCK)
             WHERE prod_name = N'Классический' OR prod_name LIKE N'%Привилегия%'
       )
-      AND a.prod_name NOT IN (  -- нежелательные тех/эскроу-продукты
+      AND a.prod_name NOT IN (  -- тех/эскроу-исключения
             N'Агентские эскроу ФЛ по ставке КС+спред',
             N'Спец. банк.счёт',
             N'Залоговый',
@@ -29,65 +24,40 @@ WITH raw_base AS (
             N'Депозит ФЛ (суррогатный договор для счета Новой Афины)'
       )
 ),
--- === 2) Первая дата в истории по клиенту (оцениваем новизну по всей raw_base)
-first_dt AS (
-    SELECT CLI_ID, MIN(DT_OPEN) AS min_dt_open
-    FROM raw_base
-    GROUP BY CLI_ID
+-- ===== 2) Клиенты, у которых был хоть один договор ДО окна (строго раньше @dt_from)
+prior_any AS (
+    SELECT DISTINCT CLI_ID
+    FROM base
+    WHERE DT_OPEN < @dt_from
 ),
--- === 3) Новые клиенты из окна (их первая дата попала в окно)
-new_clients AS (
-    SELECT CLI_ID
-    FROM first_dt
-    WHERE min_dt_open >= @dt_from
-      AND min_dt_open < DATEADD(day, 1, @dt_to)
-),
--- === 4) Все их договоры, открытые именно в окне (для проверки состава продуктов)
+-- ===== 3) Ряды в самом окне (полуинтервал [from; to_next))
 win_rows AS (
-    SELECT b.*
-    FROM raw_base b
-    JOIN new_clients n ON n.CLI_ID = b.CLI_ID
-    WHERE b.DT_OPEN >= @dt_from
-      AND b.DT_OPEN <  DATEADD(day, 1, @dt_to)
+    SELECT *
+    FROM base
+    WHERE DT_OPEN >= @dt_from
+      AND DT_OPEN <  @dt_to_next
 ),
--- === 5) Оставляем только тех новых, у кого в окне НЕ было накопительных счетов
+-- ===== 4) Новые на момент окна: есть договор(ы) в окне И нет ничего раньше
+new_clients_now AS (
+    SELECT DISTINCT w.CLI_ID
+    FROM win_rows w
+    WHERE NOT EXISTS (SELECT 1 FROM prior_any p WHERE p.CLI_ID = w.CLI_ID)
+),
+-- ===== 5) Оставляем только тех новых, у кого в окне НЕ было накопительных
 pure_deposit_clients AS (
-    SELECT CLI_ID
-    FROM win_rows
-    GROUP BY CLI_ID
-    HAVING SUM(CASE WHEN PROD_NAME IN (N'Накопительный счёт', N'Накопительный счётУльтра') THEN 1 ELSE 0 END) = 0
-       AND COUNT(*) > 0  -- на всякий случай, чтобы у клиента в окне точно что-то было
+    SELECT w.CLI_ID
+    FROM win_rows w
+    JOIN new_clients_now n ON n.CLI_ID = w.CLI_ID
+    GROUP BY w.CLI_ID
+    HAVING SUM(CASE WHEN w.PROD_NAME IN (N'Накопительный счёт', N'Накопительный счётУльтра') THEN 1 ELSE 0 END) = 0
+       AND COUNT(*) > 0
 )
--- === 6) Финальный вывод: CON_ID договоров, открытых в окне, и являющихся ВКЛАДАМИ
+-- ===== 6) Финал: CON_ID договоров «чисто-вкладных» новых клиентов, открытых в окне
 SELECT w.CON_ID
 FROM win_rows w
 JOIN pure_deposit_clients p ON p.CLI_ID = w.CLI_ID
 WHERE w.PROD_NAME NOT IN (N'Накопительный счёт', N'Накопительный счётУльтра')
 ORDER BY w.CON_ID;
-```
-
-Если нужен **ровно один CON_ID на клиента** (например, самый ранний в окне), замените финал на:
-
-```sql
-SELECT MIN(w.CON_ID) AS CON_ID
-FROM win_rows w
-JOIN pure_deposit_clients p ON p.CLI_ID = w.CLI_ID
-WHERE w.PROD_NAME NOT IN (N'Накопительный счёт', N'Накопительный счётУльтра')
-GROUP BY w.CLI_ID
-ORDER BY MIN(w.CON_ID);
-```
-
-Опциональный индекс для ускорения (если ещё нет):
-
-```sql
-CREATE INDEX IX_DepositContract_cli_dt
-ON LIQUIDITY.liq.DepositContract_all (CLI_ID, DT_OPEN, CON_ID)
-INCLUDE (PROD_NAME, cli_short_name, seg_name, cur);
-```
-
-Итог: это действительно **подмножество** результата предыдущего запроса — оставляем только «чисто-вкладных» новых клиентов в заданном окне.
-
-
 
 
 понял. Держи цельный, готовый к вставке **ШАГ 0.5** “как было”, но с **единственной заменой**: вместо `heatmap_cpr_by_month` теперь строится
