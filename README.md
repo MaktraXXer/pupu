@@ -1,3 +1,56 @@
+DECLARE @dt_from date = '2025-10-01';
+DECLARE @dt_to   date = '2025-10-08';  -- включительно
+
+WITH base AS (
+    SELECT a.CLI_ID, a.CON_ID, a.PROD_NAME, a.DT_OPEN
+    FROM LIQUIDITY.liq.DepositContract_all a WITH (NOLOCK)
+    WHERE a.DT_OPEN IS NOT NULL
+      AND a.cli_short_name = N'ФЛ'
+      AND a.seg_name       = N'Розничный бизнес'
+      AND a.cur            = 'RUR'
+      AND a.con_id NOT IN (
+            SELECT con_id
+            FROM LIQUIDITY.liq.DepositContract_all WITH (NOLOCK)
+            WHERE prod_name = N'Классический' OR prod_name LIKE N'%Привилегия%'
+      )
+      AND a.prod_name NOT IN (
+            N'Агентские эскроу ФЛ по ставке КС+спред',
+            N'Спец. банк.счёт',
+            N'Залоговый',
+            N'Агентские эскроу ФЛ по ставке КС/2',
+            N'Эскроу',
+            N'Депозит ФЛ (суррогатный договор для счета Новой Афины)',
+            N'Накопительный счётУльтра',
+            N'Накопительный счёт'
+      )
+),
+first_dt AS (  -- первая дата в этой "витринке" для каждого клиента
+    SELECT CLI_ID, MIN(DT_OPEN) AS min_dt_open
+    FROM base
+    GROUP BY CLI_ID
+),
+new_clients AS ( -- клиенты, у которых первый договор в base попадает в нужное окно
+    SELECT CLI_ID
+    FROM first_dt
+    WHERE min_dt_open >= @dt_from
+      AND min_dt_open < DATEADD(day, 1, @dt_to)  -- half-open для "включительно"
+)
+SELECT DISTINCT b.CON_ID
+FROM base b
+JOIN new_clients n
+  ON n.CLI_ID = b.CLI_ID
+WHERE b.DT_OPEN >= @dt_from
+  AND b.DT_OPEN <  DATEADD(day, 1, @dt_to)
+ORDER BY b.CON_ID;
+
+
+
+
+
+
+
+
+
 понял. Держи цельный, готовый к вставке **ШАГ 0.5** “как было”, но с **единственной заменой**: вместо `heatmap_cpr_by_month` теперь строится
 `heatmap_od_share_by_month_byCPR` — по аналогии с `heatmap_od_share_by_month`, только по **CPR-бинам** (цвет = доля OD в месяце).
 Все прочие графики и Excel-листы сохранены. Есть автообрезка редких столбцов/строк по доле OD.
