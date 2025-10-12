@@ -1,76 +1,69 @@
-DECLARE @dt_from    date = '2025-10-01';
-DECLARE @dt_to      date = '2025-10-10';  -- включительно
-DECLARE @dt_to_next date = DATEADD(day, 1, @dt_to); -- полуинтервал
+DECLARE @dt_rep       date        = '2025-10-10';          -- дата снимка
+DECLARE @cur          varchar(3)  = '810';
+DECLARE @section_name nvarchar(50) = N'Срочные';
+DECLARE @block_name   nvarchar(100)= N'Привлечение ФЛ';
+DECLARE @acc_role     nvarchar(10) = N'LIAB';
+DECLARE @od_only      bit          = 1;                    -- учитывать только OD (=1)
 
-IF OBJECT_ID('tempdb..#hui') IS NOT NULL DROP TABLE #hui;
+-- Значения ставок под разные конвенции (под условия РК)
+DECLARE @rate_AT_THE_END    decimal(9,6) = 0.165;          -- conv = 'AT_THE_END'
+DECLARE @rate_NOT_AT_THE_END decimal(9,6) = 0.162;         -- conv <> 'AT_THE_END'
 
-WITH base AS (  -- витринка: фильтры по ФЛ/РБ/валюте и т.п.
-    SELECT a.CLI_ID, a.CON_ID, a.PROD_NAME, a.DT_OPEN
-    FROM LIQUIDITY.liq.DepositContract_all a WITH (NOLOCK)
-    WHERE a.DT_OPEN IS NOT NULL
-      AND a.cli_short_name = N'ФЛ'
-      AND a.seg_name       = N'Розничный бизнес'
-      AND a.cur            = 'RUR'
-      AND a.prod_name NOT IN (  -- тех/эскроу-исключения
-            N'Агентские эскроу ФЛ по ставке КС+спред',
-            N'Спец. банк.счёт',
-            N'Залоговый',
-            N'Агентские эскроу ФЛ по ставке КС/2',
-            N'Эскроу',
-            N'Депозит ФЛ (суррогатный договор для счета Новой Афины)'
-      )
-),
-prior_any AS (              -- была ли история до окна?
-    SELECT DISTINCT CLI_ID
-    FROM base
-    WHERE DT_OPEN < @dt_from
-),
-win_rows AS (               -- строки в окне
-    SELECT *
-    FROM base
-    WHERE DT_OPEN >= @dt_from
-      AND DT_OPEN <  @dt_to_next
-),
-new_clients_now AS (        -- новые на момент окна
-    SELECT DISTINCT w.CLI_ID
-    FROM win_rows w
-    WHERE NOT EXISTS (SELECT 1 FROM prior_any p WHERE p.CLI_ID = w.CLI_ID)
-),
+-- Автоопределение начала месяца
+DECLARE @month_start date = DATEFROMPARTS(YEAR(@dt_rep), MONTH(@dt_rep), 1);
 
--- 🔹 (1) СНАЧАЛА исключаем клиентов, у кого в окне был НС/НС Ультра
-pure_deposit_clients AS (
-    SELECT w.CLI_ID
-    FROM win_rows w
-    JOIN new_clients_now n ON n.CLI_ID = w.CLI_ID
-    GROUP BY w.CLI_ID
-    HAVING SUM(CASE WHEN w.PROD_NAME IN (N'Накопительный счёт', N'Накопительный счётУльтра') THEN 1 ELSE 0 END) = 0
-),
-
--- 🔹 (2) ТОЛЬКО ПОСЛЕ этого считаем «первый договор в окне» (детерминированно)
-first_in_window AS (
+;WITH base AS (
     SELECT
-        w.*,
-        ROW_NUMBER() OVER (PARTITION BY w.CLI_ID ORDER BY w.DT_OPEN ASC, w.CON_ID ASC) AS rn
-    FROM win_rows w
-    JOIN pure_deposit_clients p ON p.CLI_ID = w.CLI_ID
+        CAST(t.dt_open AS date) AS dt_open_d,
+        t.con_id,
+        t.cli_id,
+        t.out_rub,
+        t.rate_con,
+        t.conv
+    FROM ALM.ALM.VW_Balance_Rest_All AS t WITH (NOLOCK)
+    WHERE
+        t.dt_rep       = @dt_rep
+        AND t.section_name = @section_name
+        AND t.block_name   = @block_name
+        AND (@od_only = 0 OR t.od_flag = 1)
+        AND t.cur          = @cur
+        AND t.acc_role     = @acc_role
+        AND t.out_rub IS NOT NULL
+        AND t.out_rub >= 0
+        AND t.dt_open >= @month_start
+        AND t.dt_open <= @dt_rep
 ),
-
--- 🔹 (3) Из “первых в окне” оставляем только маркетплейс-вклады
-mkt_first AS (
-    SELECT CLI_ID
-    FROM first_in_window
-    WHERE rn = 1
-      AND PROD_NAME IN (
-           N'Надёжный прайм', N'Надёжный VIP', N'Надёжный премиум',
-           N'Надёжный промо', N'Надёжный старт',
-           N'Надёжный Т2', N'Надёжный T2',  -- на всякий оба варианта
-           N'Надёжный Мегафон', N'Надёжный процент',
-           N'Надёжный', N'ДОМа надёжно', N'Всё в ДОМ'
-      )
+-- Фильтрация по ставке и конвенции
+filt AS (
+    SELECT * FROM base WHERE conv = 'AT_THE_END'  AND rate_con = @rate_AT_THE_END
+    UNION ALL
+    SELECT * FROM base WHERE conv <> 'AT_THE_END' AND rate_con = @rate_NOT_AT_THE_END
+),
+-- Убираем возможные дубли con_id
+by_con AS (
+    SELECT
+        dt_open_d,
+        con_id,
+        MIN(cli_id) AS cli_id,
+        SUM(out_rub) AS out_rub
+    FROM filt
+    GROUP BY dt_open_d, con_id
+),
+-- Даты, на которые будем считать накопительный итог
+cal AS (
+    SELECT TOP (DATEDIFF(DAY, @month_start, @dt_rep) + 1)
+           DATEADD(DAY, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1, @month_start) AS open_date
+    FROM master..spt_values
 )
-
--- Финал: «новые из окна», «в окне не было НС», и «первый — из списка маркетплейсов»
-SELECT DISTINCT m.CLI_ID
-INTO #hui
-FROM mkt_first m
-ORDER BY m.CLI_ID;
+-- Финальный расчёт накопительных итогов
+SELECT
+    c.open_date,
+    COUNT(DISTINCT b.con_id)      AS cnt_deposits_cum,   -- количество вкладов с начала месяца
+    COUNT(DISTINCT b.cli_id)      AS cnt_cli_cum,        -- уникальные клиенты с начала месяца
+    SUM(b.out_rub)                AS sum_out_rub_cum,    -- сумма вкладов с начала месяца
+    CAST(SUM(b.out_rub) / 1e9 AS decimal(18,6)) AS sum_out_rub_cum_bln
+FROM cal c
+LEFT JOIN by_con b
+       ON b.dt_open_d <= c.open_date
+GROUP BY c.open_date
+ORDER BY c.open_date;
