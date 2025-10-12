@@ -33,13 +33,13 @@ DECLARE @month_start date = DATEFROMPARTS(YEAR(@dt_rep), MONTH(@dt_rep), 1);
         AND t.dt_open >= @month_start
         AND t.dt_open <= @dt_rep
 ),
--- Фильтруем по ставке и конвенции (две ветки, быстрее чем OR)
+-- Фильтрация по ставке и конвенции
 filt AS (
     SELECT * FROM base WHERE conv = 'AT_THE_END'  AND rate_con = @rate_AT_THE_END
     UNION ALL
     SELECT * FROM base WHERE conv <> 'AT_THE_END' AND rate_con = @rate_NOT_AT_THE_END
 ),
--- Схлопываем по con_id (если дубли)
+-- Убираем возможные дубли con_id
 by_con AS (
     SELECT
         dt_open_d,
@@ -49,35 +49,21 @@ by_con AS (
     FROM filt
     GROUP BY dt_open_d, con_id
 ),
--- Агрегируем дневные значения (вклады, клиенты, суммы)
-daily AS (
-    SELECT
-        dt_open_d AS open_date,
-        COUNT(*) AS cnt_deposits,
-        COUNT(DISTINCT cli_id) AS cnt_cli_day,
-        SUM(out_rub) AS sum_out_rub,
-        CAST(SUM(out_rub) / 1e9 AS decimal(18,6)) AS sum_out_rub_bln
-    FROM by_con
-    GROUP BY dt_open_d
-),
--- Находим накопительный итог по уникальным клиентам
-cumulative_clients AS (
-    SELECT
-        d1.open_date,
-        COUNT(DISTINCT b.cli_id) AS cnt_cli_cum
-    FROM daily d1
-    JOIN by_con b
-      ON b.dt_open_d <= d1.open_date
-    GROUP BY d1.open_date
+-- Даты, на которые будем считать накопительный итог
+cal AS (
+    SELECT TOP (DATEDIFF(DAY, @month_start, @dt_rep) + 1)
+           DATEADD(DAY, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1, @month_start) AS open_date
+    FROM master..spt_values
 )
--- Финальный вывод
+-- Финальный расчёт накопительных итогов
 SELECT
-    d.open_date,
-    d.cnt_deposits,
-    d.cnt_cli_day,                      -- новые клиенты за день (уникальные за дату)
-    c.cnt_cli_cum,                      -- накопительный итог уникальных клиентов
-    d.sum_out_rub,
-    d.sum_out_rub_bln
-FROM daily d
-JOIN cumulative_clients c ON c.open_date = d.open_date
-ORDER BY d.open_date;
+    c.open_date,
+    COUNT(DISTINCT b.con_id)      AS cnt_deposits_cum,   -- количество вкладов с начала месяца
+    COUNT(DISTINCT b.cli_id)      AS cnt_cli_cum,        -- уникальные клиенты с начала месяца
+    SUM(b.out_rub)                AS sum_out_rub_cum,    -- сумма вкладов с начала месяца
+    CAST(SUM(b.out_rub) / 1e9 AS decimal(18,6)) AS sum_out_rub_cum_bln
+FROM cal c
+LEFT JOIN by_con b
+       ON b.dt_open_d <= c.open_date
+GROUP BY c.open_date
+ORDER BY c.open_date;
