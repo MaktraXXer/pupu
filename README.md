@@ -1,69 +1,75 @@
-DECLARE @dt_rep       date        = '2025-10-10';          -- дата снимка
-DECLARE @cur          varchar(3)  = '810';
-DECLARE @section_name nvarchar(50) = N'Срочные';
-DECLARE @block_name   nvarchar(100)= N'Привлечение ФЛ';
-DECLARE @acc_role     nvarchar(10) = N'LIAB';
-DECLARE @od_only      bit          = 1;                    -- учитывать только OD (=1)
+DECLARE @dt_old date = '2025-09-30';
+DECLARE @dt_new date = '2025-10-10';
 
--- Значения ставок под разные конвенции (под условия РК)
-DECLARE @rate_AT_THE_END    decimal(9,6) = 0.165;          -- conv = 'AT_THE_END'
-DECLARE @rate_NOT_AT_THE_END decimal(9,6) = 0.162;         -- conv <> 'AT_THE_END'
+-- 1️⃣ Клиенты с переводами себе в Т-Банк
+WITH transfers AS (
+    SELECT DISTINCT cli_id
+    FROM ALM.[ehd].[VW_transfers_FL_det] t
+    WHERE t.dt_rep BETWEEN '2025-10-01' AND '2025-10-10'
+      AND t.is_self_flag = 1
+      AND t.transaction_type <> N'Наличные'
+      AND t.transit_max_id IS NULL
+      AND t.direction_type = N'Переводы себе'
+      AND t.[целевая категория] = 1
+      AND t.bank_name_main = N'АО "ТБанк"'
+      AND t.spec_cat = N'-'
+),
 
--- Автоопределение начала месяца
-DECLARE @month_start date = DATEFROMPARTS(YEAR(@dt_rep), MONTH(@dt_rep), 1);
-
-;WITH base AS (
+-- 2️⃣ Остатки на 30 сентября
+old AS (
     SELECT
-        CAST(t.dt_open AS date) AS dt_open_d,
-        t.con_id,
-        t.cli_id,
-        t.out_rub,
-        t.rate_con,
-        t.conv
-    FROM ALM.ALM.VW_Balance_Rest_All AS t WITH (NOLOCK)
-    WHERE
-        t.dt_rep       = @dt_rep
-        AND t.section_name = @section_name
-        AND t.block_name   = @block_name
-        AND (@od_only = 0 OR t.od_flag = 1)
-        AND t.cur          = @cur
-        AND t.acc_role     = @acc_role
-        AND t.out_rub IS NOT NULL
-        AND t.out_rub >= 0
-        AND t.dt_open >= @month_start
-        AND t.dt_open <= @dt_rep
+        dt_rep,
+        cli_id,
+        SUM(CASE WHEN cur = '810' THEN OUT_RUB END) / 1e6 AS всего_остаток_млн_руб_старое,
+        SUM(CASE WHEN cur = '810' AND section_name = N'Срочные' THEN OUT_RUB END) / 1e6 AS вклады_млн_руб_старое,
+        SUM(CASE WHEN cur = '810' AND section_name = N'До востребования' THEN OUT_RUB END) / 1e6 AS двс_млн_руб_старое,
+        SUM(CASE WHEN cur = '810' AND section_name = N'Накопительный счёт' THEN OUT_RUB END) / 1e6 AS накоп_млн_руб_старое
+    FROM ALM.ALM.balance_rest_all WITH (NOLOCK)
+    WHERE dt_rep = @dt_old
+      AND od_flag = 1
+      AND block_name = N'Привлечение ФЛ'
+      AND SECTION_NAME NOT IN (N'Аккредитивы', N'Аккредитив под строительство', N'Брокерское обслуживание')
+    GROUP BY dt_rep, cli_id
 ),
--- Фильтрация по ставке и конвенции
-filt AS (
-    SELECT * FROM base WHERE conv = 'AT_THE_END'  AND rate_con = @rate_AT_THE_END
-    UNION ALL
-    SELECT * FROM base WHERE conv <> 'AT_THE_END' AND rate_con = @rate_NOT_AT_THE_END
-),
--- Убираем возможные дубли con_id
-by_con AS (
+
+-- 3️⃣ Остатки на 10 октября
+new AS (
     SELECT
-        dt_open_d,
-        con_id,
-        MIN(cli_id) AS cli_id,
-        SUM(out_rub) AS out_rub
-    FROM filt
-    GROUP BY dt_open_d, con_id
-),
--- Даты, на которые будем считать накопительный итог
-cal AS (
-    SELECT TOP (DATEDIFF(DAY, @month_start, @dt_rep) + 1)
-           DATEADD(DAY, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1, @month_start) AS open_date
-    FROM master..spt_values
+        dt_rep,
+        cli_id,
+        SUM(CASE WHEN cur = '810' THEN OUT_RUB END) / 1e6 AS всего_остаток_млн_руб_новое,
+        SUM(CASE WHEN cur = '810' AND section_name = N'Срочные' THEN OUT_RUB END) / 1e6 AS вклады_млн_руб_новое,
+        SUM(CASE WHEN cur = '810' AND section_name = N'До востребования' THEN OUT_RUB END) / 1e6 AS двс_млн_руб_новое,
+        SUM(CASE WHEN cur = '810' AND section_name = N'Накопительный счёт' THEN OUT_RUB END) / 1e6 AS накоп_млн_руб_новое
+    FROM ALM.ALM.balance_rest_all WITH (NOLOCK)
+    WHERE dt_rep = @dt_new
+      AND od_flag = 1
+      AND block_name = N'Привлечение ФЛ'
+      AND SECTION_NAME NOT IN (N'Аккредитивы', N'Аккредитив под строительство', N'Брокерское обслуживание')
+    GROUP BY dt_rep, cli_id
 )
--- Финальный расчёт накопительных итогов
+
+-- 4️⃣ Сводка только по клиентам с переводами
 SELECT
-    c.open_date,
-    COUNT(DISTINCT b.con_id)      AS cnt_deposits_cum,   -- количество вкладов с начала месяца
-    COUNT(DISTINCT b.cli_id)      AS cnt_cli_cum,        -- уникальные клиенты с начала месяца
-    SUM(b.out_rub)                AS sum_out_rub_cum,    -- сумма вкладов с начала месяца
-    CAST(SUM(b.out_rub) / 1e9 AS decimal(18,6)) AS sum_out_rub_cum_bln
-FROM cal c
-LEFT JOIN by_con b
-       ON b.dt_open_d <= c.open_date
-GROUP BY c.open_date
-ORDER BY c.open_date;
+    COALESCE(n.cli_id, o.cli_id) AS cli_id,
+    o.всего_остаток_млн_руб_старое,
+    n.всего_остаток_млн_руб_новое,
+    n.всего_остаток_млн_руб_новое - COALESCE(o.всего_остаток_млн_руб_старое, 0) AS дельта_общий,
+
+    o.вклады_млн_руб_старое,
+    n.вклады_млн_руб_новое,
+    n.вклады_млн_руб_новое - COALESCE(o.вклады_млн_руб_старое, 0) AS дельта_вклады,
+
+    o.двс_млн_руб_старое,
+    n.двс_млн_руб_новое,
+    n.двс_млн_руб_новое - COALESCE(o.двс_млн_руб_старое, 0) AS дельта_двс,
+
+    o.накоп_млн_руб_старое,
+    n.накоп_млн_руб_новое,
+    n.накоп_млн_руб_новое - COALESCE(o.накоп_млн_руб_старое, 0) AS дельта_накоп
+FROM new n
+FULL OUTER JOIN old o
+    ON n.cli_id = o.cli_id
+INNER JOIN transfers t
+    ON t.cli_id = COALESCE(n.cli_id, o.cli_id)
+ORDER BY дельта_накоп ASC; -- можно сменить DESC, если нужно видеть рост
