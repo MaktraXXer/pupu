@@ -1,389 +1,560 @@
-да, всё понял — твой способ с con_id not in (allowed set) на @dt_rep — самый надёжный. Ниже я вставил твой метод исключения клиентов (как подмножество когорты) в все три скрипта и поправил логику там, где нужно.
+# -*- coding: utf-8 -*-
+"""
+STEP 0.5 — EDA перед Step 1 (итоговая версия с Age×Stim heatmap и Excel-таблицами под графики).
 
-⸻
+Изменения по запросу:
+  • heatmap_cpr_by_month → heatmap_od_share_by_month_byCPR (месяц × CPR_bin → доля OD).
+  • ДОБАВЛЕНО: heatmap_age_vs_stim_od_share (ось Y: age_group_id, ось X: StimBin, значение: share_od_all).
+    + в Excel кладём полную и обрезанную матрицу.
+  • ДОБАВЛЕНО: Excel-таблицы под графики
+      - stimulus_hist_overall_tbl
+      - stacked_topK_shares_tbl и stacked_topK_abs_tbl
+      - agegroup_volumes_tbl
 
-Скрипт 1
+CPR агрегатный (как в шагах 2/4):
+  CPR = 0, если sum_od <= 0; иначе 1 - (1 - sum_premat/sum_od)^12
+"""
 
-Новые вкладные клиенты → кумулятив по вкладам + кумулятив НС-остатков и исключение bad_cli через твой метод
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib import ticker
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+import warnings
+from typing import Tuple, List
 
-/* =========================
-   Параметры периода и снимка
-   ========================= */
-DECLARE @dt_from    date = '2025-10-01';
-DECLARE @dt_to      date = '2025-10-10'; -- включительно
-DECLARE @dt_rep     date = '2025-10-10'; -- дата снимка баланса
-DECLARE @dt_to_next date = DATEADD(day, 1, @dt_to);
-
-DECLARE @cur           varchar(3)   = '810';
-DECLARE @section_name  nvarchar(50) = N'Срочные';
-DECLARE @block_name    nvarchar(100)= N'Привлечение ФЛ';
-DECLARE @acc_role      nvarchar(10) = N'LIAB';
-DECLARE @od_only       bit          = 1;
-
-DECLARE @period_end date = CASE WHEN @dt_to <= @dt_rep THEN @dt_to ELSE @dt_rep END;
-
-/* =============== TMP-таблицы =============== */
-IF OBJECT_ID('tempdb..#new_cli_base') IS NOT NULL DROP TABLE #new_cli_base;
-IF OBJECT_ID('tempdb..#bad_cli')      IS NOT NULL DROP TABLE #bad_cli;
-IF OBJECT_ID('tempdb..#good_cli')     IS NOT NULL DROP TABLE #good_cli;
-
-/* === 1) Когорта «новые вкладные клиенты» (без future-leak) === */
-WITH base AS (
-    SELECT a.CLI_ID, a.CON_ID, a.PROD_NAME, a.DT_OPEN
-    FROM LIQUIDITY.liq.DepositContract_all a WITH (NOLOCK)
-    WHERE a.DT_OPEN IS NOT NULL
-      AND a.cli_short_name = N'ФЛ'
-      AND a.seg_name       = N'Розничный бизнес'
-      AND a.cur            = 'RUR'
-      AND a.prod_name NOT IN (
-            N'Агентские эскроу ФЛ по ставке КС+спред',
-            N'Спец. банк.счёт',
-            N'Залоговый',
-            N'Агентские эскроу ФЛ по ставке КС/2',
-            N'Эскроу',
-            N'Депозит ФЛ (суррогатный договор для счета Новой Афины)'
-      )
-),
-prior_any AS ( SELECT DISTINCT CLI_ID FROM base WHERE DT_OPEN < @dt_from ),
-win_rows  AS ( SELECT * FROM base WHERE DT_OPEN >= @dt_from AND DT_OPEN < @dt_to_next ),
-new_clients_now AS (
-    SELECT DISTINCT w.CLI_ID
-    FROM win_rows w
-    WHERE NOT EXISTS (SELECT 1 FROM prior_any p WHERE p.CLI_ID = w.CLI_ID)
-),
-pure_deposit_clients AS (  -- в окне не должно быть НС
-    SELECT w.CLI_ID
-    FROM win_rows w JOIN new_clients_now n ON n.CLI_ID = w.CLI_ID
-    GROUP BY w.CLI_ID
-    HAVING SUM(CASE WHEN w.PROD_NAME IN (N'Накопительный счёт', N'Накопительный счётУльтра', N'Накопительный счёт Ультра') THEN 1 ELSE 0 END) = 0
-)
-SELECT DISTINCT CLI_ID INTO #new_cli_base FROM pure_deposit_clients;
-
-/* === 1.1) ТВОЙ МЕТОД исключения bad-клиентов, но ТОЛЬКО внутри когорты === */
-WITH allowed_con AS (  -- set A: все договоры "разрешённых" секций на @dt_rep
-    SELECT DISTINCT t.con_id
-    FROM ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
-    WHERE t.dt_rep     = @dt_rep
-      AND t.cur        = @cur
-      AND t.block_name = @block_name
-      AND t.acc_role   = @acc_role
-      AND (@od_only = 0 OR t.od_flag = 1)
-      AND ISNULL(t.out_rub,0) > 0
-      AND t.section_name IN (N'Срочные', N'Накопительный счёт', N'До востребования')
-),
-bad AS (       -- всё, что НЕ из разрешённых секций, для интересующей когорты
-    SELECT DISTINCT t.cli_id
-    FROM ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
-    WHERE t.dt_rep     = @dt_rep
-      AND t.cur        = @cur
-      AND t.block_name = @block_name
-      AND t.acc_role   = @acc_role
-      AND (@od_only = 0 OR t.od_flag = 1)
-      AND ISNULL(t.out_rub,0) <> 0
-      AND t.cli_id IN (SELECT cli_id FROM #new_cli_base)
-      AND t.con_id NOT IN (SELECT con_id FROM allowed_con)
-)
-SELECT cli_id INTO #bad_cli FROM bad;
-
-SELECT cli_id INTO #good_cli
-FROM #new_cli_base
-WHERE cli_id NOT IN (SELECT cli_id FROM #bad_cli);
-
-/* === 2) Кумулятив по вкладам + кумулятив НС-остатка (на @dt_rep) === */
-;WITH snap AS (  -- вкладные строки по good-когорте
-    SELECT CAST(t.dt_open AS date) AS dt_open_d, t.con_id, t.cli_id, t.out_rub
-    FROM ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
-    WHERE t.dt_rep       = @dt_rep
-      AND t.section_name = @section_name
-      AND t.block_name   = @block_name
-      AND t.acc_role     = @acc_role
-      AND (@od_only = 0 OR t.od_flag = 1)
-      AND t.cur          = @cur
-      AND ISNULL(t.out_rub,0) >= 0
-      AND t.dt_open BETWEEN @dt_from AND @period_end
-      AND t.cli_id IN (SELECT cli_id FROM #good_cli)
-),
-by_con AS (
-    SELECT dt_open_d, con_id, MIN(cli_id) AS cli_id, SUM(out_rub) AS out_rub
-    FROM snap GROUP BY dt_open_d, con_id
-),
-min_open_by_cli AS (
-    SELECT cli_id, MIN(dt_open_d) AS min_open
-    FROM by_con GROUP BY cli_id
-),
-ns_bal_by_cli AS (   -- НС-остатки по этим же клиентам на @dt_rep
-    SELECT t.cli_id, SUM(t.out_rub) AS ns_out_rub
-    FROM ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
-    WHERE t.dt_rep       = @dt_rep
-      AND t.block_name   = @block_name
-      AND t.acc_role     = @acc_role
-      AND (@od_only = 0 OR t.od_flag = 1)
-      AND t.cur          = @cur
-      AND t.section_name = N'Накопительный счёт'
-      AND ISNULL(t.out_rub,0) > 0
-      AND t.cli_id IN (SELECT cli_id FROM #good_cli)
-    GROUP BY t.cli_id
-),
-ns_cohort AS ( SELECT m.cli_id, m.min_open, n.ns_out_rub FROM min_open_by_cli m JOIN ns_bal_by_cli n ON n.cli_id = m.cli_id ),
-cal AS (
-    SELECT TOP (DATEDIFF(DAY, @dt_from, @period_end) + 1)
-           DATEADD(DAY, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1, @dt_from) AS open_date
-    FROM master..spt_values
-)
-SELECT
-    c.open_date,
-    COUNT(DISTINCT b.con_id)                              AS cnt_deposits_cum,
-    COUNT(DISTINCT b.cli_id)                              AS cnt_cli_cum,
-    SUM(b.out_rub)                                        AS sum_out_rub_cum,
-    CAST(SUM(b.out_rub)/1e9 AS decimal(18,6))             AS sum_out_rub_cum_bln,
-    /* + НС — кумулятивом */
-    SUM(CASE WHEN nc.min_open <= c.open_date THEN nc.ns_out_rub ELSE 0 END)                 AS ns_out_rub_cum,
-    CAST(SUM(CASE WHEN nc.min_open <= c.open_date THEN nc.ns_out_rub ELSE 0 END)/1e9 AS decimal(18,6)) AS ns_out_rub_cum_bln
-FROM cal c
-LEFT JOIN by_con   b  ON b.dt_open_d <= c.open_date
-LEFT JOIN ns_cohort nc ON nc.min_open <= c.open_date
-GROUP BY c.open_date
-ORDER BY c.open_date;
+warnings.filterwarnings("ignore", category=FutureWarning)
+plt.rcParams["axes.formatter.useoffset"] = False
 
 
-⸻
+# ── helpers ─────────────────────────────────────
+def _ensure_dir(p: str) -> str:
+    os.makedirs(p, exist_ok=True)
+    return p
 
-Скрипт 2
+_RU_MONTHS = {
+    1: "январь", 2: "февраль", 3: "март", 4: "апрель", 5: "май", 6: "июнь",
+    7: "июль", 8: "август", 9: "сентябрь", 10: "октябрь", 11: "ноябрь", 12: "декабрь"
+}
+def _ru_month_label(ts: pd.Timestamp) -> str:
+    ts = pd.Timestamp(ts)
+    return f"{_RU_MONTHS[int(ts.month)].lower()} {int(ts.year)}"
 
-Маркетплейс-вклады (подмножество скрипта 1) + кумулятив НС и исключение bad_cli твоим методом
+def _build_stim_bins(x: pd.Series, bin_width: float) -> Tuple[np.ndarray, List[str]]:
+    x = pd.to_numeric(x, errors="coerce")
+    lo = np.floor(np.nanmin(x) / bin_width) * bin_width if np.isfinite(np.nanmin(x)) else -5.0
+    hi = np.ceil(np.nanmax(x) / bin_width) * bin_width if np.isfinite(np.nanmax(x)) else 5.0
+    if hi <= lo: hi = lo + bin_width
+    edges = np.arange(lo, hi + bin_width * 0.5, bin_width, dtype=float)
+    if edges.size < 2: edges = np.array([lo, lo + bin_width], dtype=float)
+    labels = [f"{edges[i]:.2f}..{edges[i+1]:.2f}" for i in range(len(edges)-1)]
+    return edges, labels
 
-/* Параметры и период */
-DECLARE @dt_from date='2025-10-01', @dt_to date='2025-10-10', @dt_rep date='2025-10-10';
-DECLARE @dt_to_next date = DATEADD(day,1,@dt_to);
-DECLARE @period_end date = CASE WHEN @dt_to<=@dt_rep THEN @dt_to ELSE @dt_rep END;
+def _bin_center_from_label(lbl: str) -> float:
+    try:
+        a, b = str(lbl).split(".."); return (float(a) + float(b)) / 2.0
+    except Exception:
+        return np.nan
 
-DECLARE @cur varchar(3)='810', @section_name nvarchar(50)=N'Срочные',
-        @block_name nvarchar(100)=N'Привлечение ФЛ', @acc_role nvarchar(10)=N'LIAB',
-        @od_only bit=1;
+def _agg_cpr(sum_od, sum_premat):
+    return np.where(sum_od > 0, 1 - np.power(1 - (sum_premat / sum_od), 12), 0.0)
 
-IF OBJECT_ID('tempdb..#hui_base') IS NOT NULL DROP TABLE #hui_base;
-IF OBJECT_ID('tempdb..#bad_cli')  IS NOT NULL DROP TABLE #bad_cli;
-IF OBJECT_ID('tempdb..#good_cli') IS NOT NULL DROP TABLE #good_cli;
+def _make_masked_imshow(ax, mat2d, xticks, yticks, title, cbar_label, out_path, vmin=None, vmax=None):
+    arr = np.array(mat2d, dtype=float)
+    mask = ~np.isfinite(arr)
+    marr = np.ma.array(arr, mask=mask)
+    cmap = plt.cm.viridis.copy()
+    cmap.set_bad(color="white", alpha=0.0)  # NaN — не закрашиваем
+    im = ax.imshow(marr, aspect="auto", interpolation="nearest", cmap=cmap, vmin=vmin, vmax=vmax)
+    ax.set_xticks(np.arange(len(xticks))); ax.set_xticklabels(xticks, rotation=90)
+    ax.set_yticks(np.arange(len(yticks))); ax.set_yticklabels(yticks)
+    ax.set_title(title)
+    cb = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04); cb.set_label(cbar_label)
+    ax.grid(False)
+    ax.figure.tight_layout()
+    ax.figure.savefig(out_path, dpi=240)
+    plt.close(ax.figure)
 
-/* Когорта: новые вкладные → первый в окне = маркетплейс */
-WITH base AS ( 
-    SELECT a.CLI_ID, a.CON_ID, a.PROD_NAME, a.DT_OPEN
-    FROM LIQUIDITY.liq.DepositContract_all a WITH (NOLOCK)
-    WHERE a.DT_OPEN IS NOT NULL AND a.cli_short_name=N'ФЛ' AND a.seg_name=N'Розничный бизнес'
-      AND a.cur='RUR'
-      AND a.prod_name NOT IN (N'Агентские эскроу ФЛ по ставке КС+спред',N'Спец. банк.счёт',N'Залоговый',
-                              N'Агентские эскроу ФЛ по ставке КС/2',N'Эскроу',
-                              N'Депозит ФЛ (суррогатный договор для счета Новой Афины)')
-),
-prior_any AS ( SELECT DISTINCT CLI_ID FROM base WHERE DT_OPEN<@dt_from ),
-win_rows  AS ( SELECT * FROM base WHERE DT_OPEN>=@dt_from AND DT_OPEN<@dt_to_next ),
-new_clients_now AS (
-    SELECT DISTINCT w.CLI_ID FROM win_rows w
-    WHERE NOT EXISTS (SELECT 1 FROM prior_any p WHERE p.CLI_ID=w.CLI_ID)
-),
-pure_deposit_clients AS (
-    SELECT w.CLI_ID
-    FROM win_rows w JOIN new_clients_now n ON n.CLI_ID=w.CLI_ID
-    GROUP BY w.CLI_ID
-    HAVING SUM(CASE WHEN w.PROD_NAME IN (N'Накопительный счёт',N'Накопительный счётУльтра',N'Накопительный счёт Ультра') THEN 1 ELSE 0 END)=0
-),
-first_in_window AS (
-    SELECT w.*, ROW_NUMBER() OVER (PARTITION BY w.CLI_ID ORDER BY w.DT_OPEN, w.CON_ID) AS rn
-    FROM win_rows w JOIN pure_deposit_clients p ON p.CLI_ID=w.CLI_ID
-),
-mkt_first AS (
-    SELECT CLI_ID
-    FROM first_in_window
-    WHERE rn=1 AND PROD_NAME IN (
-        N'Надёжный прайм',N'Надёжный VIP',N'Надёжный премиум',N'Надёжный промо',N'Надёжный старт',
-        N'Надёжный Т2',N'Надёжный T2',N'Надёжный Мегафон',N'Надёжный процент',N'Надёжный',N'ДОМа надёжно',N'Всё в ДОМ'
+def _ensure_series(shares, index) -> pd.Series:
+    """
+    Гарантируем pd.Series по заданному index. Если None/скаляр/другая форма — выравниваем.
+    Заполняем пропуски нулями.
+    """
+    if shares is None:
+        return pd.Series(0.0, index=index, dtype=float)
+    if isinstance(shares, pd.Series):
+        return shares.reindex(index=index).fillna(0.0).astype(float)
+    try:
+        return pd.Series(shares, index=index, dtype=float).fillna(0.0)
+    except Exception:
+        return pd.Series(0.0, index=index, dtype=float)
+
+def _crop_by_share(matrix_df: pd.DataFrame, axis: int, shares, min_share: float) -> pd.DataFrame:
+    """
+    Автообрезка теплокарты по доле OD.
+      - axis: 1 → фильтруем столбцы; 0 → строки.
+      - shares: pd.Series с долями по меткам соответствующей оси (можно None).
+      - min_share: порог (например, 0.002 = 0.2%).
+    Если после фильтра пусто — оставляем топ-10 меток по сумме.
+    """
+    if matrix_df is None or matrix_df.empty:
+        return matrix_df
+
+    if axis == 1:
+        s = _ensure_series(shares, matrix_df.columns)
+        keep = matrix_df.columns[(s >= float(min_share)).values]
+        if len(keep) == 0:
+            keep = matrix_df.sum(axis=0).sort_values(ascending=False).head(10).index
+        return matrix_df.loc[:, keep]
+    else:
+        s = _ensure_series(shares, matrix_df.index)
+        keep = matrix_df.index[(s >= float(min_share)).values]
+        if len(keep) == 0:
+            keep = matrix_df.sum(axis=1).sort_values(ascending=False).head(10).index
+        return matrix_df.loc[keep, :]
+
+def _safe_sheetname(name: str) -> str:
+    s = str(name).replace("/", "_")
+    return s[:31] if len(s) > 31 else s
+
+
+# ── main ────────────────────────────────────────
+def run_step05_exploratory(
+    df_raw_program: pd.DataFrame,
+    out_root: str = r"C:\Users\mi.makhmudov\Desktop\SCurve_step05",
+    program_name: str = "UNKNOWN",
+    stim_bin_width: float = 0.5,
+    cpr_bin_width: float = 0.01,       # ширина CPR-бина (для месяц×CPR и 2D)
+    last_months: int = 6,              # окно динамики
+    top_k_bins_for_stack: int = 10,    # топ-K стимула в стеке
+    min_od_share_heatmap: float = 0.002  # автообрезка (0.2%)
+):
+    # выходные папки
+    ts_dir = _ensure_dir(os.path.join(out_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S")))
+    charts_dir = _ensure_dir(os.path.join(ts_dir, "charts"))
+
+    # вход
+    need = ["stimul", "od_after_plan", "premat_payment", "age_group_id", "payment_period"]
+    miss = [c for c in need if c not in df_raw_program.columns]
+    if miss: raise KeyError(f"Нет колонок: {miss}")
+
+    df = df_raw_program.copy()
+    df["stimul"] = pd.to_numeric(df["stimul"], errors="coerce")
+    df["od_after_plan"] = pd.to_numeric(df["od_after_plan"], errors="coerce")
+    df["premat_payment"] = pd.to_numeric(df["premat_payment"], errors="coerce")
+    df["age_group_id"] = pd.to_numeric(df["age_group_id"], errors="coerce").astype("Int64")
+    df["payment_period"] = pd.to_datetime(df["payment_period"], errors="coerce").dt.normalize()
+    df = df[(df["stimul"].notna()) & (df["od_after_plan"].notna()) & (df["premat_payment"].notna())]
+    df = df[df["od_after_plan"] >= 0]
+
+    # договорный CPR на уровне сделок (для CPR-бинов)
+    df["CPR_fact_deal"] = np.where(
+        df["od_after_plan"] > 0,
+        1 - np.power(1 - (df["premat_payment"] / df["od_after_plan"]), 12),
+        0.0
+    ).clip(0, 1)
+
+    # бины стимулов
+    stim_edges, stim_labels = _build_stim_bins(df["stimul"], stim_bin_width)
+    df["stim_bin"] = pd.cut(df["stimul"], bins=stim_edges, include_lowest=True, right=False, labels=stim_labels)
+
+    # бины CPR для месяц×CPR
+    cpr_edges = np.arange(0.0, 1.0 + cpr_bin_width*0.5, cpr_bin_width)
+    if len(cpr_edges) < 2: cpr_edges = np.array([0.0, 1.0])
+    cpr_labels = [f"{cpr_edges[i]:.3f}..{cpr_edges[i+1]:.3f}" for i in range(len(cpr_edges)-1)]
+    df["cpr_bin"] = pd.cut(df["CPR_fact_deal"], bins=cpr_edges, include_lowest=True, right=False, labels=cpr_labels)
+
+    # 1) Общие агрегаты (Age × StimBin)
+    gb_all = df.groupby(["age_group_id", "stim_bin"], dropna=False)
+    agg_all = gb_all.agg(sum_od=("od_after_plan", "sum"),
+                         sum_premat=("premat_payment", "sum")).reset_index()
+    agg_all["CPR_agg"] = _agg_cpr(agg_all["sum_od"], agg_all["sum_premat"])
+    agg_all["stim_bin_center"] = agg_all["stim_bin"].astype(str).map(_bin_center_from_label)
+
+    # глобальные доли
+    total_od_all = float(agg_all["sum_od"].sum()) or 1.0
+    total_pr_all = float(agg_all["sum_premat"].sum()) or 1.0
+    agg_all["share_od_all"] = agg_all["sum_od"] / total_od_all
+    agg_all["share_premat_all"] = agg_all["sum_premat"] / total_pr_all
+
+    # доли внутри age
+    age_totals = agg_all.groupby("age_group_id", as_index=False)[["sum_od","sum_premat"]].sum().rename(
+        columns={"sum_od":"sum_od_in_age","sum_premat":"sum_premat_in_age"})
+    agg_all = agg_all.merge(age_totals, on="age_group_id", how="left")
+    agg_all["share_od_in_age"] = np.where(agg_all["sum_od_in_age"]>0, agg_all["sum_od"]/agg_all["sum_od_in_age"], 0.0)
+    agg_all["share_premat_in_age"] = np.where(agg_all["sum_premat_in_age"]>0, agg_all["sum_premat"]/agg_all["sum_premat_in_age"], 0.0)
+
+    # 2) Последние N месяцев
+    if last_months < 1: last_months = 1
+    max_p = df["payment_period"].max()
+    if pd.isna(max_p): raise ValueError("Не удалось определить максимальный payment_period.")
+    min_p = max_p - relativedelta(months=last_months - 1)
+    df_recent = df[df["payment_period"].between(min_p, max_p)].copy()
+
+    # (месяц × стимул)
+    gb_mb = df_recent.groupby(["payment_period","stim_bin"], dropna=False)
+    month_bin = gb_mb.agg(sum_od=("od_after_plan","sum"),
+                          sum_premat=("premat_payment","sum")).reset_index()
+    month_bin["CPR_agg"] = _agg_cpr(month_bin["sum_od"], month_bin["sum_premat"])
+    month_totals = month_bin.groupby("payment_period", as_index=False)["sum_od"].sum().rename(columns={"sum_od":"sum_od_month"})
+    month_bin = month_bin.merge(month_totals, on="payment_period", how="left")
+    month_bin["share_od_in_month"] = np.where(month_bin["sum_od_month"]>0, month_bin["sum_od"]/month_bin["sum_od_month"], np.nan)
+
+    # общий CPR по месяцам
+    month_summary = (df_recent.groupby("payment_period", as_index=False)
+                     .agg(sum_od=("od_after_plan","sum"), sum_premat=("premat_payment","sum")))
+    month_summary["CPR_month"] = _agg_cpr(month_summary["sum_od"], month_summary["sum_premat"])
+    month_summary["month_label"] = month_summary["payment_period"].map(_ru_month_label)
+
+    # (месяц × age × стимул) + доля внутри age/месяца
+    gb_mba = df_recent.groupby(["payment_period","age_group_id","stim_bin"], dropna=False)
+    month_bin_age = gb_mba.agg(sum_od=("od_after_plan","sum"),
+                               sum_premat=("premat_payment","sum")).reset_index()
+    month_bin_age["CPR_agg"] = _agg_cpr(month_bin_age["sum_od"], month_bin_age["sum_premat"])
+    tmp = month_bin_age.groupby(["payment_period","age_group_id"], as_index=False)["sum_od"].sum().rename(columns={"sum_od":"sum_od_month_age"})
+    month_bin_age = month_bin_age.merge(tmp, on=["payment_period","age_group_id"], how="left")
+    month_bin_age["share_od_in_month_age"] = np.where(month_bin_age["sum_od_month_age"]>0,
+                                                      month_bin_age["sum_od"]/month_bin_age["sum_od_month_age"], np.nan)
+
+    # (месяц × CPR_bin) → доля OD в месяце (новая метрика взамен heatmap_cpr_by_month)
+    gb_mc = df_recent.groupby(["payment_period","cpr_bin"], dropna=False)["od_after_plan"].sum().reset_index(name="sum_od")
+    month_cpr = gb_mc.copy()
+    month_cpr_tot = month_cpr.groupby("payment_period", as_index=False)["sum_od"].sum().rename(columns={"sum_od":"sum_od_month"})
+    month_cpr = month_cpr.merge(month_cpr_tot, on="payment_period", how="left")
+    month_cpr["share_od_in_month"] = np.where(month_cpr["sum_od_month"]>0, month_cpr["sum_od"]/month_cpr["sum_od_month"], np.nan)
+
+    # 3) 2D: Stim × CPR-bin → OD (overall)
+    cpr_vals = agg_all["CPR_agg"].replace([np.inf, -np.inf], np.nan)
+    cmin = float(np.nanmin(cpr_vals)) if np.isfinite(np.nanmin(cpr_vals)) else 0.0
+    cmax = float(np.nanmax(cpr_vals)) if np.isfinite(np.nanmax(cpr_vals)) else 1.0
+    cmin = max(0.0, min(1.0, cmin)); cmax = max(cmin + cpr_bin_width, min(1.0, cmax))
+    c_edges = np.arange(cmin, cmax + cpr_bin_width*0.5, cpr_bin_width)
+    c_labels = [f"{c_edges[i]:.3f}..{c_edges[i+1]:.3f}" for i in range(len(c_edges)-1)]
+    stim_vs_cpr = agg_all.copy()
+    stim_vs_cpr["CPR_bin"] = pd.cut(stim_vs_cpr["CPR_agg"].clip(0,1), bins=c_edges, include_lowest=True, right=False, labels=c_labels)
+    vol_mat_all = (stim_vs_cpr.groupby(["CPR_bin","stim_bin"], dropna=False)["sum_od"]
+                   .sum().reset_index().pivot(index="CPR_bin", columns="stim_bin", values="sum_od").sort_index())
+
+    # 4) Excel (основные листы)
+    excel_path = os.path.join(ts_dir, "eda_summary.xlsx")
+    with pd.ExcelWriter(excel_path, engine="openpyxl") as xw:
+        agg_all.to_excel(xw, sheet_name="by_age_stim_bin_all", index=False)
+        month_bin.to_excel(xw, sheet_name="by_month_stim_bin", index=False)
+        month_bin_age.to_excel(xw, sheet_name="by_month_stim_bin_age", index=False)
+        month_summary.to_excel(xw, sheet_name="month_summary", index=False)
+        vol_mat_all.reset_index().to_excel(xw, sheet_name="stim_x_cpr_volume", index=False)
+        month_cpr.to_excel(xw, sheet_name="by_month_cpr_bin", index=False)  # новый лист
+
+        hm_share_all = month_bin.pivot_table(index="payment_period", columns="stim_bin",
+                                             values="share_od_in_month", aggfunc="mean")
+        if hm_share_all is not None and not hm_share_all.empty:
+            tmp = hm_share_all.copy(); tmp.insert(0,"payment_period", tmp.index)
+            tmp["month_label"] = tmp["payment_period"].map(_ru_month_label)
+            tmp.reset_index(drop=True).to_excel(xw, sheet_name=_safe_sheetname("hm_share_by_month_table"), index=False)
+
+        hm_cpr_share_all = month_cpr.pivot_table(index="payment_period", columns="cpr_bin",
+                                                 values="share_od_in_month", aggfunc="mean")
+        if hm_cpr_share_all is not None and not hm_cpr_share_all.empty:
+            tmp = hm_cpr_share_all.copy(); tmp.insert(0,"payment_period", tmp.index)
+            tmp["month_label"] = tmp["payment_period"].map(_ru_month_label)
+            tmp.reset_index(drop=True).to_excel(xw, sheet_name=_safe_sheetname("hm_share_by_month_byCPR_table"), index=False)
+
+    # 5) Графики — общий уровень
+    # 5.1 Гистограмма OD по стимулам (+ Excel-таблица)
+    vol_by_bin = agg_all.groupby("stim_bin", as_index=False)["sum_od"].sum()
+    vol_by_bin["center"] = vol_by_bin["stim_bin"].astype(str).map(_bin_center_from_label)
+    fig, ax = plt.subplots(figsize=(10,5))
+    ax.bar(vol_by_bin["center"], vol_by_bin["sum_od"]/1e9, width=stim_bin_width*0.9)
+    ax.set_xlabel("Incentive (центр бина), п.п."); ax.set_ylabel("OD, млрд руб.")
+    ax.set_title(f"{program_name}: распределение OD по стимулам (шаг {stim_bin_width})")
+    ax.grid(ls="--", alpha=0.3); fig.tight_layout()
+    fig.savefig(os.path.join(charts_dir,"stimulus_hist_overall.png"), dpi=240); plt.close(fig)
+    # Excel для hist
+    stim_hist_tbl = (
+        vol_by_bin[["stim_bin","center","sum_od"]]
+        .rename(columns={"stim_bin":"stim_bin_label","center":"stim_bin_center","sum_od":"sum_od"})
     )
-)
-SELECT DISTINCT CLI_ID INTO #hui_base FROM mkt_first;
+    with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as xw:
+        stim_hist_tbl.to_excel(xw, sheet_name=_safe_sheetname("stimulus_hist_overall_tbl"), index=False)
 
-/* ТВОЙ МЕТОД: bad_cli только среди этой когорты */
-WITH allowed_con AS (
-    SELECT DISTINCT t.con_id
-    FROM ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
-    WHERE t.dt_rep=@dt_rep AND t.cur=@cur AND t.block_name=@block_name AND t.acc_role=@acc_role
-      AND (@od_only=0 OR t.od_flag=1) AND ISNULL(t.out_rub,0)>0
-      AND t.section_name IN (N'Срочные',N'Накопительный счёт',N'До востребования')
-),
-bad AS (
-    SELECT DISTINCT t.cli_id
-    FROM ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
-    WHERE t.dt_rep=@dt_rep AND t.cur=@cur AND t.block_name=@block_name AND t.acc_role=@acc_role
-      AND (@od_only=0 OR t.od_flag=1) AND ISNULL(t.out_rub,0)<>0
-      AND t.cli_id IN (SELECT cli_id FROM #hui_base)
-      AND t.con_id NOT IN (SELECT con_id FROM allowed_con)
-)
-SELECT cli_id INTO #bad_cli FROM bad;
+    # 5.2 Стек-доли OD по стимулам (top-K + OTHER) (+ Excel-таблицы)
+    if not month_bin.empty:
+        tmp_share_sum = month_bin.groupby("stim_bin", as_index=False)["sum_od"].sum()
+        tmp_share_sum["share"] = tmp_share_sum["sum_od"]/(tmp_share_sum["sum_od"].sum() or 1.0)
+        tmp_share_sum = tmp_share_sum.sort_values("share", ascending=False)
+        top_bins = tmp_share_sum["stim_bin"].head(top_k_bins_for_stack).tolist()
 
-SELECT cli_id INTO #good_cli
-FROM #hui_base
-WHERE cli_id NOT IN (SELECT cli_id FROM #bad_cli);
+        pivot_share = (month_bin.pivot_table(index="payment_period", columns="stim_bin",
+                                             values="share_od_in_month", aggfunc="mean")
+                       .fillna(0.0).sort_index())
+        keep_cols = [c for c in pivot_share.columns if c in top_bins]
+        other = pivot_share.drop(columns=keep_cols, errors="ignore").sum(axis=1)
+        stack_df = pivot_share[keep_cols].copy()
+        stack_df["OTHER"] = other
 
-/* Снимок и кумулятив + НС-остатки (аналог скрипта 1) */
-;WITH snap AS (
-    SELECT CAST(t.dt_open AS date) AS dt_open_d, t.con_id, t.cli_id, t.out_rub
-    FROM ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
-    WHERE t.dt_rep=@dt_rep AND t.section_name=@section_name AND t.block_name=@block_name
-      AND t.acc_role=@acc_role AND (@od_only=0 OR t.od_flag=1) AND t.cur=@cur
-      AND ISNULL(t.out_rub,0)>=0 AND t.dt_open BETWEEN @dt_from AND @period_end
-      AND t.cli_id IN (SELECT cli_id FROM #good_cli)
-),
-by_con AS (SELECT dt_open_d, con_id, MIN(cli_id) AS cli_id, SUM(out_rub) AS out_rub
-           FROM snap GROUP BY dt_open_d, con_id),
-min_open_by_cli AS (SELECT cli_id, MIN(dt_open_d) AS min_open FROM by_con GROUP BY cli_id),
-ns_bal_by_cli AS (
-    SELECT t.cli_id, SUM(t.out_rub) AS ns_out_rub
-    FROM ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
-    WHERE t.dt_rep=@dt_rep AND t.block_name=@block_name AND t.acc_role=@acc_role
-      AND (@od_only=0 OR t.od_flag=1) AND t.cur=@cur AND t.section_name=N'Накопительный счёт'
-      AND ISNULL(t.out_rub,0)>0 AND t.cli_id IN (SELECT cli_id FROM #good_cli)
-    GROUP BY t.cli_id
-),
-ns_cohort AS (SELECT m.cli_id, m.min_open, n.ns_out_rub FROM min_open_by_cli m JOIN ns_bal_by_cli n ON n.cli_id=m.cli_id),
-cal AS (
-    SELECT TOP (DATEDIFF(DAY,@dt_from,@period_end)+1)
-           DATEADD(DAY,ROW_NUMBER() OVER (ORDER BY (SELECT NULL))-1,@dt_from) AS open_date
-    FROM master..spt_values
-)
-SELECT
-    c.open_date,
-    COUNT(DISTINCT b.con_id)                              AS cnt_deposits_cum,
-    COUNT(DISTINCT b.cli_id)                              AS cnt_cli_cum,
-    SUM(b.out_rub)                                        AS sum_out_rub_cum,
-    CAST(SUM(b.out_rub)/1e9 AS decimal(18,6))             AS sum_out_rub_cum_bln,
-    SUM(CASE WHEN nc.min_open<=c.open_date THEN nc.ns_out_rub ELSE 0 END)                 AS ns_out_rub_cum,
-    CAST(SUM(CASE WHEN nc.min_open<=c.open_date THEN nc.ns_out_rub ELSE 0 END)/1e9 AS decimal(18,6)) AS ns_out_rub_cum_bln
-FROM cal c
-LEFT JOIN by_con   b  ON b.dt_open_d<=c.open_date
-LEFT JOIN ns_cohort nc ON nc.min_open<=c.open_date
-GROUP BY c.open_date
-ORDER BY c.open_date;
+        fig, ax = plt.subplots(figsize=(max(9, 0.55*stack_df.shape[0]), 5))
+        x = np.arange(stack_df.shape[0]); bottom = np.zeros_like(x, dtype=float)
+        for col in stack_df.columns:
+            ax.bar(x, stack_df[col].values, bottom=bottom, width=0.8, label=str(col)); bottom += stack_df[col].values
+        ax.set_xticks(x); ax.set_xticklabels([_ru_month_label(d) for d in stack_df.index], rotation=45, ha="right")
+        ax.set_ylabel("Доля OD в месяце"); ax.set_title(f"{program_name}: доля OD по стимулам (top {top_k_bins_for_stack} + OTHER)")
+        ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda y,_: f"{y:.0%}"))
+        ax.legend(loc="upper left", bbox_to_anchor=(1.01,1.0), fontsize=8)
+        ax.grid(ls="--", alpha=0.3, axis="y"); fig.tight_layout()
+        fig.savefig(os.path.join(charts_dir,"stacked_od_share_by_month_topK.png"), dpi=240); plt.close(fig)
+
+        # Excel для стека: shares + abs
+        stack_shares_tbl = stack_df.copy()
+        stack_shares_tbl.insert(0, "payment_period", stack_shares_tbl.index)
+        stack_shares_tbl.insert(1, "month_label", stack_shares_tbl["payment_period"].map(_ru_month_label))
+        stack_shares_tbl.reset_index(drop=True, inplace=True)
+        pivot_od = (
+            month_bin.pivot_table(index="payment_period", columns="stim_bin", values="sum_od", aggfunc="sum")
+            .fillna(0.0).sort_index()
+        )
+        pivot_od_top = pivot_od[keep_cols].copy()
+        pivot_od_top["OTHER"] = pivot_od.drop(columns=keep_cols, errors="ignore").sum(axis=1)
+        stack_abs_tbl = pivot_od_top.copy()
+        stack_abs_tbl.insert(0, "payment_period", stack_abs_tbl.index)
+        stack_abs_tbl.insert(1, "month_label", stack_abs_tbl["payment_period"].map(_ru_month_label))
+        stack_abs_tbl.reset_index(drop=True, inplace=True)
+        with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as xw:
+            stack_shares_tbl.to_excel(xw, sheet_name=_safe_sheetname("stacked_topK_shares_tbl"), index=False)
+            stack_abs_tbl.to_excel(xw, sheet_name=_safe_sheetname("stacked_topK_abs_tbl"), index=False)
+
+    # 5.3 Объёмы по возрастам (+ Excel-таблица)
+    vol_by_age = agg_all.groupby("age_group_id", as_index=False)[["sum_od","sum_premat"]].sum()
+    fig, ax = plt.subplots(figsize=(9,5))
+    ax.bar(vol_by_age["age_group_id"]-0.15, vol_by_age["sum_od"]/1e9, width=0.3, label="OD")
+    ax.bar(vol_by_age["age_group_id"]+0.15, vol_by_age["sum_premat"]/1e9, width=0.3, label="Premat")
+    ax.set_xlabel("LoanAge"); ax.set_ylabel("млрд руб."); ax.set_title(f"{program_name}: объёмы OD и Premat по возрастам")
+    ax.legend(); ax.grid(ls="--", alpha=0.3); fig.tight_layout()
+    fig.savefig(os.path.join(charts_dir,"agegroup_volumes.png"), dpi=240); plt.close(fig)
+    agegroup_tbl = vol_by_age.sort_values("age_group_id")
+    with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as xw:
+        agegroup_tbl.to_excel(xw, sheet_name=_safe_sheetname("agegroup_volumes_tbl"), index=False)
+
+    # 5.4 Heatmap — Stim×CPR → OD (overall) c автообрезкой
+    if vol_mat_all.shape[0] > 0 and vol_mat_all.shape[1] > 0:
+        total = float(np.nansum(vol_mat_all.values)) or 1.0
+        col_sh = vol_mat_all.sum(axis=0)/total; row_sh = vol_mat_all.sum(axis=1)/total
+        mat_c = _crop_by_share(_crop_by_share(vol_mat_all, axis=1, shares=col_sh, min_share=min_od_share_heatmap),
+                               axis=0, shares=row_sh, min_share=min_od_share_heatmap)
+        if mat_c.shape[0] > 0 and mat_c.shape[1] > 0:
+            fig_w = max(10, 0.55*mat_c.shape[1]); fig_h = max(6, 0.35*mat_c.shape[0])
+            fig, ax = plt.subplots(figsize=(fig_w,fig_h))
+            _make_masked_imshow(
+                ax=ax,
+                mat2d=mat_c.values/1e9,
+                xticks=mat_c.columns.tolist(),
+                yticks=mat_c.index.tolist(),
+                title=f"{program_name}: OD по (Stim × CPR-бин) [auto-crop]",
+                cbar_label="OD, млрд руб.",
+                out_path=os.path.join(charts_dir,"heatmap_stim_vs_cpr_volume_overall.png")
+            )
+
+    # 5.5 Heatmap — месяц×стимул → доля OD (auto-crop)
+    hm_share_all = month_bin.pivot_table(index="payment_period", columns="stim_bin",
+                                         values="share_od_in_month", aggfunc="mean")
+    if hm_share_all is not None and not hm_share_all.empty:
+        hm_share_all = hm_share_all.sort_index()
+        stim_sum_recent = month_bin.groupby("stim_bin", as_index=False)["sum_od"].sum().set_index("stim_bin")["sum_od"]
+        stim_share_recent = stim_sum_recent/(stim_sum_recent.sum() or 1.0)
+        hm_share_crop = _crop_by_share(hm_share_all, axis=1, shares=stim_share_recent, min_share=min_od_share_heatmap)
+        if not hm_share_crop.empty:
+            fig_w = max(10, 0.55*hm_share_crop.shape[1]); fig_h = max(5, 0.45*hm_share_crop.shape[0])
+            fig, ax = plt.subplots(figsize=(fig_w,fig_h))
+            _make_masked_imshow(
+                ax=ax,
+                mat2d=hm_share_crop.values,
+                xticks=hm_share_crop.columns.tolist(),
+                yticks=[_ru_month_label(d) for d in hm_share_crop.index],
+                title=f"{program_name}: доля OD по стимулам (последние {last_months} мес., auto-crop)",
+                cbar_label="Доля OD в месяце",
+                out_path=os.path.join(charts_dir,"heatmap_od_share_by_month.png"),
+                vmin=0.0, vmax=1.0
+            )
+
+    # 5.6 Heatmap — месяц×CPR_bin → доля OD (НОВЫЙ)
+    hm_cpr_share_all = month_cpr.pivot_table(index="payment_period", columns="cpr_bin",
+                                             values="share_od_in_month", aggfunc="mean")
+    if hm_cpr_share_all is not None and not hm_cpr_share_all.empty:
+        hm_cpr_share_all = hm_cpr_share_all.sort_index()
+        cpr_sum_recent = month_cpr.groupby("cpr_bin", as_index=False)["sum_od"].sum().set_index("cpr_bin")["sum_od"]
+        cpr_share_recent = cpr_sum_recent/(cpr_sum_recent.sum() or 1.0)
+        hm_cpr_share_crop = _crop_by_share(hm_cpr_share_all, axis=1, shares=cpr_share_recent, min_share=min_od_share_heatmap)
+        if not hm_cpr_share_crop.empty:
+            fig_w = max(10, 0.55*hm_cpr_share_crop.shape[1]); fig_h = max(5, 0.45*hm_cpr_share_crop.shape[0])
+            fig, ax = plt.subplots(figsize=(fig_w,fig_h))
+            _make_masked_imshow(
+                ax=ax,
+                mat2d=hm_cpr_share_crop.values,
+                xticks=hm_cpr_share_crop.columns.tolist(),
+                yticks=[_ru_month_label(d) for d in hm_cpr_share_crop.index],
+                title=f"{program_name}: доля OD по CPR-бинам (последние {last_months} мес., auto-crop)",
+                cbar_label="Доля OD в месяце",
+                out_path=os.path.join(charts_dir,"heatmap_od_share_by_month_byCPR.png"),
+                vmin=0.0, vmax=1.0
+            )
+
+    # 5.7 NEW Heatmap — age_group × stim_bin → share_od_all (global) + Excel (full & cropped)
+    hm_age_stim = agg_all.pivot_table(index="age_group_id", columns="stim_bin",
+                                      values="share_od_all", aggfunc="sum").sort_index()
+    if hm_age_stim is not None and not hm_age_stim.empty:
+        # доли для автообрезки: складываем share_od_all по колонкам/строкам (даёт общий вклад)
+        col_share = hm_age_stim.sum(axis=0)  # вклад стимула в общий OD
+        row_share = hm_age_stim.sum(axis=1)  # вклад age в общий OD
+
+        hm_age_stim_c = _crop_by_share(hm_age_stim, axis=1, shares=col_share, min_share=min_od_share_heatmap)
+        hm_age_stim_c = _crop_by_share(hm_age_stim_c, axis=0, shares=row_share, min_share=min_od_share_heatmap)
+
+        # Excel — полная и обрезанная матрицы
+        with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as xw:
+            tmp_full = hm_age_stim.copy()
+            tmp_full.insert(0, "age_group_id", tmp_full.index)
+            tmp_full.reset_index(drop=True).to_excel(xw, sheet_name=_safe_sheetname("age_vs_stim_share_full"), index=False)
+
+            if not hm_age_stim_c.empty:
+                tmp_c = hm_age_stim_c.copy()
+                tmp_c.insert(0, "age_group_id", tmp_c.index)
+                tmp_c.reset_index(drop=True).to_excel(xw, sheet_name=_safe_sheetname("age_vs_stim_share_cropped"), index=False)
+
+        # Картинка
+        if not hm_age_stim_c.empty:
+            vmax_h = float(max(0.001, np.nanmax(hm_age_stim_c.values)*1.02))
+            fig_w = max(10, 0.55*hm_age_stim_c.shape[1]); fig_h = max(5, 0.5*hm_age_stim_c.shape[0])
+            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+            _make_masked_imshow(
+                ax=ax,
+                mat2d=hm_age_stim_c.values,
+                xticks=hm_age_stim_c.columns.tolist(),
+                yticks=[str(i) for i in hm_age_stim_c.index],
+                title=f"{program_name}: доля от общего OD по (Age × Stim) [auto-crop]",
+                cbar_label="Доля от общего OD",
+                out_path=os.path.join(charts_dir, "heatmap_age_vs_stim_od_share.png"),
+                vmin=0.0, vmax=vmax_h
+            )
+
+    # 6) По каждому age — 3 картинки (третья — по CPR-бинам)
+    ages = sorted(agg_all["age_group_id"].dropna().astype(int).unique().tolist())
+    with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as xw:
+        for h in ages:
+            # 6.1 Stim×CPR → OD (внутри age)
+            sub = agg_all[agg_all["age_group_id"] == h].copy()
+            if not sub.empty:
+                sub["CPR_bin"] = pd.cut(sub["CPR_agg"].clip(0,1), bins=c_edges, include_lowest=True, right=False, labels=c_labels)
+                mat_h = (sub.groupby(["CPR_bin","stim_bin"], dropna=False)["sum_od"].sum()
+                         .reset_index().pivot(index="CPR_bin", columns="stim_bin", values="sum_od").sort_index())
+                if (mat_h.shape[0]>0) and (mat_h.shape[1]>0):
+                    total_h = float(np.nansum(mat_h.values)) or 1.0
+                    col_sh = mat_h.sum(axis=0)/total_h; row_sh = mat_h.sum(axis=1)/total_h
+                    mat_hc = _crop_by_share(_crop_by_share(mat_h, axis=1, shares=col_sh, min_share=min_od_share_heatmap),
+                                            axis=0, shares=row_sh, min_share=min_od_share_heatmap)
+                    if mat_hc.shape[0]>0 and mat_hc.shape[1]>0:
+                        fig_w = max(10, 0.55*mat_hc.shape[1]); fig_h = max(6, 0.35*mat_hc.shape[0])
+                        fig, ax = plt.subplots(figsize=(fig_w,fig_h))
+                        _make_masked_imshow(
+                            ax=ax,
+                            mat2d=mat_hc.values/1e9,
+                            xticks=mat_hc.columns.tolist(),
+                            yticks=mat_hc.index.tolist(),
+                            title=f"{program_name}: h={h} | OD по (Stim × CPR-бин) [auto-crop]",
+                            cbar_label="OD, млрд руб.",
+                            out_path=os.path.join(charts_dir, f"heatmap_stim_vs_cpr_volume_age_h{h}.png")
+                        )
+                # Excel
+                mat_h.reset_index().to_excel(xw, sheet_name=_safe_sheetname(f"hm_stim_x_cpr_age_h{h}"), index=False)
+
+            # 6.2 месяц×стимул → доля OD (внутри age)
+            sub_mb = month_bin_age[month_bin_age["age_group_id"] == h]
+            if not sub_mb.empty:
+                hm_share_h = sub_mb.pivot_table(index="payment_period", columns="stim_bin",
+                                                values="share_od_in_month_age", aggfunc="mean")
+                if not hm_share_h.empty:
+                    hm_share_h = hm_share_h.sort_index()
+                    stim_sum_h = sub_mb.groupby("stim_bin", as_index=False)["sum_od"].sum().set_index("stim_bin")["sum_od"]
+                    stim_share_h = stim_sum_h/(stim_sum_h.sum() or 1.0)
+                    hm_share_hc = _crop_by_share(hm_share_h, axis=1, shares=stim_share_h, min_share=min_od_share_heatmap)
+                    if not hm_share_hc.empty:
+                        fig_w = max(10, 0.55*hm_share_hc.shape[1]); fig_h = max(5, 0.45*hm_share_hc.shape[0])
+                        fig, ax = plt.subplots(figsize=(fig_w,fig_h))
+                        _make_masked_imshow(
+                            ax=ax,
+                            mat2d=hm_share_hc.values,
+                            xticks=hm_share_hc.columns.tolist(),
+                            yticks=[_ru_month_label(d) for d in hm_share_hc.index],
+                            title=f"{program_name}: h={h} | доля OD по стимулам (последние {last_months} мес., auto-crop)",
+                            cbar_label="Доля OD в месяце (внутри age)",
+                            out_path=os.path.join(charts_dir, f"heatmap_od_share_by_month_age_h{h}.png"),
+                            vmin=0.0, vmax=1.0
+                        )
+                # Excel
+                if not hm_share_h.empty:
+                    tmp = hm_share_h.copy(); tmp.insert(0,"payment_period", tmp.index)
+                    tmp["month_label"] = tmp["payment_period"].map(_ru_month_label)
+                    tmp.reset_index(drop=True).to_excel(xw, sheet_name=_safe_sheetname(f"hm_share_by_month_h{h}"), index=False)
+
+            # 6.3 месяц×CPR_bin → доля OD (внутри age)
+            sub_deals = df_recent[df_recent["age_group_id"] == h]
+            if not sub_deals.empty:
+                mc_h = (sub_deals.groupby(["payment_period","cpr_bin"], dropna=False)["od_after_plan"]
+                        .sum().reset_index(name="sum_od"))
+                tot_h = mc_h.groupby("payment_period", as_index=False)["sum_od"].sum().rename(columns={"sum_od":"sum_od_month_age"})
+                mc_h = mc_h.merge(tot_h, on="payment_period", how="left")
+                mc_h["share_od_in_month_age"] = np.where(mc_h["sum_od_month_age"]>0, mc_h["sum_od"]/mc_h["sum_od_month_age"], np.nan)
+
+                hm_cpr_h = mc_h.pivot_table(index="payment_period", columns="cpr_bin",
+                                            values="share_od_in_month_age", aggfunc="mean")
+                if not hm_cpr_h.empty:
+                    hm_cpr_h = hm_cpr_h.sort_index()
+                    cpr_sum_h = mc_h.groupby("cpr_bin", as_index=False)["sum_od"].sum().set_index("cpr_bin")["sum_od"]
+                    cpr_share_h = cpr_sum_h/(cpr_sum_h.sum() or 1.0)
+                    hm_cpr_hc = _crop_by_share(hm_cpr_h, axis=1, shares=cpr_share_h, min_share=min_od_share_heatmap)
+                    if not hm_cpr_hc.empty:
+                        fig_w = max(10, 0.55*hm_cpr_hc.shape[1]); fig_h = max(5, 0.45*hm_cpr_hc.shape[0])
+                        fig, ax = plt.subplots(figsize=(fig_w,fig_h))
+                        _make_masked_imshow(
+                            ax=ax,
+                            mat2d=hm_cpr_hc.values,
+                            xticks=hm_cpr_hc.columns.tolist(),
+                            yticks=[_ru_month_label(d) for d in hm_cpr_hc.index],
+                            title=f"{program_name}: h={h} | доля OD по CPR-бинам (последние {last_months} мес., auto-crop)",
+                            cbar_label="Доля OD в месяце (внутри age)",
+                            out_path=os.path.join(charts_dir, f"heatmap_od_share_by_month_byCPR_age_h{h}.png"),
+                            vmin=0.0, vmax=1.0
+                        )
+                # Excel
+                if not hm_cpr_h.empty:
+                    tmp = hm_cpr_h.copy(); tmp.insert(0,"payment_period", tmp.index)
+                    tmp["month_label"] = tmp["payment_period"].map(_ru_month_label)
+                    tmp.reset_index(drop=True).to_excel(xw, sheet_name=_safe_sheetname(f"hm_share_by_month_byCPR_h{h}"), index=False)
+
+    print(f"\n✅ STEP 0.5 готово для {program_name}")
+    print(f"• Окно: {_ru_month_label(min_p)} — {_ru_month_label(max_p)}")
+    print(f"• Папка: {ts_dir}")
+    print("  - eda_summary.xlsx")
+    print("  - charts/*.png")
+
+    return {
+        "output_dir": ts_dir,
+        "agg_all": agg_all,
+        "month_bin": month_bin,
+        "month_cpr": month_cpr,
+        "month_bin_age": month_bin_age,
+        "month_summary": month_summary
+    }
 
 
-⸻
-
-Скрипт 3
-
-Новые НС-клиенты (считаем на дату открытия, только out_rub>0) и исключаем bad_cli твоим методом внутри когорты
-
-/* Параметры */
-DECLARE @dt_from date='2025-10-01', @dt_to date='2025-10-10', @dt_rep date='2025-10-10';
-DECLARE @dt_to_next date = DATEADD(day,1,@dt_to);
-DECLARE @period_end date = CASE WHEN @dt_to<=@dt_rep THEN @dt_to ELSE @dt_rep END;
-
-DECLARE @cur varchar(3)='810', @block_name nvarchar(100)=N'Привлечение ФЛ',
-        @acc_role nvarchar(10)=N'LIAB', @od_only bit=1;
-
-IF OBJECT_ID('tempdb..#new_ns_cli_base') IS NOT NULL DROP TABLE #new_ns_cli_base;
-IF OBJECT_ID('tempdb..#bad_cli')         IS NOT NULL DROP TABLE #bad_cli;
-IF OBJECT_ID('tempdb..#good_cli')        IS NOT NULL DROP TABLE #good_cli;
-
-/* Когорта «новые с НС в окне» (без future-leak) */
-WITH base AS (
-    SELECT a.CLI_ID, a.CON_ID, a.PROD_NAME, a.DT_OPEN
-    FROM LIQUIDITY.liq.DepositContract_all a WITH (NOLOCK)
-    WHERE a.DT_OPEN IS NOT NULL AND a.cli_short_name=N'ФЛ' AND a.seg_name=N'Розничный бизнес' AND a.cur='RUR'
-      AND a.prod_name NOT IN (N'Агентские эскроу ФЛ по ставке КС+спред',N'Спец. банк.счёт',N'Залоговый',
-                              N'Агентские эскроу ФЛ по ставке КС/2',N'Эскроу',
-                              N'Депозит ФЛ (суррогатный договор для счета Новой Афины)')
-),
-prior_any AS ( SELECT DISTINCT CLI_ID FROM base WHERE DT_OPEN<@dt_from ),
-win_rows  AS ( SELECT * FROM base WHERE DT_OPEN>=@dt_from AND DT_OPEN<@dt_to_next ),
-new_clients_now AS (
-    SELECT DISTINCT w.CLI_ID FROM win_rows w
-    WHERE NOT EXISTS (SELECT 1 FROM prior_any p WHERE p.CLI_ID=w.CLI_ID)
-),
-ns_clients AS (  -- в окне есть НС
-    SELECT DISTINCT w.CLI_ID
-    FROM win_rows w JOIN new_clients_now n ON n.CLI_ID=w.CLI_ID
-    WHERE w.PROD_NAME IN (N'Накопительный счёт',N'Накопительный счётУльтра',N'Накопительный счёт Ультра')
-)
-SELECT DISTINCT CLI_ID INTO #new_ns_cli_base FROM ns_clients;
-
-/* ТВОЙ МЕТОД: bad_cli внутри когорты */
-WITH allowed_con AS (
-    SELECT DISTINCT t.con_id
-    FROM ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
-    WHERE t.dt_rep=@dt_rep AND t.cur=@cur AND t.block_name=@block_name AND t.acc_role=@acc_role
-      AND (@od_only=0 OR t.od_flag=1) AND ISNULL(t.out_rub,0)<>0
-      AND t.section_name IN (N'Срочные',N'Накопительный счёт',N'До востребования')
-),
-bad AS (
-    SELECT DISTINCT t.cli_id
-    FROM ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
-    WHERE t.dt_rep=@dt_rep AND t.cur=@cur AND t.block_name=@block_name AND t.acc_role=@acc_role
-      AND (@od_only=0 OR t.od_flag=1) AND ISNULL(t.out_rub,0)<>0
-      AND t.cli_id IN (SELECT cli_id FROM #new_ns_cli_base)
-      AND t.con_id NOT IN (SELECT con_id FROM allowed_con)
-)
-SELECT cli_id INTO #bad_cli FROM bad;
-
-SELECT cli_id INTO #good_cli
-FROM #new_ns_cli_base
-WHERE cli_id NOT IN (SELECT cli_id FROM #bad_cli);
-
-/* Инкремент на дату открытия (ТОЛЬКО если out_rub>0 в этот день), затем кумулятив */
-;WITH opened_ns AS (
-    SELECT CAST(t.dt_open AS date) AS dt_open_d, t.con_id, t.cli_id, t.out_rub
-    FROM ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
-    WHERE t.dt_rep BETWEEN @dt_from AND @period_end
-      AND t.dt_rep   = CAST(t.dt_open AS date)   -- РОВНО день открытия
-      AND (@od_only=0 OR t.od_flag=1)
-      AND t.cur=@cur AND t.block_name=@block_name AND t.acc_role=@acc_role
-      AND t.section_name = N'Накопительный счёт'
-      AND ISNULL(t.out_rub,0) > 0               -- <— только ненулевой остаток на дату открытия
-      AND t.cli_id IN (SELECT cli_id FROM #good_cli)   -- <— исключаем bad
-),
-by_con AS (
-    SELECT dt_open_d, con_id, MIN(cli_id) AS cli_id, SUM(out_rub) AS out_rub
-    FROM opened_ns GROUP BY dt_open_d, con_id
-),
-daily AS (
-    SELECT dt_open_d,
-           COUNT(DISTINCT con_id) AS cnt_ns_accounts_day,
-           COUNT(DISTINCT cli_id) AS cnt_ns_clients_day,
-           SUM(out_rub)           AS sum_ns_out_rub_day
-    FROM by_con GROUP BY dt_open_d
-),
-cal AS (
-    SELECT TOP (DATEDIFF(DAY,@dt_from,@period_end)+1)
-           DATEADD(DAY,ROW_NUMBER() OVER (ORDER BY (SELECT NULL))-1,@dt_from) AS open_date
-    FROM master..spt_values
-),
-daily_filled AS (
-    SELECT c.open_date,
-           ISNULL(d.cnt_ns_accounts_day,0) AS cnt_ns_accounts_day,
-           ISNULL(d.cnt_ns_clients_day,0)  AS cnt_ns_clients_day,
-           ISNULL(d.sum_ns_out_rub_day,0)  AS sum_ns_out_rub_day
-    FROM cal c LEFT JOIN daily d ON d.dt_open_d=c.open_date
-)
-SELECT
-    open_date,
-    SUM(cnt_ns_accounts_day) OVER (ORDER BY open_date ROWS UNBOUNDED PRECEDING) AS cnt_ns_accounts_cum,
-    SUM(cnt_ns_clients_day)  OVER (ORDER BY open_date ROWS UNBOUNDED PRECEDING) AS cnt_ns_clients_cum,
-    SUM(sum_ns_out_rub_day)  OVER (ORDER BY open_date ROWS UNBOUNDED PRECEDING) AS sum_ns_out_rub_cum,
-    CAST(SUM(sum_ns_out_rub_day) OVER (ORDER BY open_date ROWS UNBOUNDED PRECEDING)/1e9 AS decimal(18,6)) AS sum_ns_out_rub_cum_bln
-FROM daily_filled
-ORDER BY open_date;
-
-Если хочется диагностику по исключённым уже внутри когорты (что именно «чужое» у них есть), твой же селект можно оставить как отчёт:
-
--- Диагностика "чужих" продуктов у исключённых (внутри когорты)
-SELECT t.*
-FROM ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
-WHERE t.dt_rep=@dt_rep AND t.cur=@cur AND t.block_name=@block_name AND t.acc_role=@acc_role
-  AND (@od_only=0 OR t.od_flag=1) AND ISNULL(t.out_rub,0)<>0
-  AND t.cli_id IN (SELECT cli_id FROM #bad_cli)
-  AND t.con_id NOT IN (
-        SELECT con_id FROM ALM.ALM.vw_balance_rest_all x WITH (NOLOCK)
-        WHERE x.dt_rep=@dt_rep AND x.cur=@cur AND x.block_name=@block_name AND x.acc_role=@acc_role
-          AND (@od_only=0 OR x.od_flag=1) AND ISNULL(x.out_rub,0)<>0
-          AND x.section_name IN (N'Срочные',N'Накопительный счёт',N'До востребования')
-  )
-ORDER BY t.cli_id, t.section_name, t.prod_name_res, t.out_rub DESC;
-
-Если ещё что-то подправить — скажи, допилю точечно.
+# ===== пример запуска =====
+# res05 = run_step05_exploratory(
+#     df_raw_program=df_raw_program,
+#     out_root=r"C:\Users\mi.makhmudov\Desktop\SCurve_step05",
+#     program_name="Семейная ипотека",
+#     stim_bin_width=1,
+#     cpr_bin_width=0.01,
+#     last_months=6,
+#     top_k_bins_for_stack=10,
+#     min_od_share_heatmap=0.002
+# )
