@@ -1,560 +1,470 @@
 # -*- coding: utf-8 -*-
 """
-STEP 0.5 — EDA перед Step 1 (итоговая версия с Age×Stim heatmap и Excel-таблицами под графики).
+STEP 1 — интерактивная маркировка нерепрезентативных зон (без удаления данных)
+и сохранение «обрезанных» графиков + бета-параметров + сводного графика.
 
-Изменения по запросу:
-  • heatmap_cpr_by_month → heatmap_od_share_by_month_byCPR (месяц × CPR_bin → доля OD).
-  • ДОБАВЛЕНО: heatmap_age_vs_stim_od_share (ось Y: age_group_id, ось X: StimBin, значение: share_od_all).
-    + в Excel кладём полную и обрезанную матрицу.
-  • ДОБАВЛЕНО: Excel-таблицы под графики
-      - stimulus_hist_overall_tbl
-      - stacked_topK_shares_tbl и stacked_topK_abs_tbl
-      - agegroup_volumes_tbl
+Новое:
+  • all_ages_curves_and_volumes.png — общий график: все кривые (без точек) и стек-столбики OD по стимулам цветом по age.
+  • «жирные» точки на графиках по age: размер и толщина обводки ∝ объёму OD.
 
-CPR агрегатный (как в шагах 2/4):
-  CPR = 0, если sum_od <= 0; иначе 1 - (1 - sum_premat/sum_od)^12
+Сохраняем:
+  • points_full.xlsx      — исходные точки (aggregated) без изменений
+  • betas_full.xlsx       — коэффициенты кривых для каждой age
+  • ignored_bins.xlsx     — решения об исключении age/диапазонов стимулов
+  • summary.txt           — min/max/step по стимулам и список исключений
+  • by_age/age_<h>.png    — графики с обрезкой
+  • all_ages_curves_and_volumes.png — сводный график (кривые + объёмы)
 """
 
 import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib import ticker
+from scipy.optimize import minimize
 from datetime import datetime
-from dateutil.relativedelta import relativedelta
 import warnings
-from typing import Tuple, List
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 plt.rcParams["axes.formatter.useoffset"] = False
 
 
-# ── helpers ─────────────────────────────────────
+# ══════════════ УТИЛИТЫ ══════════════
 def _ensure_dir(p: str) -> str:
     os.makedirs(p, exist_ok=True)
     return p
 
-_RU_MONTHS = {
-    1: "январь", 2: "февраль", 3: "март", 4: "апрель", 5: "май", 6: "июнь",
-    7: "июль", 8: "август", 9: "сентябрь", 10: "октябрь", 11: "ноябрь", 12: "декабрь"
-}
-def _ru_month_label(ts: pd.Timestamp) -> str:
-    ts = pd.Timestamp(ts)
-    return f"{_RU_MONTHS[int(ts.month)].lower()} {int(ts.year)}"
 
-def _build_stim_bins(x: pd.Series, bin_width: float) -> Tuple[np.ndarray, List[str]]:
-    x = pd.to_numeric(x, errors="coerce")
-    lo = np.floor(np.nanmin(x) / bin_width) * bin_width if np.isfinite(np.nanmin(x)) else -5.0
-    hi = np.ceil(np.nanmax(x) / bin_width) * bin_width if np.isfinite(np.nanmax(x)) else 5.0
-    if hi <= lo: hi = lo + bin_width
-    edges = np.arange(lo, hi + bin_width * 0.5, bin_width, dtype=float)
-    if edges.size < 2: edges = np.array([lo, lo + bin_width], dtype=float)
-    labels = [f"{edges[i]:.2f}..{edges[i+1]:.2f}" for i in range(len(edges)-1)]
-    return edges, labels
-
-def _bin_center_from_label(lbl: str) -> float:
-    try:
-        a, b = str(lbl).split(".."); return (float(a) + float(b)) / 2.0
-    except Exception:
-        return np.nan
-
-def _agg_cpr(sum_od, sum_premat):
-    return np.where(sum_od > 0, 1 - np.power(1 - (sum_premat / sum_od), 12), 0.0)
-
-def _make_masked_imshow(ax, mat2d, xticks, yticks, title, cbar_label, out_path, vmin=None, vmax=None):
-    arr = np.array(mat2d, dtype=float)
-    mask = ~np.isfinite(arr)
-    marr = np.ma.array(arr, mask=mask)
-    cmap = plt.cm.viridis.copy()
-    cmap.set_bad(color="white", alpha=0.0)  # NaN — не закрашиваем
-    im = ax.imshow(marr, aspect="auto", interpolation="nearest", cmap=cmap, vmin=vmin, vmax=vmax)
-    ax.set_xticks(np.arange(len(xticks))); ax.set_xticklabels(xticks, rotation=90)
-    ax.set_yticks(np.arange(len(yticks))); ax.set_yticklabels(yticks)
-    ax.set_title(title)
-    cb = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04); cb.set_label(cbar_label)
-    ax.grid(False)
-    ax.figure.tight_layout()
-    ax.figure.savefig(out_path, dpi=240)
-    plt.close(ax.figure)
-
-def _ensure_series(shares, index) -> pd.Series:
-    """
-    Гарантируем pd.Series по заданному index. Если None/скаляр/другая форма — выравниваем.
-    Заполняем пропуски нулями.
-    """
-    if shares is None:
-        return pd.Series(0.0, index=index, dtype=float)
-    if isinstance(shares, pd.Series):
-        return shares.reindex(index=index).fillna(0.0).astype(float)
-    try:
-        return pd.Series(shares, index=index, dtype=float).fillna(0.0)
-    except Exception:
-        return pd.Series(0.0, index=index, dtype=float)
-
-def _crop_by_share(matrix_df: pd.DataFrame, axis: int, shares, min_share: float) -> pd.DataFrame:
-    """
-    Автообрезка теплокарты по доле OD.
-      - axis: 1 → фильтруем столбцы; 0 → строки.
-      - shares: pd.Series с долями по меткам соответствующей оси (можно None).
-      - min_share: порог (например, 0.002 = 0.2%).
-    Если после фильтра пусто — оставляем топ-10 меток по сумме.
-    """
-    if matrix_df is None or matrix_df.empty:
-        return matrix_df
-
-    if axis == 1:
-        s = _ensure_series(shares, matrix_df.columns)
-        keep = matrix_df.columns[(s >= float(min_share)).values]
-        if len(keep) == 0:
-            keep = matrix_df.sum(axis=0).sort_values(ascending=False).head(10).index
-        return matrix_df.loc[:, keep]
-    else:
-        s = _ensure_series(shares, matrix_df.index)
-        keep = matrix_df.index[(s >= float(min_share)).values]
-        if len(keep) == 0:
-            keep = matrix_df.sum(axis=1).sort_values(ascending=False).head(10).index
-        return matrix_df.loc[keep, :]
-
-def _safe_sheetname(name: str) -> str:
-    s = str(name).replace("/", "_")
-    return s[:31] if len(s) > 31 else s
-
-
-# ── main ────────────────────────────────────────
-def run_step05_exploratory(
-    df_raw_program: pd.DataFrame,
-    out_root: str = r"C:\Users\mi.makhmudov\Desktop\SCurve_step05",
-    program_name: str = "UNKNOWN",
-    stim_bin_width: float = 0.5,
-    cpr_bin_width: float = 0.01,       # ширина CPR-бина (для месяц×CPR и 2D)
-    last_months: int = 6,              # окно динамики
-    top_k_bins_for_stack: int = 10,    # топ-K стимула в стеке
-    min_od_share_heatmap: float = 0.002  # автообрезка (0.2%)
-):
-    # выходные папки
-    ts_dir = _ensure_dir(os.path.join(out_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S")))
-    charts_dir = _ensure_dir(os.path.join(ts_dir, "charts"))
-
-    # вход
-    need = ["stimul", "od_after_plan", "premat_payment", "age_group_id", "payment_period"]
-    miss = [c for c in need if c not in df_raw_program.columns]
-    if miss: raise KeyError(f"Нет колонок: {miss}")
-
-    df = df_raw_program.copy()
-    df["stimul"] = pd.to_numeric(df["stimul"], errors="coerce")
-    df["od_after_plan"] = pd.to_numeric(df["od_after_plan"], errors="coerce")
-    df["premat_payment"] = pd.to_numeric(df["premat_payment"], errors="coerce")
-    df["age_group_id"] = pd.to_numeric(df["age_group_id"], errors="coerce").astype("Int64")
-    df["payment_period"] = pd.to_datetime(df["payment_period"], errors="coerce").dt.normalize()
-    df = df[(df["stimul"].notna()) & (df["od_after_plan"].notna()) & (df["premat_payment"].notna())]
-    df = df[df["od_after_plan"] >= 0]
-
-    # договорный CPR на уровне сделок (для CPR-бинов)
-    df["CPR_fact_deal"] = np.where(
-        df["od_after_plan"] > 0,
-        1 - np.power(1 - (df["premat_payment"] / df["od_after_plan"]), 12),
-        0.0
-    ).clip(0, 1)
-
-    # бины стимулов
-    stim_edges, stim_labels = _build_stim_bins(df["stimul"], stim_bin_width)
-    df["stim_bin"] = pd.cut(df["stimul"], bins=stim_edges, include_lowest=True, right=False, labels=stim_labels)
-
-    # бины CPR для месяц×CPR
-    cpr_edges = np.arange(0.0, 1.0 + cpr_bin_width*0.5, cpr_bin_width)
-    if len(cpr_edges) < 2: cpr_edges = np.array([0.0, 1.0])
-    cpr_labels = [f"{cpr_edges[i]:.3f}..{cpr_edges[i+1]:.3f}" for i in range(len(cpr_edges)-1)]
-    df["cpr_bin"] = pd.cut(df["CPR_fact_deal"], bins=cpr_edges, include_lowest=True, right=False, labels=cpr_labels)
-
-    # 1) Общие агрегаты (Age × StimBin)
-    gb_all = df.groupby(["age_group_id", "stim_bin"], dropna=False)
-    agg_all = gb_all.agg(sum_od=("od_after_plan", "sum"),
-                         sum_premat=("premat_payment", "sum")).reset_index()
-    agg_all["CPR_agg"] = _agg_cpr(agg_all["sum_od"], agg_all["sum_premat"])
-    agg_all["stim_bin_center"] = agg_all["stim_bin"].astype(str).map(_bin_center_from_label)
-
-    # глобальные доли
-    total_od_all = float(agg_all["sum_od"].sum()) or 1.0
-    total_pr_all = float(agg_all["sum_premat"].sum()) or 1.0
-    agg_all["share_od_all"] = agg_all["sum_od"] / total_od_all
-    agg_all["share_premat_all"] = agg_all["sum_premat"] / total_pr_all
-
-    # доли внутри age
-    age_totals = agg_all.groupby("age_group_id", as_index=False)[["sum_od","sum_premat"]].sum().rename(
-        columns={"sum_od":"sum_od_in_age","sum_premat":"sum_premat_in_age"})
-    agg_all = agg_all.merge(age_totals, on="age_group_id", how="left")
-    agg_all["share_od_in_age"] = np.where(agg_all["sum_od_in_age"]>0, agg_all["sum_od"]/agg_all["sum_od_in_age"], 0.0)
-    agg_all["share_premat_in_age"] = np.where(agg_all["sum_premat_in_age"]>0, agg_all["sum_premat"]/agg_all["sum_premat_in_age"], 0.0)
-
-    # 2) Последние N месяцев
-    if last_months < 1: last_months = 1
-    max_p = df["payment_period"].max()
-    if pd.isna(max_p): raise ValueError("Не удалось определить максимальный payment_period.")
-    min_p = max_p - relativedelta(months=last_months - 1)
-    df_recent = df[df["payment_period"].between(min_p, max_p)].copy()
-
-    # (месяц × стимул)
-    gb_mb = df_recent.groupby(["payment_period","stim_bin"], dropna=False)
-    month_bin = gb_mb.agg(sum_od=("od_after_plan","sum"),
-                          sum_premat=("premat_payment","sum")).reset_index()
-    month_bin["CPR_agg"] = _agg_cpr(month_bin["sum_od"], month_bin["sum_premat"])
-    month_totals = month_bin.groupby("payment_period", as_index=False)["sum_od"].sum().rename(columns={"sum_od":"sum_od_month"})
-    month_bin = month_bin.merge(month_totals, on="payment_period", how="left")
-    month_bin["share_od_in_month"] = np.where(month_bin["sum_od_month"]>0, month_bin["sum_od"]/month_bin["sum_od_month"], np.nan)
-
-    # общий CPR по месяцам
-    month_summary = (df_recent.groupby("payment_period", as_index=False)
-                     .agg(sum_od=("od_after_plan","sum"), sum_premat=("premat_payment","sum")))
-    month_summary["CPR_month"] = _agg_cpr(month_summary["sum_od"], month_summary["sum_premat"])
-    month_summary["month_label"] = month_summary["payment_period"].map(_ru_month_label)
-
-    # (месяц × age × стимул) + доля внутри age/месяца
-    gb_mba = df_recent.groupby(["payment_period","age_group_id","stim_bin"], dropna=False)
-    month_bin_age = gb_mba.agg(sum_od=("od_after_plan","sum"),
-                               sum_premat=("premat_payment","sum")).reset_index()
-    month_bin_age["CPR_agg"] = _agg_cpr(month_bin_age["sum_od"], month_bin_age["sum_premat"])
-    tmp = month_bin_age.groupby(["payment_period","age_group_id"], as_index=False)["sum_od"].sum().rename(columns={"sum_od":"sum_od_month_age"})
-    month_bin_age = month_bin_age.merge(tmp, on=["payment_period","age_group_id"], how="left")
-    month_bin_age["share_od_in_month_age"] = np.where(month_bin_age["sum_od_month_age"]>0,
-                                                      month_bin_age["sum_od"]/month_bin_age["sum_od_month_age"], np.nan)
-
-    # (месяц × CPR_bin) → доля OD в месяце (новая метрика взамен heatmap_cpr_by_month)
-    gb_mc = df_recent.groupby(["payment_period","cpr_bin"], dropna=False)["od_after_plan"].sum().reset_index(name="sum_od")
-    month_cpr = gb_mc.copy()
-    month_cpr_tot = month_cpr.groupby("payment_period", as_index=False)["sum_od"].sum().rename(columns={"sum_od":"sum_od_month"})
-    month_cpr = month_cpr.merge(month_cpr_tot, on="payment_period", how="left")
-    month_cpr["share_od_in_month"] = np.where(month_cpr["sum_od_month"]>0, month_cpr["sum_od"]/month_cpr["sum_od_month"], np.nan)
-
-    # 3) 2D: Stim × CPR-bin → OD (overall)
-    cpr_vals = agg_all["CPR_agg"].replace([np.inf, -np.inf], np.nan)
-    cmin = float(np.nanmin(cpr_vals)) if np.isfinite(np.nanmin(cpr_vals)) else 0.0
-    cmax = float(np.nanmax(cpr_vals)) if np.isfinite(np.nanmax(cpr_vals)) else 1.0
-    cmin = max(0.0, min(1.0, cmin)); cmax = max(cmin + cpr_bin_width, min(1.0, cmax))
-    c_edges = np.arange(cmin, cmax + cpr_bin_width*0.5, cpr_bin_width)
-    c_labels = [f"{c_edges[i]:.3f}..{c_edges[i+1]:.3f}" for i in range(len(c_edges)-1)]
-    stim_vs_cpr = agg_all.copy()
-    stim_vs_cpr["CPR_bin"] = pd.cut(stim_vs_cpr["CPR_agg"].clip(0,1), bins=c_edges, include_lowest=True, right=False, labels=c_labels)
-    vol_mat_all = (stim_vs_cpr.groupby(["CPR_bin","stim_bin"], dropna=False)["sum_od"]
-                   .sum().reset_index().pivot(index="CPR_bin", columns="stim_bin", values="sum_od").sort_index())
-
-    # 4) Excel (основные листы)
-    excel_path = os.path.join(ts_dir, "eda_summary.xlsx")
-    with pd.ExcelWriter(excel_path, engine="openpyxl") as xw:
-        agg_all.to_excel(xw, sheet_name="by_age_stim_bin_all", index=False)
-        month_bin.to_excel(xw, sheet_name="by_month_stim_bin", index=False)
-        month_bin_age.to_excel(xw, sheet_name="by_month_stim_bin_age", index=False)
-        month_summary.to_excel(xw, sheet_name="month_summary", index=False)
-        vol_mat_all.reset_index().to_excel(xw, sheet_name="stim_x_cpr_volume", index=False)
-        month_cpr.to_excel(xw, sheet_name="by_month_cpr_bin", index=False)  # новый лист
-
-        hm_share_all = month_bin.pivot_table(index="payment_period", columns="stim_bin",
-                                             values="share_od_in_month", aggfunc="mean")
-        if hm_share_all is not None and not hm_share_all.empty:
-            tmp = hm_share_all.copy(); tmp.insert(0,"payment_period", tmp.index)
-            tmp["month_label"] = tmp["payment_period"].map(_ru_month_label)
-            tmp.reset_index(drop=True).to_excel(xw, sheet_name=_safe_sheetname("hm_share_by_month_table"), index=False)
-
-        hm_cpr_share_all = month_cpr.pivot_table(index="payment_period", columns="cpr_bin",
-                                                 values="share_od_in_month", aggfunc="mean")
-        if hm_cpr_share_all is not None and not hm_cpr_share_all.empty:
-            tmp = hm_cpr_share_all.copy(); tmp.insert(0,"payment_period", tmp.index)
-            tmp["month_label"] = tmp["payment_period"].map(_ru_month_label)
-            tmp.reset_index(drop=True).to_excel(xw, sheet_name=_safe_sheetname("hm_share_by_month_byCPR_table"), index=False)
-
-    # 5) Графики — общий уровень
-    # 5.1 Гистограмма OD по стимулам (+ Excel-таблица)
-    vol_by_bin = agg_all.groupby("stim_bin", as_index=False)["sum_od"].sum()
-    vol_by_bin["center"] = vol_by_bin["stim_bin"].astype(str).map(_bin_center_from_label)
-    fig, ax = plt.subplots(figsize=(10,5))
-    ax.bar(vol_by_bin["center"], vol_by_bin["sum_od"]/1e9, width=stim_bin_width*0.9)
-    ax.set_xlabel("Incentive (центр бина), п.п."); ax.set_ylabel("OD, млрд руб.")
-    ax.set_title(f"{program_name}: распределение OD по стимулам (шаг {stim_bin_width})")
-    ax.grid(ls="--", alpha=0.3); fig.tight_layout()
-    fig.savefig(os.path.join(charts_dir,"stimulus_hist_overall.png"), dpi=240); plt.close(fig)
-    # Excel для hist
-    stim_hist_tbl = (
-        vol_by_bin[["stim_bin","center","sum_od"]]
-        .rename(columns={"stim_bin":"stim_bin_label","center":"stim_bin_center","sum_od":"sum_od"})
+def _f_from_betas(b, x):
+    x = np.asarray(x, float)
+    return (
+        b[0]
+        + b[1] * np.arctan(b[2] + b[3] * x)
+        + b[4] * np.arctan(b[5] + b[6] * x)
     )
-    with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as xw:
-        stim_hist_tbl.to_excel(xw, sheet_name=_safe_sheetname("stimulus_hist_overall_tbl"), index=False)
 
-    # 5.2 Стек-доли OD по стимулам (top-K + OTHER) (+ Excel-таблицы)
-    if not month_bin.empty:
-        tmp_share_sum = month_bin.groupby("stim_bin", as_index=False)["sum_od"].sum()
-        tmp_share_sum["share"] = tmp_share_sum["sum_od"]/(tmp_share_sum["sum_od"].sum() or 1.0)
-        tmp_share_sum = tmp_share_sum.sort_values("share", ascending=False)
-        top_bins = tmp_share_sum["stim_bin"].head(top_k_bins_for_stack).tolist()
 
-        pivot_share = (month_bin.pivot_table(index="payment_period", columns="stim_bin",
-                                             values="share_od_in_month", aggfunc="mean")
-                       .fillna(0.0).sort_index())
-        keep_cols = [c for c in pivot_share.columns if c in top_bins]
-        other = pivot_share.drop(columns=keep_cols, errors="ignore").sum(axis=1)
-        stack_df = pivot_share[keep_cols].copy()
-        stack_df["OTHER"] = other
+def _fit_arctan_unconstrained(x, y, w,
+                              start=(0.2, 0.05, -2.0, 2.2, 0.07, 2.0, 0.2)):
+    x, y, w = np.asarray(x, float), np.asarray(y, float), np.asarray(w, float)
+    if len(x) < 5:
+        return np.array([np.nan] * 7), np.nan, np.nan
 
-        fig, ax = plt.subplots(figsize=(max(9, 0.55*stack_df.shape[0]), 5))
-        x = np.arange(stack_df.shape[0]); bottom = np.zeros_like(x, dtype=float)
-        for col in stack_df.columns:
-            ax.bar(x, stack_df[col].values, bottom=bottom, width=0.8, label=str(col)); bottom += stack_df[col].values
-        ax.set_xticks(x); ax.set_xticklabels([_ru_month_label(d) for d in stack_df.index], rotation=45, ha="right")
-        ax.set_ylabel("Доля OD в месяце"); ax.set_title(f"{program_name}: доля OD по стимулам (top {top_k_bins_for_stack} + OTHER)")
-        ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda y,_: f"{y:.0%}"))
-        ax.legend(loc="upper left", bbox_to_anchor=(1.01,1.0), fontsize=8)
-        ax.grid(ls="--", alpha=0.3, axis="y"); fig.tight_layout()
-        fig.savefig(os.path.join(charts_dir,"stacked_od_share_by_month_topK.png"), dpi=240); plt.close(fig)
+    w = np.where(np.isfinite(w) & (w > 0), w, 0.0)
+    w = (w / w.sum()) if w.sum() > 0 else np.ones_like(w) / len(w)
 
-        # Excel для стека: shares + abs
-        stack_shares_tbl = stack_df.copy()
-        stack_shares_tbl.insert(0, "payment_period", stack_shares_tbl.index)
-        stack_shares_tbl.insert(1, "month_label", stack_shares_tbl["payment_period"].map(_ru_month_label))
-        stack_shares_tbl.reset_index(drop=True, inplace=True)
-        pivot_od = (
-            month_bin.pivot_table(index="payment_period", columns="stim_bin", values="sum_od", aggfunc="sum")
-            .fillna(0.0).sort_index()
+    def f(b, xx):
+        return (
+            b[0]
+            + b[1] * np.arctan(b[2] + b[3] * xx)
+            + b[4] * np.arctan(b[5] + b[6] * xx)
         )
-        pivot_od_top = pivot_od[keep_cols].copy()
-        pivot_od_top["OTHER"] = pivot_od.drop(columns=keep_cols, errors="ignore").sum(axis=1)
-        stack_abs_tbl = pivot_od_top.copy()
-        stack_abs_tbl.insert(0, "payment_period", stack_abs_tbl.index)
-        stack_abs_tbl.insert(1, "month_label", stack_abs_tbl["payment_period"].map(_ru_month_label))
-        stack_abs_tbl.reset_index(drop=True, inplace=True)
-        with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as xw:
-            stack_shares_tbl.to_excel(xw, sheet_name=_safe_sheetname("stacked_topK_shares_tbl"), index=False)
-            stack_abs_tbl.to_excel(xw, sheet_name=_safe_sheetname("stacked_topK_abs_tbl"), index=False)
 
-    # 5.3 Объёмы по возрастам (+ Excel-таблица)
-    vol_by_age = agg_all.groupby("age_group_id", as_index=False)[["sum_od","sum_premat"]].sum()
-    fig, ax = plt.subplots(figsize=(9,5))
-    ax.bar(vol_by_age["age_group_id"]-0.15, vol_by_age["sum_od"]/1e9, width=0.3, label="OD")
-    ax.bar(vol_by_age["age_group_id"]+0.15, vol_by_age["sum_premat"]/1e9, width=0.3, label="Premat")
-    ax.set_xlabel("LoanAge"); ax.set_ylabel("млрд руб."); ax.set_title(f"{program_name}: объёмы OD и Premat по возрастам")
-    ax.legend(); ax.grid(ls="--", alpha=0.3); fig.tight_layout()
-    fig.savefig(os.path.join(charts_dir,"agegroup_volumes.png"), dpi=240); plt.close(fig)
-    agegroup_tbl = vol_by_age.sort_values("age_group_id")
-    with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as xw:
-        agegroup_tbl.to_excel(xw, sheet_name=_safe_sheetname("agegroup_volumes_tbl"), index=False)
+    def obj(b):
+        return np.sum(w * (y - f(b, x)) ** 2)
 
-    # 5.4 Heatmap — Stim×CPR → OD (overall) c автообрезкой
-    if vol_mat_all.shape[0] > 0 and vol_mat_all.shape[1] > 0:
-        total = float(np.nansum(vol_mat_all.values)) or 1.0
-        col_sh = vol_mat_all.sum(axis=0)/total; row_sh = vol_mat_all.sum(axis=1)/total
-        mat_c = _crop_by_share(_crop_by_share(vol_mat_all, axis=1, shares=col_sh, min_share=min_od_share_heatmap),
-                               axis=0, shares=row_sh, min_share=min_od_share_heatmap)
-        if mat_c.shape[0] > 0 and mat_c.shape[1] > 0:
-            fig_w = max(10, 0.55*mat_c.shape[1]); fig_h = max(6, 0.35*mat_c.shape[0])
-            fig, ax = plt.subplots(figsize=(fig_w,fig_h))
-            _make_masked_imshow(
-                ax=ax,
-                mat2d=mat_c.values/1e9,
-                xticks=mat_c.columns.tolist(),
-                yticks=mat_c.index.tolist(),
-                title=f"{program_name}: OD по (Stim × CPR-бин) [auto-crop]",
-                cbar_label="OD, млрд руб.",
-                out_path=os.path.join(charts_dir,"heatmap_stim_vs_cpr_volume_overall.png")
-            )
+    bounds = [[-np.inf, np.inf], [0, np.inf], [-np.inf, 0], [0, 4],
+              [0, np.inf], [0, np.inf], [0, 1]]
+    res = minimize(obj, start, bounds=bounds, method="SLSQP", options={"ftol": 1e-9})
 
-    # 5.5 Heatmap — месяц×стимул → доля OD (auto-crop)
-    hm_share_all = month_bin.pivot_table(index="payment_period", columns="stim_bin",
-                                         values="share_od_in_month", aggfunc="mean")
-    if hm_share_all is not None and not hm_share_all.empty:
-        hm_share_all = hm_share_all.sort_index()
-        stim_sum_recent = month_bin.groupby("stim_bin", as_index=False)["sum_od"].sum().set_index("stim_bin")["sum_od"]
-        stim_share_recent = stim_sum_recent/(stim_sum_recent.sum() or 1.0)
-        hm_share_crop = _crop_by_share(hm_share_all, axis=1, shares=stim_share_recent, min_share=min_od_share_heatmap)
-        if not hm_share_crop.empty:
-            fig_w = max(10, 0.55*hm_share_crop.shape[1]); fig_h = max(5, 0.45*hm_share_crop.shape[0])
-            fig, ax = plt.subplots(figsize=(fig_w,fig_h))
-            _make_masked_imshow(
-                ax=ax,
-                mat2d=hm_share_crop.values,
-                xticks=hm_share_crop.columns.tolist(),
-                yticks=[_ru_month_label(d) for d in hm_share_crop.index],
-                title=f"{program_name}: доля OD по стимулам (последние {last_months} мес., auto-crop)",
-                cbar_label="Доля OD в месяце",
-                out_path=os.path.join(charts_dir,"heatmap_od_share_by_month.png"),
-                vmin=0.0, vmax=1.0
-            )
+    y_pred = f(res.x, x)
+    mse = float(np.mean((y - y_pred) ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    r2 = 1 - np.sum((y - y_pred) ** 2) / ss_tot if ss_tot > 0 else np.nan
+    return res.x, mse, r2
 
-    # 5.6 Heatmap — месяц×CPR_bin → доля OD (НОВЫЙ)
-    hm_cpr_share_all = month_cpr.pivot_table(index="payment_period", columns="cpr_bin",
-                                             values="share_od_in_month", aggfunc="mean")
-    if hm_cpr_share_all is not None and not hm_cpr_share_all.empty:
-        hm_cpr_share_all = hm_cpr_share_all.sort_index()
-        cpr_sum_recent = month_cpr.groupby("cpr_bin", as_index=False)["sum_od"].sum().set_index("cpr_bin")["sum_od"]
-        cpr_share_recent = cpr_sum_recent/(cpr_sum_recent.sum() or 1.0)
-        hm_cpr_share_crop = _crop_by_share(hm_cpr_share_all, axis=1, shares=cpr_share_recent, min_share=min_od_share_heatmap)
-        if not hm_cpr_share_crop.empty:
-            fig_w = max(10, 0.55*hm_cpr_share_crop.shape[1]); fig_h = max(5, 0.45*hm_cpr_share_crop.shape[0])
-            fig, ax = plt.subplots(figsize=(fig_w,fig_h))
-            _make_masked_imshow(
-                ax=ax,
-                mat2d=hm_cpr_share_crop.values,
-                xticks=hm_cpr_share_crop.columns.tolist(),
-                yticks=[_ru_month_label(d) for d in hm_cpr_share_crop.index],
-                title=f"{program_name}: доля OD по CPR-бинам (последние {last_months} мес., auto-crop)",
-                cbar_label="Доля OD в месяце",
-                out_path=os.path.join(charts_dir,"heatmap_od_share_by_month_byCPR.png"),
-                vmin=0.0, vmax=1.0
-            )
 
-    # 5.7 NEW Heatmap — age_group × stim_bin → share_od_all (global) + Excel (full & cropped)
-    hm_age_stim = agg_all.pivot_table(index="age_group_id", columns="stim_bin",
-                                      values="share_od_all", aggfunc="sum").sort_index()
-    if hm_age_stim is not None and not hm_age_stim.empty:
-        # доли для автообрезки: складываем share_od_all по колонкам/строкам (даёт общий вклад)
-        col_share = hm_age_stim.sum(axis=0)  # вклад стимула в общий OD
-        row_share = hm_age_stim.sum(axis=1)  # вклад age в общий OD
+def _aggregate_points(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """Агрегируем договоры в точки (LoanAge × Incentive) c CPR и весом."""
+    df = df_raw[(df_raw["stimul"].notna()) &
+                (pd.to_numeric(df_raw["refin_rate"], errors="coerce") > 0) &
+                (pd.to_numeric(df_raw["con_rate"], errors="coerce") > 0)].copy()
 
-        hm_age_stim_c = _crop_by_share(hm_age_stim, axis=1, shares=col_share, min_share=min_od_share_heatmap)
-        hm_age_stim_c = _crop_by_share(hm_age_stim_c, axis=0, shares=row_share, min_share=min_od_share_heatmap)
+    grp = df.groupby(["age_group_id", "stimul"], as_index=False).agg(
+        premat_sum=("premat_payment", "sum"),
+        od_sum=("od_after_plan", "sum")
+    )
+    cpr = np.where(
+        grp["od_sum"] <= 0, 0.0,
+        1.0 - np.power(1.0 - (grp["premat_sum"] / grp["od_sum"]), 12.0)
+    )
 
-        # Excel — полная и обрезанная матрицы
-        with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as xw:
-            tmp_full = hm_age_stim.copy()
-            tmp_full.insert(0, "age_group_id", tmp_full.index)
-            tmp_full.reset_index(drop=True).to_excel(xw, sheet_name=_safe_sheetname("age_vs_stim_share_full"), index=False)
+    pts = pd.DataFrame({
+        "LoanAge": pd.to_numeric(grp["age_group_id"], errors="coerce").astype("Int64"),
+        "Incentive": pd.to_numeric(grp["stimul"], errors="coerce"),
+        "CPR": cpr,
+        "TotalDebtBln": grp["od_sum"] / 1e9
+    }).dropna(subset=["LoanAge", "Incentive", "CPR", "TotalDebtBln"])
+    pts = pts[pts["TotalDebtBln"] > 0]
+    return pts.reset_index(drop=True)
 
-            if not hm_age_stim_c.empty:
-                tmp_c = hm_age_stim_c.copy()
-                tmp_c.insert(0, "age_group_id", tmp_c.index)
-                tmp_c.reset_index(drop=True).to_excel(xw, sheet_name=_safe_sheetname("age_vs_stim_share_cropped"), index=False)
 
-        # Картинка
-        if not hm_age_stim_c.empty:
-            vmax_h = float(max(0.001, np.nanmax(hm_age_stim_c.values)*1.02))
-            fig_w = max(10, 0.55*hm_age_stim_c.shape[1]); fig_h = max(5, 0.5*hm_age_stim_c.shape[0])
-            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-            _make_masked_imshow(
-                ax=ax,
-                mat2d=hm_age_stim_c.values,
-                xticks=hm_age_stim_c.columns.tolist(),
-                yticks=[str(i) for i in hm_age_stim_c.index],
-                title=f"{program_name}: доля от общего OD по (Age × Stim) [auto-crop]",
-                cbar_label="Доля от общего OD",
-                out_path=os.path.join(charts_dir, "heatmap_age_vs_stim_od_share.png"),
-                vmin=0.0, vmax=vmax_h
-            )
+def _parse_range(rule: str):
+    rule = rule.strip()
+    if not rule:
+        return None
+    if rule.startswith("<"):
+        hi = float(rule[1:])
+        return (-np.inf, hi)
+    if rule.startswith(">"):
+        lo = float(rule[1:])
+        return (lo, np.inf)
+    if ".." in rule:
+        a, b = rule.split("..")
+        return (float(a), float(b))
+    return None
 
-    # 6) По каждому age — 3 картинки (третья — по CPR-бинам)
-    ages = sorted(agg_all["age_group_id"].dropna().astype(int).unique().tolist())
-    with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as xw:
-        for h in ages:
-            # 6.1 Stim×CPR → OD (внутри age)
-            sub = agg_all[agg_all["age_group_id"] == h].copy()
-            if not sub.empty:
-                sub["CPR_bin"] = pd.cut(sub["CPR_agg"].clip(0,1), bins=c_edges, include_lowest=True, right=False, labels=c_labels)
-                mat_h = (sub.groupby(["CPR_bin","stim_bin"], dropna=False)["sum_od"].sum()
-                         .reset_index().pivot(index="CPR_bin", columns="stim_bin", values="sum_od").sort_index())
-                if (mat_h.shape[0]>0) and (mat_h.shape[1]>0):
-                    total_h = float(np.nansum(mat_h.values)) or 1.0
-                    col_sh = mat_h.sum(axis=0)/total_h; row_sh = mat_h.sum(axis=1)/total_h
-                    mat_hc = _crop_by_share(_crop_by_share(mat_h, axis=1, shares=col_sh, min_share=min_od_share_heatmap),
-                                            axis=0, shares=row_sh, min_share=min_od_share_heatmap)
-                    if mat_hc.shape[0]>0 and mat_hc.shape[1]>0:
-                        fig_w = max(10, 0.55*mat_hc.shape[1]); fig_h = max(6, 0.35*mat_hc.shape[0])
-                        fig, ax = plt.subplots(figsize=(fig_w,fig_h))
-                        _make_masked_imshow(
-                            ax=ax,
-                            mat2d=mat_hc.values/1e9,
-                            xticks=mat_hc.columns.tolist(),
-                            yticks=mat_hc.index.tolist(),
-                            title=f"{program_name}: h={h} | OD по (Stim × CPR-бин) [auto-crop]",
-                            cbar_label="OD, млрд руб.",
-                            out_path=os.path.join(charts_dir, f"heatmap_stim_vs_cpr_volume_age_h{h}.png")
-                        )
-                # Excel
-                mat_h.reset_index().to_excel(xw, sheet_name=_safe_sheetname(f"hm_stim_x_cpr_age_h{h}"), index=False)
 
-            # 6.2 месяц×стимул → доля OD (внутри age)
-            sub_mb = month_bin_age[month_bin_age["age_group_id"] == h]
-            if not sub_mb.empty:
-                hm_share_h = sub_mb.pivot_table(index="payment_period", columns="stim_bin",
-                                                values="share_od_in_month_age", aggfunc="mean")
-                if not hm_share_h.empty:
-                    hm_share_h = hm_share_h.sort_index()
-                    stim_sum_h = sub_mb.groupby("stim_bin", as_index=False)["sum_od"].sum().set_index("stim_bin")["sum_od"]
-                    stim_share_h = stim_sum_h/(stim_sum_h.sum() or 1.0)
-                    hm_share_hc = _crop_by_share(hm_share_h, axis=1, shares=stim_share_h, min_share=min_od_share_heatmap)
-                    if not hm_share_hc.empty:
-                        fig_w = max(10, 0.55*hm_share_hc.shape[1]); fig_h = max(5, 0.45*hm_share_hc.shape[0])
-                        fig, ax = plt.subplots(figsize=(fig_w,fig_h))
-                        _make_masked_imshow(
-                            ax=ax,
-                            mat2d=hm_share_hc.values,
-                            xticks=hm_share_hc.columns.tolist(),
-                            yticks=[_ru_month_label(d) for d in hm_share_hc.index],
-                            title=f"{program_name}: h={h} | доля OD по стимулам (последние {last_months} мес., auto-crop)",
-                            cbar_label="Доля OD в месяце (внутри age)",
-                            out_path=os.path.join(charts_dir, f"heatmap_od_share_by_month_age_h{h}.png"),
-                            vmin=0.0, vmax=1.0
-                        )
-                # Excel
-                if not hm_share_h.empty:
-                    tmp = hm_share_h.copy(); tmp.insert(0,"payment_period", tmp.index)
-                    tmp["month_label"] = tmp["payment_period"].map(_ru_month_label)
-                    tmp.reset_index(drop=True).to_excel(xw, sheet_name=_safe_sheetname(f"hm_share_by_month_h{h}"), index=False)
+def _merge_intervals(intervals):
+    if not intervals:
+        return []
+    xs = sorted((float(lo), float(hi)) for lo, hi in intervals)
+    merged = [xs[0]]
+    for lo, hi in xs[1:]:
+        last_lo, last_hi = merged[-1]
+        if lo <= last_hi:
+            merged[-1] = (last_lo, max(last_hi, hi))
+        else:
+            merged.append((lo, hi))
+    return merged
 
-            # 6.3 месяц×CPR_bin → доля OD (внутри age)
-            sub_deals = df_recent[df_recent["age_group_id"] == h]
-            if not sub_deals.empty:
-                mc_h = (sub_deals.groupby(["payment_period","cpr_bin"], dropna=False)["od_after_plan"]
-                        .sum().reset_index(name="sum_od"))
-                tot_h = mc_h.groupby("payment_period", as_index=False)["sum_od"].sum().rename(columns={"sum_od":"sum_od_month_age"})
-                mc_h = mc_h.merge(tot_h, on="payment_period", how="left")
-                mc_h["share_od_in_month_age"] = np.where(mc_h["sum_od_month_age"]>0, mc_h["sum_od"]/mc_h["sum_od_month_age"], np.nan)
 
-                hm_cpr_h = mc_h.pivot_table(index="payment_period", columns="cpr_bin",
-                                            values="share_od_in_month_age", aggfunc="mean")
-                if not hm_cpr_h.empty:
-                    hm_cpr_h = hm_cpr_h.sort_index()
-                    cpr_sum_h = mc_h.groupby("cpr_bin", as_index=False)["sum_od"].sum().set_index("cpr_bin")["sum_od"]
-                    cpr_share_h = cpr_sum_h/(cpr_sum_h.sum() or 1.0)
-                    hm_cpr_hc = _crop_by_share(hm_cpr_h, axis=1, shares=cpr_share_h, min_share=min_od_share_heatmap)
-                    if not hm_cpr_hc.empty:
-                        fig_w = max(10, 0.55*hm_cpr_hc.shape[1]); fig_h = max(5, 0.45*hm_cpr_hc.shape[0])
-                        fig, ax = plt.subplots(figsize=(fig_w,fig_h))
-                        _make_masked_imshow(
-                            ax=ax,
-                            mat2d=hm_cpr_hc.values,
-                            xticks=hm_cpr_hc.columns.tolist(),
-                            yticks=[_ru_month_label(d) for d in hm_cpr_hc.index],
-                            title=f"{program_name}: h={h} | доля OD по CPR-бинам (последние {last_months} мес., auto-crop)",
-                            cbar_label="Доля OD в месяце (внутри age)",
-                            out_path=os.path.join(charts_dir, f"heatmap_od_share_by_month_byCPR_age_h{h}.png"),
-                            vmin=0.0, vmax=1.0
-                        )
-                # Excel
-                if not hm_cpr_h.empty:
-                    tmp = hm_cpr_h.copy(); tmp.insert(0,"payment_period", tmp.index)
-                    tmp["month_label"] = tmp["payment_period"].map(_ru_month_label)
-                    tmp.reset_index(drop=True).to_excel(xw, sheet_name=_safe_sheetname(f"hm_share_by_month_byCPR_h{h}"), index=False)
+def _complement_intervals(base_lo, base_hi, excluded):
+    if base_lo >= base_hi:
+        return []
+    if not excluded:
+        return [(base_lo, base_hi)]
 
-    print(f"\n✅ STEP 0.5 готово для {program_name}")
-    print(f"• Окно: {_ru_month_label(min_p)} — {_ru_month_label(max_p)}")
-    print(f"• Папка: {ts_dir}")
-    print("  - eda_summary.xlsx")
-    print("  - charts/*.png")
+    clipped = []
+    for lo, hi in excluded:
+        if hi < base_lo or lo > base_hi:
+            continue
+        clipped.append((max(lo, base_lo), min(hi, base_hi)))
+    exc = _merge_intervals(clipped)
+    if not exc:
+        return [(base_lo, base_hi)]
 
-    return {
-        "output_dir": ts_dir,
-        "agg_all": agg_all,
-        "month_bin": month_bin,
-        "month_cpr": month_cpr,
-        "month_bin_age": month_bin_age,
-        "month_summary": month_summary
+    allowed = []
+    cur = base_lo
+    for lo, hi in exc:
+        if lo > cur:
+            allowed.append((cur, lo))
+        cur = max(cur, hi)
+    if cur < base_hi:
+        allowed.append((cur, base_hi))
+    return allowed
+
+
+def _show_age_plot_cut(pts_h: pd.DataFrame, h: int, b, allowed_ranges, step_hint=None, show=True):
+    """
+    Рисует график с ОБРЕЗКОЙ вне allowed_ranges.
+    Обновлено: «жирные» точки — размер и толщина обводки масштабируются объёмом OD.
+    Кривая — оранжевая.
+    """
+    fig, axL = plt.subplots(figsize=(10, 6))
+    axR = axL.twinx()
+
+    axL.grid(ls="--", alpha=0.3)
+    axL.set_xlabel("Incentive, п.п.")
+    axL.set_ylabel("CPR, доли/год")
+    axR.set_ylabel("TotalDebtBln, млрд руб.")
+    axL.set_title(f"h={h}: S-curve (orange) • cut by ranges")
+
+    if step_hint is None:
+        uniq = np.sort(pts_h["Incentive"].unique())
+        step_hint = np.median(np.diff(uniq)) if len(uniq) > 1 else 0.25
+    barw = float(step_hint) * 0.9 if (step_hint and np.isfinite(step_hint)) else 0.2
+
+    for (lo, hi) in allowed_ranges:
+        sub = pts_h[(pts_h["Incentive"] >= lo) & (pts_h["Incentive"] <= hi)]
+        if sub.empty:
+            continue
+        w = sub["TotalDebtBln"].to_numpy(float)
+        if np.nanmax(w) <= 0:
+            w_norm = np.zeros_like(w)
+        else:
+            w_norm = w / np.nanmax(w)
+
+        # размер и толщина контура ∝ объёму
+        sizes = 60.0 + 340.0 * np.sqrt(np.clip(w_norm, 0, 1))
+        lws = 0.6 + 2.4 * np.clip(w_norm, 0, 1)
+
+        axL.scatter(
+            sub["Incentive"], sub["CPR"],
+            s=sizes,
+            facecolors="#1f77b4",
+            edgecolors="black",
+            linewidths=lws,
+            alpha=0.50
+        )
+
+        xg = np.linspace(sub["Incentive"].min(), sub["Incentive"].max(), 400)
+        axL.plot(xg, _f_from_betas(b, xg), color="#ff7f0e", lw=2.8)
+        axR.bar(sub["Incentive"], sub["TotalDebtBln"], width=barw,
+                color="#1f77b4", alpha=0.22, edgecolor="none")
+
+    if not pts_h.empty:
+        axL.set_xlim(float(pts_h["Incentive"].min()), float(pts_h["Incentive"].max()))
+        ymax = max(np.nanmax(pts_h["CPR"].to_numpy(float)), 0.0)
+        axL.set_ylim(0, ymax * 1.06 if ymax > 0 else 0.45)
+
+    fig.tight_layout()
+    if show:
+        plt.show()
+    return fig
+
+
+def _palette(n):
+    """Возвращает n различимых цветов (tab20 по кругу)."""
+    cmap = plt.get_cmap("tab20")
+    return [cmap(i % 20) for i in range(n)]
+
+
+def _build_allowed_map(ages, before_summary, ignored_records):
+    """
+    Собираем словарь allowed[h] = [(lo, hi), ...] с учётом исключений.
+    Если age исключён целиком — список пустой.
+    """
+    # базовые диапазоны по age
+    base = {int(row["LoanAge"]): (float(row["min"]), float(row["max"]))
+            for row in before_summary}
+    # разметка исключений
+    exc_by_age = {}
+    excl_age = set()
+    for r in ignored_records:
+        h = int(r["LoanAge"])
+        t = r.get("Type", "")
+        if t == "exclude_age":
+            excl_age.add(h)
+        elif t == "exclude_range":
+            exc_by_age.setdefault(h, []).append((float(r["Incentive_lo"]), float(r["Incentive_hi"])))
+
+    allowed = {}
+    for h in ages:
+        if h in excl_age or h not in base:
+            allowed[h] = []
+            continue
+        lo, hi = base[h]
+        allowed[h] = _complement_intervals(lo, hi, _merge_intervals(exc_by_age.get(h, [])))
+    return allowed
+
+
+# ══════════════ ОСНОВНОЙ ШАГ 1 ══════════════
+def run_interactive_cut_step1(
+    df_raw_program: pd.DataFrame,
+    out_root: str,
+    program_name: str = "UNKNOWN"
+):
+    pts = _aggregate_points(df_raw_program)
+    if pts.empty:
+        raise RuntimeError("Нет точек для построения после агрегации.")
+
+    ts_dir = _ensure_dir(os.path.join(out_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S")))
+    by_age_dir = _ensure_dir(os.path.join(ts_dir, "by_age"))
+
+    ignored_records = []
+    before_summary = []
+    after_summary = []
+    beta_records = []
+
+    ages = sorted(pts["LoanAge"].dropna().unique().astype(int).tolist())
+
+    for h in ages:
+        pts_h = pts[pts["LoanAge"] == h].copy()
+        if pts_h.empty:
+            continue
+
+        uniq = np.sort(pts_h["Incentive"].unique())
+        step = np.median(np.diff(uniq)) if len(uniq) > 1 else np.nan
+        min_x, max_x = float(uniq.min()), float(uniq.max())
+
+        before_summary.append({
+            "LoanAge": h, "min": min_x, "max": max_x,
+            "step_med": float(step) if np.isfinite(step) else np.nan,
+            "n_bins": int(len(uniq))
+        })
+
+        # ---- фит кривой по всем данным ----
+        b, mse, r2 = _fit_arctan_unconstrained(
+            pts_h["Incentive"], pts_h["CPR"], pts_h["TotalDebtBln"])
+        beta_records.append({
+            "LoanAge": h,
+            "b0": b[0], "b1": b[1], "b2": b[2], "b3": b[3],
+            "b4": b[4], "b5": b[5], "b6": b[6],
+            "MSE_fit": mse, "R2_fit": r2,
+            "Incentive_min": min_x, "Incentive_max": max_x
+        })
+
+        # ---- показать график и интерактив ----
+        print(f"\n=== AGE {h} ===")
+        print(f"Incentive: {min_x:.2f} → {max_x:.2f}, шаг ≈ {step:.2f}, bins={len(uniq)}")
+        _show_age_plot_cut(pts_h, h, b, allowed_ranges=[(min_x, max_x)], step_hint=step, show=True)
+
+        ans = input(f"Исключить возраст h={h} полностью? (y/n): ").strip().lower()
+        if ans == "y":
+            ignored_records.append({"LoanAge": h, "Incentive_lo": min_x, "Incentive_hi": max_x,
+                                    "Inclusive": True, "Type": "exclude_age", "Reason": "manual"})
+            fig = plt.figure(figsize=(8, 3.5))
+            plt.axis("off")
+            plt.text(0.5, 0.6, f"h={h} — ИСКЛЮЧЁН из анализа",
+                     ha="center", va="center", fontsize=14, color="crimson")
+            plt.text(0.5, 0.3, f"Диапазон стимулов: {min_x:.2f}..{max_x:.2f}",
+                     ha="center", va="center", fontsize=10)
+            fig.tight_layout()
+            fig.savefig(os.path.join(by_age_dir, f"age_{h}.png"), dpi=300)
+            plt.close(fig)
+            after_summary.append({"LoanAge": h, "allowed_ranges": "— (age excluded)"})
+            continue
+
+        excluded_ranges = []
+        while True:
+            rule = input("Введите диапазон исключения ('<-3', '>4', '-2..3') или Enter чтобы продолжить: ").strip()
+            if not rule:
+                break
+            rng = _parse_range(rule)
+            if rng is None:
+                print("Не понял правило. Пример: <-3 | >4 | -2..3")
+                continue
+            lo, hi = rng
+            print(f"  Кандидат: исключить [{lo} .. {hi}] (включительно).")
+            conf = input("Подтвердить? (y/n): ").strip().lower()
+            if conf == "y":
+                excluded_ranges.append((lo, hi))
+                ignored_records.append({"LoanAge": h, "Incentive_lo": lo, "Incentive_hi": hi,
+                                        "Inclusive": True, "Type": "exclude_range", "Reason": "visual_cut"})
+            else:
+                print("  Отмена.")
+
+        allowed = _complement_intervals(min_x, max_x, _merge_intervals(excluded_ranges))
+        if not allowed:
+            fig = plt.figure(figsize=(8, 3.5))
+            plt.axis("off")
+            plt.text(0.5, 0.6, f"h={h}: все стимулы исключены визуально",
+                     ha="center", va="center", fontsize=14, color="crimson")
+            plt.text(0.5, 0.3, f"Исходный диапазон: {min_x:.2f}..{max_x:.2f}",
+                     ha="center", va="center", fontsize=10)
+            fig.tight_layout()
+            fig.savefig(os.path.join(by_age_dir, f"age_{h}.png"), dpi=300)
+            plt.close(fig)
+            after_summary.append({"LoanAge": h, "allowed_ranges": "— (all cut)"})
+            continue
+
+        fig = _show_age_plot_cut(pts_h, h, b, allowed_ranges=allowed, step_hint=step, show=True)
+        fig.savefig(os.path.join(by_age_dir, f"age_{h}.png"), dpi=300)
+        plt.close(fig)
+        allowed_str = "; ".join([f"{a:.4g}..{b:.4g}" for a, b in allowed])
+        after_summary.append({"LoanAge": h, "allowed_ranges": allowed_str})
+
+    # ══════════════ СОХРАНЕНИЕ ОСНОВНЫХ ФАЙЛОВ ══════════════
+    pts.to_excel(os.path.join(ts_dir, "points_full.xlsx"), index=False)
+    pd.DataFrame(beta_records).to_excel(os.path.join(ts_dir, "betas_full.xlsx"), index=False)
+    pd.DataFrame(ignored_records).to_excel(os.path.join(ts_dir, "ignored_bins.xlsx"), index=False)
+
+    with open(os.path.join(ts_dir, "summary.txt"), "w", encoding="utf-8") as f:
+        f.write(f"Программа: {program_name}\n\n")
+        f.write("==== Диапазоны стимулов ДО ====\n")
+        f.write(pd.DataFrame(before_summary).to_string(index=False))
+        f.write("\n\n==== Разрешённые диапазоны ПОСЛЕ ====\n")
+        f.write(pd.DataFrame(after_summary).to_string(index=False))
+        f.write("\n\n==== Качество фиттинга ====\n")
+        f.write(pd.DataFrame(beta_records)[["LoanAge", "R2_fit", "MSE_fit"]].to_string(index=False))
+        f.write("\n\nПояснение: диапазоны исключаются ВКЛЮЧИТЕЛЬНО.\n")
+
+    # ══════════════ ИТОГОВЫЙ СВОДНЫЙ ГРАФИК (все кривые + стек-столбики OD) ══════════════
+    # 1) карта разрешённых интервалов по age
+    allowed_map = _build_allowed_map(
+        ages=ages,
+        before_summary=before_summary,
+        ignored_records=ignored_records
+    )
+
+    # 2) словарь бета-параметров по age
+    betas_by_age = {
+        int(r["LoanAge"]): np.array([r["b0"], r["b1"], r["b2"], r["b3"], r["b4"], r["b5"], r["b6"]], float)
+        for r in beta_records
+        if np.all(np.isfinite([r["b0"], r["b1"], r["b2"], r["b3"], r["b4"], r["b5"], r["b6"]]))
     }
 
+    # 3) стек-объёмы OD по стимулам (учитываем только разрешённые зоны)
+    x_all = np.sort(pts["Incentive"].unique())
+    if len(x_all) > 1:
+        step_glob = float(np.median(np.diff(x_all)))
+    else:
+        step_glob = 0.25
+    barw = 0.9 * step_glob if np.isfinite(step_glob) and step_glob > 0 else 0.2
 
-# ===== пример запуска =====
-# res05 = run_step05_exploratory(
-#     df_raw_program=df_raw_program,
-#     out_root=r"C:\Users\mi.makhmudov\Desktop\SCurve_step05",
-#     program_name="Семейная ипотека",
-#     stim_bin_width=1,
-#     cpr_bin_width=0.01,
-#     last_months=6,
-#     top_k_bins_for_stack=10,
-#     min_od_share_heatmap=0.002
-# )
+    # матрица volumes: index=Incentive, columns=age
+    vol_mat = pd.DataFrame(index=x_all, columns=ages, data=0.0)
+    for h in ages:
+        allowed = allowed_map.get(h, [])
+        if not allowed:  # age полностью исключён
+            continue
+        pts_h = pts[pts["LoanAge"] == h]
+        if pts_h.empty:
+            continue
+        ser = pd.Series(0.0, index=x_all, dtype=float)
+        for (lo, hi) in allowed:
+            sub = pts_h[(pts_h["Incentive"] >= lo) & (pts_h["Incentive"] <= hi)]
+            if sub.empty:
+                continue
+            ser = ser.add(sub.set_index("Incentive")["TotalDebtBln"], fill_value=0.0)
+        vol_mat[h] = ser.fillna(0.0)
+
+    # если всё пусто — не строим общий график
+    if (vol_mat.sum(axis=1).sum() > 0) and (len(betas_by_age) > 0):
+        # 4) рисуем
+        colors = {h: c for h, c in zip(ages, _palette(len(ages)))}
+        fig, axL = plt.subplots(figsize=(12, 6.8))
+        axR = axL.twinx()
+
+        # стек-столбики по стимулам
+        x = x_all
+        bottom = np.zeros_like(x, dtype=float)
+        for h in ages:
+            y = vol_mat[h].reindex(x, fill_value=0.0).to_numpy(float)
+            if np.allclose(y.sum(), 0):
+                continue
+            axR.bar(x, y, width=barw, bottom=bottom, color=colors[h], alpha=0.28, edgecolor="none", label=f"OD h={h}")
+            bottom += y
+
+        # кривые по age (без точек), только на разрешённых интервалах
+        for h in ages:
+            b = betas_by_age.get(h, None)
+            allowed = allowed_map.get(h, [])
+            if b is None or not allowed:
+                continue
+            for lo, hi in allowed:
+                if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                    continue
+                xg = np.linspace(max(lo, x.min()), min(hi, x.max()), 600)
+                if xg.size <= 1:
+                    continue
+                axL.plot(xg, _f_from_betas(b, xg), color=colors[h], lw=2.5, label=f"h={h}")
+
+        # оформление
+        axL.set_xlabel("Incentive, п.п.")
+        axL.set_ylabel("CPR, доли/год")
+        axR.set_ylabel("TotalDebtBln, млрд руб.")
+        axL.grid(ls="--", alpha=0.35)
+        axL.set_title(f"{program_name}: S-curves по age (без точек) + стек OD по стимулам")
+
+        # легенда только для кривых (уникальные метки)
+        handles, labels = axL.get_legend_handles_labels()
+        uniq = dict(zip(labels, handles))
+        axL.legend(uniq.values(), uniq.keys(), loc="upper left", ncol=2, fontsize=9, frameon=True)
+
+        fig.tight_layout()
+        out_path = os.path.join(ts_dir, "all_ages_curves_and_volumes.png")
+        fig.savefig(out_path, dpi=300)
+        plt.close(fig)
+
+    print("\n✅ ШАГ 1 готов.")
+    print("Сохранено в:", ts_dir)
+    print("  • points_full.xlsx")
+    print("  • betas_full.xlsx  ✅ (коэффициенты арктан-фита)")
+    print("  • ignored_bins.xlsx")
+    print("  • summary.txt")
+    print("  • by_age/*.png")
+    print("  • all_ages_curves_and_volumes.png  ✅")
+
+    return {"output_dir": ts_dir}
