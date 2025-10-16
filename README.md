@@ -17,15 +17,15 @@ Private Function FindColumnByHeader(ws As Worksheet, headerText As String) As Lo
     FindColumnByHeader = 0
 End Function
 
-Public Sub BatchFill_FastAndSafe_NNKL_TS()
-    Const SHEET_SVOD As String = "СВОД_ННКЛ"
-    Const SHEET_DATA As String = "ТАБЛИЦА"   ' поменяй, если имя другое
+Public Sub BatchFill_FastAndSafe_NKL_TS()
+    Const SHEET_SVOD As String = "СВОД_ННКЛ"   ' если лист свода переименован — поменяй здесь
+    Const SHEET_DATA As String = "ТАБЛИЦА"      ' имя листа с данными
 
     ' === Заголовки новой таблицы ===
     Const HDR_PROD_TYPE As String = "prod_type"                     ' F
     Const HDR_IS_PDR    As String = "is_pdr"                        ' G
     Const HDR_MATUR     As String = "matur"                         ' J
-    ' ⚠️ Теперь берём ИМЕННО T-столбец:
+    ' Вход: T — «Спред ТС к КС (ежемес)»
     Const HDR_INPUT_TS_SPREAD As String = "Спред ТС к КС  (ежемес)" ' T
 
     Dim wb As Workbook
@@ -56,13 +56,13 @@ Public Sub BatchFill_FastAndSafe_NNKL_TS()
     colIsPdr    = FindColumnByHeader(wsData, HDR_IS_PDR)
     colMatur    = FindColumnByHeader(wsData, HDR_MATUR)
     colInput    = FindColumnByHeader(wsData, HDR_INPUT_TS_SPREAD)
-    colOut      = 23 ' W — сюда пишем результат
+    colOut      = 25 ' Y — сюда пишем результат
 
     If colProdType * colMatur * colInput = 0 Then
         MsgBox "Не найден один из заголовков: " & vbCrLf & _
                "  • " & HDR_PROD_TYPE & vbCrLf & _
                "  • " & HDR_MATUR & vbCrLf & _
-               "  • " & HDR_INPUT_TS_SPREAD, vbCritical, "BatchFill_NNKL_TS"
+               "  • " & HDR_INPUT_TS_SPREAD, vbCritical, "BatchFill_NKL_TS"
         Exit Sub
     End If
 
@@ -70,7 +70,7 @@ Public Sub BatchFill_FastAndSafe_NNKL_TS()
     If lastRow < 2 Then Exit Sub
     n = lastRow - 1
 
-    ' --- Очищаем W перед запуском ---
+    ' --- Очищаем Y перед запуском ---
     wsData.Range(wsData.Cells(2, colOut), wsData.Cells(lastRow, colOut)).ClearContents
 
     ' --- Грузим данные в массивы ---
@@ -104,7 +104,7 @@ Public Sub BatchFill_FastAndSafe_NNKL_TS()
     ' === ВАЖНО: расчёт "в терминах ТС"
     ' C2 <- Подаём "Спред ТС к КС (ежемес)" (T-колонка таблицы)
     ' C3 <- Подаём matur (или 30, если is_pdr=1 ИЛИ prod_type="MIN_BAL")
-    ' Результат берём из C56 и пишем в W
+    ' Результат берём из C35 (не C56!) и пишем в Y
 
     ' --- Основной цикл ---
     For i = 1 To n
@@ -115,6 +115,7 @@ Public Sub BatchFill_FastAndSafe_NNKL_TS()
         vIsPdr = arrIsPdr(i, 1)                        ' G
         vProd  = UCase$(Trim$(CStr(arrProd(i, 1))))    ' F
 
+        ' 1) как прежде: исключения -> 30 дней
         If (Val(CStr(vIsPdr)) = 1) Or (vProd = "MIN_BAL") Then
             useMatur = 30
         Else
@@ -134,7 +135,8 @@ Public Sub BatchFill_FastAndSafe_NNKL_TS()
                 DoEvents
             Loop
 
-            res = wsSvod.Range("C56").Value2
+            ' 2) читаем из C35
+            res = wsSvod.Range("C35").Value2
             If IsError(res) Or LenB(CStr(res)) = 0 Then res = Empty
             dict.Add key, res
         End If
@@ -149,7 +151,7 @@ RowSoft:
 NextI:
     Next i
 
-    ' --- Массовая запись результатов в W ---
+    ' 4) Массовая запись результатов в Y
     wsData.Range(wsData.Cells(2, colOut), wsData.Cells(lastRow, colOut)).Value = outArr
 
 Done:
