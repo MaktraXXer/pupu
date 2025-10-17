@@ -1,170 +1,238 @@
-Option Explicit
+# -*- coding: utf-8 -*-
+import pandas as pd
 
-' Поиск колонки по заголовку (строка 1), без учёта регистра
-Private Function FindColumnByHeader(ws As Worksheet, headerText As String) As Long
-    Dim lastCol As Long, c As Long, v As String
-    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
-    For c = 1 To lastCol
-        v = CStr(ws.Cells(1, c).Value2)
-        If Len(v) > 0 Then
-            If StrComp(Trim$(v), Trim$(headerText), vbTextCompare) = 0 _
-               Or InStr(1, Trim$(v), Trim$(headerText), vbTextCompare) > 0 Then
-                FindColumnByHeader = c
-                Exit Function
-            End If
-        End If
-    Next c
-    FindColumnByHeader = 0
-End Function
+# ===== НАСТРОЙКИ =====
+TARGET_PRODUCTS = {'ДОМа надёжно'}
+FU_PRODUCTS = {
+    'Надёжный','Надёжный VIP','Надёжный премиум',
+    'Надёжный промо','Надёжный старт',
+    'Надёжный T2','Надёжный Мегафон','Надёжный прайм','Надёжный процент'
+}
+MIN_BAL_RUB = 1.0
+COHORT_FROM = pd.Timestamp('2024-01-01')
+SNAP_DATE   = pd.Timestamp('2025-10-15')
+COHORT_TO   = SNAP_DATE
 
-Public Sub BatchFill_FastAndSafe_NKL_V2()
-    Const SHEET_SVOD As String = "СВОД_НКЛ"  ' <-- переименовано: было СВОД_ННКЛ
-    Const SHEET_DATA As String = "ТАБЛИЦА"   ' имя листа с данными
+DETAIL_XLSX  = f"fu_firstentry_detail_{SNAP_DATE.date()}.xlsx"
+MONTHLY_XLSX = f"fu_firstentry_monthly_{SNAP_DATE.date()}.xlsx"
 
-    ' Имена заголовков (как в вашей таблице)
-    Const HDR_PROD_TYPE As String = "prod_type"
-    Const HDR_IS_PDR    As String = "is_pdr"
-    Const HDR_MATUR     As String = "matur"
-    Const HDR_SPREAD    As String = "Спред внешней ставки к КС (ежемес)" ' S
+# ===== ВХОД =====
+df = df_sql.copy()
 
-    Dim wb As Workbook
-    Dim wsSvod As Worksheet, wsData As Worksheet
-    Dim calcMode As XlCalculation
-    Dim lastRow As Long, n As Long, i As Long
+# Даты
+for c in ['DT_OPEN','DT_CLOSE','DT_CLOSE_PLAN']:
+    if c in df.columns:
+        df[c] = pd.to_datetime(df[c], errors='coerce')
 
-    Dim colProdType As Long, colIsPdr As Long, colMatur As Long, colSpread As Long, colOut As Long
-    Dim arrSpread As Variant, arrMatur As Variant, arrIsPdr As Variant, arrProd As Variant
-    Dim outArr() As Variant
+# Страховки по колонкам
+if 'OUT_RUB' not in df.columns:
+    df['OUT_RUB'] = df.get('BALANCE_RUB', pd.Series(0.0, index=df.index))
+if 'BALANCE_RUB' not in df.columns:
+    df['BALANCE_RUB'] = df['OUT_RUB']
 
-    Dim vSpread As Variant, vMatur As Variant, vIsPdr As Variant, vProd As String
-    Dim useMatur As Variant, res As Variant, key As String
+df['OUT_RUB_SNAP'] = df['OUT_RUB']
 
-    Dim dict As Object
-    Dim oldC2 As Variant, oldC3 As Variant
+# Флаги корзин (приоритет: Target > FU > Bank/Other)
+df['is_target'] = df['PROD_NAME'].isin(TARGET_PRODUCTS)
+df['is_fu']     = (~df['is_target']) & df['PROD_NAME'].isin(FU_PRODUCTS)
+df['is_bank']   = (~df['is_target']) & (~df['is_fu'])
 
-    On Error GoTo Fatal
+# ===== КОГОРТА: «первый вход = ФУ» =====
+first_any_in_window = (
+    df.loc[(df['DT_OPEN'] >= COHORT_FROM) & (df['DT_OPEN'] <= COHORT_TO)]
+      .sort_values(['CLI_ID','DT_OPEN'])
+      .groupby('CLI_ID', as_index=True)
+      .first()[['DT_OPEN','PROD_NAME']]
+)
+cohort_cli = set(
+    first_any_in_window.index[first_any_in_window['PROD_NAME'].isin(FU_PRODUCTS)]
+)
 
-    Set wb = ThisWorkbook
-    Set wsSvod = wb.Worksheets(SHEET_SVOD)
-    Set wsData = wb.Worksheets(SHEET_DATA)
+# ===== ЖИВЫ НА SNAP_DATE =====
+alive_mask = (
+    (df['DT_OPEN'] <= SNAP_DATE) &
+    (df['DT_CLOSE_PLAN'].isna() | (df['DT_CLOSE_PLAN'] > SNAP_DATE))
+)
+live = df.loc[alive_mask & (df['OUT_RUB_SNAP'].fillna(0) >= MIN_BAL_RUB)].copy()
 
-    ' --- находим нужные колонки по заголовкам ---
-    colProdType = FindColumnByHeader(wsData, HDR_PROD_TYPE)
-    colIsPdr    = FindColumnByHeader(wsData, HDR_IS_PDR)
-    colMatur    = FindColumnByHeader(wsData, HDR_MATUR)
-    colSpread   = FindColumnByHeader(wsData, HDR_SPREAD)
-    colOut      = 24  ' X — теперь пишем сюда
+# Объёмы по корзинам
+live['vol_target'] = live['OUT_RUB_SNAP'].where(live['is_target'], 0.0)
+live['vol_fu']     = live['OUT_RUB_SNAP'].where(live['is_fu'],     0.0)
+live['vol_bank']   = live['OUT_RUB_SNAP'].where(live['is_bank'],   0.0)
 
-    If colProdType * colMatur * colSpread = 0 Then
-        MsgBox "Не найден один из заголовков: " & vbCrLf & _
-               "  • " & HDR_PROD_TYPE & vbCrLf & _
-               "  • " & HDR_MATUR & vbCrLf & _
-               "  • " & HDR_SPREAD, vbCritical, "BatchFill_NKL_V2"
-        Exit Sub
-    End If
+# Агрегация по клиенту
+g_all_snap = (live.groupby('CLI_ID', as_index=True)
+                   .agg(vol_target=('vol_target','sum'),
+                        vol_fu=('vol_fu','sum'),
+                        vol_bank=('vol_bank','sum')))
 
-    lastRow = wsData.Cells(wsData.Rows.Count, 1).End(xlUp).Row
-    If lastRow < 2 Then Exit Sub
-    n = lastRow - 1
+def snapshot_7cats(cli_ids):
+    """
+    7 категорий удержания на SNAP_DATE (только по когорте ФУ):
+      1) только ФУ
+      2) только Целевой
+      3) только Банк
+      4) ФУ + Целевой
+      5) ФУ + Банк
+      6) Целевой + Банк
+      7) ФУ + Целевой + Банк
+      + ИТОГО
+    """
+    cols = ['Клиентов','Объем ФУ','Объем Целевые','Объем Банк']
+    idx = ['только ФУ','только Целевой','только Банк',
+           'ФУ + Целевой','ФУ + Банк','Целевой + Банк',
+           'ФУ + Целевой + Банк','ИТОГО']
+    if not cli_ids:
+        return pd.DataFrame([[0,0.0,0.0,0.0]]*len(idx), columns=cols, index=idx)
 
-    ' --- очищаем X перед запуском ---
-    wsData.Range(wsData.Cells(2, colOut), wsData.Cells(lastRow, colOut)).ClearContents
+    g = g_all_snap.loc[g_all_snap.index.isin(cli_ids)].copy()
+    has_f = g['vol_fu']     > 0
+    has_t = g['vol_target'] > 0
+    has_b = g['vol_bank']   > 0
 
-    ' --- выгружаем нужные диапазоны в массивы ---
-    arrSpread = wsData.Range(wsData.Cells(2, colSpread), wsData.Cells(lastRow, colSpread)).Value2
-    arrMatur  = wsData.Range(wsData.Cells(2, colMatur), wsData.Cells(lastRow, colMatur)).Value2
-    arrProd   = wsData.Range(wsData.Cells(2, colProdType), wsData.Cells(lastRow, colProdType)).Value2
-    If colIsPdr > 0 Then
-        arrIsPdr = wsData.Range(wsData.Cells(2, colIsPdr), wsData.Cells(lastRow, colIsPdr)).Value2
-    Else
-        ReDim arrIsPdr(1 To n, 1 To 1)
-        For i = 1 To n: arrIsPdr(i, 1) = 0: Next i
-    End If
-    ReDim outArr(1 To n, 1 To 1)
+    def agg(mask):
+        sub = g.loc[mask]
+        return [
+            int(len(sub)),
+            float(sub['vol_fu'].sum()),
+            float(sub['vol_target'].sum()),
+            float(sub['vol_bank'].sum()),
+        ]
 
-    ' --- подготовка окружения ---
-    Set dict = CreateObject("Scripting.Dictionary")
-    dict.CompareMode = 1
+    rows = [
+        agg( has_f & ~has_t & ~has_b),   # только ФУ
+        agg(~has_f &  has_t & ~has_b),   # только Целевой
+        agg(~has_f & ~has_t &  has_b),   # только Банк
+        agg( has_f &  has_t & ~has_b),   # ФУ + Целевой
+        agg( has_f & ~has_t &  has_b),   # ФУ + Банк
+        agg(~has_f &  has_t &  has_b),   # Целевой + Банк
+        agg( has_f &  has_t &  has_b),   # ФУ + Целевой + Банк
+        agg( has_f |  has_t |  has_b),   # ИТОГО
+    ]
+    return pd.DataFrame(rows, columns=cols, index=idx)
 
-    oldC2 = wsSvod.Range("C2").Value2
-    oldC3 = wsSvod.Range("C3").Value2
+def entered_fu_volume_by_balance(cli_ids, month_start, month_end):
+    """
+    Объем ФУ-договоров, открытых в месяце (BALANCE_RUB по ФУ-договорам у клиентов когорты)
+    """
+    if not cli_ids:
+        return 0.0
+    sub = df.loc[
+        (df['CLI_ID'].isin(cli_ids)) &
+        (df['is_fu']) &
+        (df['DT_OPEN'] >= month_start) & (df['DT_OPEN'] <= month_end)
+    ]
+    return float(sub['BALANCE_RUB'].fillna(0.0).sum())
 
-    Application.ScreenUpdating = False
-    Application.EnableEvents = False
-    Application.DisplayAlerts = False
-    calcMode = Application.Calculation
-    Application.Calculation = xlCalculationManual
-    Application.Cursor = xlWait
+# ===== Месяцы =====
+months = pd.period_range(start=COHORT_FROM.to_period('M'),
+                         end=COHORT_TO.to_period('M'), freq='M')
+month_pretty = {1:'январь',2:'февраль',3:'март',4:'апрель',5:'май',6:'июнь',
+                7:'июль',8:'август',9:'сентябрь',10:'октябрь',11:'ноябрь',12:'декабрь'}
 
-    Application.CalculateFullRebuild
+# ===== ФАЙЛ 1 (детальный) =====
+detail_rows = []
+detail_cols = ['Заголовок/Категория','Клиентов','Объем ФУ','Объем Целевые','Объем Банк']
 
-    ' === ЛОГИКА:
-    ' C2 <- Спред внешней ставки к КС (ежемес) (S)
-    ' C3 <- matur, но если is_pdr=1 ИЛИ prod_type="MIN_BAL", то 30 дней
-    ' Результат читаем из C35 (не C56!) и пишем в X
+# ===== ФАЙЛ 2 (wide) =====
+monthly_data = {}
 
-    ' --- основной цикл ---
-    For i = 1 To n
-        On Error GoTo RowSoft
+for p in months:
+    month_start = pd.Timestamp(p.start_time.date())
+    month_end   = pd.Timestamp(p.end_time.date())
+    col_name = f"{p.year}, {month_pretty[p.month]}"
 
-        vSpread = arrSpread(i, 1)
-        vMatur  = arrMatur(i, 1)
-        vIsPdr  = arrIsPdr(i, 1)
-        vProd   = UCase$(Trim$(CStr(arrProd(i, 1))))
+    entered_cli = set(
+        first_any_in_window.index[
+            first_any_in_window['PROD_NAME'].isin(FU_PRODUCTS) &
+            (first_any_in_window['DT_OPEN'] >= month_start) &
+            (first_any_in_window['DT_OPEN'] <= month_end)
+        ]
+    )
+    entered_cnt = len(entered_cli)
+    entered_fu_vol = entered_fu_volume_by_balance(entered_cli, month_start, month_end)
 
-        ' 1) исключения -> 30 дней
-        If (Val(CStr(vIsPdr)) = 1) Or (vProd = "MIN_BAL") Then
-            useMatur = 30
-        Else
-            useMatur = vMatur
-        End If
+    # живые на дату
+    alive_cli = set(g_all_snap.index.intersection(entered_cli))
+    snap7 = snapshot_7cats(alive_cli)
 
-        key = CStr(vSpread) & "|" & CStr(useMatur)
+    # — Детальный файл
+    detail_rows.append([f'Новые клиенты (первый вход = ФУ) {p.strftime("%Y-%m")}',
+                        entered_cnt, entered_fu_vol, '', ''])
+    for idx, row in snap7.iterrows():
+        detail_rows.append([
+            idx,
+            int(row['Клиентов']),
+            float(row['Объем ФУ']),
+            float(row['Объем Целевые']),
+            float(row['Объем Банк']),
+        ])
+    detail_rows.extend([['','','','',''], ['','','','','']])
 
-        If dict.Exists(key) Then
-            res = dict(key)
-        Else
-            wsSvod.Range("C2").Value2 = vSpread
-            wsSvod.Range("C3").Value2 = useMatur
+    # — Wide файл
+    def pct(part, total): return round(100.0 * part / total, 2) if total else 0.0
 
-            Application.Calculate
-            Do While Application.CalculationState <> xlDone
-                DoEvents
-            Loop
+    monthly_data[col_name] = {
+        'Кол-во новых клиентов (ФУ-вход)'         : entered_cnt,
+        '(объем ФУ-договоров, открытых этими клиентами в месяце)' : entered_fu_vol,
 
-            ' 2) читаем из C35 (замена C56)
-            res = wsSvod.Range("C35").Value2
-            If IsError(res) Or LenB(CStr(res)) = 0 Then res = Empty
+        '% удержания ВСЕГО'              : pct(int(snap7.loc['ИТОГО','Клиентов']), entered_cnt),
+        '% удержаны только на ФУ'         : pct(int(snap7.loc['только ФУ','Клиентов']), entered_cnt),
+        '% удержаны только на целевом'    : pct(int(snap7.loc['только Целевой','Клиентов']), entered_cnt),
+        '% удержаны только на банке'      : pct(int(snap7.loc['только Банк','Клиентов']), entered_cnt),
+        '% удержаны на ФУ и целевом'      : pct(int(snap7.loc['ФУ + Целевой','Клиентов']), entered_cnt),
+        '% удержаны на ФУ и банке'        : pct(int(snap7.loc['ФУ + Банк','Клиентов']), entered_cnt),
+        '% удержаны на целевом и банке'   : pct(int(snap7.loc['Целевой + Банк','Клиентов']), entered_cnt),
+        '% удержаны и там и там и там'    : pct(int(snap7.loc['ФУ + Целевой + Банк','Клиентов']), entered_cnt),
 
-            dict.Add key, res
-        End If
+        'Объем только ФУ'                 : float(snap7.loc['только ФУ','Объем ФУ']),
+        'Объем только Целевой'            : float(snap7.loc['только Целевой','Объем Целевые']),
+        'Объем только Банк'               : float(snap7.loc['только Банк','Объем Банк']),
 
-        outArr(i, 1) = res
-        If (i Mod 500) = 0 Then DoEvents
-        GoTo NextI
+        'Объем ФУ + Целевой (ФУ-часть)'   : float(snap7.loc['ФУ + Целевой','Объем ФУ']),
+        'Объем ФУ + Целевой (Целевой-часть)': float(snap7.loc['ФУ + Целевой','Объем Целевые']),
 
-RowSoft:
-        outArr(i, 1) = Empty
-        Err.Clear
-NextI:
-    Next i
+        'Объем ФУ + Банк (ФУ-часть)'      : float(snap7.loc['ФУ + Банк','Объем ФУ']),
+        'Объем ФУ + Банк (Банк-часть)'    : float(snap7.loc['ФУ + Банк','Объем Банк']),
 
-    ' --- массовая запись результатов в X ---
-    wsData.Range(wsData.Cells(2, colOut), wsData.Cells(lastRow, colOut)).Value = outArr
+        'Объем Целевой + Банк (Целевой-часть)': float(snap7.loc['Целевой + Банк','Объем Целевые']),
+        'Объем Целевой + Банк (Банк-часть)'   : float(snap7.loc['Целевой + Банк','Объем Банк']),
 
-Done:
-    wsSvod.Range("C2").Value2 = oldC2
-    wsSvod.Range("C3").Value2 = oldC3
-    Application.Cursor = xlDefault
-    Application.Calculation = calcMode
-    Application.DisplayAlerts = True
-    Application.EnableEvents = True
-    Application.ScreenUpdating = True
-    Exit Sub
+        'Объем ФУ + Целевой + Банк (ФУ)'  : float(snap7.loc['ФУ + Целевой + Банк','Объем ФУ']),
+        'Объем ФУ + Целевой + Банк (цел.)': float(snap7.loc['ФУ + Целевой + Банк','Объем Целевые']),
+        'Объем ФУ + Целевой + Банк (банк)': float(snap7.loc['ФУ + Целевой + Банк','Объем Банк']),
+    }
 
-Fatal:
-    On Error Resume Next
-    wsSvod.Range("C2").Value2 = oldC2
-    wsSvod.Range("C3").Value2 = oldC3
-    Resume Done
-End Sub
+# ===== Сохранение =====
+detail_df = pd.DataFrame(detail_rows, columns=detail_cols)
+detail_df.to_excel(DETAIL_XLSX, index=False)
+
+row_order = [
+    'Кол-во новых клиентов (ФУ-вход)',
+    '(объем ФУ-договоров, открытых этими клиентами в месяце)',
+    '% удержания ВСЕГО',
+    '% удержаны только на ФУ',
+    '% удержаны только на целевом',
+    '% удержаны только на банке',
+    '% удержаны на ФУ и целевом',
+    '% удержаны на ФУ и банке',
+    '% удержаны на целевом и банке',
+    '% удержаны и там и там и там',
+    'Объем только ФУ',
+    'Объем только Целевой',
+    'Объем только Банк',
+    'Объем ФУ + Целевой (ФУ-часть)',
+    'Объем ФУ + Целевой (Целевой-часть)',
+    'Объем ФУ + Банк (ФУ-часть)',
+    'Объем ФУ + Банк (Банк-часть)',
+    'Объем Целевой + Банк (Целевой-часть)',
+    'Объем Целевой + Банк (Банк-часть)',
+    'Объем ФУ + Целевой + Банк (ФУ)',
+    'Объем ФУ + Целевой + Банк (цел.)',
+    'Объем ФУ + Целевой + Банк (банк)',
+]
+monthly_df = pd.DataFrame.from_dict(monthly_data, orient='columns')
+monthly_df = monthly_df.reindex(row_order)
+monthly_df.to_excel(MONTHLY_XLSX, header=True)
+
+print(f"Готово:\n 1) {DETAIL_XLSX}\n 2) {MONTHLY_XLSX}")
