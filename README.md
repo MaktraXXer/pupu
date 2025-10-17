@@ -32,7 +32,7 @@ if 'BALANCE_RUB' not in df.columns:
 
 df['OUT_RUB_SNAP'] = df['OUT_RUB']
 
-# Флаги корзин (приоритет: Target > FU > Bank/Other)
+# Флаги корзин (приоритет Target > FU > Bank/Other)
 df['is_target'] = df['PROD_NAME'].isin(TARGET_PRODUCTS)
 df['is_fu']     = (~df['is_target']) & df['PROD_NAME'].isin(FU_PRODUCTS)
 df['is_bank']   = (~df['is_target']) & (~df['is_fu'])
@@ -77,8 +77,9 @@ def snapshot_7cats(cli_ids):
       6) Целевой + Банк
       7) ФУ + Целевой + Банк
       + ИТОГО
+    Возвращает DataFrame: ['Клиентов','Объем Целевые','Объем ФУ','Объем Банк']
     """
-    cols = ['Клиентов','Объем ФУ','Объем Целевые','Объем Банк']
+    cols = ['Клиентов','Объем Целевые','Объем ФУ','Объем Банк']
     idx = ['только ФУ','только Целевой','только Банк',
            'ФУ + Целевой','ФУ + Банк','Целевой + Банк',
            'ФУ + Целевой + Банк','ИТОГО']
@@ -94,8 +95,8 @@ def snapshot_7cats(cli_ids):
         sub = g.loc[mask]
         return [
             int(len(sub)),
-            float(sub['vol_fu'].sum()),
             float(sub['vol_target'].sum()),
+            float(sub['vol_fu'].sum()),
             float(sub['vol_bank'].sum()),
         ]
 
@@ -130,11 +131,11 @@ months = pd.period_range(start=COHORT_FROM.to_period('M'),
 month_pretty = {1:'январь',2:'февраль',3:'март',4:'апрель',5:'май',6:'июнь',
                 7:'июль',8:'август',9:'сентябрь',10:'октябрь',11:'ноябрь',12:'декабрь'}
 
-# ===== ФАЙЛ 1 (детальный) =====
+# ===== ФАЙЛ 1: детальный =====
 detail_rows = []
-detail_cols = ['Заголовок/Категория','Клиентов','Объем ФУ','Объем Целевые','Объем Банк']
+detail_cols  = ['Заголовок/Категория','Клиентов','Объем Целевые','Объем ФУ','Объем Банк']
 
-# ===== ФАЙЛ 2 (wide) =====
+# ===== ФАЙЛ 2: wide =====
 monthly_data = {}
 
 for p in months:
@@ -158,15 +159,18 @@ for p in months:
 
     # — Детальный файл
     detail_rows.append([f'Новые клиенты (первый вход = ФУ) {p.strftime("%Y-%m")}',
-                        entered_cnt, entered_fu_vol, '', ''])
+                        entered_cnt, '', '', ''])
     for idx, row in snap7.iterrows():
         detail_rows.append([
-            idx,
-            int(row['Клиентов']),
-            float(row['Объем ФУ']),
+            idx, int(row['Клиентов']),
             float(row['Объем Целевые']),
+            float(row['Объем ФУ']),
             float(row['Объем Банк']),
         ])
+    detail_rows.append([
+        '(объем ФУ-договоров, открытых этими клиентами в месяце)',
+        '', '', float(entered_fu_vol), ''
+    ])
     detail_rows.extend([['','','','',''], ['','','','','']])
 
     # — Wide файл
