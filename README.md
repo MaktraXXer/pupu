@@ -1,20 +1,43 @@
-DECLARE @dt_rep       date        = '2025-10-10';
-DECLARE @cur          varchar(3)  = '810';
+Да, понял задачу. Ниже даю готовые T-SQL скрипты под ваш кейс — один «основной» (без исключения маркетов), и второй — фильтр только «маркетов», чтобы посмотреть их структуру. Оба скрипта:
+	•	Берут один снимок баланса на 2025-10-18 (@dt_rep).
+	•	Считают дневные объёмы новых сделок (без накопительного итога) по dt_open с 2025-10-01 по 2025-10-18.
+	•	Делают маппинг срочности по вашему правилу.
+	•	В строках дают «срочности» + отдельную строку 91 РК (только трёхмесячные по рекламным ставкам), в столбцах — даты (динамический PIVOT).
+	•	Логика РК-ставок для 91 дня меняется с 16.10:
+— 01–15.10: AT_THE_END ∈ {0.165, 0.163}, NOT_AT_THE_END ∈ {0.162, 0.160}
+— 16–18.10: AT_THE_END ∈ {0.170, 0.168}, NOT_AT_THE_END ∈ {0.167, 0.165}
+	•	Дедуп по договору в день открытия (агрегация по con_id).
+
+⸻
+
+Скрипт A — все сделки (маркет не исключаем), плюс строка «91 РК»
+
+/* =============================== *
+   ПАРАМЕТРЫ
+*  =============================== */
+DECLARE @dt_rep       date         = '2025-10-18';        -- один снимок баланса
+DECLARE @date_from    date         = '2025-10-01';
+DECLARE @date_to      date         = '2025-10-18';
+DECLARE @cur          varchar(3)   = '810';
 DECLARE @section_name nvarchar(50) = N'Срочные';
 DECLARE @block_name   nvarchar(100)= N'Привлечение ФЛ';
 DECLARE @acc_role     nvarchar(10) = N'LIAB';
 DECLARE @od_only      bit          = 1;
- 
--- Расширенный набор РК-ставок
-DECLARE @rate_AT_THE_END TABLE (r decimal(9,6)); 
-INSERT INTO @rate_AT_THE_END VALUES (0.165), (0.163);
- 
-DECLARE @rate_NOT_AT_THE_END TABLE (r decimal(9,6)); 
-INSERT INTO @rate_NOT_AT_THE_END VALUES (0.162), (0.160);
- 
-DECLARE @month_start date = DATEFROMPARTS(YEAR(@dt_rep), MONTH(@dt_rep), 1);
- 
-;WITH base AS (
+
+/* ——— РК-ставки: октябрь разбит на 2 периода ——— */
+DECLARE @rate_old_AT_THE_END       TABLE (r decimal(9,6)); INSERT INTO @rate_old_AT_THE_END       VALUES (0.165),(0.163);  -- 01–15.10
+DECLARE @rate_old_NOT_AT_THE_END   TABLE (r decimal(9,6)); INSERT INTO @rate_old_NOT_AT_THE_END   VALUES (0.162),(0.160);
+DECLARE @rate_new_AT_THE_END       TABLE (r decimal(9,6)); INSERT INTO @rate_new_AT_THE_END       VALUES (0.170),(0.168);  -- 16–18.10
+DECLARE @rate_new_NOT_AT_THE_END   TABLE (r decimal(9,6)); INSERT INTO @rate_new_NOT_AT_THE_END   VALUES (0.167),(0.165);
+
+DECLARE @rk_switch_from date = '2025-10-16';   -- дата смены рекламных ставок (включительно)
+
+IF OBJECT_ID('tempdb..#tall') IS NOT NULL DROP TABLE #tall;
+
+/* =============================== *
+   ОСНОВНАЯ БАЗА: один снимок, окно открытий
+*  =============================== */
+WITH base AS (
     SELECT
         CAST(t.dt_open AS date) AS dt_open_d,
         t.con_id,
@@ -23,286 +46,283 @@ DECLARE @month_start date = DATEFROMPARTS(YEAR(@dt_rep), MONTH(@dt_rep), 1);
         t.rate_con,
         t.conv,
         t.termdays
-    FROM ALM.ALM.VW_Balance_Rest_All AS t WITH (NOLOCK)
+    FROM ALM.ALM.VW_Balance_Rest_All t WITH (NOLOCK)
     WHERE
-        t.dt_rep = @dt_rep
+        t.dt_rep       = @dt_rep
         AND t.section_name = @section_name
         AND t.block_name   = @block_name
         AND (@od_only = 0 OR t.od_flag = 1)
-        AND t.cur = @cur
-        AND t.acc_role = @acc_role
+        AND t.cur          = @cur
+        AND t.acc_role     = @acc_role
         AND t.out_rub IS NOT NULL
         AND t.out_rub >= 0
-        AND t.dt_open >= @month_start
-        AND t.dt_open <= @dt_rep
-        AND t.termdays BETWEEN 80 AND 100
+        AND t.dt_open BETWEEN @date_from AND @date_to
 ),
-filt AS (
-    SELECT *
-    FROM base b
-    WHERE b.conv = 'AT_THE_END'
-      AND b.rate_con IN (SELECT r FROM @rate_AT_THE_END)
- 
+/* Дедуп по договору на дату открытия */
+by_con AS (
+    SELECT
+        dt_open_d,
+        con_id,
+        MIN(cli_id)  AS cli_id,
+        SUM(out_rub) AS out_rub,
+        MIN(rate_con) AS rate_con,             -- ставка на договор (если несколько строк)
+        MIN(conv)     AS conv,
+        MIN(termdays) AS termdays
+    FROM base
+    GROUP BY dt_open_d, con_id
+),
+/* Маппинг срочности */
+mapped AS (
+    SELECT
+        dt_open_d,
+        con_id,
+        cli_id,
+        out_rub,
+        rate_con,
+        conv,
+        CASE
+            WHEN (termdays>=28  AND termdays<=33)   THEN 31
+            WHEN (termdays>=60  AND termdays<=70)   THEN 61
+            WHEN (termdays>=80  AND termdays<=100)  THEN 91
+            WHEN (termdays>=119 AND termdays<=140)  THEN 124
+            WHEN (termdays>=175 AND termdays<=200)  THEN 181
+            WHEN (termdays>=245 AND termdays<=290)  THEN 274
+            WHEN (termdays>=340 AND termdays<=405)  THEN 365
+            WHEN (termdays>=540 AND termdays<=621)  THEN 550
+            WHEN (termdays>=720 AND termdays<=763)  THEN 750
+            WHEN (termdays>=1090 AND termdays<=1140) THEN 1100
+            WHEN (termdays>=1450 AND termdays<=1475) THEN 1460
+            WHEN (termdays>=1795 AND termdays<=1830) THEN 1825
+            ELSE termdays
+        END AS term_bucket
+    FROM by_con
+),
+/* Флаг «91 РК»: только 91-дневные и только если ставка попадает в набор РК, причём набор зависит от даты открытия */
+flag_91rk AS (
+    SELECT
+        m.*,
+        CASE
+            WHEN m.term_bucket = 91 AND m.conv = 'AT_THE_END' AND m.dt_open_d <  @rk_switch_from AND m.rate_con IN (SELECT r FROM @rate_old_AT_THE_END)     THEN 1
+            WHEN m.term_bucket = 91 AND (m.conv <> 'AT_THE_END')            AND m.dt_open_d <  @rk_switch_from AND m.rate_con IN (SELECT r FROM @rate_old_NOT_AT_THE_END) THEN 1
+
+            WHEN m.term_bucket = 91 AND m.conv = 'AT_THE_END' AND m.dt_open_d >= @rk_switch_from AND m.rate_con IN (SELECT r FROM @rate_new_AT_THE_END)     THEN 1
+            WHEN m.term_bucket = 91 AND (m.conv <> 'AT_THE_END')            AND m.dt_open_d >= @rk_switch_from AND m.rate_con IN (SELECT r FROM @rate_new_NOT_AT_THE_END) THEN 1
+            ELSE 0
+        END AS is_91_rk
+    FROM mapped m
+),
+/* Высота (tall): одна строка = [СтрокаОтчёта, Дата, Объём]
+   — строкаОтчёта = <числовая срочность> ИЛИ специальная строка '91 РК' */
+tall AS (
+    /* обычные срочности (в т.ч. 91 общий) */
+    SELECT
+        CAST(flag_91rk.term_bucket AS nvarchar(20)) AS row_label,
+        flag_91rk.dt_open_d AS col_date,
+        SUM(flag_91rk.out_rub) AS out_rub
+    FROM flag_91rk
+    GROUP BY flag_91rk.term_bucket, flag_91rk.dt_open_d
+
     UNION ALL
- 
-    SELECT *
-    FROM base b
-    WHERE b.conv <> 'AT_THE_END'
-      AND b.rate_con IN (SELECT r FROM @rate_NOT_AT_THE_END)
+
+    /* специальная строка только по 91 РК */
+    SELECT
+        N'91 РК' AS row_label,
+        f.dt_open_d AS col_date,
+        SUM(f.out_rub) AS out_rub
+    FROM flag_91rk f
+    WHERE f.term_bucket = 91 AND f.is_91_rk = 1
+    GROUP BY f.dt_open_d
+)
+SELECT *
+INTO #tall
+FROM tall;
+
+/* =============================== *
+   ДИНАМИЧЕСКИЙ PIVOT: даты — по столбцам
+*  =============================== */
+DECLARE @cols nvarchar(max) =
+    STUFF((
+        SELECT DISTINCT ', ' + QUOTENAME(CONVERT(varchar(10), col_date, 120))
+        FROM #tall
+        ORDER BY ', ' + QUOTENAME(CONVERT(varchar(10), col_date, 120))
+        FOR XML PATH(''), TYPE
+    ).value('.', 'nvarchar(max)'), 1, 2, '');
+
+DECLARE @sql nvarchar(max) = N'
+SELECT row_label, ' + @cols + N'
+FROM (
+    SELECT row_label,
+           CONVERT(varchar(10), col_date, 120) AS col_date,
+           out_rub
+    FROM #tall
+) s
+PIVOT (
+    SUM(out_rub) FOR col_date IN (' + @cols + N')
+) p
+ORDER BY
+    CASE WHEN row_label = N''91 РК'' THEN 999999 ELSE TRY_CONVERT(int, row_label) END, row_label;';
+
+EXEC sp_executesql @sql;
+
+Что получите: таблицу, где строки — «31, 61, 91, 124, …, 1825, 91 РК», а столбцы — даты 2025-10-01..18; в ячейках — объёмы новых открытий (по out_rub) на соответствующую дату. Строка 91 РК содержит только «трёхмесячные» сделки, удовлетворяющие рекламным ставкам с учётом смены ставок 16.10.
+
+⸻
+
+Скрипт B — только «маркет»-продукты (для анализа структуры маркетов)
+
+/* Те же параметры, тот же снимок и окно дат */
+DECLARE @dt_rep       date         = '2025-10-18';
+DECLARE @date_from    date         = '2025-10-01';
+DECLARE @date_to      date         = '2025-10-18';
+DECLARE @cur          varchar(3)   = '810';
+DECLARE @section_name nvarchar(50) = N'Срочные';
+DECLARE @block_name   nvarchar(100)= N'Привлечение ФЛ';
+DECLARE @acc_role     nvarchar(10) = N'LIAB';
+DECLARE @od_only      bit          = 1;
+
+DECLARE @rate_old_AT_THE_END       TABLE (r decimal(9,6)); INSERT INTO @rate_old_AT_THE_END       VALUES (0.165),(0.163);
+DECLARE @rate_old_NOT_AT_THE_END   TABLE (r decimal(9,6)); INSERT INTO @rate_old_NOT_AT_THE_END   VALUES (0.162),(0.160);
+DECLARE @rate_new_AT_THE_END       TABLE (r decimal(9,6)); INSERT INTO @rate_new_AT_THE_END       VALUES (0.170),(0.168);
+DECLARE @rate_new_NOT_AT_THE_END   TABLE (r decimal(9,6)); INSERT INTO @rate_new_NOT_AT_THE_END   VALUES (0.167),(0.165);
+
+DECLARE @rk_switch_from date = '2025-10-16';
+
+IF OBJECT_ID('tempdb..#tall_mrk') IS NOT NULL DROP TABLE #tall_mrk;
+
+/* Набор маркет-продуктов (как у вас в примерах) */
+DECLARE @market TABLE (name nvarchar(100));
+INSERT INTO @market(name) VALUES
+ (N'Надёжный прайм'), (N'Надёжный VIP'), (N'Надёжный премиум'),
+ (N'Надёжный промо'), (N'Надёжный старт'),
+ (N'Надёжный Т2'), (N'Надёжный T2'),
+ (N'Надёжный Мегафон'), (N'Надёжный процент'),
+ (N'Надёжный'), (N'ДОМа надёжно'), (N'Всё в ДОМ');
+
+WITH base AS (
+    SELECT
+        CAST(t.dt_open AS date) AS dt_open_d,
+        t.con_id,
+        t.cli_id,
+        t.out_rub,
+        t.rate_con,
+        t.conv,
+        t.termdays,
+        t.prod_name_res
+    FROM ALM.ALM.VW_Balance_Rest_All t WITH (NOLOCK)
+    WHERE
+        t.dt_rep       = @dt_rep
+        AND t.section_name = @section_name
+        AND t.block_name   = @block_name
+        AND (@od_only = 0 OR t.od_flag = 1)
+        AND t.cur          = @cur
+        AND t.acc_role     = @acc_role
+        AND t.out_rub IS NOT NULL
+        AND t.out_rub >= 0
+        AND t.dt_open BETWEEN @date_from AND @date_to
+        AND EXISTS (SELECT 1 FROM @market m WHERE m.name = t.prod_name_res)  -- только маркеты
 ),
 by_con AS (
-    SELECT dt_open_d, con_id, MIN(cli_id) AS cli_id, SUM(out_rub) AS out_rub
-    FROM filt
-    GROUP BY dt_open_d, con_id
-),
-cal AS (
-    SELECT TOP (DATEDIFF(DAY, @month_start, @dt_rep) + 1)
-           DATEADD(DAY, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1, @month_start) AS open_date
-    FROM master..spt_values
-)
-SELECT
-    c.open_date,
-    COUNT(DISTINCT b.con_id)  AS cnt_deposits_cum,
-    COUNT(DISTINCT b.cli_id)  AS cnt_cli_cum,
-    SUM(b.out_rub)            AS sum_out_rub_cum,
-    CAST(SUM(b.out_rub) / 1e9 AS decimal(18,6)) AS sum_out_rub_cum_bln
-FROM cal c
-LEFT JOIN by_con b ON b.dt_open_d <= c.open_date
-GROUP BY c.open_date
-ORDER BY c.open_date;
- 
-Вот мой скрипт где я выделял накопительным итогом выделял обьемы по ставке РК – там прописано какая именно ставка
- 
- 
-Ниже второй скрипт где я беру и исключаю сделки которые попали в выгрузку 1! Важно именно так исключать! – и вывожу динамику с накопительным итогом но только по вкладам не маркетов ( не из списка)
-/* === ПАРАМЕТРЫ (как в скрипте 1) === */
-DECLARE @dt_rep       date         = '2025-10-10';
-DECLARE @cur          varchar(3)   = '810';
-DECLARE @section_name nvarchar(50) = N'Срочные';
-DECLARE @block_name   nvarchar(100)= N'Привлечение ФЛ';
-DECLARE @acc_role     nvarchar(10) = N'LIAB';
-DECLARE @od_only      bit          = 1;
- 
--- РК-ставки (как в скрипте 1) — только для построения множества rk_ids
-DECLARE @rate_AT_THE_END TABLE (r decimal(9,6));  INSERT INTO @rate_AT_THE_END VALUES (0.165),(0.163);
-DECLARE @rate_NOT_AT_THE_END TABLE (r decimal(9,6));  INSERT INTO @rate_NOT_AT_THE_END VALUES (0.162),(0.160);
- 
-DECLARE @month_start date = DATEFROMPARTS(YEAR(@dt_rep), MONTH(@dt_rep), 1);
- 
-/* === Общая база за окно с начала месяца до @dt_rep === */
-WITH base AS (
-    SELECT
-        CAST(t.dt_open AS date) AS dt_open_d,
-        t.con_id,
-        t.cli_id,
-        t.out_rub,
-        t.rate_con,
-        t.conv,
-        t.prod_name_res
-    FROM ALM.ALM.VW_Balance_Rest_All AS t WITH (NOLOCK)
-    WHERE
-        t.dt_rep       = @dt_rep
-        AND t.section_name = @section_name
-        AND t.block_name   = @block_name
-        AND (@od_only = 0 OR t.od_flag = 1)
-        AND t.cur          = @cur
-        AND t.acc_role     = @acc_role
-        AND t.out_rub IS NOT NULL
-        AND t.out_rub >= 0
-        AND t.dt_open BETWEEN @month_start AND @dt_rep
-),
-/* === РК-множество из СКРИПТА 1 (строго те же правила!) === */
-rk_filt AS (
-    SELECT * FROM base b
-    WHERE b.conv = 'AT_THE_END'
-      AND b.rate_con IN (SELECT r FROM @rate_AT_THE_END)
-    UNION ALL
-    SELECT * FROM base b
-    WHERE (b.conv <> 'AT_THE_END')   -- NULL не попадёт в РК
-      AND b.rate_con IN (SELECT r FROM @rate_NOT_AT_THE_END)
-),
-rk_ids AS (    -- distinct договоры РК
-    SELECT DISTINCT con_id FROM rk_filt
-),
-/* === НЕ-РК = base \ rk_ids (никаких условий по ставкам здесь!) === */
-nonrk_base AS (
-    SELECT b.*
-    FROM base b
-    WHERE NOT EXISTS (SELECT 1 FROM rk_ids r WHERE r.con_id = b.con_id)
-),
-/* === Скрипт 2: из НЕ-РК исключаем набор продуктов === */
-nonrk_filtered AS (
-    SELECT *
-    FROM nonrk_base
-    WHERE prod_name_res NOT IN (
-        N'Надёжный прайм', N'Надёжный VIP', N'Надёжный премиум',
-        N'Надёжный промо', N'Надёжный старт',
-        N'Надёжный Т2', N'Надёжный T2',
-        N'Надёжный Мегафон', N'Надёжный процент',
-        N'Надёжный', N'ДОМа надёжно', N'Всё в ДОМ'
-    )
-),
-by_con AS (  -- схлопываем по договору (на дату открытия)
     SELECT
         dt_open_d,
         con_id,
         MIN(cli_id)  AS cli_id,
-        SUM(out_rub) AS out_rub
-    FROM nonrk_filtered
+        SUM(out_rub) AS out_rub,
+        MIN(rate_con) AS rate_con,
+        MIN(conv)     AS conv,
+        MIN(termdays) AS termdays
+    FROM base
     GROUP BY dt_open_d, con_id
 ),
-cal AS (     -- календарь для накопительного итога
-    SELECT TOP (DATEDIFF(DAY, @month_start, @dt_rep) + 1)
-           DATEADD(DAY, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1, @month_start) AS open_date
-    FROM master..spt_values
-)
-SELECT
-    c.open_date,
-    COUNT(DISTINCT b.con_id)                    AS cnt_deposits_cum,
-    COUNT(DISTINCT b.cli_id)                    AS cnt_cli_cum,
-    SUM(b.out_rub)                              AS sum_out_rub_cum,
-    CAST(SUM(b.out_rub) / 1e9 AS decimal(18,6)) AS sum_out_rub_cum_bln
-FROM cal c
-LEFT JOIN by_con b
-       ON b.dt_open_d <= c.open_date
-GROUP BY c.open_date
-ORDER BY c.open_date;
-Ниже третий скрипт- аналогичный скрипту 2 только вклады маркетов
-/* === ПАРАМЕТРЫ (как в скрипте 1) === */
-DECLARE @dt_rep       date         = '2025-10-10';
-DECLARE @cur          varchar(3)   = '810';
-DECLARE @section_name nvarchar(50) = N'Срочные';
-DECLARE @block_name   nvarchar(100)= N'Привлечение ФЛ';
-DECLARE @acc_role     nvarchar(10) = N'LIAB';
-DECLARE @od_only      bit          = 1;
- 
--- РК-ставки (как в скрипте 1) — только для построения множества rk_ids
-DECLARE @rate_AT_THE_END TABLE (r decimal(9,6));  INSERT INTO @rate_AT_THE_END VALUES (0.165),(0.163);
-DECLARE @rate_NOT_AT_THE_END TABLE (r decimal(9,6));  INSERT INTO @rate_NOT_AT_THE_END VALUES (0.162),(0.160);
- 
-DECLARE @month_start date = DATEFROMPARTS(YEAR(@dt_rep), MONTH(@dt_rep), 1);
- 
-/* === Общая база за окно с начала месяца до @dt_rep === */
-WITH base AS (
-    SELECT
-        CAST(t.dt_open AS date) AS dt_open_d,
-        t.con_id,
-        t.cli_id,
-        t.out_rub,
-        t.rate_con,
-        t.conv,
-        t.prod_name_res
-    FROM ALM.ALM.VW_Balance_Rest_All AS t WITH (NOLOCK)
-    WHERE
-        t.dt_rep       = @dt_rep
-        AND t.section_name = @section_name
-        AND t.block_name   = @block_name
-        AND (@od_only = 0 OR t.od_flag = 1)
-        AND t.cur          = @cur
-        AND t.acc_role     = @acc_role
-        AND t.out_rub IS NOT NULL
-        AND t.out_rub >= 0
-        AND t.dt_open BETWEEN @month_start AND @dt_rep
-),
-/* === РК-множество из СКРИПТА 1 (строго те же правила!) === */
-rk_filt AS (
-    SELECT * FROM base b
-    WHERE b.conv = 'AT_THE_END'
-      AND b.rate_con IN (SELECT r FROM @rate_AT_THE_END)
-    UNION ALL
-    SELECT * FROM base b
-    WHERE (b.conv <> 'AT_THE_END')   -- NULL не попадёт в РК
-      AND b.rate_con IN (SELECT r FROM @rate_NOT_AT_THE_END)
-),
-rk_ids AS (    -- distinct договоры РК
-    SELECT DISTINCT con_id FROM rk_filt
-),
-/* === НЕ-РК = base \ rk_ids (никаких условий по ставкам здесь!) === */
-nonrk_base AS (
-    SELECT b.*
-    FROM base b
-    WHERE NOT EXISTS (SELECT 1 FROM rk_ids r WHERE r.con_id = b.con_id)
-),
-/* === Скрипт 2: из НЕ-РК исключаем набор продуктов === */
-nonrk_filtered AS (
-    SELECT *
-    FROM nonrk_base
-    WHERE prod_name_res  IN (
-        N'Надёжный прайм', N'Надёжный VIP', N'Надёжный премиум',
-        N'Надёжный промо', N'Надёжный старт',
-        N'Надёжный Т2', N'Надёжный T2',
-        N'Надёжный Мегафон', N'Надёжный процент',
-        N'Надёжный', N'ДОМа надёжно', N'Всё в ДОМ'
-    )
-),
-by_con AS (  -- схлопываем по договору (на дату открытия)
+mapped AS (
     SELECT
         dt_open_d,
         con_id,
-        MIN(cli_id)  AS cli_id,
-        SUM(out_rub) AS out_rub
-    FROM nonrk_filtered
-    GROUP BY dt_open_d, con_id
+        cli_id,
+        out_rub,
+        rate_con,
+        conv,
+        CASE
+            WHEN (termdays>=28  AND termdays<=33)   THEN 31
+            WHEN (termdays>=60  AND termdays<=70)   THEN 61
+            WHEN (termdays>=80  AND termdays<=100)  THEN 91
+            WHEN (termdays>=119 AND termdays<=140)  THEN 124
+            WHEN (termdays>=175 AND termdays<=200)  THEN 181
+            WHEN (termdays>=245 AND termdays<=290)  THEN 274
+            WHEN (termdays>=340 AND termdays<=405)  THEN 365
+            WHEN (termdays>=540 AND termdays<=621)  THEN 550
+            WHEN (termdays>=720 AND termdays<=763)  THEN 750
+            WHEN (termdays>=1090 AND termdays<=1140) THEN 1100
+            WHEN (termdays>=1450 AND termdays<=1475) THEN 1460
+            WHEN (termdays>=1795 AND termdays<=1830) THEN 1825
+            ELSE termdays
+        END AS term_bucket
+    FROM by_con
 ),
-cal AS (     -- календарь для накопительного итога
-    SELECT TOP (DATEDIFF(DAY, @month_start, @dt_rep) + 1)
-           DATEADD(DAY, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1, @month_start) AS open_date
-    FROM master..spt_values
+flag_91rk AS (
+    SELECT
+        m.*,
+        CASE
+            WHEN m.term_bucket = 91 AND m.conv = 'AT_THE_END' AND m.dt_open_d <  @rk_switch_from AND m.rate_con IN (SELECT r FROM @rate_old_AT_THE_END)     THEN 1
+            WHEN m.term_bucket = 91 AND (m.conv <> 'AT_THE_END')            AND m.dt_open_d <  @rk_switch_from AND m.rate_con IN (SELECT r FROM @rate_old_NOT_AT_THE_END) THEN 1
+
+            WHEN m.term_bucket = 91 AND m.conv = 'AT_THE_END' AND m.dt_open_d >= @rk_switch_from AND m.rate_con IN (SELECT r FROM @rate_new_AT_THE_END)     THEN 1
+            WHEN m.term_bucket = 91 AND (m.conv <> 'AT_THE_END')            AND m.dt_open_d >= @rk_switch_from AND m.rate_con IN (SELECT r FROM @rate_new_NOT_AT_THE_END) THEN 1
+            ELSE 0
+        END AS is_91_rk
+    FROM mapped m
+),
+tall AS (
+    SELECT CAST(term_bucket AS nvarchar(20)) AS row_label,
+           dt_open_d AS col_date,
+           SUM(out_rub) AS out_rub
+    FROM flag_91rk
+    GROUP BY term_bucket, dt_open_d
+
+    UNION ALL
+
+    SELECT N'91 РК' AS row_label,
+           f.dt_open_d AS col_date,
+           SUM(f.out_rub) AS out_rub
+    FROM flag_91rk f
+    WHERE f.term_bucket = 91 AND f.is_91_rk = 1
+    GROUP BY f.dt_open_d
 )
-SELECT
-    c.open_date,
-    COUNT(DISTINCT b.con_id)                    AS cnt_deposits_cum,
-    COUNT(DISTINCT b.cli_id)                    AS cnt_cli_cum,
-    SUM(b.out_rub)                              AS sum_out_rub_cum,
-    CAST(SUM(b.out_rub) / 1e9 AS decimal(18,6)) AS sum_out_rub_cum_bln
-FROM cal c
-LEFT JOIN by_con b
-       ON b.dt_open_d <= c.open_date
-GROUP BY c.open_date
-ORDER BY c.open_date;
- 
- 
-Что требуется!
- 
-Мне нужен объем нового привлечения по срокам с 16.10. по 18.10
-12:12
-с разрезе сроков
-12:12
-На 3 мес. выделить объем по ставке РК,
- 
-Как мы это будем делать:
-Будем брать снимок баланса на 18.10.2025
-ЗАПОМНИМ что с 1 октября по 15 октября включительно рекламные ставки на 3 месяца были такими как в коде
-DECLARE @rate_AT_THE_END TABLE (r decimal(9,6)); 
-INSERT INTO @rate_AT_THE_END VALUES (0.165), (0.163);
- 
-DECLARE @rate_NOT_AT_THE_END TABLE (r decimal(9,6)); 
-INSERT INTO @rate_NOT_AT_THE_END VALUES (0.162), (0.160);
-НО С 16 октября ставки рекламные другие стали!
-INSERT INTO @rate_AT_THE_END VALUES (0.170), (0.168);
-INSERT INTO @rate_NOT_AT_THE_END VALUES (0.167), (0.165);
- 
- 
-Напоминаю тебе маппинг срочности сделок
- 
- 
-       when (termdays>=28 and termdays<=33) then 31
-       when (termdays>=60 and termdays<=70) then 61
-       when (termdays>=80 and termdays<=100) then 91
-       when (termdays>=119 and termdays<=140) then 124
-       when (termdays>=175 and termdays<=200) then 181
-       when (termdays>=245 and termdays<=290) then 274
-       when (termdays>=340 and termdays<=405) then 365
-       when (termdays>=540 and termdays<=621) then 550
-       when (termdays>=720 and termdays<=763) then 750
-       when (termdays>=1090 and termdays<=1140) then 1100
-       when (termdays>=1450 and termdays<=1475) then 1460
-       when (termdays>=1795 and termdays<=1830) then 1825
-          ELSE termdays
-      END AS [Срок, дн.],
- 
-Нас интересует обьем открытых сделок пожалуй с 1 октября где мы как в скриптах 1-3 берем баланс снимок его и разбиваем сделки- но за каждый день ОБЬЕМЫ НОВЫХ СДЕЛОК! Без накопительного итога
-Будем так выводить – ты просто в стольцаз даты в строках получаемые срочности + срочность “91 РК”
-Исключать маркеты не будем но ты мне сделаешь аналогичный второй скрипт где я посмотрю структуру распределения маркетов
- 
-Жду от тебя кода ты понял задачу?
+SELECT *
+INTO #tall_mrk
+FROM tall;
+
+/* Динамический PIVOT по датам */
+DECLARE @cols_m nvarchar(max) =
+    STUFF((
+        SELECT DISTINCT ', ' + QUOTENAME(CONVERT(varchar(10), col_date, 120))
+        FROM #tall_mrk
+        ORDER BY ', ' + QUOTENAME(CONVERT(varchar(10), col_date, 120))
+        FOR XML PATH(''), TYPE
+    ).value('.', 'nvarchar(max)'), 1, 2, '');
+
+DECLARE @sql_m nvarchar(max) = N'
+SELECT row_label, ' + @cols_m + N'
+FROM (
+    SELECT row_label,
+           CONVERT(varchar(10), col_date, 120) AS col_date,
+           out_rub
+    FROM #tall_mrk
+) s
+PIVOT (
+    SUM(out_rub) FOR col_date IN (' + @cols_m + N')
+) p
+ORDER BY
+    CASE WHEN row_label = N''91 РК'' THEN 999999 ELSE TRY_CONVERT(int, row_label) END, row_label;';
+
+EXEC sp_executesql @sql_m;
+
+
+⸻
+
+Примечания и нюансы
+	•	NULL conv в РК не учитываем (как в ваших прежних правилах): в проверках стоит m.conv = 'AT_THE_END' и (m.conv <> 'AT_THE_END'), так что NULL в РК не попадёт и уйдёт в «обычные 91».
+	•	Если хотите видеть ноль для дат/строк без сделок: текущий PIVOT вернёт NULL, можно оборачивать в ISNULL на чтении результата, либо пост-процессингом в отчёте.
+	•	Если нужно отдельное «Итого» по строкам/датам — скажите, добавлю вторым UNION ALL.
+	•	Список «маркетов» взял из ваших примеров. Если он расширяется — просто добавьте значения в @market.
+
+Если хочешь, сделаю ещё третий маленький запрос-проверку: в разрезе дат 01–18.10 вывести сколько 91-дневных попало в РК-наборы старые/новые отдельно — для быстрой валидации смены ставок с 16.10.
