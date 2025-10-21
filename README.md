@@ -1,23 +1,38 @@
 # -*- coding: utf-8 -*-
 """
-STEP 1 — интерактивная маркировка нерепрезентативных зон (без удаления данных)
-и сохранение «обрезанных» графиков + бета-параметров + сводного графика
-+ ОДНА ДОП. ЭКСЕЛЬКА с двумя таблицами:
-    • od_by_incentive_age — разбивка OD по (Incentive × LoanAge)
-    • model_cpr_by_incentive_age — модельный CPR по (Incentive × LoanAge), посчитанный из бета
+Оценка и сравнение S-кривых на панельных данных + (опция) OOS 90/10.
 
-Важно для таблиц:
-    • Сетка Incentive берётся от min до max с шагом = медианный шаг по данным (если не получилось — 0.1).
-    • Колонки LoanAge = все целые от min до max встречающихся возрастов.
-    • Пустые ячейки остаются пустыми (NaN). Расчёт идёт по всем данным/кривым, БЕЗ учёта ручных ограничений.
+Вход:
+  • dataset_path: Excel с колонками [Incentive, LoanAge, TotalDebtBln, CPR]
+      - CPR может быть строкой с %, будет распарсено.
+  • betas_ref_path: Excel с эталонными бетами: [LoanAge, b0..b6] (имена колонок как указано).
+  • out_root: куда писать результаты. Имя подпапки берётся из имени входного файла.
+
+Выходные файлы/папки:
+  charts/
+    - age_<h>.png                — по каждому LoanAge: OD-гистограмма, точки, 2 кривые (наша/эталон), RMSE/MAPE
+    - all_ages_curves_and_volumes.png  — сводный: стек-OD + 2 набора кривых (сплошные наша, пунктир эталон)
+  plot_data/
+    - age_<h>_plotdata.xlsx      — всё, что на графике по возрасту (точки + предсказания)
+  betas_compare.xlsx             — наши беты, эталонные и side-by-side
+  errors_summary.xlsx            — RMSE/MAPE по возрастам + строка ALL (взвешено OD), как в шаге 2
+  errors_detail.xlsx             — деталка по (LoanAge × Incentive) с SE/APE для обеих моделей
+  panel_long.xlsx                — длинная панель: факт, обе модели, SE/APE; удобно для сводного анализа
+
+Опционально (если вызвать run_oos_cv_from_panel):
+  oos/results_iter.xlsx          — ошибки на каждой итерации 90/10
+  oos/summary.xlsx               — средние/стд по итерациям (по age и ALL)
+  oos/hist_rmse_model.png/.csv   — гистограмма RMSE (модель) по всем итерациям (агрегировано)
+  oos/hist_rmse_ref.png/.csv     — гистограмма RMSE (эталон) по всем итерациям (агрегировано)
 """
 
 import os
+import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.optimize import minimize
 from datetime import datetime
+from scipy.optimize import minimize
 import warnings
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -29,6 +44,24 @@ plt.rcParams["axes.formatter.useoffset"] = False
 def _ensure_dir(p: str) -> str:
     os.makedirs(p, exist_ok=True)
     return p
+
+
+def _parse_percent_like(x):
+    """Парсит CPR, если это строка вида '5.2%' или '0,052' и т.п."""
+    if pd.isna(x):
+        return np.nan
+    if isinstance(x, (int, float, np.floating)):
+        return float(x)
+    s = str(x).strip().replace(",", ".")
+    if s.endswith("%"):
+        try:
+            return float(s[:-1]) / 100.0
+        except Exception:
+            return np.nan
+    try:
+        return float(s)
+    except Exception:
+        return np.nan
 
 
 def _f_from_betas(b, x):
@@ -44,6 +77,7 @@ def _fit_arctan_unconstrained(x, y, w,
                               start=(0.2, 0.05, -2.0, 2.2, 0.07, 2.0, 0.2)):
     x, y, w = np.asarray(x, float), np.asarray(y, float), np.asarray(w, float)
     if len(x) < 5:
+        # вернём NaN-ы — график просто не нарисует кривую
         return np.array([np.nan] * 7), np.nan, np.nan
 
     w = np.where(np.isfinite(w) & (w > 0), w, 0.0)
@@ -70,313 +104,211 @@ def _fit_arctan_unconstrained(x, y, w,
     return res.x, mse, r2
 
 
-def _aggregate_points(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """Агрегируем договоры в точки (LoanAge × Incentive) c CPR и весом."""
-    df = df_raw[(df_raw["stimul"].notna()) &
-                (pd.to_numeric(df_raw["refin_rate"], errors="coerce") > 0) &
-                (pd.to_numeric(df_raw["con_rate"], errors="coerce") > 0)].copy()
-
-    grp = df.groupby(["age_group_id", "stimul"], as_index=False).agg(
-        premat_sum=("premat_payment", "sum"),
-        od_sum=("od_after_plan", "sum")
-    )
-    cpr = np.where(
-        grp["od_sum"] <= 0, 0.0,
-        1.0 - np.power(1.0 - (grp["premat_sum"] / grp["od_sum"]), 12.0)
-    )
-
-    pts = pd.DataFrame({
-        "LoanAge": pd.to_numeric(grp["age_group_id"], errors="coerce").astype("Int64"),
-        "Incentive": pd.to_numeric(grp["stimul"], errors="coerce"),
-        "CPR": cpr,
-        "TotalDebtBln": grp["od_sum"] / 1e9
-    }).dropna(subset=["LoanAge", "Incentive", "CPR", "TotalDebtBln"])
-    pts = pts[pts["TotalDebtBln"] > 0]
-    return pts.reset_index(drop=True)
+def _weighted_rmse(y_true, y_pred, w):
+    y_true, y_pred, w = map(np.asarray, (y_true, y_pred, w))
+    m = np.isfinite(y_true) & np.isfinite(y_pred) & np.isfinite(w) & (w > 0)
+    if not m.any():
+        return np.nan
+    mse = np.sum(w[m] * (y_true[m] - y_pred[m]) ** 2) / np.sum(w[m])
+    return float(np.sqrt(mse))
 
 
-def _parse_range(rule: str):
-    rule = rule.strip()
-    if not rule:
-        return None
-    if rule.startswith("<"):
-        hi = float(rule[1:])
-        return (-np.inf, hi)
-    if rule.startswith(">"):
-        lo = float(rule[1:])
-        return (lo, np.inf)
-    if ".." in rule:
-        a, b = rule.split("..")
-        return (float(a), float(b))
-    return None
-
-
-def _merge_intervals(intervals):
-    if not intervals:
-        return []
-    xs = sorted((float(lo), float(hi)) for lo, hi in intervals)
-    merged = [xs[0]]
-    for lo, hi in xs[1:]:
-        last_lo, last_hi = merged[-1]
-        if lo <= last_hi:
-            merged[-1] = (last_lo, max(last_hi, hi))
-        else:
-            merged.append((lo, hi))
-    return merged
-
-
-def _complement_intervals(base_lo, base_hi, excluded):
-    if base_lo >= base_hi:
-        return []
-    if not excluded:
-        return [(base_lo, base_hi)]
-
-    clipped = []
-    for lo, hi in excluded:
-        if hi < base_lo or lo > base_hi:
-            continue
-        clipped.append((max(lo, base_lo), min(hi, base_hi)))
-    exc = _merge_intervals(clipped)
-    if not exc:
-        return [(base_lo, base_hi)]
-
-    allowed = []
-    cur = base_lo
-    for lo, hi in exc:
-        if lo > cur:
-            allowed.append((cur, lo))
-        cur = max(cur, hi)
-    if cur < base_hi:
-        allowed.append((cur, base_hi))
-    return allowed
-
-
-def _show_age_plot_cut(pts_h: pd.DataFrame, h: int, b, allowed_ranges, step_hint=None, show=True):
-    """
-    Рисует график с ОБРЕЗКОЙ вне allowed_ranges.
-    «Жирные» точки — размер и толщина обводки масштабируются объёмом OD.
-    Кривая — оранжевая.
-    """
-    fig, axL = plt.subplots(figsize=(10, 6))
-    axR = axL.twinx()
-
-    axL.grid(ls="--", alpha=0.3)
-    axL.set_xlabel("Incentive, п.п.")
-    axL.set_ylabel("CPR, доли/год")
-    axR.set_ylabel("TotalDebtBln, млрд руб.")
-    axL.set_title(f"h={h}: S-curve (orange) • cut by ranges")
-
-    if step_hint is None:
-        uniq = np.sort(pts_h["Incentive"].unique())
-        step_hint = np.median(np.diff(uniq)) if len(uniq) > 1 else 0.25
-    barw = float(step_hint) * 0.9 if (step_hint and np.isfinite(step_hint)) else 0.2
-
-    for (lo, hi) in allowed_ranges:
-        sub = pts_h[(pts_h["Incentive"] >= lo) & (pts_h["Incentive"] <= hi)]
-        if sub.empty:
-            continue
-        w = sub["TotalDebtBln"].to_numpy(float)
-        if np.nanmax(w) <= 0:
-            w_norm = np.zeros_like(w)
-        else:
-            w_norm = w / np.nanmax(w)
-
-        sizes = 60.0 + 340.0 * np.sqrt(np.clip(w_norm, 0, 1))
-        lws = 0.6 + 2.4 * np.clip(w_norm, 0, 1)
-
-        axL.scatter(
-            sub["Incentive"], sub["CPR"],
-            s=sizes,
-            facecolors="#1f77b4",
-            edgecolors="black",
-            linewidths=lws,
-            alpha=0.50
-        )
-
-        xg = np.linspace(sub["Incentive"].min(), sub["Incentive"].max(), 400)
-        axL.plot(xg, _f_from_betas(b, xg), color="#ff7f0e", lw=2.8)
-        axR.bar(sub["Incentive"], sub["TotalDebtBln"], width=barw,
-                color="#1f77b4", alpha=0.22, edgecolor="none")
-
-    if not pts_h.empty:
-        axL.set_xlim(float(pts_h["Incentive"].min()), float(pts_h["Incentive"].max()))
-        ymax = max(np.nanmax(pts_h["CPR"].to_numpy(float)), 0.0)
-        axL.set_ylim(0, ymax * 1.06 if ymax > 0 else 0.45)
-
-    fig.tight_layout()
-    if show:
-        plt.show()
-    return fig
+def _weighted_mape(y_true, y_pred, w):
+    y_true, y_pred, w = map(np.asarray, (y_true, y_pred, w))
+    m = np.isfinite(y_true) & np.isfinite(y_pred) & np.isfinite(w) & (w > 0) & (y_true != 0)
+    if not m.any():
+        return np.nan
+    ape = np.abs((y_true[m] - y_pred[m]) / y_true[m])
+    return float(np.sum(w[m] * ape) / np.sum(w[m]))
 
 
 def _palette(n):
-    """Возвращает n различимых цветов (tab20 по кругу)."""
     cmap = plt.get_cmap("tab20")
     return [cmap(i % 20) for i in range(n)]
 
 
-def _build_allowed_map(ages, before_summary, ignored_records):
-    """
-    Собираем словарь allowed[h] = [(lo, hi), ...] с учётом исключений.
-    Если age исключён целиком — список пустой.
-    """
-    base = {int(row["LoanAge"]): (float(row["min"]), float(row["max"]))
-            for row in before_summary}
-    exc_by_age = {}
-    excl_age = set()
-    for r in ignored_records:
-        h = int(r["LoanAge"])
-        t = r.get("Type", "")
-        if t == "exclude_age":
-            excl_age.add(h)
-        elif t == "exclude_range":
-            exc_by_age.setdefault(h, []).append((float(r["Incentive_lo"]), float(r["Incentive_hi"])))
-
-    allowed = {}
-    for h in ages:
-        if h in excl_age or h not in base:
-            allowed[h] = []
-            continue
-        lo, hi = base[h]
-        allowed[h] = _complement_intervals(lo, hi, _merge_intervals(exc_by_age.get(h, [])))
-    return allowed
+def _base_title_from_filename(path: str) -> str:
+    base = os.path.basename(path)
+    base = re.sub(r"\.xlsx?$", "", base, flags=re.IGNORECASE)
+    return base
 
 
-# ══════════════ ОСНОВНОЙ ШАГ 1 ══════════════
-def run_interactive_cut_step1(
-    df_raw_program: pd.DataFrame,
-    out_root: str,
-    program_name: str = "UNKNOWN"
+# ══════════════ ОСНОВНАЯ ФУНКЦИЯ: оценка и сравнение по панельным данным ══════════════
+def evaluate_from_panel(
+    dataset_path: str,
+    betas_ref_path: str,
+    out_root: str = r"C:\Users\mi.makhmudov\Desktop\SCurve_panel_eval",
+    program_name: str | None = None
 ):
-    pts = _aggregate_points(df_raw_program)
-    if pts.empty:
-        raise RuntimeError("Нет точек для построения после агрегации.")
+    """Основное сравнение: строим наши беты, сравниваем с эталоном, считаем ошибки, рисуем графики, сохраняем Excel."""
+    # ── входной датасет
+    df0 = pd.read_excel(dataset_path)
+    # нормализуем имена (на случай рус/англ регистра)
+    cols = {c.lower(): c for c in df0.columns}
+    need = ["incentive", "loanage", "totaldebtbln", "cpr"]
+    miss = [c for c in need if c not in [k.lower() for k in df0.columns]]
+    if miss:
+        raise KeyError(f"Нет колонок: {miss}. Ожидаю {need}")
+    df = pd.DataFrame({
+        "Incentive": pd.to_numeric(df0[cols["incentive"]], errors="coerce"),
+        "LoanAge": pd.to_numeric(df0[cols["loanage"]], errors="coerce").astype("Int64"),
+        "TotalDebtBln": pd.to_numeric(df0[cols["totaldebtbln"]], errors="coerce"),
+        "CPR": df0[cols["cpr"]].map(_parse_percent_like)
+    }).dropna(subset=["Incentive", "LoanAge", "TotalDebtBln", "CPR"])
+    # если дубли по ячейкам — агрегируем
+    df = (df.groupby(["LoanAge", "Incentive"], as_index=False)
+            .agg(TotalDebtBln=("TotalDebtBln", "sum"),
+                 CPR=("CPR", "mean")))
 
-    ts_dir = _ensure_dir(os.path.join(out_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S")))
-    by_age_dir = _ensure_dir(os.path.join(ts_dir, "by_age"))
+    # ── программа/папки
+    base_title = _base_title_from_filename(dataset_path)
+    title = program_name or base_title
+    ts_dir = _ensure_dir(os.path.join(out_root, f"{base_title}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"))
+    charts_dir = _ensure_dir(os.path.join(ts_dir, "charts"))
+    plotdata_dir = _ensure_dir(os.path.join(ts_dir, "plot_data"))
 
-    ignored_records = []
-    before_summary = []
-    after_summary = []
-    beta_records = []
+    # ── эталонные беты
+    betas_ref = pd.read_excel(betas_ref_path)
+    # допускаем, что в файле колонки могут быть [LoanAge, b0..b6] или с лишними колонками
+    if not set(["LoanAge", "b0", "b1", "b2", "b3", "b4", "b5", "b6"]).issubset(betas_ref.columns):
+        raise KeyError("В эталонном файле нужны колонки: LoanAge, b0..b6")
+    betas_ref = betas_ref[["LoanAge", "b0", "b1", "b2", "b3", "b4", "b5", "b6"]].copy()
+    betas_ref["LoanAge"] = pd.to_numeric(betas_ref["LoanAge"], errors="coerce").astype("Int64")
 
-    ages = sorted(pts["LoanAge"].dropna().unique().astype(int).tolist())
+    ages = sorted(df["LoanAge"].dropna().unique().astype(int).tolist())
+    colors = {h: c for h, c in zip(ages, _palette(len(ages)))}
 
+    # ── наши беты по панельным данным
+    my_betas_rows = []
     for h in ages:
-        pts_h = pts[pts["LoanAge"] == h].copy()
-        if pts_h.empty:
+        sub = df[df["LoanAge"] == h]
+        b, mse, r2 = _fit_arctan_unconstrained(sub["Incentive"], sub["CPR"], sub["TotalDebtBln"])
+        my_betas_rows.append({"LoanAge": h, "b0": b[0], "b1": b[1], "b2": b[2], "b3": b[3],
+                              "b4": b[4], "b5": b[5], "b6": b[6], "MSE_fit": mse, "R2_fit": r2})
+    betas_my = pd.DataFrame(my_betas_rows)
+
+    # ── side-by-side
+    betas_side = (betas_my.merge(betas_ref, on="LoanAge", suffixes=("_my", "_ref"))
+                         .sort_values("LoanAge"))
+
+    # ── длинная панель с предсказаниями/ошибками (без учёта обрезок)
+    betas_map_my = {int(r["LoanAge"]): np.array([r["b0"], r["b1"], r["b2"], r["b3"], r["b4"], r["b5"], r["b6"]], float)
+                    for _, r in betas_my.iterrows()
+                    if np.all(np.isfinite([r["b0"], r["b1"], r["b2"], r["b3"], r["b4"], r["b5"], r["b6"]]))}
+    betas_map_ref = {int(r["LoanAge"]): np.array([r["b0"], r["b1"], r["b2"], r["b3"], r["b4"], r["b5"], r["b6"]], float)
+                     for _, r in betas_ref.iterrows()
+                     if np.all(np.isfinite([r["b0"], r["b1"], r["b2"], r["b3"], r["b4"], r["b5"], r["b6"]]))}
+
+    panel = df.copy()
+    panel["CPR_model"] = panel.apply(lambda r: _f_from_betas(betas_map_my.get(int(r["LoanAge"]), np.array([np.nan]*7)), r["Incentive"]), axis=1)
+    panel["CPR_ref"]   = panel.apply(lambda r: _f_from_betas(betas_map_ref.get(int(r["LoanAge"]), np.array([np.nan]*7)), r["Incentive"]), axis=1)
+
+    # компоненты ошибок для двух моделей
+    panel["err_model"] = panel["CPR"] - panel["CPR_model"]
+    panel["err_ref"]   = panel["CPR"] - panel["CPR_ref"]
+    panel["SE_model"]  = panel["err_model"]**2
+    panel["SE_ref"]    = panel["err_ref"]**2
+    panel["APE_model"] = np.where(panel["CPR"] != 0, np.abs(panel["err_model"]/panel["CPR"]), np.nan)
+    panel["APE_ref"]   = np.where(panel["CPR"] != 0, np.abs(panel["err_ref"]/panel["CPR"]), np.nan)
+
+    # ── summary ошибок по возрастам + ALL (взвешено OD)
+    sum_rows = []
+    for h in ages:
+        sub = panel[panel["LoanAge"] == h]
+        rmse_m = _weighted_rmse(sub["CPR"], sub["CPR_model"], sub["TotalDebtBln"])
+        mape_m = _weighted_mape(sub["CPR"], sub["CPR_model"], sub["TotalDebtBln"])
+        rmse_r = _weighted_rmse(sub["CPR"], sub["CPR_ref"],   sub["TotalDebtBln"])
+        mape_r = _weighted_mape(sub["CPR"], sub["CPR_ref"],   sub["TotalDebtBln"])
+        sum_rows.append({"LoanAge": h,
+                         "RMSE_model": rmse_m, "MAPE_model": mape_m,
+                         "RMSE_ref": rmse_r,   "MAPE_ref": mape_r,
+                         "OD_sum": float(sub["TotalDebtBln"].sum()),
+                         "N_points": int(len(sub))})
+    # строка ALL (взвешено общим OD)
+    rmse_all_m = _weighted_rmse(panel["CPR"], panel["CPR_model"], panel["TotalDebtBln"])
+    mape_all_m = _weighted_mape(panel["CPR"], panel["CPR_model"], panel["TotalDebtBln"])
+    rmse_all_r = _weighted_rmse(panel["CPR"], panel["CPR_ref"],   panel["TotalDebtBln"])
+    mape_all_r = _weighted_mape(panel["CPR"], panel["CPR_ref"],   panel["TotalDebtBln"])
+    sum_rows.append({"LoanAge": "ALL",
+                     "RMSE_model": rmse_all_m, "MAPE_model": mape_all_m,
+                     "RMSE_ref": rmse_all_r,   "MAPE_ref": mape_all_r,
+                     "OD_sum": float(panel["TotalDebtBln"].sum()),
+                     "N_points": int(len(panel))})
+    errors_summary = pd.DataFrame(sum_rows)
+
+    # ── деталка ошибок по (LoanAge, Incentive)
+    errors_detail = (panel[["LoanAge", "Incentive", "TotalDebtBln", "CPR",
+                            "CPR_model", "CPR_ref", "SE_model", "SE_ref",
+                            "APE_model", "APE_ref"]]
+                     .sort_values(["LoanAge", "Incentive"]))
+
+    # ── графики по каждому возрасту + данные на график (Excel)
+    for h in ages:
+        sub = panel[panel["LoanAge"] == h].copy()
+        if sub.empty:
             continue
 
-        uniq = np.sort(pts_h["Incentive"].unique())
-        step = np.median(np.diff(uniq)) if len(uniq) > 1 else np.nan
-        min_x, max_x = float(uniq.min()), float(uniq.max())
+        # для графика: шаг бина = медианный шаг стимулов
+        xs = np.sort(sub["Incentive"].unique())
+        step = float(np.median(np.diff(xs))) if len(xs) > 1 else 0.1
+        barw = 0.9 * step if np.isfinite(step) and step > 0 else 0.2
 
-        before_summary.append({
-            "LoanAge": h, "min": min_x, "max": max_x,
-            "step_med": float(step) if np.isfinite(step) else np.nan,
-            "n_bins": int(len(uniq))
-        })
+        # метрики для заголовка
+        rmse_m = float(errors_summary.loc[errors_summary["LoanAge"] == h, "RMSE_model"])
+        mape_m = float(errors_summary.loc[errors_summary["LoanAge"] == h, "MAPE_model"])
+        rmse_r = float(errors_summary.loc[errors_summary["LoanAge"] == h, "RMSE_ref"])
+        mape_r = float(errors_summary.loc[errors_summary["LoanAge"] == h, "MAPE_ref"])
 
-        # ---- фит кривой по всем данным ----
-        b, mse, r2 = _fit_arctan_unconstrained(
-            pts_h["Incentive"], pts_h["CPR"], pts_h["TotalDebtBln"])
-        beta_records.append({
-            "LoanAge": h,
-            "b0": b[0], "b1": b[1], "b2": b[2], "b3": b[3],
-            "b4": b[4], "b5": b[5], "b6": b[6],
-            "MSE_fit": mse, "R2_fit": r2,
-            "Incentive_min": min_x, "Incentive_max": max_x
-        })
+        # линии на сгущённой сетке
+        b_my = betas_map_my.get(h, None)
+        b_rf = betas_map_ref.get(h, None)
+        xg = np.linspace(float(xs.min()), float(xs.max()), 600)
+        yg_my = _f_from_betas(b_my, xg) if b_my is not None else np.full_like(xg, np.nan)
+        yg_rf = _f_from_betas(b_rf, xg) if b_rf is not None else np.full_like(xg, np.nan)
 
-        # ---- показать график и интерактив ----
-        print(f"\n=== AGE {h} ===")
-        print(f"Incentive: {min_x:.2f} → {max_x:.2f}, шаг ≈ {step:.2f}, bins={len(uniq)}")
-        _show_age_plot_cut(pts_h, h, b, allowed_ranges=[(min_x, max_x)], step_hint=step, show=True)
+        fig, axL = plt.subplots(figsize=(10.8, 6.2))
+        axR = axL.twinx()
 
-        ans = input(f"Исключить возраст h={h} полностью? (y/n): ").strip().lower()
-        if ans == "y":
-            ignored_records.append({"LoanAge": h, "Incentive_lo": min_x, "Incentive_hi": max_x,
-                                    "Inclusive": True, "Type": "exclude_age", "Reason": "manual"})
-            fig = plt.figure(figsize=(8, 3.5))
-            plt.axis("off")
-            plt.text(0.5, 0.6, f"h={h} — ИСКЛЮЧЁН из анализа",
-                     ha="center", va="center", fontsize=14, color="crimson")
-            plt.text(0.5, 0.3, f"Диапазон стимулов: {min_x:.2f}..{max_x:.2f}",
-                     ha="center", va="center", fontsize=10)
-            fig.tight_layout()
-            fig.savefig(os.path.join(by_age_dir, f"age_{h}.png"), dpi=300)
-            plt.close(fig)
-            after_summary.append({"LoanAge": h, "allowed_ranges": "— (age excluded)"})
-            continue
+        # гистограмма OD
+        axR.bar(sub["Incentive"], sub["TotalDebtBln"], width=barw, color=colors[h], alpha=0.25, edgecolor="none")
 
-        excluded_ranges = []
-        while True:
-            rule = input("Введите диапазон исключения ('<-3', '>4', '-2..3') или Enter чтобы продолжить: ").strip()
-            if not rule:
-                break
-            rng = _parse_range(rule)
-            if rng is None:
-                print("Не понял правило. Пример: <-3 | >4 | -2..3")
-                continue
-            lo, hi = rng
-            print(f"  Кандидат: исключить [{lo} .. {hi}] (включительно).")
-            conf = input("Подтвердить? (y/n): ").strip().lower()
-            if conf == "y":
-                excluded_ranges.append((lo, hi))
-                ignored_records.append({"LoanAge": h, "Incentive_lo": lo, "Incentive_hi": hi,
-                                        "Inclusive": True, "Type": "exclude_range", "Reason": "visual_cut"})
-            else:
-                print("  Отмена.")
+        # точки факта — «жирные» ∝ объёму
+        w = sub["TotalDebtBln"].to_numpy(float)
+        w_norm = w / w.max() if w.max() > 0 else w
+        sizes = 60 + 340 * np.sqrt(np.clip(w_norm, 0, 1))
+        lws = 0.6 + 2.4 * np.clip(w_norm, 0, 1)
+        axL.scatter(sub["Incentive"], sub["CPR"], s=sizes, facecolors=colors[h], edgecolors="black",
+                    linewidths=lws, alpha=0.55, label="Fact")
 
-        allowed = _complement_intervals(min_x, max_x, _merge_intervals(excluded_ranges))
-        if not allowed:
-            fig = plt.figure(figsize=(8, 3.5))
-            plt.axis("off")
-            plt.text(0.5, 0.6, f"h={h}: все стимулы исключены визуально",
-                     ha="center", va="center", fontsize=14, color="crimson")
-            plt.text(0.5, 0.3, f"Исходный диапазон: {min_x:.2f}..{max_x:.2f}",
-                     ha="center", va="center", fontsize=10)
-            fig.tight_layout()
-            fig.savefig(os.path.join(by_age_dir, f"age_{h}.png"), dpi=300)
-            plt.close(fig)
-            after_summary.append({"LoanAge": h, "allowed_ranges": "— (all cut)"})
-            continue
+        # кривые
+        if np.isfinite(yg_my).any():
+            axL.plot(xg, yg_my, color=colors[h], lw=2.6, label="Model (ours)")
+        if np.isfinite(yg_rf).any():
+            axL.plot(xg, yg_rf, color=colors[h], lw=2.2, ls="--", label="Model (ref)")
 
-        fig = _show_age_plot_cut(pts_h, h, b, allowed_ranges=allowed, step_hint=step, show=True)
-        fig.savefig(os.path.join(by_age_dir, f"age_{h}.png"), dpi=300)
+        axL.set_xlabel("Incentive, п.п.")
+        axL.set_ylabel("CPR")
+        axR.set_ylabel("TotalDebtBln, млрд руб.")
+        axL.grid(ls="--", alpha=0.35)
+        axL.set_title(f"{title} • h={h} | ours: RMSE={rmse_m:.4f}, MAPE={mape_m:.2%} • ref: RMSE={rmse_r:.4f}, MAPE={mape_r:.2%}")
+        axL.legend(loc="upper left")
+
+        fig.tight_layout()
+        fig.savefig(os.path.join(charts_dir, f"age_{h}.png"), dpi=300)
         plt.close(fig)
-        allowed_str = "; ".join([f"{a:.4g}..{b:.4g}" for a, b in allowed])
-        after_summary.append({"LoanAge": h, "allowed_ranges": allowed_str})
 
-    # ══════════════ СОХРАНЕНИЕ ОСНОВНЫХ ФАЙЛОВ ══════════════
-    pts.to_excel(os.path.join(ts_dir, "points_full.xlsx"), index=False)
-    pd.DataFrame(beta_records).to_excel(os.path.join(ts_dir, "betas_full.xlsx"), index=False)
-    pd.DataFrame(ignored_records).to_excel(os.path.join(ts_dir, "ignored_bins.xlsx"), index=False)
+        # данные на график — отдельная экселька
+        out_plot_xlsx = os.path.join(plotdata_dir, f"age_{h}_plotdata.xlsx")
+        df_plot = sub[["Incentive", "TotalDebtBln", "CPR", "CPR_model", "CPR_ref",
+                       "SE_model", "SE_ref", "APE_model", "APE_ref"]].copy()
+        with pd.ExcelWriter(out_plot_xlsx, engine="openpyxl") as xw:
+            df_plot.to_excel(xw, sheet_name="data_points", index=False)
+            pd.DataFrame({"x": xg, "y_model": yg_my, "y_ref": yg_rf}).to_excel(
+                xw, sheet_name="curves", index=False
+            )
 
-    with open(os.path.join(ts_dir, "summary.txt"), "w", encoding="utf-8") as f:
-        f.write(f"Программа: {program_name}\n\n")
-        f.write("==== Диапазоны стимулов ДО ====\n")
-        f.write(pd.DataFrame(before_summary).to_string(index=False))
-        f.write("\n\n==== Разрешённые диапазоны ПОСЛЕ ====\n")
-        f.write(pd.DataFrame(after_summary).to_string(index=False))
-        f.write("\n\n==== Качество фиттинга ====\n")
-        f.write(pd.DataFrame(beta_records)[["LoanAge", "R2_fit", "MSE_fit"]].to_string(index=False))
-        f.write("\n\nПояснение: диапазоны исключаются ВКЛЮЧИТЕЛЬНО.\n")
-
-    # ══════════════ ИТОГОВЫЙ СВОДНЫЙ ГРАФИК (все кривые + стек-столбики OD) ══════════════
-    allowed_map = _build_allowed_map(
-        ages=ages,
-        before_summary=before_summary,
-        ignored_records=ignored_records
-    )
-
-    betas_by_age = {
-        int(r["LoanAge"]): np.array([r["b0"], r["b1"], r["b2"], r["b3"], r["b4"], r["b5"], r["b6"]], float)
-        for r in beta_records
-        if np.all(np.isfinite([r["b0"], r["b1"], r["b2"], r["b3"], r["b4"], r["b5"], r["b6"]]))
-    }
-
-    x_all = np.sort(pts["Incentive"].unique())
+    # ── общий график: стек OD + все кривые (наша — сплошная, эталон — пунктир), без точек и без метрик
+    x_all = np.sort(panel["Incentive"].unique())
     if len(x_all) > 1:
         step_glob = float(np.median(np.diff(x_all)))
         if not np.isfinite(step_glob) or step_glob <= 0:
@@ -385,112 +317,235 @@ def run_interactive_cut_step1(
         step_glob = 0.1
     barw = 0.9 * step_glob if np.isfinite(step_glob) and step_glob > 0 else 0.2
 
-    vol_mat = pd.DataFrame(index=x_all, columns=ages, data=0.0)
+    # матрица объемов (Incentive × age)
+    vol_mat = (panel.pivot_table(index="Incentive", columns="LoanAge",
+                                 values="TotalDebtBln", aggfunc="sum")
+                     .reindex(index=x_all, columns=ages).fillna(0.0))
+
+    fig, axL = plt.subplots(figsize=(12.5, 7.0))
+    axR = axL.twinx()
+
+    # стек-столбики
+    bottom = np.zeros_like(x_all, dtype=float)
     for h in ages:
-        allowed = allowed_map.get(h, [])
-        if not allowed:
+        y = vol_mat[h].to_numpy(float)
+        if np.allclose(y.sum(), 0):
             continue
-        pts_h = pts[pts["LoanAge"] == h]
-        if pts_h.empty:
+        axR.bar(x_all, y, width=barw, bottom=bottom, color=colors[h], alpha=0.28, edgecolor="none", label=f"OD h={h}")
+        bottom += y
+
+    # кривые — обе модели
+    for h in ages:
+        b_my = betas_map_my.get(h, None)
+        b_rf = betas_map_ref.get(h, None)
+        if b_my is not None:
+            xg = np.linspace(float(x_all.min()), float(x_all.max()), 800)
+            axL.plot(xg, _f_from_betas(b_my, xg), color=colors[h], lw=2.2)
+        if b_rf is not None:
+            xg = np.linspace(float(x_all.min()), float(x_all.max()), 800)
+            axL.plot(xg, _f_from_betas(b_rf, xg), color=colors[h], lw=1.8, ls="--")
+
+    axL.set_xlabel("Incentive, п.п.")
+    axL.set_ylabel("CPR")
+    axR.set_ylabel("TotalDebtBln, млрд руб.")
+    axL.grid(ls="--", alpha=0.35)
+    axL.set_title(f"{title}: S-curves (ours — solid, ref — dashed) + stacked OD by incentive")
+    fig.tight_layout()
+    fig.savefig(os.path.join(charts_dir, "all_ages_curves_and_volumes.png"), dpi=300)
+    plt.close(fig)
+
+    # ── Excel-выгрузки
+    betas_my.to_excel(os.path.join(ts_dir, "betas_my.xlsx"), index=False)
+    betas_ref.to_excel(os.path.join(ts_dir, "betas_ref.xlsx"), index=False)
+    betas_side.to_excel(os.path.join(ts_dir, "betas_compare.xlsx"), index=False)
+    errors_summary.to_excel(os.path.join(ts_dir, "errors_summary.xlsx"), index=False)
+    errors_detail.to_excel(os.path.join(ts_dir, "errors_detail.xlsx"), index=False)
+    panel[["LoanAge", "Incentive", "TotalDebtBln", "CPR", "CPR_model", "CPR_ref",
+           "err_model", "SE_model", "APE_model", "err_ref", "SE_ref", "APE_ref"]].to_excel(
+        os.path.join(ts_dir, "panel_long.xlsx"), index=False
+    )
+
+    print("\n✅ Оценка по панели готова.")
+    print("Папка:", ts_dir)
+    print("  • charts/*.png")
+    print("  • plot_data/age_*.xlsx")
+    print("  • betas_my.xlsx, betas_ref.xlsx, betas_compare.xlsx")
+    print("  • errors_summary.xlsx, errors_detail.xlsx")
+    print("  • panel_long.xlsx")
+
+    return {"output_dir": ts_dir,
+            "panel": panel,
+            "betas_my": betas_my,
+            "betas_ref": betas_ref,
+            "errors_summary": errors_summary}
+
+
+# ══════════════ (ОПЦИОНАЛЬНО) OOS 90/10 по панельным данным ══════════════
+def run_oos_cv_from_panel(
+    dataset_path: str,
+    betas_ref_path: str,
+    out_dir_from_eval: str,
+    n_iter: int = 200,
+    random_seed: int = 42,
+    program_name: str | None = None
+):
+    """
+    Делим по каждому LoanAge по стимулам: 90% строк train, 10% test (страт. по стимулу).
+    Фитим беты на train (веса = TotalDebtBln), считаем ошибки на test (взв. по TotalDebtBln), как в STEP2.
+    Сохраняем построчно итерации и summary + гистограммы распределений RMSE (модель/эталон).
+    """
+    rng = np.random.default_rng(random_seed)
+    df0 = pd.read_excel(dataset_path)
+    cols = {c.lower(): c for c in df0.columns}
+    df = pd.DataFrame({
+        "Incentive": pd.to_numeric(df0[cols["incentive"]], errors="coerce"),
+        "LoanAge": pd.to_numeric(df0[cols["loanage"]], errors="coerce").astype("Int64"),
+        "TotalDebtBln": pd.to_numeric(df0[cols["totaldebtbln"]], errors="coerce"),
+        "CPR": df0[cols["cpr"]].map(_parse_percent_like)
+    }).dropna(subset=["Incentive", "LoanAge", "TotalDebtBln", "CPR"])
+    df = (df.groupby(["LoanAge", "Incentive"], as_index=False)
+            .agg(TotalDebtBln=("TotalDebtBln", "sum"),
+                 CPR=("CPR", "mean")))
+
+    betas_ref = pd.read_excel(betas_ref_path)
+    betas_ref = betas_ref[["LoanAge", "b0", "b1", "b2", "b3", "b4", "b5", "b6"]].copy()
+    betas_ref["LoanAge"] = pd.to_numeric(betas_ref["LoanAge"], errors="coerce").astype("Int64")
+    betas_map_ref = {int(r["LoanAge"]): np.array([r["b0"], r["b1"], r["b2"], r["b3"], r["b4"], r["b5"], r["b6"]], float)
+                     for _, r in betas_ref.iterrows()
+                     if np.all(np.isfinite([r["b0"], r["b1"], r["b2"], r["b3"], r["b4"], r["b5"], r["b6"]]))}
+
+    oos_dir = _ensure_dir(os.path.join(out_dir_from_eval, "oos"))
+    charts_dir = _ensure_dir(os.path.join(oos_dir, "charts"))
+
+    ages = sorted(df["LoanAge"].dropna().unique().astype(int).tolist())
+    iter_rows = []
+
+    def _split_age(df_age: pd.DataFrame):
+        train_idx, test_idx = [], []
+        for _, g in df_age.groupby("Incentive"):
+            idx = g.index.to_numpy()
+            n = len(idx)
+            if n == 1:
+                if rng.random() < 0.9:
+                    train_idx.append(idx[0])
+                else:
+                    test_idx.append(idx[0])
+                continue
+            k = int(np.floor(n * 0.9))
+            k = max(1, min(k, n - 1))
+            sel = rng.choice(idx, size=k, replace=False)
+            train_idx.extend(sel)
+            test_idx.extend(np.setdiff1d(idx, sel))
+        return train_idx, test_idx
+
+    # итерации
+    for it in range(1, n_iter + 1):
+        for h in ages:
+            df_h = df[df["LoanAge"] == h].copy()
+            if df_h.empty or df_h["Incentive"].nunique() < 2:
+                continue
+            tr_idx, te_idx = _split_age(df_h)
+            if len(te_idx) < 3 or len(tr_idx) < 3:
+                continue
+            train, test = df_h.loc[tr_idx], df_h.loc[te_idx]
+            # фитаем на train
+            b_fit, _, _ = _fit_arctan_unconstrained(train["Incentive"], train["CPR"], train["TotalDebtBln"])
+            # предсказываем на test
+            test = test.copy()
+            test["CPR_model"] = _f_from_betas(b_fit, test["Incentive"])
+            b_ref = betas_map_ref.get(h, None)
+            test["CPR_ref"] = _f_from_betas(b_ref, test["Incentive"]) if b_ref is not None else np.nan
+
+            # ошибки (взвешенно по TotalDebtBln)
+            rmse_m = _weighted_rmse(test["CPR"], test["CPR_model"], test["TotalDebtBln"])
+            mape_m = _weighted_mape(test["CPR"], test["CPR_model"], test["TotalDebtBln"])
+            rmse_r = _weighted_rmse(test["CPR"], test["CPR_ref"],   test["TotalDebtBln"])
+            mape_r = _weighted_mape(test["CPR"], test["CPR_ref"],   test["TotalDebtBln"])
+
+            iter_rows.append({"Iter": it, "LoanAge": h,
+                              "RMSE_model": rmse_m, "MAPE_model": mape_m,
+                              "RMSE_ref": rmse_r,   "MAPE_ref": mape_r,
+                              "Test_OD_sum": float(test["TotalDebtBln"].sum()),
+                              "Test_n": int(len(test))})
+
+    it_df = pd.DataFrame(iter_rows).sort_values(["LoanAge", "Iter"])
+    # summary по age и строка ALL
+    sum_rows = []
+    for h in ages:
+        sub = it_df[it_df["LoanAge"] == h]
+        if sub.empty:
             continue
-        ser = pd.Series(0.0, index=x_all, dtype=float)
-        for (lo, hi) in allowed:
-            sub = pts_h[(pts_h["Incentive"] >= lo) & (pts_h["Incentive"] <= hi)]
-            if sub.empty:
-                continue
-            ser = ser.add(sub.set_index("Incentive")["TotalDebtBln"], fill_value=0.0)
-        vol_mat[h] = ser.fillna(0.0)
+        sum_rows.append({"LoanAge": h,
+                         "N_iter": int(sub["Iter"].nunique()),
+                         "RMSE_model_mean": float(np.nanmean(sub["RMSE_model"])),
+                         "RMSE_model_std":  float(np.nanstd(sub["RMSE_model"])),
+                         "MAPE_model_mean": float(np.nanmean(sub["MAPE_model"])),
+                         "MAPE_model_std":  float(np.nanstd(sub["MAPE_model"])),
+                         "RMSE_ref_mean":   float(np.nanmean(sub["RMSE_ref"])),
+                         "RMSE_ref_std":    float(np.nanstd(sub["RMSE_ref"])),
+                         "MAPE_ref_mean":   float(np.nanmean(sub["MAPE_ref"])),
+                         "MAPE_ref_std":    float(np.nanstd(sub["MAPE_ref"]))})
+    if sum_rows:
+        all_row = {"LoanAge": "ALL"}
+        for k in ["RMSE_model_mean", "RMSE_model_std", "MAPE_model_mean", "MAPE_model_std",
+                  "RMSE_ref_mean", "RMSE_ref_std", "MAPE_ref_mean", "MAPE_ref_std"]:
+            all_row[k] = float(np.nanmean([r[k] for r in sum_rows if k in r]))
+        sum_rows.append(all_row)
+    sum_df = pd.DataFrame(sum_rows)
 
-    if (vol_mat.sum(axis=1).sum() > 0) and (len(betas_by_age) > 0):
-        colors = {h: c for h, c in zip(ages, _palette(len(ages)))}
-        fig, axL = plt.subplots(figsize=(12, 6.8))
-        axR = axL.twinx()
+    # гистограммы распределения RMSE (агрегировано по всем age)
+    def _save_hist(series, title, out_png, out_csv):
+        s = pd.Series(series).replace([np.inf, -np.inf], np.nan).dropna()
+        plt.figure(figsize=(8, 4.4))
+        plt.hist(s.values, bins=30, alpha=0.8)
+        plt.title(title)
+        plt.xlabel("RMSE")
+        plt.ylabel("Count")
+        plt.grid(ls="--", alpha=0.35)
+        plt.tight_layout()
+        plt.savefig(out_png, dpi=220)
+        plt.close()
+        pd.DataFrame({"RMSE": s}).to_csv(out_csv, index=False, encoding="utf-8-sig")
 
-        x = x_all
-        bottom = np.zeros_like(x, dtype=float)
-        for h in ages:
-            y = vol_mat[h].reindex(x, fill_value=0.0).to_numpy(float)
-            if np.allclose(y.sum(), 0):
-                continue
-            axR.bar(x, y, width=barw, bottom=bottom, color=colors[h], alpha=0.28, edgecolor="none", label=f"OD h={h}")
-            bottom += y
+    _save_hist(it_df["RMSE_model"], f"{program_name or _base_title_from_filename(dataset_path)} — OOS RMSE (model)",
+               os.path.join(charts_dir, "hist_rmse_model.png"),
+               os.path.join(oos_dir, "hist_rmse_model.csv"))
+    _save_hist(it_df["RMSE_ref"], f"{program_name or _base_title_from_filename(dataset_path)} — OOS RMSE (ref)",
+               os.path.join(charts_dir, "hist_rmse_ref.png"),
+               os.path.join(oos_dir, "hist_rmse_ref.csv"))
 
-        for h in ages:
-            b = betas_by_age.get(h, None)
-            allowed = allowed_map.get(h, [])
-            if b is None or not allowed:
-                continue
-            for lo, hi in allowed:
-                if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-                    continue
-                xg = np.linspace(max(lo, x.min()), min(hi, x.max()), 600)
-                if xg.size <= 1:
-                    continue
-                axL.plot(xg, _f_from_betas(b, xg), color=colors[h], lw=2.5, label=f"h={h}")
+    it_df.to_excel(os.path.join(oos_dir, "results_iter.xlsx"), index=False)
+    sum_df.to_excel(os.path.join(oos_dir, "summary.xlsx"), index=False)
 
-        axL.set_xlabel("Incentive, п.п.")
-        axL.set_ylabel("CPR, доли/год")
-        axR.set_ylabel("TotalDebtBln, млрд руб.")
-        axL.grid(ls="--", alpha=0.35)
-        axL.set_title(f"{program_name}: S-curves по age (без точек) + стек OD по стимулам")
+    print("\n✅ OOS 90/10 по панели готово.")
+    print("Папка:", oos_dir)
+    print("  • results_iter.xlsx, summary.xlsx")
+    print("  • charts/hist_rmse_*.png (+ CSV)")
 
-        handles, labels = axL.get_legend_handles_labels()
-        uniq = dict(zip(labels, handles))
-        if len(uniq) > 0:
-            axL.legend(uniq.values(), uniq.keys(), loc="upper left", ncol=2, fontsize=9, frameon=True)
+    return {"oos_dir": oos_dir, "iter": it_df, "summary": sum_df}
 
-        fig.tight_layout()
-        out_path = os.path.join(ts_dir, "all_ages_curves_and_volumes.png")
-        fig.savefig(out_path, dpi=300)
-        plt.close(fig)
 
-    # ══════════════ ДОП. ЭКСЕЛЬ: OD и МОДЕЛЬНЫЙ CPR по (Incentive × LoanAge), БЕЗ учёта обрезок ══════════════
-    x_min = float(pts["Incentive"].min())
-    x_max = float(pts["Incentive"].max())
-    uniq = np.sort(pts["Incentive"].unique())
-    step_grid = float(np.median(np.diff(uniq))) if len(uniq) > 1 else 0.1
-    if not np.isfinite(step_grid) or step_grid <= 0:
-        step_grid = 0.1
-    x_grid = np.round(np.arange(x_min, x_max + step_grid * 0.5, step_grid), 6)
+# ══════════════ ПРИМЕР ЗАПУСКА ══════════════
+if __name__ == "__main__":
+    # ВХОДНЫЕ ДАННЫЕ
+    dataset_path = r"C:\Users\mi.makhmudov\Desktop\Вторичка (Казна+ЦЦ).xlsx"  # твой панельный файл
+    betas_ref_path = r"C:\Users\mi.makhmudов\Desktop\beta для сравнения.xlsx"  # эталонные беты
+    out_root = r"C:\Users\mi.makhmudov\Desktop\SCurve_panel_eval"
 
-    age_min = int(pts["LoanAge"].min())
-    age_max = int(pts["LoanAge"].max())
-    ages_full = list(range(age_min, age_max + 1))
+    # ОСНОВНОЕ СРАВНЕНИЕ
+    res = evaluate_from_panel(
+        dataset_path=dataset_path,
+        betas_ref_path=betas_ref_path,
+        out_root=out_root,
+        program_name=None  # или задавай строкой
+    )
 
-    # 1) OD по (Incentive × LoanAge)
-    pivot_od = pts.pivot_table(index="Incentive", columns="LoanAge", values="TotalDebtBln", aggfunc="sum")
-    pivot_od = pivot_od.reindex(index=x_grid, columns=ages_full)
-    pivot_od.index.name = "Incentive"
-    od_tbl = pivot_od.reset_index()
-
-    # 2) Модельный CPR из бета по (Incentive × LoanAge)
-    model_cpr_mat = pd.DataFrame(index=x_grid, columns=ages_full, dtype=float)
-    # подготовим быстрый доступ к бета
-    betas_map = {int(r["LoanAge"]): np.array([r["b0"], r["b1"], r["b2"], r["b3"], r["b4"], r["b5"], r["b6"]], float)
-                 for r in beta_records
-                 if np.all(np.isfinite([r["b0"], r["b1"], r["b2"], r["b3"], r["b4"], r["b5"], r["b6"]]))}
-    for h in ages_full:
-        b = betas_map.get(h, None)
-        if b is None:
-            continue  # оставляем NaN (нет кривой)
-        model_cpr_mat[h] = _f_from_betas(b, x_grid)
-
-    model_cpr_mat.index.name = "Incentive"
-    model_cpr_tbl = model_cpr_mat.reset_index()
-
-    excel_extra = os.path.join(ts_dir, "od_cpr_by_incentive_age.xlsx")
-    with pd.ExcelWriter(excel_extra, engine="openpyxl") as xw:
-        od_tbl.to_excel(xw, sheet_name="od_by_incentive_age", index=False)
-        model_cpr_tbl.to_excel(xw, sheet_name="model_cpr_by_incentive_age", index=False)
-
-    print("\n✅ ШАГ 1 готов.")
-    print("Сохранено в:", ts_dir)
-    print("  • points_full.xlsx")
-    print("  • betas_full.xlsx")
-    print("  • ignored_bins.xlsx")
-    print("  • summary.txt")
-    print("  • by_age/*.png")
-    print("  • all_ages_curves_and_volumes.png")
-    print("  • od_cpr_by_incentive_age.xlsx  ✅")
-
-    return {"output_dir": ts_dir}
+    # (ОПЦИОНАЛЬНО) OOS 90/10 с сохранением метрик и гистограмм
+    # run_oos_cv_from_panel(
+    #     dataset_path=dataset_path,
+    #     betas_ref_path=betas_ref_path,
+    #     out_dir_from_eval=res["output_dir"],
+    #     n_iter=200,
+    #     random_seed=42,
+    #     program_name=None
+    # )
