@@ -1,97 +1,196 @@
-У тебя упало на np.isfinite из-за того, что в betas_ref.xlsx колонки b0..b6 пришли как строки (часто с запятой вместо точки). np.isfinite на строках — это TypeError.
+Option Explicit
 
-Ниже даю компактный «патч», который:
-	•	жёстко приводит LoanAge, b0..b6 к float (заменяя запятые на точки),
-	•	фильтрует строки, где в бетах есть NaN,
-	•	делает то же для betas_model на всякий случай.
+Private Function FindColumnByHeader(ws As Worksheet, headerText As String) As Long
+    Dim lastCol As Long, c As Long, v As String
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    For c = 1 To lastCol
+        v = CStr(ws.Cells(1, c).Value2)
+        If Len(v) > 0 Then
+            If StrComp(Trim$(v), Trim$(headerText), vbTextCompare) = 0 _
+               Or InStr(1, Trim$(v), Trim$(headerText), vbTextCompare) > 0 Then
+                FindColumnByHeader = c
+                Exit Function
+            End If
+        End If
+    Next c
+    FindColumnByHeader = 0
+End Function
 
-Вставь эти две вспомогательные функции и замени кусок с построением betas_map_model/betas_map_ref в твоём STEP 2.
+Public Sub BatchFill_FastAndSafe_NNKL_V3()
+    Const SHEET_SVOD As String = "СВОД_ННКЛ"
+    Const SHEET_DATA As String = "ТАБЛИЦА" ' измените при необходимости
 
-⸻
+    ' Заголовки входов
+    Const HDR_PROD_TYPE As String = "prod_type"
+    Const HDR_IS_PDR    As String = "is_pdr"
+    Const HDR_MATUR     As String = "matur"
+    Const HDR_SPREAD    As String = "Спред внешней ставки к КС (ежемес)"
 
-1) Вставь ХЕЛПЕРЫ (куда-нибудь над evaluate_scurves_model)
+    Dim wb As Workbook
+    Dim wsSvod As Worksheet, wsData As Worksheet
+    Dim calcMode As XlCalculation
+    Dim lastRow As Long, n As Long, i As Long
 
-def _to_float_series(s: pd.Series) -> pd.Series:
-    """Аккуратно приводит столбец к float: запятые -> точки, пробелы -> пусто."""
-    return pd.to_numeric(s.astype(str).str.replace(",", ".", regex=False).str.replace(" ", "", regex=False),
-                         errors="coerce")
+    Dim colProdType As Long, colIsPdr As Long, colMatur As Long, colSpread As Long
+    Dim colW As Long, colX As Long, colY As Long
 
-def _build_betas_map(df: pd.DataFrame, allow_positional: bool = True) -> dict[int, np.ndarray]:
-    """
-    Из DataFrame с колонками (лучше) LoanAge, b0..b6 собирает словарь {age: betas[7]}.
-    Если b0..b6 нет, а allow_positional=True — пытаемся взять 2..8 колонки по позиции.
-    """
-    # нормализуем имена
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
+    Dim arrSpread As Variant, arrMatur As Variant, arrIsPdr As Variant, arrProd As Variant
+    Dim outW() As Variant, outX() As Variant, outY() As Variant
 
-    # найти колонки b0..b6 независимо от регистра
-    name_map = {c.lower(): c for c in df.columns}
-    have_named = all(k in name_map for k in ["loanage", "b0", "b1", "b2", "b3", "b4", "b5", "b6"])
+    Dim vSpread As Variant, vMatur As Variant, vIsPdr As Variant, vProd As String
+    Dim useMatur As Variant, key As String
 
-    if have_named:
-        cols = [name_map[k] for k in ["loanage", "b0", "b1", "b2", "b3", "b4", "b5", "b6"]]
-        tmp = df[cols].copy()
-        tmp.rename(columns={cols[0]: "LoanAge"}, inplace=True)
-        # привести к float/Int
-        tmp["LoanAge"] = pd.to_numeric(tmp["LoanAge"], errors="coerce").astype("Int64")
-        for c in ["b0","b1","b2","b3","b4","b5","b6"]:
-            tmp[c] = _to_float_series(tmp[c])
-    else:
-        if not allow_positional:
-            return {}
-        # позиционный режим: LoanAge в первом столбце, b0..b6 — 2..8
-        if df.shape[1] < 8:
-            return {}
-        tmp = df.iloc[:, :8].copy()
-        tmp.columns = ["LoanAge", "b0","b1","b2","b3","b4","b5","b6"]
-        tmp["LoanAge"] = pd.to_numeric(tmp["LoanAge"], errors="coerce").astype("Int64")
-        for c in ["b0","b1","b2","b3","b4","b5","b6"]:
-            tmp[c] = _to_float_series(tmp[c])
+    Dim dict As Object
+    Dim oldC2 As Variant, oldC3 As Variant
 
-    # отфильтровать строки, где любые из b0..b6 нечисловые
-    mask = tmp[["b0","b1","b2","b3","b4","b5","b6"]].apply(np.isfinite).all(axis=1)
-    tmp = tmp[mask & tmp["LoanAge"].notna()]
+    Dim res54 As Variant, res55 As Variant, res56 As Variant
+    Dim pack As Variant
 
-    betas_map = {
-        int(r["LoanAge"]): r[["b0","b1","b2","b3","b4","b5","b6"]].to_numpy(dtype=float)
-        for _, r in tmp.iterrows()
-    }
-    return betas_map
+    On Error GoTo Fatal
 
+    Set wb = ThisWorkbook
+    Set wsSvod = wb.Worksheets(SHEET_SVOD)
+    Set wsData = wb.Worksheets(SHEET_DATA)
 
-⸻
+    ' Входные колонки по заголовкам
+    colProdType = FindColumnByHeader(wsData, HDR_PROD_TYPE)
+    colIsPdr = FindColumnByHeader(wsData, HDR_IS_PDR)
+    colMatur = FindColumnByHeader(wsData, HDR_MATUR)
+    colSpread = FindColumnByHeader(wsData, HDR_SPREAD)
 
-2) ЗАМЕНИ блок со сборкой карт бет внутри evaluate_scurves_model
+    ' Выходные колонки: W, X, Y
+    colW = 23 ' W: C56
+    colX = 24 ' X: C54
+    colY = 25 ' Y: C55
 
-Найди в твоей функции участок (он у тебя и был в трейсбэке):
+    If colProdType * colMatur * colSpread = 0 Then
+        MsgBox "Не найден один из заголовков: " & vbCrLf & _
+               "  • " & HDR_PROD_TYPE & vbCrLf & _
+               "  • " & HDR_MATUR & vbCrLf & _
+               "  • " & HDR_SPREAD, vbCritical, "BatchFill_NNKL_V3"
+        Exit Sub
+    End If
 
-betas_map_model = {int(r["LoanAge"]): r[["b0","b1","b2","b3","b4","b5","b6"]].to_numpy(float)
-                   for _, r in betas_model.iterrows()
-                   if np.all(np.isfinite(r[["b0","b1","b2","b3","b4","b5","b6"]]))}
-if betas_ref is not None:
-    if set(["LoanAge","b0","b1","b2","b3","b4","b5","b6"]).issubset(betas_ref.columns):
-        betas_map_ref = {int(r["LoanAge"]): r[["b0","b1","b2","b3","b4","b5","b6"]].to_numpy(float)
-                         for _, r in betas_ref.iterrows()
-                         if np.all(np.isfinite(r[["b0","b1","b2","b3","b4","b5","b6"]]))}
-    else:
-        betas_map_ref = {int(r["LoanAge"]): r.iloc[1:8].to_numpy(float)
-                         for _, r in betas_ref.iterrows()
-                         if np.all(np.isfinite(r.iloc[1:8]))}
-else:
-    betas_map_ref = {}
+    lastRow = wsData.Cells(wsData.Rows.Count, 1).End(xlUp).Row
+    If lastRow < 2 Then Exit Sub
+    n = lastRow - 1
 
-и полностью замени на:
+    ' Чистим только W:X:Y (A–V не трогаем)
+    wsData.Range(wsData.Cells(2, colW), wsData.Cells(lastRow, colY)).ClearContents
 
-# Надёжная сборка карт бет с принудительным приведением типов
-betas_map_model = _build_betas_map(betas_model, allow_positional=False)
-betas_map_ref   = _build_betas_map(betas_ref,   allow_positional=True) if betas_ref is not None else {}
+    ' Быстрая выгрузка входов
+    arrSpread = wsData.Range(wsData.Cells(2, colSpread), wsData.Cells(lastRow, colSpread)).Value2
+    arrMatur  = wsData.Range(wsData.Cells(2, colMatur),  wsData.Cells(lastRow, colMatur)).Value2
+    arrProd   = wsData.Range(wsData.Cells(2, colProdType), wsData.Cells(lastRow, colProdType)).Value2
 
+    If colIsPdr > 0 Then
+        arrIsPdr = wsData.Range(wsData.Cells(2, colIsPdr), wsData.Cells(lastRow, colIsPdr)).Value2
+    Else
+        ReDim arrIsPdr(1 To n, 1 To 1)
+        For i = 1 To n: arrIsPdr(i, 1) = 0: Next i
+    End If
 
-⸻
+    ReDim outW(1 To n, 1 To 1)
+    ReDim outX(1 To n, 1 To 1)
+    ReDim outY(1 To n, 1 To 1)
 
-Почему это починит ошибку
-	•	Мы явно конвертируем b0..b6 из строк (с запятыми/пробелами) в float; после этого np.isfinite отрабатывает корректно.
-	•	Если у эталона нет именованных колонок b0..b6, но структура «LoanAge + 7 следующих столбцов» — тоже поддержали.
+    ' Подготовка окружения
+    Set dict = CreateObject("Scripting.Dictionary")
+    dict.CompareMode = 1 ' TextCompare
 
-Остальная логика скрипта (клип CPR, клип premat, «наивная» ветка, все Excel и графики) остаётся без изменений.
+    oldC2 = wsSvod.Range("C2").Value2
+    oldC3 = wsSvod.Range("C3").Value2
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    calcMode = Application.Calculation
+    Application.Calculation = xlCalculationManual
+    Application.Cursor = xlWait
+
+    Application.CalculateFullRebuild
+
+    ' Основной цикл
+    For i = 1 To n
+        On Error GoTo RowSoft
+
+        vSpread = arrSpread(i, 1)
+        vMatur  = arrMatur(i, 1)
+        vIsPdr  = arrIsPdr(i, 1)
+        vProd   = UCase$(Trim$(CStr(arrProd(i, 1))))
+
+        ' Правило срочности 30 для is_pdr=1 или MIN_BAL
+        If (Val(CStr(vIsPdr)) = 1) Or (vProd = "MIN_BAL") Then
+            useMatur = 30
+        Else
+            useMatur = vMatur
+        End If
+
+        key = CStr(vSpread) & "|" & CStr(useMatur)
+
+        If dict.Exists(key) Then
+            pack = dict(key)
+            res56 = pack(0)
+            res54 = pack(1)
+            res55 = pack(2)
+        Else
+            ' Подаём входы на СВОД_ННКЛ
+            wsSvod.Range("C2").Value2 = vSpread
+            wsSvod.Range("C3").Value2 = useMatur
+
+            Application.Calculate
+            Do While Application.CalculationState <> xlDone
+                DoEvents
+            Loop
+
+            res56 = wsSvod.Range("C56").Value2
+            res54 = wsSvod.Range("C54").Value2
+            res55 = wsSvod.Range("C55").Value2
+
+            If IsError(res56) Then res56 = Empty
+            If IsError(res54) Then res54 = Empty
+            If IsError(res55) Then res55 = Empty
+
+            pack = Array(res56, res54, res55)
+            dict.Add key, pack
+        End If
+
+        ' Заполняем выходные массивы:
+        ' C56 → W, C54 → X, C55 → Y
+        outW(i, 1) = res56
+        outX(i, 1) = res54
+        outY(i, 1) = res55
+
+        If (i Mod 500) = 0 Then DoEvents
+        GoTo NextI
+
+RowSoft:
+        outW(i, 1) = Empty
+        outX(i, 1) = Empty
+        outY(i, 1) = Empty
+        Err.Clear
+NextI:
+    Next i
+
+    ' Массовая запись результатов
+    wsData.Range(wsData.Cells(2, colW), wsData.Cells(lastRow, colW)).Value = outW
+    wsData.Range(wsData.Cells(2, colX), wsData.Cells(lastRow, colX)).Value = outX
+    wsData.Range(wsData.Cells(2, colY), wsData.Cells(lastRow, colY)).Value = outY
+
+Done:
+    ' Откат окружения
+    wsSvod.Range("C2").Value2 = oldC2
+    wsSvod.Range("C3").Value2 = oldC3
+    Application.Cursor = xlDefault
+    Application.Calculation = calcMode
+    Application.DisplayAlerts = True
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    Exit Sub
+
+Fatal:
+    On Error Resume Next
+    wsSvod.Range("C2").Value2 = oldC2
+    wsSvod.Range("C3").Value2 = oldC3
+    Resume Done
+End Sub
