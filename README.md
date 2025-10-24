@@ -7,7 +7,7 @@
      • промо: с dt_open до предпоследнего дня следующего месяца;
      • base_day — базовая @BaseRate;
      • base_day и 1-е числа — ПОЛНЫЙ перелив Σ клиента на max ставку.
-   v.2025-08-11  (+ флаг фикс-промо с 1-го числа следующего месяца)
+   v.2025-08-11  (+ флаг: фикс-промо действует только в МЕСЯЦЕ после якоря)
 ═══════════════════════════════════════════════════════════════*/
 USE ALM_TEST;
 GO
@@ -19,9 +19,16 @@ DECLARE
     @Anchor     date         = '2025-10-22',
     @HorizonTo  date         = '2025-12-31',
     @BaseRate   decimal(9,4) = 0.0450,  -- базовая ставка на base-day
-    @UseFixedPromoFromNextMonth bit = 1; -- НОВОЕ: 1 = с первого числа следующего месяца берём фикс-промо
+    @UseFixedPromoFromNextMonth bit = 1; -- 1 = включить фикс-промо ТОЛЬКО в месяце после якоря
 
-DECLARE @FixedPromoStart date = DATEADD(day,1,EOMONTH(@Anchor)); -- НОВОЕ
+/* Окно действия фикс-промо при включённом флаге:
+   [ @FixedPromoStart ; @FixedPromoEnd ), то есть ровно один календарный месяц
+   после @Anchor. Примеры:
+   Anchor=2025-10-22 → окно = [2025-11-01 ; 2025-12-01)
+   Anchor=2026-01-30 → окно = [2026-02-01 ; 2026-03-01)
+*/
+DECLARE @FixedPromoStart date = DATEADD(day,1,EOMONTH(@Anchor));
+DECLARE @FixedPromoEnd   date = DATEADD(month,1,@FixedPromoStart);
 
 /* диапазон dt_open для «живых» договоров: пред. месяц .. EOM(Anchor) */
 DECLARE
@@ -204,7 +211,7 @@ SELECT
     CASE
       WHEN d.d <= c.promo_end THEN
            CASE
-             WHEN @UseFixedPromoFromNextMonth = 1 AND d.d >= @FixedPromoStart THEN
+             WHEN @UseFixedPromoFromNextMonth = 1 AND d.d >= @FixedPromoStart AND d.d < @FixedPromoEnd THEN
                   CASE c.TSEGMENTNAME
                        WHEN N'ДЧБО'            THEN @PromoRate_DChbo
                        ELSE                          @PromoRate_Retail
@@ -273,13 +280,13 @@ IF OBJECT_ID('tempdb..#day1_candidates') IS NOT NULL DROP TABLE #day1_candidates
     FROM #cycles c
 ),
 cand AS (
-    /* 1-е внутри текущего окна — ставка фикс цикла/или фикс-промо по флагу */
+    /* 1-е внутри текущего окна — ставка фикс цикла/или фикс-промо по флагу в месяце после якоря */
     SELECT
         m.con_id, m.cli_id, m.TSEGMENTNAME, m.out_rub, m.cycle_no,
         dt_rep = m.m1_in,
         rate_con =
             CASE
-              WHEN @UseFixedPromoFromNextMonth = 1 AND m.m1_in >= @FixedPromoStart THEN
+              WHEN @UseFixedPromoFromNextMonth = 1 AND m.m1_in >= @FixedPromoStart AND m.m1_in < @FixedPromoEnd THEN
                    CASE m.TSEGMENTNAME
                         WHEN N'ДЧБО'            THEN @PromoRate_DChbo
                         ELSE                          @PromoRate_Retail
@@ -301,13 +308,13 @@ cand AS (
 
     UNION ALL
 
-    /* 1-е нового окна — новая промо (KEY(1-е)+спред) или фикс-промо по флагу */
+    /* 1-е нового окна — новая промо (KEY(1-е)+спред) или фикс-промо по флагу в месяце после якоря */
     SELECT
         m.con_id, m.cli_id, m.TSEGMENTNAME, m.out_rub, m.cycle_no + 1 AS cycle_no,
         dt_rep = m.m1_new,
         rate_con =
             CASE
-              WHEN @UseFixedPromoFromNextMonth = 1 AND m.m1_new >= @FixedPromoStart THEN
+              WHEN @UseFixedPromoFromNextMonth = 1 AND m.m1_new >= @FixedPromoStart AND m.m1_new < @FixedPromoEnd THEN
                    CASE m.TSEGMENTNAME
                         WHEN N'ДЧБО'            THEN @PromoRate_DChbo
                         ELSE                          @PromoRate_Retail
