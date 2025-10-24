@@ -3,11 +3,21 @@
    Снапшот @Anchor как в mail.usp_fill_balance_metrics_savings
    + ДОБАВЛЕНЫ нулевые договоры ALM.ehd.import_ZeroContracts
      (с учётом TSEGMENTNAME и подстановкой промо-ставок).
+
+   ФЛАГИ:
+   • @UseFixedPromoFromNextMonth: ВКЛ → фикс-промо (@PromoRate_*)
+     действует ТОЛЬКО в месяце, следующем за якорем:
+     окно [ @FixedPromoStart ; @FixedPromoEnd ).
+   • @UseHardPromoSpread: ВКЛ → вместо расчетного спреда использовать
+     жёстко заданный спред (@HardSpread_*), начиная с @HardSpreadStart.
+   ПРИОРИТЕТ: фикс-промо (если окно)  → иначе жесткий спред (если включён)
+             → иначе стандартная модель (как была).
+
    Правила:
      • промо: с dt_open до предпоследнего дня следующего месяца;
      • base_day — базовая @BaseRate;
      • base_day и 1-е числа — ПОЛНЫЙ перелив Σ клиента на max ставку.
-   v.2025-08-11  (+ флаг: фикс-промо действует только в МЕСЯЦЕ после якоря)
+   v.2025-08-11 (+флаги: фикс-промо-месяц и жёсткие спреды)
 ═══════════════════════════════════════════════════════════════*/
 USE ALM_TEST;
 GO
@@ -19,23 +29,26 @@ DECLARE
     @Anchor     date         = '2025-10-22',
     @HorizonTo  date         = '2025-12-31',
     @BaseRate   decimal(9,4) = 0.0450,  -- базовая ставка на base-day
-    @UseFixedPromoFromNextMonth bit = 1; -- 1 = включить фикс-промо ТОЛЬКО в месяце после якоря
 
-/* Окно действия фикс-промо при включённом флаге:
-   [ @FixedPromoStart ; @FixedPromoEnd ), то есть ровно один календарный месяц
-   после @Anchor. Примеры:
-   Anchor=2025-10-22 → окно = [2025-11-01 ; 2025-12-01)
-   Anchor=2026-01-30 → окно = [2026-02-01 ; 2026-03-01)
-*/
-DECLARE @FixedPromoStart date = DATEADD(day,1,EOMONTH(@Anchor));
-DECLARE @FixedPromoEnd   date = DATEADD(month,1,@FixedPromoStart);
+    /* Флаг 1: фикс-промо ТОЛЬКО в месяце, следующем за якорем */
+    @UseFixedPromoFromNextMonth bit = 1,
+
+    /* Флаг 2: жёсткие спреды (заменяют расчетные спреды) */
+    @UseHardPromoSpread bit = 1;
+
+/* Окно фикс-промо: ровно один месяц после якоря */
+DECLARE @FixedPromoStart date = DATEADD(day,1,EOMONTH(@Anchor));   -- 1-е следующего месяца
+DECLARE @FixedPromoEnd   date = DATEADD(month,1,@FixedPromoStart); -- 1-е через месяц
+
+/* Старт применения жёстких спредов (по умолчанию — с якоря; можно переопределить) */
+DECLARE @HardSpreadStart date = @Anchor;
 
 /* диапазон dt_open для «живых» договоров: пред. месяц .. EOM(Anchor) */
 DECLARE
     @OpenFrom date = DATEFROMPARTS(YEAR(DATEADD(month,-1,@Anchor)), MONTH(DATEADD(month,-1,@Anchor)), 1),
     @OpenTo   date = EOMONTH(@Anchor);
 
-PRINT @OpenFrom;
+-- PRINT @OpenFrom;
 
 /* ── 0) Календарь горизонта + KEY(TERM=1) ───────────────────── */
 IF OBJECT_ID('tempdb..#cal') IS NOT NULL DROP TABLE #cal;
@@ -53,7 +66,7 @@ WHERE  Scenario = @Scenario AND TERM = 1
 DECLARE @KeyAtAnchor decimal(9,4);
 SELECT @KeyAtAnchor = KEY_RATE FROM #key WHERE DT_REP = @Anchor;
 
-/* ── (A) Входные промо-ставки → спреды к KEY(@Anchor) ──────── */
+/* ── (A) Промо-ставки и расчетные спреды (старая логика) ───── */
 DECLARE
     @PromoRate_DChbo  decimal(9,4) = 0.1620,  -- промо ДЧБО (УЧК)
     @PromoRate_Retail decimal(9,4) = 0.1610;  -- промо Розница
@@ -61,6 +74,11 @@ DECLARE
 DECLARE
     @Spread_DChbo  decimal(9,4) = @PromoRate_DChbo  - @KeyAtAnchor,
     @Spread_Retail decimal(9,4) = @PromoRate_Retail - @KeyAtAnchor;
+
+/* ── (A2) Жёсткие спреды (новая опция) ─────────────────────── */
+DECLARE
+    @HardSpread_DChbo  decimal(9,4) = 0.0040,  -- напр. 0.40% ДЧБО
+    @HardSpread_Retail decimal(9,4) = 0.0050;  -- напр. 0.50% Розница
 
 IF OBJECT_ID('WORK.NS_Spreads','U') IS NOT NULL DROP TABLE WORK.NS_Spreads;
 CREATE TABLE WORK.NS_Spreads(
@@ -136,7 +154,7 @@ SELECT
     con_id,
     cli_id,
     out_rub,
-    rate_anchor = CAST(rate_use AS decimal(9,4)),  -- ставка на Anchor из той же логики
+    rate_anchor = CAST(rate_use AS decimal(9,4)),  -- ставка на Anchor
     dt_open,
     TSEGMENTNAME
 INTO #bal_prom
@@ -210,19 +228,35 @@ SELECT
     d.d AS dt_rep,
     CASE
       WHEN d.d <= c.promo_end THEN
+           /* ПРИОРИТЕТ 1: Фикс-промо только в окне следующего месяца */
            CASE
-             WHEN @UseFixedPromoFromNextMonth = 1 AND d.d >= @FixedPromoStart AND d.d < @FixedPromoEnd THEN
+             WHEN @UseFixedPromoFromNextMonth = 1
+              AND d.d >= @FixedPromoStart AND d.d < @FixedPromoEnd THEN
                   CASE c.TSEGMENTNAME
                        WHEN N'ДЧБО'            THEN @PromoRate_DChbo
                        ELSE                          @PromoRate_Retail
                   END
+
+             /* ПРИОРИТЕТ 2: Жёсткие спреды (замена расчетных спредов) */
+             WHEN @UseHardPromoSpread = 1 AND d.d >= @HardSpreadStart THEN
+                  CASE
+                    WHEN c.cycle_no = 0
+                         THEN bp.rate_anchor  -- нулевой цикл как в модели
+                    ELSE CASE c.TSEGMENTNAME
+                           WHEN N'ДЧБО'            THEN @HardSpread_DChbo  + k_open.KEY_RATE
+                           ELSE                          @HardSpread_Retail+ k_open.KEY_RATE
+                         END
+                  END
+
+             /* Иначе: исходная модель (как была) */
              ELSE
-                  CASE WHEN c.cycle_no = 0
-                       THEN bp.rate_anchor
-                       ELSE (CASE c.TSEGMENTNAME
-                               WHEN N'ДЧБО'            THEN @Spread_DChbo  + k_open.KEY_RATE
-                               ELSE                          @Spread_Retail+ k_open.KEY_RATE
-                            END)
+                  CASE
+                    WHEN c.cycle_no = 0
+                         THEN bp.rate_anchor
+                    ELSE CASE c.TSEGMENTNAME
+                           WHEN N'ДЧБО'            THEN @Spread_DChbo  + k_open.KEY_RATE
+                           ELSE                          @Spread_Retail+ k_open.KEY_RATE
+                         END
                   END
            END
       WHEN d.d = c.base_day THEN @BaseRate
@@ -280,24 +314,35 @@ IF OBJECT_ID('tempdb..#day1_candidates') IS NOT NULL DROP TABLE #day1_candidates
     FROM #cycles c
 ),
 cand AS (
-    /* 1-е внутри текущего окна — ставка фикс цикла/или фикс-промо по флагу в месяце после якоря */
+    /* 1-е внутри текущего окна */
     SELECT
         m.con_id, m.cli_id, m.TSEGMENTNAME, m.out_rub, m.cycle_no,
         dt_rep = m.m1_in,
         rate_con =
             CASE
-              WHEN @UseFixedPromoFromNextMonth = 1 AND m.m1_in >= @FixedPromoStart AND m.m1_in < @FixedPromoEnd THEN
+              WHEN @UseFixedPromoFromNextMonth = 1
+               AND m.m1_in >= @FixedPromoStart AND m.m1_in < @FixedPromoEnd THEN
                    CASE m.TSEGMENTNAME
                         WHEN N'ДЧБО'            THEN @PromoRate_DChbo
                         ELSE                          @PromoRate_Retail
                    END
+              WHEN @UseHardPromoSpread = 1 AND m.m1_in >= @HardSpreadStart THEN
+                   CASE
+                     WHEN m.cycle_no = 0
+                          THEN bp.rate_anchor
+                     ELSE CASE m.TSEGMENTNAME
+                            WHEN N'ДЧБО'            THEN @HardSpread_DChbo  + k_open.KEY_RATE
+                            ELSE                          @HardSpread_Retail+ k_open.KEY_RATE
+                          END
+                   END
               ELSE
-                   CASE WHEN m.cycle_no=0
-                        THEN bp.rate_anchor
-                        ELSE (CASE m.TSEGMENTNAME
-                                WHEN N'ДЧБО'            THEN @Spread_DChbo  + k_open.KEY_RATE
-                                ELSE                          @Spread_Retail+ k_open.KEY_RATE
-                             END)
+                   CASE
+                     WHEN m.cycle_no = 0
+                          THEN bp.rate_anchor
+                     ELSE CASE m.TSEGMENTNAME
+                            WHEN N'ДЧБО'            THEN @Spread_DChbo  + k_open.KEY_RATE
+                            ELSE                          @Spread_Retail+ k_open.KEY_RATE
+                          END
                    END
             END
     FROM marks m
@@ -308,16 +353,22 @@ cand AS (
 
     UNION ALL
 
-    /* 1-е нового окна — новая промо (KEY(1-е)+спред) или фикс-промо по флагу в месяце после якоря */
+    /* 1-е нового окна */
     SELECT
         m.con_id, m.cli_id, m.TSEGMENTNAME, m.out_rub, m.cycle_no + 1 AS cycle_no,
         dt_rep = m.m1_new,
         rate_con =
             CASE
-              WHEN @UseFixedPromoFromNextMonth = 1 AND m.m1_new >= @FixedPromoStart AND m.m1_new < @FixedPromoEnd THEN
+              WHEN @UseFixedPromoFromNextMonth = 1
+               AND m.m1_new >= @FixedPromoStart AND m.m1_new < @FixedPromoEnd THEN
                    CASE m.TSEGMENTNAME
                         WHEN N'ДЧБО'            THEN @PromoRate_DChbo
                         ELSE                          @PromoRate_Retail
+                   END
+              WHEN @UseHardPromoSpread = 1 AND m.m1_new >= @HardSpreadStart THEN
+                   CASE m.TSEGMENTNAME
+                     WHEN N'ДЧБО'            THEN @HardSpread_DChbo  + k_new.KEY_RATE
+                     ELSE                          @HardSpread_Retail+ k_new.KEY_RATE
                    END
               ELSE
                    CASE m.TSEGMENTNAME
