@@ -1,34 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 STEP 3 — out-of-sample валидация (90/10) с учётом ignored_bins и сравнением с эталоном.
-
-Что делает:
-  • Для каждого LoanAge делит данные по каждому stimulus: 90% train, 10% test (стратификация по stimulus).
-  • Фитит S-кривую на train (веса = OD), предсказывает на test.
-  • CPR_model/CPR_ref клипятся к [0; 1) , premat неотрицателен.
-  • Ошибки считает как в STEP 2:
-      - контрактный уровень: RMSE/MAPE по CPR_fact vs CPR_model (веса = OD);
-      - агрегатный уровень: агрегация по stimulus → CPR = 1-(1-sum(premat)/sum(OD))^12, затем RMSE/MAPE (веса = sum(OD)).
-  • Ошибки оцениваются ТОЛЬКО на "разрешённых" (age×stimulus) из ignored_bins (train/fit — по всем).
-
-Сохраняет:
-  • results_iter.xlsx  — строка на каждую итерацию и возраст (все 8 метрик + объёмы теста).
-  • summary.xlsx       — средние/стд ошибок по age и строка ALL.
-  • charts/age_<h>.png — факт-vs-модель (и ref) по ПОСЛЕДНЕЙ удачной итерации (агрегаты).
-  • charts/hist_*.png  — гистограммы распределений ошибок по итерациям (+ CSV рядом).
-      - RMSE_agg_model/ref, MAPE_agg_model/ref,
-        RMSE_contract_model/ref, MAPE_contract_model/ref
+Обновлено: клип/агрегаты полностью синхронизированы со STEP 2 + OD-взвешенные сводки.
 
 Как запускать:
-  res = run_step3_cv_validation(
-      df_raw_program=df_raw_program,
-      step1_dir=step1_dir,
-      betas_ref_path=r"...\beta для сравнения.xlsx",
-      out_root=r"...\SCurve_step3",
-      program_name=programma,
-      n_iter=200,
-      random_seed=42
-  )
+res3 = run_step3_cv_validation(
+    df_raw_program=df_raw_program,
+    step1_dir=step1_dir,
+    betas_ref_path=r"C:\Users\mi.makhmudов\Desktop\beta для сравнения.xlsx",
+    out_root=r"...\SCurve_step3",
+    program_name=programma,
+    n_iter=200,
+    random_seed=42
+)
 """
 
 import os
@@ -44,24 +28,37 @@ warnings.filterwarnings("ignore", category=UserWarning)
 plt.rcParams["axes.formatter.useoffset"] = False
 
 
-# ═══════════════════════ ВСПОМОГАТЕЛЬНЫЕ ═══════════════════════
+# ───────────── helpers (как в STEP 2) ─────────────
+
 def _ensure_dir(p: str) -> str:
     os.makedirs(p, exist_ok=True)
     return p
 
-def _clip01(v):
-    """Клип CPR к [0; 1) — верх слегка отступаем, чтобы (1-CPR) > 0."""
-    return np.clip(v, 0.0, 0.999999)
+def _clip01(v, eps: float = 1e-9):
+    """Клип CPR к [0; 1-eps] — строго как в STEP 2."""
+    arr = np.asarray(v, float)
+    return np.clip(arr, 0.0, 1.0 - eps)
+
+def _safe_premat(od, cpr):
+    """
+    Полностью как в STEP 2:
+      - CPR клипим к [0;1)
+      - OD < 0 -> 0
+      - premat = OD * (1 - (1-CPR)^(1/12)), затем клип к [0; OD]
+    """
+    od = np.asarray(od, float)
+    cpr = _clip01(cpr)
+    od_pos = np.maximum(od, 0.0)
+    prem = od_pos * (1 - np.power(1 - cpr, 1/12))
+    return np.clip(prem, 0.0, od_pos)
 
 def _f_from_betas(b, x):
     x = np.asarray(x, float)
     if b is None or (isinstance(b, (list, np.ndarray)) and not np.all(np.isfinite(b))):
         return np.full_like(x, np.nan, dtype=float)
-    return (
-        b[0]
-        + b[1] * np.arctan(b[2] + b[3] * x)
-        + b[4] * np.arctan(b[5] + b[6] * x)
-    )
+    return (b[0]
+            + b[1] * np.arctan(b[2] + b[3] * x)
+            + b[4] * np.arctan(b[5] + b[6] * x))
 
 def _fit_arctan_unconstrained(x, y, w,
                               start=(0.2, 0.05, -2.0, 2.2, 0.07, 2.0, 0.2)):
@@ -74,11 +71,9 @@ def _fit_arctan_unconstrained(x, y, w,
     w = (w / w.sum()) if w.sum() > 0 else np.ones_like(w) / len(w)
 
     def f(b, xx):
-        return (
-            b[0]
-            + b[1] * np.arctan(b[2] + b[3] * xx)
-            + b[4] * np.arctan(b[5] + b[6] * xx)
-        )
+        return (b[0]
+                + b[1] * np.arctan(b[2] + b[3] * xx)
+                + b[4] * np.arctan(b[5] + b[6] * xx))
 
     def obj(b):
         return np.sum(w * (y - f(b, x)) ** 2)
@@ -112,7 +107,7 @@ def _load_betas_and_ignored(step1_dir: str):
     return betas, ignored
 
 def _get_allowed_mask(df_sub, ignored_df):
-    """True — если age×stimulus разрешён для подсчёта ошибки."""
+    """True — если age×stimulus разрешён для подсчёта ошибки (train не режем — по твоему решению)."""
     if ignored_df is None or ignored_df.empty:
         return np.ones(len(df_sub), bool)
     mask = np.ones(len(df_sub), bool)
@@ -127,16 +122,13 @@ def _get_allowed_mask(df_sub, ignored_df):
     return mask
 
 def _stratified_split_by_stimul(df_age: pd.DataFrame, rng: np.random.Generator, train_frac: float = 0.9):
-    """Стратификация по каждому стимулу, как просил: 90%/10% внутри стимула."""
+    """Стратификация по каждому стимулу: 90%/10% внутри стимула."""
     train_idx, test_idx = [], []
     for _, g in df_age.groupby("stimul"):
         idx = g.index.to_numpy()
         n = len(idx)
         if n == 1:
-            if rng.random() < train_frac:
-                train_idx.append(idx[0])
-            else:
-                test_idx.append(idx[0])
+            (train_idx if rng.random() < train_frac else test_idx).append(idx[0])
             continue
         k = int(np.floor(n * train_frac))
         k = max(1, min(k, n - 1))
@@ -146,7 +138,8 @@ def _stratified_split_by_stimul(df_age: pd.DataFrame, rng: np.random.Generator, 
     return train_idx, test_idx
 
 
-# ═══════════════════════ ОСНОВНОЙ ШАГ 3 ═══════════════════════
+# ───────────── основной STEP 3 ─────────────
+
 def run_step3_cv_validation(
     df_raw_program: pd.DataFrame,
     step1_dir: str,
@@ -157,33 +150,33 @@ def run_step3_cv_validation(
     random_seed: int = 42
 ):
     """
-    Out-of-sample 90/10 валидация:
-      • фитим на 90% договоров (стратификация по стимулу), смотрим ошибку на 10%;
-      • ошибку считаем ТОЛЬКО на разрешённых age×stimulus (ignored_bins).
+    Out-of-sample 90/10:
+      • фитим на 90% договоров (стратификация по стимулу), тестируем на 10%;
+      • ошибку считаем ТОЛЬКО на разрешённых age×stimulus (ignored_bins),
+      • premat/model/agg — как в STEP 2 (через _safe_premat, _clip01),
+      • добавлены OD-взвешенные сводки и “ALL_weighted_exact”.
     """
     betas_model, ignored_df = _load_betas_and_ignored(step1_dir)
     betas_ref = pd.read_excel(betas_ref_path) if (betas_ref_path and os.path.exists(betas_ref_path)) else None
 
-    # подмэпим модели и ref-беты по age
-    betas_map_ref = {}
+    # ref-беты по age
+    betas_map_ref: dict[int, np.ndarray] = {}
     if betas_ref is not None:
         if set(["LoanAge","b0","b1","b2","b3","b4","b5","b6"]).issubset(betas_ref.columns):
             for _, r in betas_ref.iterrows():
                 h = int(pd.to_numeric(r["LoanAge"], errors="coerce"))
                 b = r[["b0","b1","b2","b3","b4","b5","b6"]].to_numpy(float)
-                if np.all(np.isfinite(b)):
-                    betas_map_ref[h] = b
+                if np.all(np.isfinite(b)): betas_map_ref[h] = b
         else:
             for _, r in betas_ref.iterrows():
-                h = int(pd.to_numeric(r["LoanAge"], errors="coerce"))
+                h = int(pd.to_numeric(r.iloc[0], errors="coerce"))
                 b = r.iloc[1:8].to_numpy(float)
-                if np.all(np.isfinite(b)):
-                    betas_map_ref[h] = b
+                if np.all(np.isfinite(b)): betas_map_ref[h] = b
 
     ts_dir = _ensure_dir(os.path.join(out_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S")))
     charts_dir = _ensure_dir(os.path.join(ts_dir, "charts"))
 
-    # фильтрация исходных договоров — как в STEP 2
+    # базовая фильтрация (как в STEP 2)
     df = df_raw_program.copy()
     df = df[(df["stimul"].notna()) &
             (pd.to_numeric(df["refin_rate"], errors="coerce") > 0) &
@@ -199,16 +192,18 @@ def run_step3_cv_validation(
 
     iter_rows, summary_rows = [], []
 
+    # накапливаем *агрегированные* тестовые данные для точного "ALL_weighted_exact"
+    agg_global_rows = []  # список DataFrame'ов по итерациям/возрастам
+
     for h in ages:
         df_h = df[df["age_group_id"] == h].copy()
         if df_h.empty or df_h["stimul"].nunique() < 2:
             continue
         print(f"[AGE={h}] {len(df_h)} договоров • {df_h['stimul'].nunique()} стимулов • итераций={n_iter}")
 
-        # ref-беты, если есть
         b_ref = betas_map_ref.get(h, None)
+        last_agg = None  # для картинки
 
-        last_agg = None  # для графика
         for it in range(1, n_iter + 1):
             tr_idx, te_idx = _stratified_split_by_stimul(df_h, rng, train_frac=0.9)
             if (len(tr_idx) < 5) or (len(te_idx) < 5):
@@ -221,22 +216,23 @@ def run_step3_cv_validation(
             if not np.all(np.isfinite(b_fit)):
                 continue
 
-            # предсказания на test (клип CPR, premat ≥ 0)
+            # предсказания на test — клип и premat как в STEP 2
             test = test.copy()
-            test["CPR_model"] = _clip01(_f_from_betas(b_fit, test["stimul"]))
-            test["premat_model"] = test["od_after_plan"] * (1 - np.power(1 - test["CPR_model"], 1/12))
+            cpr_m = _clip01(_f_from_betas(b_fit, test["stimul"]))
+            test["CPR_model"]    = cpr_m
+            test["premat_model"] = _safe_premat(test["od_after_plan"], test["CPR_model"])
 
             if b_ref is not None:
-                test["CPR_ref"] = _clip01(_f_from_betas(b_ref, test["stimul"]))
-                test["premat_ref"] = test["od_after_plan"] * (1 - np.power(1 - test["CPR_ref"], 1/12))
+                cpr_r = _clip01(_f_from_betas(b_ref, test["stimul"]))
+                test["CPR_ref"]    = cpr_r
+                test["premat_ref"] = _safe_premat(test["od_after_plan"], test["CPR_ref"])
             else:
                 test["CPR_ref"], test["premat_ref"] = np.nan, np.nan
 
-            # считаем ошибки ТОЛЬКО на разрешённых age×stimulus
+            # валидная область по ignored — только для скоринга
             test["age_group_id"] = h
             allowed_mask = _get_allowed_mask(test, ignored_df)
             test_valid = test[allowed_mask].copy()
-
             if len(test_valid) < 3 or test_valid["od_after_plan"].sum() <= 0:
                 continue
 
@@ -246,13 +242,16 @@ def run_step3_cv_validation(
             rmse_c_ref = _weighted_rmse(test_valid["CPR_fact"], test_valid["CPR_ref"], test_valid["od_after_plan"])
             mape_c_ref = _weighted_mape(test_valid["CPR_fact"], test_valid["CPR_ref"], test_valid["od_after_plan"])
 
-            # (2) агрегатный уровень (как в STEP 2)
+            # (2) агрегатный уровень — строго как в STEP 2
             agg = test_valid.groupby("stimul", as_index=False).agg(
                 sum_od=("od_after_plan", "sum"),
                 sum_premat_fact=("premat_payment", "sum"),
                 sum_premat_model=("premat_model", "sum"),
                 sum_premat_ref=("premat_ref", "sum")
             )
+            agg["LoanAge"] = h
+            agg["Iter"] = it
+
             agg["CPR_fact_agg"] = np.where(
                 agg["sum_od"] > 0,
                 1 - np.power(1 - agg["sum_premat_fact"] / agg["sum_od"], 12),
@@ -268,11 +267,14 @@ def run_step3_cv_validation(
                 1 - np.power(1 - agg["sum_premat_ref"] / agg["sum_od"], 12),
                 np.nan
             )
+            # клип модельных CPR (как в STEP 2)
+            agg["CPR_model_agg"] = _clip01(agg["CPR_model_agg"])
+            agg["CPR_ref_agg"]   = _clip01(agg["CPR_ref_agg"])
 
             rmse_a_model = _weighted_rmse(agg["CPR_fact_agg"], agg["CPR_model_agg"], agg["sum_od"])
             mape_a_model = _weighted_mape(agg["CPR_fact_agg"], agg["CPR_model_agg"], agg["sum_od"])
-            rmse_a_ref = _weighted_rmse(agg["CPR_fact_agg"], agg["CPR_ref_agg"], agg["sum_od"])
-            mape_a_ref = _weighted_mape(agg["CPR_fact_agg"], agg["CPR_ref_agg"], agg["sum_od"])
+            rmse_a_ref   = _weighted_rmse(agg["CPR_fact_agg"], agg["CPR_ref_agg"],   agg["sum_od"])
+            mape_a_ref   = _weighted_mape(agg["CPR_fact_agg"], agg["CPR_ref_agg"],   agg["sum_od"])
 
             iter_rows.append({
                 "LoanAge": h, "Iter": it,
@@ -288,31 +290,52 @@ def run_step3_cv_validation(
                 "Test_n": int(len(test_valid))
             })
 
-            last_agg = agg.copy()  # для графика последней итерации
+            agg_global_rows.append(agg)     # для точного ALL_weighted_exact
+            last_agg = agg.copy()           # для картинки
 
-        # сводка по возрасту
+        # сводка по возрасту: добавляем OD-взвешенные средние/стд по итерациям
         it_age = pd.DataFrame([r for r in iter_rows if r["LoanAge"] == h])
         if not it_age.empty:
-            summary_rows.append({
+            w = it_age["Test_OD_sum"].to_numpy(float)
+
+            def _wmean(s):
+                s = np.asarray(s, float)
+                m = np.isfinite(s) & np.isfinite(w) & (w > 0)
+                return float(np.sum(s[m] * w[m]) / np.sum(w[m])) if m.any() else np.nan
+
+            def _wstd(s, m_w):
+                s = np.asarray(s, float)
+                m = np.isfinite(s) & np.isfinite(w) & (w > 0)
+                if not m.any():
+                    return np.nan
+                return float(np.sqrt(np.sum(w[m] * (s[m] - m_w) ** 2) / np.sum(w[m])))
+
+            row = {
                 "LoanAge": h,
                 "N_iter": int(it_age["Iter"].nunique()),
-                "RMSE_contract_model_mean": float(np.nanmean(it_age["RMSE_contract_model"])),
-                "RMSE_contract_model_std":  float(np.nanstd(it_age["RMSE_contract_model"])),
-                "MAPE_contract_model_mean": float(np.nanmean(it_age["MAPE_contract_model"])),
-                "MAPE_contract_model_std":  float(np.nanstd(it_age["MAPE_contract_model"])),
-                "RMSE_agg_model_mean": float(np.nanmean(it_age["RMSE_agg_model"])),
-                "RMSE_agg_model_std":  float(np.nanstd(it_age["RMSE_agg_model"])),
-                "MAPE_agg_model_mean": float(np.nanmean(it_age["MAPE_agg_model"])),
-                "MAPE_agg_model_std":  float(np.nanstd(it_age["MAPE_agg_model"])),
-                "RMSE_contract_ref_mean": float(np.nanmean(it_age["RMSE_contract_ref"])),
-                "RMSE_contract_ref_std":  float(np.nanstd(it_age["RMSE_contract_ref"])),
-                "MAPE_contract_ref_mean": float(np.nanmean(it_age["MAPE_contract_ref"])),
-                "MAPE_contract_ref_std":  float(np.nanstd(it_age["MAPE_contract_ref"])),
-                "RMSE_agg_ref_mean": float(np.nanmean(it_age["RMSE_agg_ref"])),
-                "RMSE_agg_ref_std":  float(np.nanstd(it_age["RMSE_agg_ref"])),
-                "MAPE_agg_ref_mean": float(np.nanmean(it_age["MAPE_agg_ref"])),
-                "MAPE_agg_ref_std":  float(np.nanstd(it_age["MAPE_agg_ref"]))
-            })
+            }
+
+            # обычные средние/стд (как было)
+            for col in ["RMSE_contract_model","MAPE_contract_model",
+                        "RMSE_agg_model","MAPE_agg_model",
+                        "RMSE_contract_ref","MAPE_contract_ref",
+                        "RMSE_agg_ref","MAPE_agg_ref"]:
+                row[f"{col}_mean"] = float(np.nanmean(it_age[col]))
+                row[f"{col}_std"]  = float(np.nanstd(it_age[col]))
+
+            # OD-взвешенные средние/стд по итерациям
+            for col in ["RMSE_contract_model","MAPE_contract_model",
+                        "RMSE_agg_model","MAPE_agg_model",
+                        "RMSE_contract_ref","MAPE_contract_ref",
+                        "RMSE_agg_ref","MAPE_agg_ref"]:
+                m_w = _wmean(it_age[col])
+                s_w = _wstd(it_age[col], m_w)
+                row[f"{col}_mean_w"] = m_w
+                row[f"{col}_std_w"]  = s_w
+
+            # вес возраста для ALL_weighted_by_age
+            row["Age_Test_OD_sum"] = float(np.nansum(w))
+            summary_rows.append(row)
 
         # график по последней удачной итерации (агрегаты)
         if last_agg is not None and not last_agg.empty:
@@ -336,20 +359,56 @@ def run_step3_cv_validation(
     it_df = pd.DataFrame(iter_rows).sort_values(["LoanAge", "Iter"])
     sum_df = pd.DataFrame(summary_rows).sort_values("LoanAge")
 
+    # —— строки ALL
     if not sum_df.empty:
-        all_row = {"LoanAge": "ALL"}
-        # для ALL усредняем средние по age (обычно достаточно; при желании можно пересчитать с весами)
-        for col in [c for c in sum_df.columns if c.endswith("_mean")]:
+        # 1) исторический ALL (невзвешенный по age, как было)
+        all_row = {"LoanAge": "ALL", "N_iter": int(np.nanmean(sum_df["N_iter"]))}
+        for col in [c for c in sum_df.columns if c.endswith("_mean") and not c.endswith("_mean_w")]:
             all_row[col] = float(np.nanmean(sum_df[col]))
-        for col in [c for c in sum_df.columns if c.endswith("_std")]:
+        for col in [c for c in sum_df.columns if c.endswith("_std") and not c.endswith("_std_w")]:
             all_row[col] = float(np.nanmean(sum_df[col]))
-        all_row["N_iter"] = int(np.nanmean(sum_df["N_iter"]))
         sum_df = pd.concat([sum_df, pd.DataFrame([all_row])], ignore_index=True)
+
+        # 2) новый ALL_weighted_by_age — среднее по age с весом суммарного OD теста
+        w_age = sum_df.loc[sum_df["LoanAge"] != "ALL", "Age_Test_OD_sum"].to_numpy(float)
+        age_mask = (sum_df["LoanAge"] != "ALL").to_numpy()
+        all_w = {"LoanAge": "ALL_weighted_by_age", "N_iter": all_row["N_iter"]}
+
+        def _wmean_over_age(col):
+            s = sum_df.loc[age_mask, col].to_numpy(float)
+            m = np.isfinite(s) & np.isfinite(w_age) & (w_age > 0)
+            return float(np.sum(s[m] * w_age[m]) / np.sum(w_age[m])) if m.any() else np.nan
+
+        for base in ["RMSE_contract_model","MAPE_contract_model",
+                     "RMSE_agg_model","MAPE_agg_model",
+                     "RMSE_contract_ref","MAPE_contract_ref",
+                     "RMSE_agg_ref","MAPE_agg_ref"]:
+            all_w[f"{base}_mean_w"] = _wmean_over_age(f"{base}_mean_w")
+            all_w[f"{base}_std_w"]  = _wmean_over_age(f"{base}_std_w")
+        sum_df = pd.concat([sum_df, pd.DataFrame([all_w])], ignore_index=True)
+
+        # 3) новый ALL_weighted_exact — точный глобальный расчёт по всем тест-агрегатам
+        if agg_global_rows:
+            agg_all = pd.concat(agg_global_rows, ignore_index=True)
+            all_exact = {"LoanAge": "ALL_weighted_exact", "N_iter": all_row["N_iter"]}
+            all_exact["RMSE_agg_model_exact"] = _weighted_rmse(
+                agg_all["CPR_fact_agg"], agg_all["CPR_model_agg"], agg_all["sum_od"]
+            )
+            all_exact["MAPE_agg_model_exact"] = _weighted_mape(
+                agg_all["CPR_fact_agg"], agg_all["CPR_model_agg"], agg_all["sum_od"]
+            )
+            all_exact["RMSE_agg_ref_exact"] = _weighted_rmse(
+                agg_all["CPR_fact_agg"], agg_all["CPR_ref_agg"], agg_all["sum_od"]
+            )
+            all_exact["MAPE_agg_ref_exact"] = _weighted_mape(
+                agg_all["CPR_fact_agg"], agg_all["CPR_ref_agg"], agg_all["sum_od"]
+            )
+            sum_df = pd.concat([sum_df, pd.DataFrame([all_exact])], ignore_index=True)
 
     it_df.to_excel(os.path.join(ts_dir, "results_iter.xlsx"), index=False)
     sum_df.to_excel(os.path.join(ts_dir, "summary.xlsx"), index=False)
 
-    # ═════ гистограммы распределений ошибок на симуляциях (по всем age вместе) ═════
+    # ── гистограммы распределений ошибок по итерациям (как было)
     def _save_hist(series, title, out_png, out_csv, bins=30, xlabel="value"):
         s = pd.Series(series).replace([np.inf, -np.inf], np.nan).dropna()
         if s.empty:
@@ -365,7 +424,6 @@ def run_step3_cv_validation(
         plt.close()
         pd.DataFrame({xlabel: s}).to_csv(out_csv, index=False, encoding="utf-8-sig")
 
-    # наборы для гистограмм
     metrics = [
         ("RMSE_agg_model",      "OOS RMSE (agg, model)"),
         ("RMSE_agg_ref",        "OOS RMSE (agg, ref)"),
@@ -388,21 +446,20 @@ def run_step3_cv_validation(
                 xlabel=col
             )
 
-    # маленький readme по содержимому
+    # readme
     with open(os.path.join(ts_dir, "readme.txt"), "w", encoding="utf-8") as f:
         f.write("STEP 3 OOS 90/10 (стратификация по стимулу)\n")
         f.write(f"Program: {program_name}\n")
         f.write("Файлы:\n")
-        f.write(" • results_iter.xlsx — строка на каждую итерацию и возраст (все 8 метрик + размеры теста)\n")
-        f.write(" • summary.xlsx — средние/стд по age и строка ALL\n")
-        f.write(" • charts/age_*.png — графики последней удачной итерации по age (агрегаты)\n")
-        f.write(" • charts/hist_*.png и hist_*.csv — гистограммы/данные распределений ошибок\n")
+        f.write(" • results_iter.xlsx — по итерациям (метрики + размеры теста)\n")
+        f.write(" • summary.xlsx — по age (обычные и OD-взвешенные) + строки ALL/ALL_weighted_by_age/ALL_weighted_exact\n")
+        f.write(" • charts/age_*.png — графики последней удачной итерации (агрегаты)\n")
+        f.write(" • charts/hist_*.png + hist_*.csv — гистограммы/данные распределений ошибок\n")
 
     print(f"\n✅ STEP 3 готово для {program_name}")
     print(f"• Папка: {ts_dir}")
     print("• Сохранено:")
     print("   - results_iter.xlsx (по итерациям)")
-    print("   - summary.xlsx (средние/стд по age и ALL)")
-    print("   - charts/age_*.png (последняя итерация, агрегаты)")
-    print("   - charts/hist_*.png + hist_*.csv (распределения ошибок)")
+    print("   - summary.xlsx (по age + ALL, ALL_weighted_by_age, ALL_weighted_exact)")
+    print("   - charts/age_*.png; charts/hist_*.png + hist_*.csv")
     return {"output_dir": ts_dir, "iter": it_df, "summary": sum_df}
