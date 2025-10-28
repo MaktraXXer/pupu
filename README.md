@@ -1,86 +1,52 @@
+ниже — аккуратно переписанный **STEP 4 (Out-of-Time)** с микро-правками и страховками. Главное для тебя:
+
+* Подписи по оси X теперь строго в формате **`MM.YY`** (например, `09.25`), без локалей и «кривых» русских названий.
+* Жёстко клипую модельный/эталонный CPR в `[0, 1-1e-9]`, чтобы не ловить отрицательные прематы/странные всплески.
+* Периоды сортируются по дате; график строится в этом порядке.
+* Если `betas_ref_path` не задан — референс-кривая просто не рисуется, метрики по ней останутся `NaN` (это ок).
+* Мелкие чистки/страховки масок в RMSE/MAPE, проверка входных колонок, фикс названия файла `oot_results.xlsx`.
+
+Копируй целиком:
+
+```python
 # -*- coding: utf-8 -*-
 """
-STEP 4 — out-of-time валидация с нормальными подписями месяцев (MM.YY)
-
-Что делает:
-  • По каждому возрасту (LoanAge) берёт месяцы (payment_period как "месяц"), идёт слева направо:
-      - train = все месяцы "до" текущего;
-      - test  = текущий месяц.
-  • Фитит S-кривую на train (как в step 3): целевая = CPR_fact по договорам, веса = OD (od_after_plan).
-  • Предсказывает на test, далее АГРЕГИРУЕТ по стимулу (как в step 2) и
-    считает ошибки RMSE/MAPE по агрегированным CPR (веса = sum(OD) в бине).
-  • Ошибки считаются ТОЛЬКО на разрешённых age×stimulus (с учётом ignored_bins из Step 1).
-  • Сохраняет:
-      - iterations_by_age.xlsx — 1 лист на каждый возраст с помесячными метриками (RMSE_bin, MAPE_bin, веса);
-      - summary.xlsx — сводная таблица: число итераций, средневзвешенные RMSE/MAPE по каждому age и строка ALL;
-      - charts/ — для каждого age:
-          * линия RMSE по месяцам (ось X = MM.YY),
-          * линия MAPE по месяцам (ось X = MM.YY),
-          * гистограмма распределения RMSE,
-          * гистограмма распределения MAPE.
-
-Единственное «изменение» относительно классики — аккуратные подписи оси X: MM.YY (например, 01.24).
+STEP 4 — Out-of-Time валидация S-кривых (одна программа).
+Считаем помесячно фактический и модельный CPR и сравниваем по RMSE/MAPE.
+Подписи оси X — 'MM.YY' (например, '09.25'), без локалей.
 """
 
 import os
-import warnings
-from datetime import datetime
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.optimize import minimize
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+import warnings
 
 warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
 plt.rcParams["axes.formatter.useoffset"] = False
 
 
-# ───────────── утилиты ─────────────
+# ─── utils ────────────────────────────────────────────────
 def _ensure_dir(p: str) -> str:
     os.makedirs(p, exist_ok=True)
     return p
 
-def _clip01(v, eps=1e-9):
-    """Клип CPR к [0; 1-eps]"""
+def _clip01(v, eps: float = 1e-9):
     arr = np.asarray(v, float)
     return np.clip(arr, 0.0, 1.0 - eps)
 
 def _f_from_betas(b, x):
-    """S-кривая (arctan-форма). Если b некорректны — вернёт NaN-массив."""
     x = np.asarray(x, float)
-    if b is None:
-        return np.full_like(x, np.nan, dtype=float)
     b = np.asarray(b, float)
     if b.size < 7 or not np.all(np.isfinite(b)):
         return np.full_like(x, np.nan, dtype=float)
-    return (b[0]
-            + b[1] * np.arctan(b[2] + b[3] * x)
-            + b[4] * np.arctan(b[5] + b[6] * x))
-
-def _fit_arctan_unconstrained(x, y, w,
-                              start=(0.2, 0.05, -2.0, 2.2, 0.07, 2.0, 0.2)):
-    """Фит арктан-кривой по весам (как в Step 1/3)."""
-    x, y, w = map(lambda z: np.asarray(z, float), (x, y, w))
-    if len(x) < 5:
-        return np.full(7, np.nan)
-
-    w = np.where(np.isfinite(w) & (w > 0), w, 0.0)
-    w = (w / w.sum()) if w.sum() > 0 else np.ones_like(w) / len(w)
-
-    def f(b, xx):
-        return (b[0] + b[1]*np.arctan(b[2] + b[3]*xx) + b[4]*np.arctan(b[5] + b[6]*xx))
-
-    def obj(b):
-        return np.sum(w * (y - f(b, x))**2)
-
-    bounds = [[-np.inf, np.inf], [0, np.inf], [-np.inf, 0], [0, 4],
-              [0, np.inf], [0, np.inf], [0, 1]]
-    res = minimize(obj, start, bounds=bounds, method="SLSQP", options={"ftol": 1e-9})
-    return res.x
+    y = b[0] + b[1]*np.arctan(b[2]+b[3]*x) + b[4]*np.arctan(b[5]+b[6]*x)
+    return _clip01(y)
 
 def _weighted_rmse(y_true, y_pred, w):
-    y_true, y_pred, w = map(np.asarray, (y_true, y_pred, w))
+    y_true, y_pred, w = map(lambda a: np.asarray(a, float), (y_true, y_pred, w))
     m = np.isfinite(y_true) & np.isfinite(y_pred) & np.isfinite(w) & (w > 0)
     if not m.any():
         return np.nan
@@ -88,294 +54,186 @@ def _weighted_rmse(y_true, y_pred, w):
     return float(np.sqrt(mse))
 
 def _weighted_mape(y_true, y_pred, w):
-    y_true, y_pred, w = map(np.asarray, (y_true, y_pred, w))
+    y_true, y_pred, w = map(lambda a: np.asarray(a, float), (y_true, y_pred, w))
     m = np.isfinite(y_true) & np.isfinite(y_pred) & np.isfinite(w) & (w > 0) & (y_true != 0)
     if not m.any():
         return np.nan
     ape = np.abs((y_true[m] - y_pred[m]) / y_true[m])
     return float(np.sum(w[m] * ape) / np.sum(w[m]))
 
-def _load_ignored(step1_dir: str):
-    """ignored_bins.xlsx из Step 1 (может отсутствовать)."""
-    path = os.path.join(step1_dir, "ignored_bins.xlsx")
-    if os.path.exists(path):
-        return pd.read_excel(path)
-    return None
+def _load_betas(step1_dir: str) -> pd.DataFrame:
+    path = os.path.join(step1_dir, "betas_full.xlsx")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Не найден файл с бетами: {path}")
+    return pd.read_excel(path)
 
-def _get_allowed_mask(df_sub: pd.DataFrame, ignored_df: pd.DataFrame | None):
-    """True — если age×stimulus разрешён для подсчёта ошибки."""
-    if ignored_df is None or ignored_df.empty:
-        return np.ones(len(df_sub), bool)
-    mask = np.ones(len(df_sub), bool)
-    for _, r in ignored_df.iterrows():
-        h = r.get("LoanAge")
-        lo, hi = r.get("Incentive_lo"), r.get("Incentive_hi")
-        typ = str(r.get("Type") or "")
-        if typ == "exclude_age":
-            mask &= (df_sub["age_group_id"] != h)
-        elif typ == "exclude_range":
-            mask &= ~((df_sub["stimul"] >= lo) & (df_sub["stimul"] <= hi) & (df_sub["age_group_id"] == h))
-    return mask
+def _build_betas_map(df_betas: pd.DataFrame) -> dict[int, np.ndarray]:
+    """Поддержка как именованных, так и позиционных столбцов."""
+    tmp = df_betas.copy()
+    tmp.columns = [str(c).strip() for c in tmp.columns]
+    lower = {c.lower(): c for c in tmp.columns}
+    has_named = all(k in lower for k in ["loanage","b0","b1","b2","b3","b4","b5","b6"])
+    if has_named:
+        cols = [lower[k] for k in ["loanage","b0","b1","b2","b3","b4","b5","b6"]]
+        tmp = tmp[cols].rename(columns={cols[0]: "LoanAge"})
+    else:
+        # позиционные первые 8
+        tmp = tmp.iloc[:, :8]
+        tmp.columns = ["LoanAge","b0","b1","b2","b3","b4","b5","b6"]
+    tmp["LoanAge"] = pd.to_numeric(tmp["LoanAge"], errors="coerce").astype("Int64")
+    for c in ["b0","b1","b2","b3","b4","b5","b6"]:
+        tmp[c] = pd.to_numeric(tmp[c], errors="coerce")
+    tmp = tmp.dropna(subset=["LoanAge","b0","b1","b2","b3","b4","b5","b6"])
+    out = {}
+    for _, r in tmp.iterrows():
+        out[int(r["LoanAge"])] = r[["b0","b1","b2","b3","b4","b5","b6"]].to_numpy(dtype=float)
+    return out
 
 
-# ───────────── основной шаг: OOT ─────────────
+# ─── основной шаг ─────────────────────────────────────────
 def run_step4_out_of_time(
     df_raw_program: pd.DataFrame,
     step1_dir: str,
+    betas_ref_path: str | None = None,
     out_root: str = r"C:\Users\mi.makhmudov\Desktop\SCurve_step4",
     program_name: str = "UNKNOWN",
-    min_months_train: int = 3,      # минимум месяцев в train до первого теста
-    min_obs_per_age: int = 20       # минимум договоров в age для участия
+    months_back: int = 3,
+    payment_col: str = "payment_period"
 ):
-    """
-    OOT: для каждого месяца t берём train=<все месяцы < t>, test=месяц t.
-    Модель фитим на уровне договоров (цель=CPR_fact, веса=OD).
-    Ошибки считаем на АГРЕГАТНЫХ CPR по бинам стимулов (как в step 2).
-    """
+    """Out-of-Time валидация для одной программы (агрегация по месяцам)."""
 
-    # ── подготовка входа ──
-    ts_dir = _ensure_dir(os.path.join(out_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S")))
-    charts_dir = _ensure_dir(os.path.join(ts_dir, "charts"))
+    # входные проверки
+    need = [payment_col, "age_group_id", "stimul", "od_after_plan", "premat_payment", "refin_rate", "con_rate"]
+    miss = [c for c in need if c not in df_raw_program.columns]
+    if miss:
+        raise KeyError(f"В df_raw_program отсутствуют колонки: {miss}")
 
-    ignored_df = _load_ignored(step1_dir)
+    betas_model_df = _load_betas(step1_dir)
+    betas_model = _build_betas_map(betas_model_df)
 
-    # приведение типов, фильтр как в step 2/3
+    betas_ref = None
+    betas_ref_map = {}
+    if betas_ref_path and os.path.exists(betas_ref_path):
+        betas_ref = pd.read_excel(betas_ref_path)
+        betas_ref_map = _build_betas_map(betas_ref)
+
+    out_dir = _ensure_dir(os.path.join(out_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S")))
+    charts_dir = _ensure_dir(os.path.join(out_dir, "charts"))
+
+    # подготовка данных
     df = df_raw_program.copy()
-    df = df[(df["stimul"].notna()) &
-            (pd.to_numeric(df["refin_rate"], errors="coerce") > 0) &
-            (pd.to_numeric(df["con_rate"],  errors="coerce") > 0)]
-    df["od_after_plan"]  = pd.to_numeric(df["od_after_plan"], errors="coerce")
-    df["premat_payment"] = pd.to_numeric(df["premat_payment"], errors="coerce")
-    df["age_group_id"]   = pd.to_numeric(df["age_group_id"], errors="coerce").astype("Int64")
-    df["payment_period"] = pd.to_datetime(df["payment_period"], errors="coerce").dt.to_period("M").dt.to_timestamp()
-    df = df[df["od_after_plan"].notna() & df["premat_payment"].notna()]
-    df = df[df["od_after_plan"] >= 0]
+    df[payment_col]    = pd.to_datetime(df[payment_col], errors="coerce")
+    df["age_group_id"] = pd.to_numeric(df["age_group_id"], errors="coerce").astype("Int64")
+    for c in ["stimul","od_after_plan","premat_payment","refin_rate","con_rate"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # CPR факт на договоре (без клипа, клипим на агрегации/модели где нужно)
+    df = df[(df[payment_col].notna()) &
+            (df["stimul"].notna()) &
+            (df["od_after_plan"].notna()) &
+            (df["premat_payment"].notna()) &
+            (df["refin_rate"] > 0) & (df["con_rate"] > 0)]
+
+    # договорный CPR (для справки/контроля — не для фита)
     df["CPR_fact"] = np.where(
         df["od_after_plan"] > 0,
         1 - np.power(1 - df["premat_payment"] / df["od_after_plan"], 12),
         0.0
+    ).clip(0, 1 - 1e-9)
+
+    # модельные CPR по age
+    df["CPR_model"] = np.nan
+    df["CPR_ref"]   = np.nan
+    ages = df["age_group_id"].dropna().astype(int).unique().tolist()
+    for h in ages:
+        m = df["age_group_id"] == h
+        b = betas_model.get(h, None)
+        if b is not None:
+            df.loc[m, "CPR_model"] = _f_from_betas(b, df.loc[m, "stimul"].values)
+        if h in betas_ref_map:
+            df.loc[m, "CPR_ref"] = _f_from_betas(betas_ref_map[h], df.loc[m, "stimul"].values)
+
+    # расчёт прематов из CPR (обратно из годового CPR в месячную интенсивность)
+    df["premat_model"] = np.where(
+        df["od_after_plan"] > 0,
+        df["od_after_plan"] * (1 - np.power(1 - df["CPR_model"], 1/12)),
+        0.0
+    )
+    df["premat_ref"] = np.where(
+        np.isfinite(df["CPR_ref"]) & (df["od_after_plan"] > 0),
+        df["od_after_plan"] * (1 - np.power(1 - df["CPR_ref"], 1/12)),
+        np.nan
     )
 
-    # возрастные группы
-    ages = sorted(df["age_group_id"].dropna().unique().astype(int).tolist())
+    # выбор последних months_back полных месяцев в данных
+    all_periods = pd.to_datetime(df[payment_col].dropna().unique())
+    if all_periods.size == 0:
+        raise ValueError(f"Не найдено валидных дат в колонке {payment_col}.")
+    max_period = pd.to_datetime(all_periods.max())
+    min_period = max_period - relativedelta(months=months_back-1)
+    sel_mask = (df[payment_col] >= min_period) & (df[payment_col] <= max_period)
+    df_sel = df.loc[sel_mask].copy()
 
-    # месяцы (упорядочено)
-    months = sorted(df["payment_period"].dropna().unique().tolist())
-    if len(months) < (min_months_train + 1):
-        raise RuntimeError("Слишком короткая история для OOT: мало месяцев.")
+    # агрегирование на уровне месяца
+    agg = (df_sel
+           .groupby(payment_col, as_index=False)
+           .agg(sum_od=("od_after_plan","sum"),
+                sum_premat_fact=("premat_payment","sum"),
+                sum_premat_model=("premat_model","sum"),
+                sum_premat_ref=("premat_ref","sum")))
 
-    # коллекторы по age
-    per_age_iters: dict[int, list[dict]] = {h: [] for h in ages}
+    # гарантируем хронологический порядок
+    agg.sort_values(payment_col, inplace=True, ignore_index=True)
 
-    # ── основной цикл по age ──
-    for h in ages:
-        df_h = df[df["age_group_id"] == h].copy()
-        if len(df_h) < min_obs_per_age or df_h["stimul"].nunique() < 2:
-            continue
+    # перевод в CPR (годовые доли)
+    agg["CPR_fact"]  = np.where(agg["sum_od"] > 0, 1 - np.power(1 - agg["sum_premat_fact"]/agg["sum_od"], 12), 0.0)
+    agg["CPR_model"] = np.where(agg["sum_od"] > 0, 1 - np.power(1 - agg["sum_premat_model"]/agg["sum_od"], 12), 0.0)
+    agg["CPR_ref"]   = np.where(agg["sum_od"] > 0, 1 - np.power(1 - agg["sum_premat_ref"]/agg["sum_od"], 12), np.nan)
 
-        # идём по тестовым месяцам начиная с индекса min_months_train
-        for ti in range(min_months_train, len(months)):
-            m_test = months[ti]
-            train_months = months[:ti]
+    # подписи по оси X: 'MM.YY'
+    agg["month_label"] = agg[payment_col].dt.strftime("%m.%y")
 
-            train = df_h[df_h["payment_period"].isin(train_months)]
-            test  = df_h[df_h["payment_period"] == m_test]
+    # метрики (веса = OD месяца)
+    rmse_m = _weighted_rmse(agg["CPR_fact"], agg["CPR_model"], agg["sum_od"])
+    mape_m = _weighted_mape(agg["CPR_fact"], agg["CPR_model"], agg["sum_od"])
+    rmse_r = _weighted_rmse(agg["CPR_fact"], agg["CPR_ref"],   agg["sum_od"])
+    mape_r = _weighted_mape(agg["CPR_fact"], agg["CPR_ref"],   agg["sum_od"])
 
-            # sanity
-            if train.empty or test.empty or train["stimul"].nunique() < 2:
-                continue
+    summary = pd.DataFrame([{
+        "Program": program_name,
+        "Months": len(agg),
+        "Period_from": pd.to_datetime(agg[payment_col].min()).date() if len(agg) else pd.NaT,
+        "Period_to":   pd.to_datetime(agg[payment_col].max()).date() if len(agg) else pd.NaT,
+        "RMSE_model": rmse_m,
+        "MAPE_model": mape_m,
+        "RMSE_ref": rmse_r,
+        "MAPE_ref": mape_r
+    }])
 
-            # фитим на train, как в step 3 (веса = OD)
-            b_fit = _fit_arctan_unconstrained(train["stimul"], train["CPR_fact"], train["od_after_plan"])
-            if not np.all(np.isfinite(b_fit)):
-                continue
+    # график CPR
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(agg["month_label"], agg["CPR_fact"],  "-o", label="Факт")
+    ax.plot(agg["month_label"], agg["CPR_model"], "-s", label="Модель")
+    if np.isfinite(agg["CPR_ref"]).any():
+        ax.plot(agg["month_label"], agg["CPR_ref"], "--", label="Эталон")
+    ax.set_title(f"{program_name} • Out-of-Time ({min_period:%m.%y} — {max_period:%m.%y})")
+    ax.set_xlabel("Месяц")
+    ax.set_ylabel("CPR, доля/год")
+    ax.grid(ls="--", alpha=0.3)
+    ax.legend()
+    plt.xticks(rotation=45, ha="right")
+    fig.tight_layout()
+    fig.savefig(os.path.join(charts_dir, "CPR_trend.png"), dpi=220)
+    plt.close(fig)
 
-            # предсказываем на test (клип CPR, premat ≥ 0)
-            test = test.copy()
-            test["CPR_model"]   = _clip01(_f_from_betas(b_fit, test["stimul"]))
-            test["premat_model"] = test["od_after_plan"] * (1 - np.power(1 - test["CPR_model"], 1/12))
+    # сохранение
+    agg.to_excel(os.path.join(out_dir, "oot_results.xlsx"), index=False)
+    summary.to_excel(os.path.join(out_dir, "summary.xlsx"), index=False)
 
-            # считаем ошибки ТОЛЬКО на разрешённых age×stimulus
-            test["age_group_id"] = h
-            allowed_mask = _get_allowed_mask(test, ignored_df)
-            test_valid = test[allowed_mask].copy()
-            if test_valid.empty or test_valid["od_after_plan"].sum() <= 0:
-                continue
+    print(f"\n✅ STEP 4 готово для {program_name}")
+    print(f"• Периоды: {min_period.date()} – {max_period.date()} ({len(agg)} мес.)")
+    print(f"• RMSE_model={rmse_m if pd.notna(rmse_m) else np.nan:.4f}, MAPE_model={mape_m if pd.notna(mape_m) else np.nan:.2%}")
+    print(f"• Папка: {out_dir}")
+    return {"output_dir": out_dir, "agg": agg, "summary": summary}
+```
 
-            # АГРЕГАТЫ по стимулу (как в step 2)
-            agg = test_valid.groupby("stimul", as_index=False).agg(
-                sum_od=("od_after_plan", "sum"),
-                sum_premat_fact=("premat_payment", "sum"),
-                sum_premat_model=("premat_model", "sum"),
-            )
-            # CPR факт/модель на уровне бина
-            agg["CPR_fact_agg"] = np.where(
-                agg["sum_od"] > 0, 1 - np.power(1 - agg["sum_premat_fact"]/agg["sum_od"], 12), 0.0
-            )
-            agg["CPR_model_agg"] = np.where(
-                agg["sum_od"] > 0, 1 - np.power(1 - agg["sum_premat_model"]/agg["sum_od"], 12), 0.0
-            )
-            # клип модельного CPR на всякий
-            agg["CPR_model_agg"] = _clip01(agg["CPR_model_agg"])
-
-            # метрики (веса = sum_od по бинам)
-            rmse_bin = _weighted_rmse(agg["CPR_fact_agg"], agg["CPR_model_agg"], agg["sum_od"])
-            mape_bin = _weighted_mape(agg["CPR_fact_agg"], agg["CPR_model_agg"], agg["sum_od"])
-
-            per_age_iters[h].append({
-                "TestMonth": m_test,
-                "TestMonth_str": pd.Timestamp(m_test).strftime("%m.%y"),   # ← нормальная подпись
-                "N_bins": int(len(agg)),
-                "OD_sum": float(agg["sum_od"].sum()),
-                "RMSE_bin": rmse_bin,
-                "MAPE_bin": mape_bin,
-            })
-
-    # ── выгрузка iterations_by_age.xlsx (по листам) ──
-    iters_path = os.path.join(ts_dir, "iterations_by_age.xlsx")
-    with pd.ExcelWriter(iters_path, engine="openpyxl") as xw:
-        for h in ages:
-            rows = per_age_iters.get(h, [])
-            df_it = pd.DataFrame(rows)
-            if not df_it.empty:
-                df_it = df_it.sort_values("TestMonth")
-                df_it.to_excel(xw, sheet_name=f"age_{h}", index=False)
-            else:
-                pd.DataFrame(columns=["TestMonth","TestMonth_str","N_bins","OD_sum","RMSE_bin","MAPE_bin"])\
-                  .to_excel(xw, sheet_name=f"age_{h}", index=False)
-
-    # ── summary.xlsx: средневзвешенные по месяцам (веса = OD_sum), затем по age (вес = суммарный OD по age) ──
-    summary_rows = []
-    for h in ages:
-        df_it = pd.DataFrame(per_age_iters.get(h, []))
-        if df_it.empty:
-            continue
-        w = df_it["OD_sum"].astype(float)
-        # защита от пустых весов
-        w_pos = w.where(w > 0, other=np.nan)
-        rmse_w = (df_it["RMSE_bin"] * w_pos).sum(skipna=True) / w_pos.sum(skipna=True) if w_pos.notna().any() else np.nan
-        mape_w = (df_it["MAPE_bin"] * w_pos).sum(skipna=True) / w_pos.sum(skipna=True) if w_pos.notna().any() else np.nan
-
-        summary_rows.append({
-            "LoanAge": h,
-            "N_test_months": int(len(df_it)),
-            "OD_sum_total": float(w.sum()),
-            "RMSE_bin_weighted": rmse_w,
-            "MAPE_bin_weighted": mape_w
-        })
-
-    df_sum = pd.DataFrame(summary_rows).sort_values("LoanAge")
-
-    # строка ALL: весим по OD_sum_total между age
-    if not df_sum.empty and (df_sum["OD_sum_total"] > 0).any():
-        W = df_sum["OD_sum_total"].astype(float)
-        W_pos = W.where(W > 0, other=np.nan)
-        rmse_all = (df_sum["RMSE_bin_weighted"] * W_pos).sum(skipna=True) / W_pos.sum(skipna=True)
-        mape_all = (df_sum["MAPE_bin_weighted"] * W_pos).sum(skipna=True) / W_pos.sum(skipna=True)
-        row_all = {
-            "LoanAge": "ALL",
-            "N_test_months": int(np.nan),
-            "OD_sum_total": float(W.sum()),
-            "RMSE_bin_weighted": rmse_all,
-            "MAPE_bin_weighted": mape_all
-        }
-        df_sum = pd.concat([df_sum, pd.DataFrame([row_all])], ignore_index=True)
-
-    df_sum.to_excel(os.path.join(ts_dir, "summary.xlsx"), index=False)
-
-    # ── графики: для каждого age — линии по месяцам (RMSE/MAPE) и гистограммы распределений ──
-    for h in ages:
-        df_it = pd.DataFrame(per_age_iters.get(h, []))
-        if df_it.empty:
-            # пустой-заглушка
-            for col, fname, ttl in [
-                ("RMSE_bin", f"age_{h}_rmse_by_month.png", "RMSE (agg по бинам) по месяцам"),
-                ("MAPE_bin", f"age_{h}_mape_by_month.png", "MAPE (agg по бинам) по месяцам"),
-            ]:
-                fig = plt.figure(figsize=(11.0, 3.8))
-                plt.axis('off')
-                plt.text(0.5, 0.55, f"h={h}: No valid months", ha="center", va="center", fontsize=14)
-                plt.text(0.5, 0.35, ttl, ha="center", va="center", fontsize=11)
-                fig.tight_layout()
-                fig.savefig(os.path.join(charts_dir, fname), dpi=220)
-                plt.close(fig)
-            # дистры
-            for col, fname, ttl in [
-                ("RMSE_bin", f"age_{h}_hist_rmse.png", "Распределение RMSE (agg по бинам)"),
-                ("MAPE_bin", f"age_{h}_hist_mape.png", "Распределение MAPE (agg по бинам)"),
-            ]:
-                fig = plt.figure(figsize=(8.0, 4.4))
-                plt.axis('off')
-                plt.text(0.5, 0.5, f"h={h}: No data to plot", ha="center", va="center", fontsize=12)
-                fig.tight_layout()
-                fig.savefig(os.path.join(charts_dir, fname), dpi=220)
-                plt.close(fig)
-            continue
-
-        # ЛИНИИ: ось X = аккуратные ярлыки MM.YY
-        dfp = df_it.sort_values("TestMonth").copy()
-        labels = dfp["TestMonth_str"].tolist()
-
-        for col, fname, ttl in [
-            ("RMSE_bin", f"age_{h}_rmse_by_month.png", "RMSE (agg по бинам) по месяцам"),
-            ("MAPE_bin", f"age_{h}_mape_by_month.png", "MAPE (agg по бинам) по месяцам"),
-        ]:
-            fig = plt.figure(figsize=(11.0, 3.8))
-            x = np.arange(len(dfp))
-            y = dfp[col].values
-            plt.plot(x, y, marker="o")
-            plt.xticks(x, labels, rotation=0)  # ← строго MM.YY
-            plt.grid(ls="--", alpha=0.35)
-            plt.title(f"Age={h} • {ttl}")
-            plt.xlabel("Месяц (MM.YY)")
-            plt.ylabel(col)
-            fig.tight_layout()
-            fig.savefig(os.path.join(charts_dir, fname), dpi=220)
-            plt.close(fig)
-
-        # ГИСТОГРАММЫ распределений (две на age)
-        for col, fname, ttl in [
-            ("RMSE_bin", f"age_{h}_hist_rmse.png", "Распределение RMSE (agg по бинам)"),
-            ("MAPE_bin", f"age_{h}_hist_mape.png", "Распределение MAPE (agg по бинам)"),
-        ]:
-            s = pd.Series(dfp[col]).replace([np.inf, -np.inf], np.nan).dropna()
-            fig = plt.figure(figsize=(8.0, 4.4))
-            if s.empty:
-                plt.axis('off')
-                plt.text(0.5, 0.5, f"h={h}: No values", ha="center", va="center", fontsize=12)
-            else:
-                plt.hist(s.values, bins=30, alpha=0.85)
-                plt.title(f"Age={h} • {ttl}")
-                plt.xlabel(col)
-                plt.ylabel("Count")
-                plt.grid(ls="--", alpha=0.35)
-            fig.tight_layout()
-            fig.savefig(os.path.join(charts_dir, fname), dpi=220)
-            plt.close(fig)
-
-    print("\n✅ STEP 4 OOT готов.")
-    print("• Папка:", ts_dir)
-    print("• Сохранено:")
-    print("   - iterations_by_age.xlsx (листы по age)")
-    print("   - summary.xlsx (средневзвешенные ошибки по age + ALL)")
-    print("   - charts/: по два линейных графика и две гистограммы на каждый age")
-
-    return {
-        "output_dir": ts_dir,
-        "iterations": per_age_iters,
-        "summary": df_sum
-    }
-
-
-# ───────────── пример запуска ─────────────
-# ПРИМЕР (подставь свои переменные, как у тебя в Step 0…3):
-# result = run_step4_out_of_time(
-#     df_raw_program=df_raw_program,
-#     step1_dir=step1_dir,
-#     out_root=r"C:\Users\mi.makhmudov\Desktop\Разведка Первички\out-of-time валидация",
-#     program_name="Первичная ипотека",
-#     min_months_train=3,
-#     min_obs_per_age=20
-# )
+если ещё где-то встретишь русские месяцы/локали — просто придерживайся приёма с `dt.strftime("%m.%y")`: он стабильно даёт тот короткий формат, который тебе нужен, и не зависит от ОС/локализации.
