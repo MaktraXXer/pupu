@@ -10,15 +10,14 @@ DECLARE @od_only        bit           = 1;
 DECLARE @dt_rep_prev    date          = '2025-09-30';  -- снимок "до" (НС на 30.09)
 DECLARE @dt_rep_now     date          = '2025-10-25';  -- снимок "после" (НС на 25.10 и открытия)
 
--- === ЕДИНСТВЕННОЕ окно ВЫХОДА (по dt_close), которое анализируем в этом прогоне ===
-DECLARE @exit_from      date          = '2025-10-01';
-DECLARE @exit_to        date          = '2025-10-15';
-
--- Окна ОТКРЫТИЙ (по dt_open) для разбиения
+-- Декады (окна для выходов и открытий)
 DECLARE @w1_from        date          = '2025-10-01';
 DECLARE @w1_to          date          = '2025-10-15';
 DECLARE @w2_from        date          = '2025-10-16';
 DECLARE @w2_to          date          = '2025-10-25';
+
+-- Выбор сценария клиентского пула: 'W1_ONLY' | 'W2_ONLY' | 'BOTH'
+DECLARE @cohort_mode    varchar(16)   = 'W1_ONLY';
 
 -- Фильтры секций
 DECLARE @section_td     nvarchar(50)  = N'Срочные';
@@ -54,31 +53,30 @@ CREATE TABLE #rk_rates(
 );
 INSERT INTO #rk_rates(d_from,d_to,conv_type,r)
 VALUES
--- волна 1: с 1-го до дня перед split
 (@month_start, DATEADD(day,-1,@rk_split_from), 'AT_THE_END',     0.165),
 (@month_start, DATEADD(day,-1,@rk_split_from), 'AT_THE_END',     0.163),
 (@month_start, DATEADD(day,-1,@rk_split_from), 'NOT_AT_THE_END', 0.162),
 (@month_start, DATEADD(day,-1,@rk_split_from), 'NOT_AT_THE_END', 0.160),
--- волна 2: c split по @dt_rep_now
 (@rk_split_from, @dt_rep_now, 'AT_THE_END',     0.170),
 (@rk_split_from, @dt_rep_now, 'AT_THE_END',     0.168),
 (@rk_split_from, @dt_rep_now, 'NOT_AT_THE_END', 0.167),
 (@rk_split_from, @dt_rep_now, 'NOT_AT_THE_END', 0.165);
 
 /* ============================================================
-   A) ПУЛ КЛИЕНТОВ: ВЫХОД ВКЛАДОВ В (@exit_from; @exit_to), НЕ-МАРКЕТ
-   (снимок 30.09)
+   A) ВЫХОДЫ НА 30.09: формируем базы по декадам (НЕ-МАРКЕТ)
    ============================================================*/
-IF OBJECT_ID('tempdb..#exit_clients') IS NOT NULL DROP TABLE #exit_clients;
-CREATE TABLE #exit_clients(
-  cli_id       bigint PRIMARY KEY,
-  sum_out_rub  decimal(20,4) NOT NULL
+IF OBJECT_ID('tempdb..#td_0930') IS NOT NULL DROP TABLE #td_0930;
+CREATE TABLE #td_0930(
+    cli_id   bigint      NOT NULL,
+    out_rub  decimal(20,4) NOT NULL,
+    dt_close date NULL
 );
 
-INSERT INTO #exit_clients(cli_id, sum_out_rub)
+INSERT INTO #td_0930(cli_id, out_rub, dt_close)
 SELECT
     t.cli_id,
-    SUM(t.out_rub) AS sum_out_rub      -- сумма выходящих вкладов (по клиенту)
+    t.out_rub,
+    TRY_CAST(t.dt_close AS date)
 FROM ALM.ALM.VW_Balance_Rest_All t WITH (NOLOCK)
 LEFT JOIN #market_names m ON m.prod_name_res = t.prod_name_res
 WHERE
@@ -89,30 +87,87 @@ WHERE
     AND t.cur          = @cur
     AND t.acc_role     = @acc_role
     AND t.out_rub IS NOT NULL AND t.out_rub >= 0
-    AND m.prod_name_res IS NULL
-    AND TRY_CAST(t.dt_close AS date) BETWEEN @exit_from AND @exit_to
-GROUP BY t.cli_id;
+    AND m.prod_name_res IS NULL;
 
-/* === Вывод 1: Сколько вкладов выходило (сумма) + кол-во клиентов === */
-SELECT
-    @exit_from AS exit_window_from,
-    @exit_to   AS exit_window_to,
-    COUNT(*)   AS clients_maturing_cnt,
-    SUM(sum_out_rub) AS deposits_maturing_sum
-FROM #exit_clients;
+IF OBJECT_ID('tempdb..#mature_w1_by_cli') IS NOT NULL DROP TABLE #mature_w1_by_cli;
+CREATE TABLE #mature_w1_by_cli(cli_id bigint PRIMARY KEY, dep_sum_w1 decimal(20,4));
+INSERT INTO #mature_w1_by_cli(cli_id, dep_sum_w1)
+SELECT cli_id, SUM(out_rub)
+FROM #td_0930
+WHERE dt_close BETWEEN @w1_from AND @w1_to
+GROUP BY cli_id;
+
+IF OBJECT_ID('tempdb..#mature_w2_by_cli') IS NOT NULL DROP TABLE #mature_w2_by_cli;
+CREATE TABLE #mature_w2_by_cli(cli_id bigint PRIMARY KEY, dep_sum_w2 decimal(20,4));
+INSERT INTO #mature_w2_by_cli(cli_id, dep_sum_w2)
+SELECT cli_id, SUM(out_rub)
+FROM #td_0930
+WHERE dt_close BETWEEN @w2_from AND @w2_to
+GROUP BY cli_id;
 
 /* ============================================================
-   B) НС на 30.09 и на 25.10 — ТОЛЬКО по этим клиентам
+   B) СЦЕНАРНЫЙ ПУЛ КЛИЕНТОВ: W1_ONLY / W2_ONLY / BOTH
    ============================================================*/
--- НС на 30.09
-IF OBJECT_ID('tempdb..#ns_0930_exit') IS NOT NULL DROP TABLE #ns_0930_exit;
-CREATE TABLE #ns_0930_exit(cli_id bigint PRIMARY KEY, out_rub decimal(20,4));
-INSERT INTO #ns_0930_exit(cli_id, out_rub)
+IF OBJECT_ID('tempdb..#clients_cohort') IS NOT NULL DROP TABLE #clients_cohort;
+CREATE TABLE #clients_cohort(cli_id bigint PRIMARY KEY);
+
+IF @cohort_mode = 'W1_ONLY'
+BEGIN
+    INSERT INTO #clients_cohort(cli_id)
+    SELECT w1.cli_id
+    FROM #mature_w1_by_cli w1
+    WHERE NOT EXISTS (SELECT 1 FROM #mature_w2_by_cli w2 WHERE w2.cli_id = w1.cli_id);
+END
+ELSE IF @cohort_mode = 'W2_ONLY'
+BEGIN
+    INSERT INTO #clients_cohort(cli_id)
+    SELECT w2.cli_id
+    FROM #mature_w2_by_cli w2
+    WHERE NOT EXISTS (SELECT 1 FROM #mature_w1_by_cli w1 WHERE w1.cli_id = w2.cli_id);
+END
+ELSE IF @cohort_mode = 'BOTH'
+BEGIN
+    INSERT INTO #clients_cohort(cli_id)
+    SELECT w1.cli_id
+    FROM #mature_w1_by_cli w1
+    INNER JOIN #mature_w2_by_cli w2 ON w2.cli_id = w1.cli_id;
+END
+ELSE
+BEGIN
+    RAISERROR('Unknown @cohort_mode. Use W1_ONLY | W2_ONLY | BOTH', 16, 1);
+    RETURN;
+END
+
+/* === сверочные суммы выходов по выбранному пулу (раздельно W1 и W2) === */
+IF OBJECT_ID('tempdb..#maturing_check') IS NOT NULL DROP TABLE #maturing_check;
+CREATE TABLE #maturing_check(
+    clients_cnt int,
+    deposits_maturing_sum_w1 decimal(20,4),
+    deposits_maturing_sum_w2 decimal(20,4)
+);
+INSERT INTO #maturing_check(clients_cnt, deposits_maturing_sum_w1, deposits_maturing_sum_w2)
 SELECT
-    t.cli_id,
-    SUM(t.out_rub) AS out_rub
+    COUNT(*) AS clients_cnt,
+    ISNULL( (SELECT SUM(w1.dep_sum_w1) FROM #mature_w1_by_cli w1 JOIN #clients_cohort c ON c.cli_id = w1.cli_id), 0) AS deposits_maturing_sum_w1,
+    ISNULL( (SELECT SUM(w2.dep_sum_w2) FROM #mature_w2_by_cli w2 JOIN #clients_cohort c ON c.cli_id = w2.cli_id), 0) AS deposits_maturing_sum_w2;
+
+/* === Вывод 1: пул и сверка выходов по декадам === */
+SELECT
+    @cohort_mode AS cohort_mode,
+    clients_cnt,
+    deposits_maturing_sum_w1,
+    deposits_maturing_sum_w2
+FROM #maturing_check;
+
+/* ============================================================
+   C) НС на 30.09 и 25.10 — только по выбранному пулу
+   ============================================================*/
+IF OBJECT_ID('tempdb..#ns_0930') IS NOT NULL DROP TABLE #ns_0930;
+CREATE TABLE #ns_0930(cli_id bigint PRIMARY KEY, out_rub decimal(20,4));
+INSERT INTO #ns_0930(cli_id, out_rub)
+SELECT t.cli_id, SUM(t.out_rub)
 FROM ALM.ALM.VW_Balance_Rest_All t WITH (NOLOCK)
-JOIN #exit_clients ec ON ec.cli_id = t.cli_id
+JOIN #clients_cohort c ON c.cli_id = t.cli_id
 WHERE
     t.dt_rep        = @dt_rep_prev
     AND t.section_name = @section_ns
@@ -122,15 +177,12 @@ WHERE
     AND t.out_rub IS NOT NULL AND t.out_rub >= 0
 GROUP BY t.cli_id;
 
--- НС на 25.10
-IF OBJECT_ID('tempdb..#ns_1025_exit') IS NOT NULL DROP TABLE #ns_1025_exit;
-CREATE TABLE #ns_1025_exit(cli_id bigint PRIMARY KEY, out_rub decimal(20,4));
-INSERT INTO #ns_1025_exit(cli_id, out_rub)
-SELECT
-    t.cli_id,
-    SUM(t.out_rub) AS out_rub
+IF OBJECT_ID('tempdb..#ns_1025') IS NOT NULL DROP TABLE #ns_1025;
+CREATE TABLE #ns_1025(cli_id bigint PRIMARY KEY, out_rub decimal(20,4));
+INSERT INTO #ns_1025(cli_id, out_rub)
+SELECT t.cli_id, SUM(t.out_rub)
 FROM ALM.ALM.VW_Balance_Rest_All t WITH (NOLOCK)
-JOIN #exit_clients ec ON ec.cli_id = t.cli_id
+JOIN #clients_cohort c ON c.cli_id = t.cli_id
 WHERE
     t.dt_rep        = @dt_rep_now
     AND t.section_name = @section_ns
@@ -140,43 +192,38 @@ WHERE
     AND t.out_rub IS NOT NULL AND t.out_rub >= 0
 GROUP BY t.cli_id;
 
-/* === Вывод 2: НС «Было» и «Стало» — только по пулу клиентов === */
--- Было НС на 30.09
+/* === Вывод 2: НС было/стало (по пулу) === */
+-- Было (30.09)
 SELECT
     COUNT(*)     AS clients_ns_0930_cnt,
     SUM(out_rub) AS ns_0930_sum
-FROM #ns_0930_exit;
+FROM #ns_0930;
 
--- Стало НС на 25.10
+-- Стало (25.10)
 SELECT
     COUNT(*)     AS clients_ns_1025_cnt,
     SUM(out_rub) AS ns_1025_sum
-FROM #ns_1025_exit;
+FROM #ns_1025;
 
 /* ============================================================
-   C) ОТКРЫТИЯ ЭТИМИ ЖЕ КЛИЕНТАМИ на 25.10-СНИМКЕ:
-      01–15 и 16–25 (по РК / не по РК), НЕ-МАРКЕТ
+   D) ОТКРЫТИЯ ЭТИМИ ЖЕ КЛИЕНТАМИ (по снимку 25.10), НЕ-МАРКЕТ
+      + деление по РК/неРК и декадам 01–15 / 16–25
    ============================================================*/
--- База срочных на 25.10 по клиентам из пула
 IF OBJECT_ID('tempdb..#td_1025_base') IS NOT NULL DROP TABLE #td_1025_base;
 CREATE TABLE #td_1025_base(
-    dt_open_d   date        NOT NULL,
-    con_id      bigint      NOT NULL,
-    cli_id      bigint      NOT NULL,
-    out_rub     decimal(20,4) NOT NULL,
-    rate_con    decimal(9,6) NULL,
-    conv        nvarchar(50) NULL
+    dt_open_d date NOT NULL,
+    con_id    bigint NOT NULL,
+    cli_id    bigint NOT NULL,
+    out_rub   decimal(20,4) NOT NULL,
+    rate_con  decimal(9,6) NULL,
+    conv      nvarchar(50) NULL
 );
 INSERT INTO #td_1025_base(dt_open_d, con_id, cli_id, out_rub, rate_con, conv)
 SELECT
-    CAST(t.dt_open AS date) AS dt_open_d,
-    t.con_id,
-    t.cli_id,
-    t.out_rub,
-    t.rate_con,
-    t.conv
+    CAST(t.dt_open AS date),
+    t.con_id, t.cli_id, t.out_rub, t.rate_con, t.conv
 FROM ALM.ALM.VW_Balance_Rest_All t WITH (NOLOCK)
-JOIN #exit_clients ec ON ec.cli_id = t.cli_id
+JOIN #clients_cohort c ON c.cli_id = t.cli_id
 LEFT JOIN #market_names m ON m.prod_name_res = t.prod_name_res
 WHERE
     t.dt_rep        = @dt_rep_now
@@ -189,38 +236,36 @@ WHERE
     AND m.prod_name_res IS NULL
     AND CAST(t.dt_open AS date) BETWEEN @w1_from AND @w2_to;
 
--- Схлопываем по con_id и нормализуем conv
 IF OBJECT_ID('tempdb..#td_1025_by_con') IS NOT NULL DROP TABLE #td_1025_by_con;
 CREATE TABLE #td_1025_by_con(
-    dt_open_d   date        NOT NULL,
-    con_id      bigint      NOT NULL PRIMARY KEY,
-    cli_id      bigint      NOT NULL,
-    out_rub     decimal(20,4) NOT NULL,
-    rate_con    decimal(9,6) NULL,
-    conv_norm   varchar(20)  NOT NULL
+    dt_open_d date NOT NULL,
+    con_id    bigint NOT NULL PRIMARY KEY,
+    cli_id    bigint NOT NULL,
+    out_rub   decimal(20,4) NOT NULL,
+    rate_con  decimal(9,6) NULL,
+    conv_norm varchar(20) NOT NULL
 );
-INSERT INTO #td_1025_by_con(dt_open_d,con_id,cli_id,out_rub,rate_con,conv_norm)
+INSERT INTO #td_1025_by_con(dt_open_d, con_id, cli_id, out_rub, rate_con, conv_norm)
 SELECT
     b.dt_open_d,
     b.con_id,
-    MIN(b.cli_id)   AS cli_id,
-    SUM(b.out_rub)  AS out_rub,
-    MIN(b.rate_con) AS rate_con,
+    MIN(b.cli_id),
+    SUM(b.out_rub),
+    MIN(b.rate_con),
     CASE
         WHEN MIN(NULLIF(LTRIM(RTRIM(COALESCE(b.conv,''))),'')) IS NULL
-             THEN 'AT_THE_END'
+            THEN 'AT_THE_END'
         ELSE UPPER(LTRIM(RTRIM(MIN(b.conv))))
-    END AS conv_norm
+    END
 FROM #td_1025_base b
 GROUP BY b.dt_open_d, b.con_id;
 
--- Флаг «по РК»
 IF OBJECT_ID('tempdb..#td_1025_flag') IS NOT NULL DROP TABLE #td_1025_flag;
 CREATE TABLE #td_1025_flag(
-    dt_open_d   date        NOT NULL,
-    cli_id      bigint      NOT NULL,
-    out_rub     decimal(20,4) NOT NULL,
-    is_rk       bit         NOT NULL
+    dt_open_d date NOT NULL,
+    cli_id    bigint NOT NULL,
+    out_rub   decimal(20,4) NOT NULL,
+    is_rk     bit NOT NULL
 );
 INSERT INTO #td_1025_flag(dt_open_d, cli_id, out_rub, is_rk)
 SELECT
@@ -229,22 +274,21 @@ SELECT
     c.out_rub,
     CASE
       WHEN c.conv_norm = 'AT_THE_END' AND EXISTS (
-         SELECT 1 FROM #rk_rates rr
-         WHERE rr.conv_type = 'AT_THE_END'
-           AND c.dt_open_d BETWEEN rr.d_from AND rr.d_to
-           AND ABS(c.rate_con - rr.r) <= @eps
+           SELECT 1 FROM #rk_rates rr
+           WHERE rr.conv_type = 'AT_THE_END'
+             AND c.dt_open_d BETWEEN rr.d_from AND rr.d_to
+             AND ABS(c.rate_con - rr.r) <= @eps
       ) THEN 1
       WHEN c.conv_norm <> 'AT_THE_END' AND EXISTS (
-         SELECT 1 FROM #rk_rates rr
-         WHERE rr.conv_type = 'NOT_AT_THE_END'
-           AND c.dt_open_d BETWEEN rr.d_from AND rr.d_to
-           AND ABS(c.rate_con - rr.r) <= @eps
+           SELECT 1 FROM #rk_rates rr
+           WHERE rr.conv_type = 'NOT_AT_THE_END'
+             AND c.dt_open_d BETWEEN rr.d_from AND rr.d_to
+             AND ABS(c.rate_con - rr.r) <= @eps
       ) THEN 1
       ELSE 0
-    END AS is_rk
+    END
 FROM #td_1025_by_con c;
 
--- Агрегируем на уровне клиента по окнам и РК-бакетам
 IF OBJECT_ID('tempdb..#openings_by_client') IS NOT NULL DROP TABLE #openings_by_client;
 CREATE TABLE #openings_by_client(
     window_label nvarchar(16),
@@ -252,8 +296,7 @@ CREATE TABLE #openings_by_client(
     cli_id       bigint,
     sum_out_rub  decimal(20,4)
 );
-
-INSERT INTO #openings_by_client(window_label,is_rk,cli_id,sum_out_rub)
+INSERT INTO #openings_by_client(window_label, is_rk, cli_id, sum_out_rub)
 SELECT N'01-15 Oct', f.is_rk, f.cli_id, SUM(f.out_rub)
 FROM #td_1025_flag f
 WHERE f.dt_open_d BETWEEN @w1_from AND @w1_to
