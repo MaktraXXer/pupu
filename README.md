@@ -3,23 +3,23 @@
    Снапшот @Anchor как в mail.usp_fill_balance_metrics_savings
    + ДОБАВЛЕНЫ нулевые договоры ALM.ehd.import_ZeroContracts
      (с учётом TSEGMENTNAME и подстановкой промо-ставок).
- 
+
    ФЛАГИ:
    • @UseFixedPromoFromNextMonth: ВКЛ → фикс-промо (@PromoRate_*)
      действует ТОЛЬКО в месяце, следующем за якорем:
      окно [ @FixedPromoStart ; @FixedPromoEnd ).
    • @UseHardPromoSpread: ВКЛ → вместо расчетного спреда использовать
      жёстко заданный спред (@HardSpread_*), начиная с @HardSpreadStart.
-   ПРИОРИТЕТ: фикс-промо (если окно)  → иначе жесткий спред (если включён)
+   ПРИОРИТЕТ: фикс-промо (если окно)  → иначе жёсткий спред (если включён)
              → иначе стандартная модель (как была).
- 
+
    Правила:
      • промо: с dt_open до предпоследнего дня следующего месяца;
      • base_day — базовая @BaseRate;
      • base_day и 1-е числа — ПОЛНЫЙ перелив Σ клиента на max ставку;
-     • НОВОЕ: после 1-го числа клиент «залипает» на выбранной max-ставке
-       до promo_end (carry-forward).
-   v.2025-08-11 (+флаги + carry-forward)
+     • Carry-forward: после 1-го числа клиент «залипает» на ставке
+       ровно = rate_con, выбранной на 1-е число, до promo_end.
+   v.2025-08-11 (+флаги + жёсткие спреды + фиксированный carry-forward)
 ═══════════════════════════════════════════════════════════════*/
 USE ALM_TEST;
 GO
@@ -33,7 +33,7 @@ DECLARE
     @BaseRate   decimal(9,4) = 0.0450,  -- базовая ставка на base-day
 
     /* Флаг 1: фикс-промо ТОЛЬКО в месяце, следующем за якорем */
-    @UseFixedPromoFromNextMonth bit = 0,
+    @UseFixedPromoFromNextMonth bit = 1,
 
     /* Флаг 2: жёсткие спреды (заменяют расчетные спреды) */
     @UseHardPromoSpread bit = 0;
@@ -66,10 +66,10 @@ WHERE  Scenario = @Scenario AND TERM = 1
 DECLARE @KeyAtAnchor decimal(9,4);
 SELECT @KeyAtAnchor = KEY_RATE FROM #key WHERE DT_REP = @Anchor;
 
-/* ── (A) Промо-ставки и расчетные спреды (старая логика) ───── */
+/* ── (A) Промо-ставки и расчетные спреды ───────────────────── */
 DECLARE
-    @PromoRate_DChbo  decimal(9,4) = 0.1600,  -- промо ДЧБО (УЧК)
-    @PromoRate_Retail decimal(9,4) = 0.1590;  -- промо Розница;
+    @PromoRate_DChbo  decimal(9,4) = 0.1600,  -- промо ДЧБО (пример)
+    @PromoRate_Retail decimal(9,4) = 0.1590;  -- промо Розница (пример)
 
 DECLARE
     @Spread_DChbo  decimal(9,4) = @PromoRate_DChbo  - @KeyAtAnchor,
@@ -77,8 +77,8 @@ DECLARE
 
 /* ── (A2) Жёсткие спреды (новая опция) ─────────────────────── */
 DECLARE
-    @HardSpread_DChbo  decimal(9,4) = -0.0030,  -- напр. +0.30 п.п. к KEY(win_start) → спред -0.0030 к KEY(@Anchor) для примера
-    @HardSpread_Retail decimal(9,4) = -0.0040;  -- напр. +0.40 п.п.
+    @HardSpread_DChbo  decimal(9,4) = -0.0030,  -- пример
+    @HardSpread_Retail decimal(9,4) = -0.0040;  -- пример
 
 IF OBJECT_ID('WORK.NS_Spreads','U') IS NOT NULL DROP TABLE WORK.NS_Spreads;
 CREATE TABLE WORK.NS_Spreads(
@@ -408,16 +408,17 @@ FROM   ranked r
 JOIN   #cli_sum cs ON cs.cli_id = r.cli_id
 GROUP  BY r.cli_id, r.dt_rep, cs.out_rub_sum;
 
-/* ── 6.5) Carry-forward после 1-го числа: клиент остаётся на max-ставке до promo_end ─ */
+/* ── 6.5) Carry-forward ПО ФАКТУ ВЫБОРА 1-го ЧИСЛА:
+         берём ТОЧНО rate_con с 1-го, тащим до promo_end ─────── */
 IF OBJECT_ID('tempdb..#carry_forward') IS NOT NULL DROP TABLE #carry_forward;
 ;WITH pick AS (
-    /* что выбрали 1-го числа: con_id, сегмент, дата перелива */
-    SELECT f.cli_id, f.con_id, f.TSEGMENTNAME, f.dt_rep AS first_day
+    /* что выбрали 1-го числа: con_id, сегмент, ставка и дата перелива */
+    SELECT f.cli_id, f.con_id, f.TSEGMENTNAME, f.dt_rep AS first_day, f.rate_con AS rate_on_first
     FROM   #firstday_assigned f
 ),
 bind AS (
-    /* к какому окну (cycle) относится это 1-е число */
-    SELECT p.cli_id, p.con_id, p.TSEGMENTNAME, p.first_day,
+    /* к какому окну (cycle) относится это 1-е число (по выбранному con_id) */
+    SELECT p.cli_id, p.con_id, p.TSEGMENTNAME, p.first_day, p.rate_on_first,
            c.cycle_no, c.win_start, c.promo_end, c.base_day
     FROM   pick p
     JOIN   #cycles c
@@ -425,60 +426,29 @@ bind AS (
           AND p.first_day BETWEEN c.win_start AND c.base_day
 ),
 days AS (
-    /* дни после 1-го числа до конца promo-окна включительно */
-    SELECT b.cli_id, b.con_id, b.TSEGMENTNAME, b.first_day,
+    /* дни ПОСЛЕ 1-го до конца promo-окна включительно */
+    SELECT b.cli_id, b.con_id, b.TSEGMENTNAME, b.first_day, b.rate_on_first,
            b.cycle_no, b.win_start, b.promo_end,
            d.d AS dt_rep
     FROM   bind b
     JOIN   #cal d
            ON d.d BETWEEN DATEADD(day,1,b.first_day) AND b.promo_end
-),
-kref AS (
-    /* KEY на старт окна (k_open = KEY(win_start)) */
-    SELECT DISTINCT b.win_start, k.KEY_RATE AS key_open
-    FROM   bind b
-    JOIN   #key k ON k.DT_REP = b.win_start
 )
 SELECT
     cf.con_id,
     cf.cli_id,
     cf.TSEGMENTNAME,
-    /* весь клиентский объём: тот же Σ, что и на 1-е число */
-    out_rub = cs.out_rub_sum,
+    out_rub = cs.out_rub_sum,           -- весь объём клиента = как на 1-е
     cf.dt_rep,
-    /* ставка по выбранному сегменту, с приоритетами:
-       1) фикс-промо в месяце после якоря
-       2) жёсткий спред (если включён)
-       3) обычный спред от промо (@Spread_*)
-       все спреды считаются от KEY(win_start) окна */
-    rate_con =
-      CASE
-        WHEN @UseFixedPromoFromNextMonth = 1
-         AND cf.dt_rep >= @FixedPromoStart AND cf.dt_rep < @FixedPromoEnd THEN
-             CASE cf.TSEGMENTNAME
-               WHEN N'ДЧБО'            THEN @PromoRate_DChbo
-               ELSE                          @PromoRate_Retail
-             END
-        WHEN @UseHardPromoSpread = 1 AND cf.dt_rep >= @HardSpreadStart THEN
-             CASE cf.TSEGMENTNAME
-               WHEN N'ДЧБО'            THEN @HardSpread_DChbo  + kr.key_open
-               ELSE                          @HardSpread_Retail+ kr.key_open
-             END
-        ELSE
-             CASE cf.TSEGMENTNAME
-               WHEN N'ДЧБО'            THEN @Spread_DChbo  + kr.key_open
-               ELSE                          @Spread_Retail+ kr.key_open
-             END
-      END
+    rate_con = cf.rate_on_first         -- РОВНО та же ставка, что на 1-е
 INTO   #carry_forward
 FROM   days cf
-JOIN   kref kr  ON kr.win_start = cf.win_start
 JOIN   #cli_sum cs ON cs.cli_id  = cf.cli_id;
 
 /* ── 7) Финальная promo-лента с учётом:
-       — base_day (full-shift, как было),
-       — 1-е числа (full-shift, как было),
-       — carry-forward после 1-го числа до promo_end ─────────── */
+       — base_day (full-shift),
+       — 1-е числа (full-shift),
+       — carry-forward (2-е число .. promo_end = фикс. ставка с 1-го) ── */
 IF OBJECT_ID('WORK.Forecast_NS_Promo','U') IS NOT NULL DROP TABLE WORK.Forecast_NS_Promo;
 
 SELECT
@@ -490,7 +460,7 @@ FROM (
     /* 7.1. Все дни из #daily_pre, КРОМЕ:
        — base_day у отмеченных клиентов (заменим),
        — 1-х чисел (заменим),
-       — дней после 1-го до promo_end для клиентов с carry-forward (заменим) */
+       — дней carry-forward (заменим) */
     SELECT dp.con_id, dp.cli_id, dp.TSEGMENTNAME, dp.out_rub, dp.dt_rep, dp.rate_con
     FROM   #daily_pre dp
     WHERE  NOT EXISTS (SELECT 1 FROM #base_dates bd
@@ -501,17 +471,17 @@ FROM (
                        WHERE cf.cli_id = dp.cli_id AND cf.dt_rep = dp.dt_rep)
 
     UNION ALL
-    /* 7.2. base_day — full shift (одна строка на клиента) */
+    /* 7.2. base_day — full shift */
     SELECT con_id, cli_id, TSEGMENTNAME, out_rub, dt_rep, rate_con
     FROM   #daily_base_adj
 
     UNION ALL
-    /* 7.3. 1-е числа — full shift (одна строка на клиента) */
+    /* 7.3. 1-е числа — full shift */
     SELECT con_id, cli_id, TSEGMENTNAME, out_rub, dt_rep, rate_con
     FROM   #firstday_assigned
 
     UNION ALL
-    /* 7.4. carry-forward: со 2-го числа до promo_end сидим на выбранной max-ставке */
+    /* 7.4. carry-forward: со 2-го до promo_end сидим на ставке 1-го числа */
     SELECT con_id, cli_id, TSEGMENTNAME, out_rub, dt_rep, rate_con
     FROM   #carry_forward
 ) u
