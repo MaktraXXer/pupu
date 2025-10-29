@@ -1,239 +1,452 @@
-ниже — аккуратно переписанный **STEP 4 (Out-of-Time)** с микро-правками и страховками. Главное для тебя:
+/* ══════════════════════════════════════════════════════════════
+   NS-forecast — Part 2 (FIX-promo-roll, prod_id = 654)
+   Снапшот @Anchor как в mail.usp_fill_balance_metrics_savings
+   + ДОБАВЛЕНЫ нулевые договоры ALM.ehd.import_ZeroContracts
+     (с учётом TSEGMENTNAME и подстановкой промо-ставок).
 
-* Подписи по оси X теперь строго в формате **`MM.YY`** (например, `09.25`), без локалей и «кривых» русских названий.
-* Жёстко клипую модельный/эталонный CPR в `[0, 1-1e-9]`, чтобы не ловить отрицательные прематы/странные всплески.
-* Периоды сортируются по дате; график строится в этом порядке.
-* Если `betas_ref_path` не задан — референс-кривая просто не рисуется, метрики по ней останутся `NaN` (это ок).
-* Мелкие чистки/страховки масок в RMSE/MAPE, проверка входных колонок, фикс названия файла `oot_results.xlsx`.
+   ФЛАГИ:
+   • @UseFixedPromoFromNextMonth: ВКЛ → фикс-промо (@PromoRate_*)
+     действует ТОЛЬКО в месяце, следующем за якорем:
+     окно [ @FixedPromoStart ; @FixedPromoEnd ).
+   • @UseHardPromoSpread: ВКЛ → вместо расчетного спреда использовать
+     жёстко заданный спред (@HardSpread_*), начиная с @HardSpreadStart.
+   ПРИОРИТЕТ: фикс-промо (если окно)  → иначе жесткий спред (если включён)
+             → иначе стандартная модель (как была).
 
-Копируй целиком:
+   Правила:
+     • промо: с dt_open до предпоследнего дня следующего месяца;
+     • base_day — базовая @BaseRate;
+     • base_day и 1-е числа — ПОЛНЫЙ перелив Σ клиента на max ставку.
+   v.2025-08-11 (+флаги: фикс-промо-месяц и жёсткие спреды)
+═══════════════════════════════════════════════════════════════*/
+USE ALM_TEST;
+GO
+SET NOCOUNT ON;
 
-```python
-# -*- coding: utf-8 -*-
-"""
-STEP 4 — Out-of-Time валидация S-кривых (одна программа).
-Считаем помесячно фактический и модельный CPR и сравниваем по RMSE/MAPE.
-Подписи оси X — 'MM.YY' (например, '09.25'), без локалей.
-"""
+/* ── параметры ─────────────────────────────────────────────── */
+DECLARE
+    @Scenario   tinyint      = 1,
+    @Anchor     date         = '2025-10-22',
+    @HorizonTo  date         = '2025-12-31',
+    @BaseRate   decimal(9,4) = 0.0450,  -- базовая ставка на base-day
 
-import os
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from datetime import datetime
-from dateutil.relativedelta import relativedelta
-import warnings
+    /* Флаг 1: фикс-промо ТОЛЬКО в месяце, следующем за якорем */
+    @UseFixedPromoFromNextMonth bit = 1,
 
-warnings.filterwarnings("ignore", category=FutureWarning)
-plt.rcParams["axes.formatter.useoffset"] = False
+    /* Флаг 2: жёсткие спреды (заменяют расчетные спреды) */
+    @UseHardPromoSpread bit = 1;
 
+/* Окно фикс-промо: ровно один месяц после якоря */
+DECLARE @FixedPromoStart date = DATEADD(day,1,EOMONTH(@Anchor));   -- 1-е следующего месяца
+DECLARE @FixedPromoEnd   date = DATEADD(month,1,@FixedPromoStart); -- 1-е через месяц
 
-# ─── utils ────────────────────────────────────────────────
-def _ensure_dir(p: str) -> str:
-    os.makedirs(p, exist_ok=True)
-    return p
+/* Старт применения жёстких спредов (по умолчанию — с якоря; можно переопределить) */
+DECLARE @HardSpreadStart date = @Anchor;
 
-def _clip01(v, eps: float = 1e-9):
-    arr = np.asarray(v, float)
-    return np.clip(arr, 0.0, 1.0 - eps)
+/* диапазон dt_open для «живых» договоров: пред. месяц .. EOM(Anchor) */
+DECLARE
+    @OpenFrom date = DATEFROMPARTS(YEAR(DATEADD(month,-1,@Anchor)), MONTH(DATEADD(month,-1,@Anchor)), 1),
+    @OpenTo   date = EOMONTH(@Anchor);
 
-def _f_from_betas(b, x):
-    x = np.asarray(x, float)
-    b = np.asarray(b, float)
-    if b.size < 7 or not np.all(np.isfinite(b)):
-        return np.full_like(x, np.nan, dtype=float)
-    y = b[0] + b[1]*np.arctan(b[2]+b[3]*x) + b[4]*np.arctan(b[5]+b[6]*x)
-    return _clip01(y)
+-- PRINT @OpenFrom;
 
-def _weighted_rmse(y_true, y_pred, w):
-    y_true, y_pred, w = map(lambda a: np.asarray(a, float), (y_true, y_pred, w))
-    m = np.isfinite(y_true) & np.isfinite(y_pred) & np.isfinite(w) & (w > 0)
-    if not m.any():
-        return np.nan
-    mse = np.sum(w[m] * (y_true[m] - y_pred[m])**2) / np.sum(w[m])
-    return float(np.sqrt(mse))
+/* ── 0) Календарь горизонта + KEY(TERM=1) ───────────────────── */
+IF OBJECT_ID('tempdb..#cal') IS NOT NULL DROP TABLE #cal;
+SELECT d = @Anchor INTO #cal;
+WHILE (SELECT MAX(d) FROM #cal) < @HorizonTo
+    INSERT #cal SELECT DATEADD(day,1,MAX(d)) FROM #cal;
 
-def _weighted_mape(y_true, y_pred, w):
-    y_true, y_pred, w = map(lambda a: np.asarray(a, float), (y_true, y_pred, w))
-    m = np.isfinite(y_true) & np.isfinite(y_pred) & np.isfinite(w) & (w > 0) & (y_true != 0)
-    if not m.any():
-        return np.nan
-    ape = np.abs((y_true[m] - y_pred[m]) / y_true[m])
-    return float(np.sum(w[m] * ape) / np.sum(w[m]))
+IF OBJECT_ID('tempdb..#key') IS NOT NULL DROP TABLE #key;
+SELECT DT_REP, KEY_RATE
+INTO   #key
+FROM   WORK.ForecastKey_Cache_Scen
+WHERE  Scenario = @Scenario AND TERM = 1
+  AND  DT_REP BETWEEN @Anchor AND @HorizonTo;
 
-def _load_betas(step1_dir: str) -> pd.DataFrame:
-    path = os.path.join(step1_dir, "betas_full.xlsx")
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Не найден файл с бетами: {path}")
-    return pd.read_excel(path)
+DECLARE @KeyAtAnchor decimal(9,4);
+SELECT @KeyAtAnchor = KEY_RATE FROM #key WHERE DT_REP = @Anchor;
 
-def _build_betas_map(df_betas: pd.DataFrame) -> dict[int, np.ndarray]:
-    """Поддержка как именованных, так и позиционных столбцов."""
-    tmp = df_betas.copy()
-    tmp.columns = [str(c).strip() for c in tmp.columns]
-    lower = {c.lower(): c for c in tmp.columns}
-    has_named = all(k in lower for k in ["loanage","b0","b1","b2","b3","b4","b5","b6"])
-    if has_named:
-        cols = [lower[k] for k in ["loanage","b0","b1","b2","b3","b4","b5","b6"]]
-        tmp = tmp[cols].rename(columns={cols[0]: "LoanAge"})
-    else:
-        # позиционные первые 8
-        tmp = tmp.iloc[:, :8]
-        tmp.columns = ["LoanAge","b0","b1","b2","b3","b4","b5","b6"]
-    tmp["LoanAge"] = pd.to_numeric(tmp["LoanAge"], errors="coerce").astype("Int64")
-    for c in ["b0","b1","b2","b3","b4","b5","b6"]:
-        tmp[c] = pd.to_numeric(tmp[c], errors="coerce")
-    tmp = tmp.dropna(subset=["LoanAge","b0","b1","b2","b3","b4","b5","b6"])
-    out = {}
-    for _, r in tmp.iterrows():
-        out[int(r["LoanAge"])] = r[["b0","b1","b2","b3","b4","b5","b6"]].to_numpy(dtype=float)
-    return out
+/* ── (A) Промо-ставки и расчетные спреды (старая логика) ───── */
+DECLARE
+    @PromoRate_DChbo  decimal(9,4) = 0.1620,  -- промо ДЧБО (УЧК)
+    @PromoRate_Retail decimal(9,4) = 0.1610;  -- промо Розница
 
+DECLARE
+    @Spread_DChbo  decimal(9,4) = @PromoRate_DChbo  - @KeyAtAnchor,
+    @Spread_Retail decimal(9,4) = @PromoRate_Retail - @KeyAtAnchor;
 
-# ─── основной шаг ─────────────────────────────────────────
-def run_step4_out_of_time(
-    df_raw_program: pd.DataFrame,
-    step1_dir: str,
-    betas_ref_path: str | None = None,
-    out_root: str = r"C:\Users\mi.makhmudov\Desktop\SCurve_step4",
-    program_name: str = "UNKNOWN",
-    months_back: int = 3,
-    payment_col: str = "payment_period"
-):
-    """Out-of-Time валидация для одной программы (агрегация по месяцам)."""
+/* ── (A2) Жёсткие спреды (новая опция) ─────────────────────── */
+DECLARE
+    @HardSpread_DChbo  decimal(9,4) = 0.0040,  -- напр. 0.40% ДЧБО
+    @HardSpread_Retail decimal(9,4) = 0.0050;  -- напр. 0.50% Розница
 
-    # входные проверки
-    need = [payment_col, "age_group_id", "stimul", "od_after_plan", "premat_payment", "refin_rate", "con_rate"]
-    miss = [c for c in need if c not in df_raw_program.columns]
-    if miss:
-        raise KeyError(f"В df_raw_program отсутствуют колонки: {miss}")
+IF OBJECT_ID('WORK.NS_Spreads','U') IS NOT NULL DROP TABLE WORK.NS_Spreads;
+CREATE TABLE WORK.NS_Spreads(
+  TSEGMENTNAME nvarchar(40) PRIMARY KEY,
+  spread       decimal(9,4) NOT NULL
+);
+INSERT WORK.NS_Spreads(TSEGMENTNAME,spread) VALUES
+(N'ДЧБО',            @Spread_DChbo),
+(N'Розничный бизнес',@Spread_Retail);
 
-    betas_model_df = _load_betas(step1_dir)
-    betas_model = _build_betas_map(betas_model_df)
+/* ── 1) СНАПШОТ promo-портфеля на @Anchor (ровно как в SP) ─── */
+IF OBJECT_ID('tempdb..#bal_src') IS NOT NULL DROP TABLE #bal_src;
+SELECT
+    t.dt_rep,
+    CAST(t.dt_open  AS date)                 AS dt_open,
+    CAST(t.dt_close AS date)                 AS dt_close,
+    CAST(t.con_id   AS bigint)               AS con_id,
+    CAST(t.cli_id   AS bigint)               AS cli_id,
+    CAST(t.prod_id  AS int)                  AS prod_id,
+    CAST(t.out_rub  AS decimal(20,2))        AS out_rub,
+    CAST(t.rate_con AS decimal(9,4))         AS rate_balance,
+    t.rate_con_src,
+    t.TSEGMENTNAME,
+    CAST(r.rate     AS decimal(9,4))         AS rate_liq
+INTO #bal_src
+FROM   alm.ALM.vw_balance_rest_all AS t WITH (NOLOCK)
+LEFT   JOIN LIQUIDITY.liq.DepositContract_Rate r
+       ON  r.con_id = t.con_id
+       AND CASE WHEN t.dt_open = t.dt_rep
+                THEN DATEADD(day,1,t.dt_rep)        -- ULTRA «нулевой» день → +1
+                ELSE t.dt_rep
+           END BETWEEN r.dt_from AND r.dt_to
+WHERE  t.dt_rep BETWEEN DATEADD(day,-2,@Anchor) AND DATEADD(day,2,@Anchor)
+  AND  t.section_name = N'Накопительный счёт'
+  AND  t.block_name   = N'Привлечение ФЛ'
+  AND  t.od_flag      = 1
+  AND  t.cur          = '810'
+  AND  t.prod_id      = 654;
 
-    betas_ref = None
-    betas_ref_map = {}
-    if betas_ref_path and os.path.exists(betas_ref_path):
-        betas_ref = pd.read_excel(betas_ref_path)
-        betas_ref_map = _build_betas_map(betas_ref)
+CREATE CLUSTERED INDEX IX_bal_src ON #bal_src (con_id, dt_rep);
 
-    out_dir = _ensure_dir(os.path.join(out_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S")))
-    charts_dir = _ensure_dir(os.path.join(out_dir, "charts"))
+IF OBJECT_ID('tempdb..#bal_prom') IS NOT NULL DROP TABLE #bal_prom;
+;WITH bal_pos AS (
+    SELECT *,
+           /* первая положительная ULTRA-ставка на +1/+2 день */
+           MIN(CASE WHEN rate_balance > 0
+                     AND rate_con_src = N'счет ультра,вручную'
+                    THEN rate_balance END)
+               OVER (PARTITION BY con_id
+                     ORDER BY dt_rep
+                     ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) AS rate_pos
+    FROM #bal_src
+    WHERE dt_rep = @Anchor
+),
+rate_calc AS (
+    SELECT *,
+           CASE
+             WHEN rate_liq IS NULL
+                  THEN CASE
+                           WHEN rate_balance < 0
+                                THEN COALESCE(rate_pos, rate_balance)
+                           ELSE rate_balance
+                       END
+             WHEN rate_liq < 0  AND rate_balance > 0 THEN rate_balance
+             WHEN rate_liq < 0  AND rate_balance < 0 THEN COALESCE(rate_pos, rate_balance)
+             WHEN rate_liq >= 0 AND rate_balance >= 0 THEN rate_liq
+             WHEN rate_liq > 0  AND rate_balance < 0 THEN rate_liq
+             ELSE rate_liq
+           END AS rate_use
+    FROM bal_pos
+)
+SELECT
+    con_id,
+    cli_id,
+    out_rub,
+    rate_anchor = CAST(rate_use AS decimal(9,4)),  -- ставка на Anchor
+    dt_open,
+    TSEGMENTNAME
+INTO #bal_prom
+FROM rate_calc
+WHERE out_rub IS NOT NULL
+  AND dt_open BETWEEN @OpenFrom AND @OpenTo;
 
-    # подготовка данных
-    df = df_raw_program.copy()
-    df[payment_col]    = pd.to_datetime(df[payment_col], errors="coerce")
-    df["age_group_id"] = pd.to_numeric(df["age_group_id"], errors="coerce").astype("Int64")
-    for c in ["stimul","od_after_plan","premat_payment","refin_rate","con_rate"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+/* ── 1a) ДОБАВЛЯЕМ НУЛЕВЫЕ ДОГОВОРЫ (dt_open <= @Anchor) ───── */
+IF OBJECT_ID('tempdb..#z0') IS NOT NULL DROP TABLE #z0;
+SELECT
+    CAST(z.con_id AS bigint)                                                    AS con_id,
+    CAST(z.cli_id AS bigint)                                                    AS cli_id,
+    CAST(0.00     AS decimal(20,2))                                             AS out_rub,
+    CAST(
+         COALESCE(
+             z.rate_con,
+             CASE WHEN LTRIM(RTRIM(COALESCE(z.TSEGMENTNAME,N''))) = N'ДЧБО'
+                  THEN @PromoRate_DChbo
+                  ELSE @PromoRate_Retail
+             END
+         )
+         AS decimal(9,4)
+    )                                                                           AS rate_anchor,
+    CAST(z.dt_open AS date)                                                     AS dt_open,
+    CASE WHEN LTRIM(RTRIM(COALESCE(z.TSEGMENTNAME,N''))) = N''
+         THEN N'Розничный бизнес'
+         ELSE z.TSEGMENTNAME
+    END                                                                          AS TSEGMENTNAME
+INTO #z0
+FROM ALM.ehd.import_ZeroContracts z WITH (NOLOCK)
+WHERE z.dt_open <= @Anchor
+  AND NOT EXISTS (SELECT 1 FROM #bal_prom p WHERE p.con_id = z.con_id);
 
-    df = df[(df[payment_col].notna()) &
-            (df["stimul"].notna()) &
-            (df["od_after_plan"].notna()) &
-            (df["premat_payment"].notna()) &
-            (df["refin_rate"] > 0) & (df["con_rate"] > 0)]
+INSERT #bal_prom (con_id, cli_id, out_rub, rate_anchor, dt_open, TSEGMENTNAME)
+SELECT con_id, cli_id, out_rub, rate_anchor, dt_open, TSEGMENTNAME
+FROM #z0;
 
-    # договорный CPR (для справки/контроля — не для фита)
-    df["CPR_fact"] = np.where(
-        df["od_after_plan"] > 0,
-        1 - np.power(1 - df["premat_payment"] / df["od_after_plan"], 12),
-        0.0
-    ).clip(0, 1 - 1e-9)
+/* контроль общего объёма на Anchor (живые объёмы; нулевые = 0) */
+DECLARE @PromoTotal decimal(20,2) = (SELECT SUM(out_rub) FROM #bal_prom);
 
-    # модельные CPR по age
-    df["CPR_model"] = np.nan
-    df["CPR_ref"]   = np.nan
-    ages = df["age_group_id"].dropna().astype(int).unique().tolist()
-    for h in ages:
-        m = df["age_group_id"] == h
-        b = betas_model.get(h, None)
-        if b is not None:
-            df.loc[m, "CPR_model"] = _f_from_betas(b, df.loc[m, "stimul"].values)
-        if h in betas_ref_map:
-            df.loc[m, "CPR_ref"] = _f_from_betas(betas_ref_map[h], df.loc[m, "stimul"].values)
+/* ── 2) Циклы (base_day = EOM(next), promo_end = base_day-1) ── */
+IF OBJECT_ID('tempdb..#cycles') IS NOT NULL DROP TABLE #cycles;
+;WITH seed AS (
+    SELECT
+        b.con_id, b.cli_id, b.TSEGMENTNAME, b.out_rub,
+        CAST(0 AS int) AS cycle_no,
+        b.dt_open AS win_start,
+        EOMONTH(DATEADD(month,1, b.dt_open))                   AS base_day,   -- последний день
+        DATEADD(day,-1, EOMONTH(DATEADD(month,1, b.dt_open)))  AS promo_end   -- предпоследний
+    FROM #bal_prom b
+),
+seq AS (
+    SELECT * FROM seed
+    UNION ALL
+    SELECT
+        s.con_id, s.cli_id, s.TSEGMENTNAME, s.out_rub,
+        s.cycle_no + 1,
+        DATEADD(day,1, s.base_day) AS win_start,               -- 1-е след. месяца
+        EOMONTH(DATEADD(month,1, DATEADD(day,1, s.base_day))) AS base_day,
+        DATEADD(day,-1, EOMONTH(DATEADD(month,1, DATEADD(day,1, s.base_day)))) AS promo_end
+    FROM seq s
+    WHERE DATEADD(day,1, s.base_day) <= @HorizonTo
+)
+SELECT * INTO #cycles FROM seq OPTION (MAXRECURSION 0);
 
-    # расчёт прематов из CPR (обратно из годового CPR в месячную интенсивность)
-    df["premat_model"] = np.where(
-        df["od_after_plan"] > 0,
-        df["od_after_plan"] * (1 - np.power(1 - df["CPR_model"], 1/12)),
-        0.0
-    )
-    df["premat_ref"] = np.where(
-        np.isfinite(df["CPR_ref"]) & (df["od_after_plan"] > 0),
-        df["od_after_plan"] * (1 - np.power(1 - df["CPR_ref"], 1/12)),
-        np.nan
-    )
+/* ── 3) Дневная лента без 1-х чисел (promo + base-day) ──────── */
+IF OBJECT_ID('tempdb..#daily_pre') IS NOT NULL DROP TABLE #daily_pre;
+SELECT
+    c.con_id, c.cli_id, c.TSEGMENTNAME, c.out_rub,
+    c.cycle_no, c.win_start, c.promo_end, c.base_day,
+    d.d AS dt_rep,
+    CASE
+      WHEN d.d <= c.promo_end THEN
+           /* ПРИОРИТЕТ 1: Фикс-промо только в окне следующего месяца */
+           CASE
+             WHEN @UseFixedPromoFromNextMonth = 1
+              AND d.d >= @FixedPromoStart AND d.d < @FixedPromoEnd THEN
+                  CASE c.TSEGMENTNAME
+                       WHEN N'ДЧБО'            THEN @PromoRate_DChbo
+                       ELSE                          @PromoRate_Retail
+                  END
 
-    # выбор последних months_back полных месяцев в данных
-    all_periods = pd.to_datetime(df[payment_col].dropna().unique())
-    if all_periods.size == 0:
-        raise ValueError(f"Не найдено валидных дат в колонке {payment_col}.")
-    max_period = pd.to_datetime(all_periods.max())
-    min_period = max_period - relativedelta(months=months_back-1)
-    sel_mask = (df[payment_col] >= min_period) & (df[payment_col] <= max_period)
-    df_sel = df.loc[sel_mask].copy()
+             /* ПРИОРИТЕТ 2: Жёсткие спреды (замена расчетных спредов) */
+             WHEN @UseHardPromoSpread = 1 AND d.d >= @HardSpreadStart THEN
+                  CASE
+                    WHEN c.cycle_no = 0
+                         THEN bp.rate_anchor  -- нулевой цикл как в модели
+                    ELSE CASE c.TSEGMENTNAME
+                           WHEN N'ДЧБО'            THEN @HardSpread_DChbo  + k_open.KEY_RATE
+                           ELSE                          @HardSpread_Retail+ k_open.KEY_RATE
+                         END
+                  END
 
-    # агрегирование на уровне месяца
-    agg = (df_sel
-           .groupby(payment_col, as_index=False)
-           .agg(sum_od=("od_after_plan","sum"),
-                sum_premat_fact=("premat_payment","sum"),
-                sum_premat_model=("premat_model","sum"),
-                sum_premat_ref=("premat_ref","sum")))
+             /* Иначе: исходная модель (как была) */
+             ELSE
+                  CASE
+                    WHEN c.cycle_no = 0
+                         THEN bp.rate_anchor
+                    ELSE CASE c.TSEGMENTNAME
+                           WHEN N'ДЧБО'            THEN @Spread_DChbo  + k_open.KEY_RATE
+                           ELSE                          @Spread_Retail+ k_open.KEY_RATE
+                         END
+                  END
+           END
+      WHEN d.d = c.base_day THEN @BaseRate
+    END AS rate_con
+INTO   #daily_pre
+FROM   #cycles c
+JOIN   #cal d       ON d.d BETWEEN c.win_start AND c.base_day
+LEFT   JOIN #key k_open ON k_open.DT_REP = c.win_start
+JOIN   #bal_prom bp ON bp.con_id = c.con_id
+WHERE  DAY(d.d) <> 1;   -- 1-е числа делаем отдельно
 
-    # гарантируем хронологический порядок
-    agg.sort_values(payment_col, inplace=True, ignore_index=True)
+/* ── 4) base_day — ПОЛНЫЙ перелив Σ клиента на max ставку дня ─ */
+IF OBJECT_ID('tempdb..#base_dates') IS NOT NULL DROP TABLE #base_dates;
+SELECT DISTINCT dp.cli_id, dp.dt_rep
+INTO   #base_dates
+FROM   #daily_pre dp
+JOIN   #cycles c ON c.con_id=dp.con_id AND c.cycle_no=dp.cycle_no
+WHERE  dp.dt_rep = c.base_day;
 
-    # перевод в CPR (годовые доли)
-    agg["CPR_fact"]  = np.where(agg["sum_od"] > 0, 1 - np.power(1 - agg["sum_premat_fact"]/agg["sum_od"], 12), 0.0)
-    agg["CPR_model"] = np.where(agg["sum_od"] > 0, 1 - np.power(1 - agg["sum_premat_model"]/agg["sum_od"], 12), 0.0)
-    agg["CPR_ref"]   = np.where(agg["sum_od"] > 0, 1 - np.power(1 - agg["sum_premat_ref"]/agg["sum_od"], 12), np.nan)
+IF OBJECT_ID('tempdb..#daily_base_adj') IS NOT NULL DROP TABLE #daily_base_adj;
+;WITH pool AS (
+    SELECT dp.*
+    FROM   #daily_pre dp
+    JOIN   #base_dates bd ON bd.cli_id=dp.cli_id AND bd.dt_rep=dp.dt_rep
+),
+ranked AS (
+    SELECT p.*,
+           ROW_NUMBER() OVER (PARTITION BY p.cli_id, p.dt_rep
+                              ORDER BY p.rate_con DESC, p.TSEGMENTNAME, p.con_id) AS rn
+    FROM   pool p
+),
+sums AS (
+    SELECT cli_id, dt_rep, SUM(out_rub) AS total_out
+    FROM   pool
+    GROUP  BY cli_id, dt_rep
+)
+SELECT
+    r.con_id,
+    r.cli_id,
+    r.TSEGMENTNAME,
+    out_rub  = CASE WHEN r.rn=1 THEN s.total_out ELSE CAST(0.00 AS decimal(20,2)) END,
+    r.dt_rep,
+    rate_con = r.rate_con
+INTO   #daily_base_adj
+FROM   ranked r
+JOIN   sums   s ON s.cli_id=r.cli_id AND s.dt_rep=r.dt_rep;
 
-    # подписи по оси X: 'MM.YY'
-    agg["month_label"] = agg[payment_col].dt.strftime("%m.%y")
+/* ── 5) 1-е числа — кандидаты (внутри окна и новое окно) ───── */
+IF OBJECT_ID('tempdb..#day1_candidates') IS NOT NULL DROP TABLE #day1_candidates;
+;WITH marks AS (
+    SELECT
+      c.con_id, c.cli_id, c.TSEGMENTNAME, c.out_rub, c.cycle_no, c.win_start, c.promo_end, c.base_day,
+      DATEFROMPARTS(YEAR(DATEADD(month,1,c.win_start)), MONTH(DATEADD(month,1,c.win_start)), 1) AS m1_in,
+      DATEADD(day,1,c.base_day) AS m1_new
+    FROM #cycles c
+),
+cand AS (
+    /* 1-е внутри текущего окна */
+    SELECT
+        m.con_id, m.cli_id, m.TSEGMENTNAME, m.out_rub, m.cycle_no,
+        dt_rep = m.m1_in,
+        rate_con =
+            CASE
+              WHEN @UseFixedPromoFromNextMonth = 1
+               AND m.m1_in >= @FixedPromoStart AND m.m1_in < @FixedPromoEnd THEN
+                   CASE m.TSEGMENTNAME
+                        WHEN N'ДЧБО'            THEN @PromoRate_DChbo
+                        ELSE                          @PromoRate_Retail
+                   END
+              WHEN @UseHardPromoSpread = 1 AND m.m1_in >= @HardSpreadStart THEN
+                   CASE
+                     WHEN m.cycle_no = 0
+                          THEN bp.rate_anchor
+                     ELSE CASE m.TSEGMENTNAME
+                            WHEN N'ДЧБО'            THEN @HardSpread_DChbo  + k_open.KEY_RATE
+                            ELSE                          @HardSpread_Retail+ k_open.KEY_RATE
+                          END
+                   END
+              ELSE
+                   CASE
+                     WHEN m.cycle_no = 0
+                          THEN bp.rate_anchor
+                     ELSE CASE m.TSEGMENTNAME
+                            WHEN N'ДЧБО'            THEN @Spread_DChbo  + k_open.KEY_RATE
+                            ELSE                          @Spread_Retail+ k_open.KEY_RATE
+                          END
+                   END
+            END
+    FROM marks m
+    JOIN #bal_prom bp ON bp.con_id = m.con_id
+    LEFT JOIN #key k_open ON k_open.DT_REP = m.win_start
+    WHERE m.m1_in BETWEEN m.win_start AND m.promo_end
+      AND m.m1_in BETWEEN @Anchor AND @HorizonTo
 
-    # метрики (веса = OD месяца)
-    rmse_m = _weighted_rmse(agg["CPR_fact"], agg["CPR_model"], agg["sum_od"])
-    mape_m = _weighted_mape(agg["CPR_fact"], agg["CPR_model"], agg["sum_od"])
-    rmse_r = _weighted_rmse(agg["CPR_fact"], agg["CPR_ref"],   agg["sum_od"])
-    mape_r = _weighted_mape(agg["CPR_fact"], agg["CPR_ref"],   agg["sum_od"])
+    UNION ALL
 
-    summary = pd.DataFrame([{
-        "Program": program_name,
-        "Months": len(agg),
-        "Period_from": pd.to_datetime(agg[payment_col].min()).date() if len(agg) else pd.NaT,
-        "Period_to":   pd.to_datetime(agg[payment_col].max()).date() if len(agg) else pd.NaT,
-        "RMSE_model": rmse_m,
-        "MAPE_model": mape_m,
-        "RMSE_ref": rmse_r,
-        "MAPE_ref": mape_r
-    }])
+    /* 1-е нового окна */
+    SELECT
+        m.con_id, m.cli_id, m.TSEGMENTNAME, m.out_rub, m.cycle_no + 1 AS cycle_no,
+        dt_rep = m.m1_new,
+        rate_con =
+            CASE
+              WHEN @UseFixedPromoFromNextMonth = 1
+               AND m.m1_new >= @FixedPromoStart AND m.m1_new < @FixedPromoEnd THEN
+                   CASE m.TSEGMENTNAME
+                        WHEN N'ДЧБО'            THEN @PromoRate_DChbo
+                        ELSE                          @PromoRate_Retail
+                   END
+              WHEN @UseHardPromoSpread = 1 AND m.m1_new >= @HardSpreadStart THEN
+                   CASE m.TSEGMENTNAME
+                     WHEN N'ДЧБО'            THEN @HardSpread_DChbo  + k_new.KEY_RATE
+                     ELSE                          @HardSpread_Retail+ k_new.KEY_RATE
+                   END
+              ELSE
+                   CASE m.TSEGMENTNAME
+                     WHEN N'ДЧБО'            THEN @Spread_DChbo  + k_new.KEY_RATE
+                     ELSE                          @Spread_Retail+ k_new.KEY_RATE
+                   END
+            END
+    FROM marks m
+    LEFT JOIN #key k_new ON k_new.DT_REP = m.m1_new
+    WHERE m.m1_new BETWEEN @Anchor AND @HorizonTo
+)
+SELECT * INTO #day1_candidates FROM cand;
 
-    # график CPR
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot(agg["month_label"], agg["CPR_fact"],  "-o", label="Факт")
-    ax.plot(agg["month_label"], agg["CPR_model"], "-s", label="Модель")
-    if np.isfinite(agg["CPR_ref"]).any():
-        ax.plot(agg["month_label"], agg["CPR_ref"], "--", label="Эталон")
-    ax.set_title(f"{program_name} • Out-of-Time ({min_period:%m.%y} — {max_period:%m.%y})")
-    ax.set_xlabel("Месяц")
-    ax.set_ylabel("CPR, доля/год")
-    ax.grid(ls="--", alpha=0.3)
-    ax.legend()
-    plt.xticks(rotation=45, ha="right")
-    fig.tight_layout()
-    fig.savefig(os.path.join(charts_dir, "CPR_trend.png"), dpi=220)
-    plt.close(fig)
+/* Σ-объём клиента на Anchor — для 1-х чисел (полный перелив) ─ */
+IF OBJECT_ID('tempdb..#cli_sum') IS NOT NULL DROP TABLE #cli_sum;
+SELECT cli_id, SUM(out_rub) AS out_rub_sum
+INTO   #cli_sum
+FROM   #bal_prom
+GROUP  BY cli_id;
 
-    # сохранение
-    agg.to_excel(os.path.join(out_dir, "oot_results.xlsx"), index=False)
-    summary.to_excel(os.path.join(out_dir, "summary.xlsx"), index=False)
+/* ── 6) 1-е числа — ПОЛНЫЙ перелив Σ клиента на max ставку ─── */
+IF OBJECT_ID('tempdb..#firstday_assigned') IS NOT NULL DROP TABLE #firstday_assigned;
+;WITH ranked AS (
+    SELECT
+        c.*,
+        ROW_NUMBER() OVER (PARTITION BY c.cli_id, c.dt_rep
+                           ORDER BY c.rate_con DESC, c.TSEGMENTNAME, c.con_id) AS rn
+    FROM #day1_candidates c
+)
+SELECT
+    con_id        = MAX(CASE WHEN rn=1 THEN con_id END),
+    r.cli_id,
+    TSEGMENTNAME  = MAX(CASE WHEN rn=1 THEN TSEGMENTNAME END),
+    out_rub       = cs.out_rub_sum,        -- весь объём клиента
+    r.dt_rep,
+    rate_con      = MAX(CASE WHEN rn=1 THEN rate_con END)
+INTO   #firstday_assigned
+FROM   ranked r
+JOIN   #cli_sum cs ON cs.cli_id = r.cli_id
+GROUP  BY r.cli_id, r.dt_rep, cs.out_rub_sum;
 
-    print(f"\n✅ STEP 4 готово для {program_name}")
-    print(f"• Периоды: {min_period.date()} – {max_period.date()} ({len(agg)} мес.)")
-    print(f"• RMSE_model={rmse_m if pd.notna(rmse_m) else np.nan:.4f}, MAPE_model={mape_m if pd.notna(mape_m) else np.nan:.2%}")
-    print(f"• Папка: {out_dir}")
-    return {"output_dir": out_dir, "agg": agg, "summary": summary}
-```
+/* ── 7) Финальная promo-лента (заменяем base-day и 1-е числа) ─ */
+IF OBJECT_ID('WORK.Forecast_NS_Promo','U') IS NOT NULL DROP TABLE WORK.Forecast_NS_Promo;
 
-если ещё где-то встретишь русские месяцы/локали — просто придерживайся приёма с `dt.strftime("%m.%y")`: он стабильно даёт тот короткий формат, который тебе нужен, и не зависит от ОС/локализации.
+SELECT
+    dt_rep,
+    out_rub_total = SUM(out_rub),
+    rate_avg      = SUM(out_rub * rate_con) / NULLIF(SUM(out_rub),0)
+INTO WORK.Forecast_NS_Promo
+FROM (
+    /* все дни, кроме base-day у отмеченных клиентов (их заменим) */
+    SELECT dp.con_id, dp.cli_id, dp.TSEGMENTNAME, dp.out_rub, dp.dt_rep, dp.rate_con
+    FROM   #daily_pre dp
+    WHERE  NOT EXISTS (
+           SELECT 1 FROM #base_dates bd
+           WHERE  bd.cli_id=dp.cli_id AND bd.dt_rep=dp.dt_rep)
+
+    UNION ALL
+    /* base-day — full shift (одна строка на клиента) */
+    SELECT con_id, cli_id, TSEGMENTNAME, out_rub, dt_rep, rate_con
+    FROM   #daily_base_adj
+
+    UNION ALL
+    /* 1-е числа — full shift (одна строка на клиента) */
+    SELECT con_id, cli_id, TSEGMENTNAME, out_rub, dt_rep, rate_con
+    FROM   #firstday_assigned
+) u
+GROUP BY dt_rep;
+
+/* ── 8) Контрольки ─────────────────────────────────────────── */
+PRINT N'=== spreads at Anchor ===';  SELECT * FROM WORK.NS_Spreads;
+
+PRINT N'=== sanity: Σ объёма по дням (равен Σ на Anchor) ===';
+SELECT TOP (120) f.dt_rep, f.out_rub_total,
+       diff_vs_anchor = CAST(f.out_rub_total - @PromoTotal AS decimal(20,2))
+FROM WORK.Forecast_NS_Promo f
+ORDER BY f.dt_rep;
+GO
+
+SELECT * FROM WORK.Forecast_NS_Promo f
+ORDER BY f.dt_rep;
