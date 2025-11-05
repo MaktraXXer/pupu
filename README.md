@@ -1,25 +1,26 @@
-Ты прав: части не стыковались по двум причинам:
-	1.	Part 1 не сохранял снапшот якорного сплита в WORK.NS_BalPromoAnchor, а Part 2 его требует.
-	2.	В Part 1 на каждый цикл не попадал «1-е нового окна» (base_day + 1) — из-за условия k.d BETWEEN win_start AND base_day. Из-за этого Part 2 видел не все 1-е числа.
+Понял задачу. Делаю «правильно и легко»:
+	•	Part 1 → одна компактная таблица интервалов ставок по каждому счёту: WORK.NS_RateIntervals(con_id, cli_id, dt_from, dt_to, rate_con, tsegmentname). Никаких «простыней» по дням и без sys.*
+Интервалы строятся из ключевых дат (якорь, все EOM внутри окна, 1-е внутри окна и 1-е нового окна = base_day+1).
+	•	Part 2 → только ключевые даты (якорь, EOM, 1-е). Выбор победителя делается строго на этих датах. Между ними значения по определению равны предыдущей ключевой дате, поэтому хранить «междудневку» не нужно.
+	•	Для сплита на якоре храню маленькую таблицу WORK.NS_BalPromoAnchor (она крошечная по сравнению с дневной лентой).
 
-Ниже даю два законченных скрипта (Part 1 → Part 2), которые дружат между собой:
-	•	Part 1 делает: WORK.NS_BalPromoAnchor и WORK.NS_RatesKeyDates, причём на каждый цикл кладёт ключевые даты: @Anchor (если внутри окна), все EOM внутри окна, 1-е внутри окна и 1-е нового окна = base_day+1 (если ≤ @HorizonTo).
-	•	Part 2 берёт только EOM и все 1-е из NS_RatesKeyDates, считает победителя и формирует дневную ленту (ступеньками). В ранжировании исключены NULL-ставки.
+Ниже — два монолита. Запускать Part 1 → Part 2 с одинаковыми параметрами.
 
 ⸻
 
-PART 1 — RATES ONLY (память ставок на ключевые даты)
+PART 1 — интервалы ставок (dt_from/dt_to) по каждому счёту
 
 /* ============================================================
-   PART 1: NS (prod_id = 654) — RATES ONLY (key-dates memory)
+   PART 1: NS (prod_id = 654) — RATE INTERVALS BY ACCOUNT
    Пишет:
-     • WORK.NS_BalPromoAnchor(con_id, cli_id, out_rub, TSEGMENTNAME)
-     • WORK.NS_RatesKeyDates(con_id, cli_id, dt_key, rate_con, …)
-   Ключевые даты по КАЖДОМУ циклу договора:
+     • WORK.NS_BalPromoAnchor(con_id, cli_id, out_rub, tsegmentname)
+     • WORK.NS_RateIntervals(con_id, cli_id, tsegmentname, dt_from, dt_to, rate_con)
+   Ключевые даты по каждому ЦИКЛУ договора:
      - @Anchor (если попадает в окно цикла)
      - все EOM внутри окна
-     - 1-е внутри окна
+     - 1-е числа внутри окна
      - 1-е НОВОГО окна (= base_day + 1), если ≤ @HorizonTo
+   Между ключевыми датами — постоянная ставка (интервалы).
    ============================================================ */
 
 USE ALM_TEST;
@@ -30,25 +31,16 @@ DECLARE
     @Scenario   tinyint      = 1,
     @Anchor     date         = '2025-11-03',
     @HorizonTo  date         = '2026-03-31',
-    @BaseRate   decimal(9,4) = 0.0450,
-    @UseFixedPromoFromNextMonth bit = 0,
-    @UseHardPromoSpread bit         = 0;
+    @BaseRate   decimal(9,4) = 0.0450,  -- базовая ставка в base_day/EOM
+    @UseFixedPromoFromNextMonth bit = 0, -- фикс-промо только в месяце, следующем за якорем
+    @UseHardPromoSpread bit         = 0; -- жёсткие спреды вместо расчётных
 
 /* окно фикс-промо: ровно месяц после якоря */
 DECLARE @FixedPromoStart date = DATEADD(day,1,EOMONTH(@Anchor));   -- 1-е след. месяца
 DECLARE @FixedPromoEnd   date = DATEADD(month,1,@FixedPromoStart); -- 1-е через месяц
-/* старт жёстких спредов */
 DECLARE @HardSpreadStart date = @Anchor;
 
-/* ---------- календарь всего диапазона ---------- */
-IF OBJECT_ID('tempdb..#cal_all') IS NOT NULL DROP TABLE #cal_all;
-;WITH d AS (
-  SELECT d = @Anchor
-  UNION ALL SELECT DATEADD(day,1,d) FROM d WHERE DATEADD(day,1,d) <= @HorizonTo
-)
-SELECT d INTO #cal_all FROM d OPTION (MAXRECURSION 0);
-
-/* ---------- ключевая ставка (TERM=1) ---------- */
+/* ---------- ключевая ставка ЦБ (TERM=1) ---------- */
 IF OBJECT_ID('tempdb..#key') IS NOT NULL DROP TABLE #key;
 SELECT DT_REP, KEY_RATE
 INTO   #key
@@ -71,12 +63,11 @@ DECLARE
     @HardSpread_DChbo  decimal(9,4) = -0.0030,
     @HardSpread_Retail decimal(9,4) = -0.0040;
 
-/* ---------- границы «живых» договоров ---------- */
+/* ---------- «живые» договоры к якорю ---------- */
 DECLARE
     @OpenFrom date = DATEFROMPARTS(YEAR(DATEADD(month,-1,@Anchor)), MONTH(DATEADD(month,-1,@Anchor)), 1),
     @OpenTo   date = EOMONTH(@Anchor);
 
-/* ---------- снапшот промо-портфеля на якоре ---------- */
 IF OBJECT_ID('tempdb..#bal_src') IS NOT NULL DROP TABLE #bal_src;
 SELECT
     t.dt_rep,
@@ -105,6 +96,7 @@ WHERE  t.dt_rep BETWEEN DATEADD(day,-2,@Anchor) AND DATEADD(day,2,@Anchor)
 
 CREATE CLUSTERED INDEX IX_bal_src ON #bal_src(con_id, dt_rep);
 
+/* ---------- ставка на якоре по каждому договору ---------- */
 IF OBJECT_ID('tempdb..#bal_prom') IS NOT NULL DROP TABLE #bal_prom;
 ;WITH bal_pos AS (
     SELECT *,
@@ -140,6 +132,9 @@ FROM rate_calc
 WHERE out_rub IS NOT NULL
   AND dt_open BETWEEN @OpenFrom AND @OpenTo;
 
+CREATE UNIQUE CLUSTERED INDEX IX_bal_prom ON #bal_prom(con_id);
+
+/* ---------- нулевые договоры к якорю (0 объём, промо ставка по сегменту) ---------- */
 IF OBJECT_ID('tempdb..#z0') IS NOT NULL DROP TABLE #z0;
 SELECT
   CAST(z.con_id AS bigint) AS con_id,
@@ -160,15 +155,13 @@ INSERT #bal_prom(con_id,cli_id,out_rub,rate_anchor,dt_open,TSEGMENTNAME)
 SELECT con_id,cli_id,out_rub,rate_anchor,dt_open,TSEGMENTNAME
 FROM #z0;
 
-CREATE UNIQUE CLUSTERED INDEX IX_bal_prom ON #bal_prom(con_id);
-
-/* ---------- ПЕРСИСТИМ сплит якоря для Part 2 ---------- */
+/* ---------- сохраняем компактный сплит якоря ---------- */
 IF OBJECT_ID('WORK.NS_BalPromoAnchor','U') IS NOT NULL DROP TABLE WORK.NS_BalPromoAnchor;
 SELECT con_id, cli_id, out_rub, TSEGMENTNAME
 INTO WORK.NS_BalPromoAnchor
 FROM #bal_prom;
 
-/* ---------- построение циклов ---------- */
+/* ---------- строим циклы окна по каждому договору ---------- */
 IF OBJECT_ID('tempdb..#cycles') IS NOT NULL DROP TABLE #cycles;
 ;WITH seed AS (
   SELECT b.con_id, b.cli_id, b.TSEGMENTNAME, b.out_rub,
@@ -194,24 +187,23 @@ SELECT * INTO #cycles FROM seq OPTION (MAXRECURSION 0);
 CREATE UNIQUE CLUSTERED INDEX IX_cycles ON #cycles(con_id, cycle_no);
 
 /* ---------- ключевые даты по КАЖДОМУ циклу ---------- */
-/* Для каждого цикла формируем:
-     • @Anchor (если @Anchor BETWEEN win_start AND base_day)
-     • все EOM внутри [win_start .. base_day]
-     • 1-е внутри [win_start .. base_day]
-     • 1-е НОВОГО окна = base_day + 1 (если ≤ @HorizonTo)         */
-
-IF OBJECT_ID('tempdb..#keys_this_cycle') IS NOT NULL DROP TABLE #keys_this_cycle;
-;WITH eom_in AS (
+IF OBJECT_ID('tempdb..#keys') IS NOT NULL DROP TABLE #keys;
+;WITH cal AS (
+  SELECT d = @Anchor
+  UNION ALL
+  SELECT DATEADD(day,1,d) FROM cal WHERE DATEADD(day,1,d) <= @HorizonTo
+),
+eom_in AS (
   SELECT c.con_id, c.cli_id, c.TSEGMENTNAME, c.cycle_no, c.win_start, c.promo_end, c.base_day,
          k = EOMONTH(x.d)
   FROM #cycles c
-  JOIN #cal_all x ON x.d BETWEEN c.win_start AND c.base_day
+  JOIN cal x ON x.d BETWEEN c.win_start AND c.base_day
 ),
 d1_in AS (
   SELECT c.con_id, c.cli_id, c.TSEGMENTNAME, c.cycle_no, c.win_start, c.promo_end, c.base_day,
          k = x.d
   FROM #cycles c
-  JOIN #cal_all x ON x.d BETWEEN c.win_start AND c.base_day
+  JOIN cal x ON x.d BETWEEN c.win_start AND c.base_day
   WHERE DAY(x.d)=1
 ),
 d1_new AS (
@@ -227,7 +219,7 @@ anch AS (
   WHERE @Anchor BETWEEN c.win_start AND c.base_day
 )
 SELECT DISTINCT con_id, cli_id, TSEGMENTNAME, cycle_no, win_start, promo_end, base_day, k AS dt_key
-INTO #keys_this_cycle
+INTO #keys
 FROM (
   SELECT * FROM eom_in
   UNION
@@ -238,11 +230,10 @@ FROM (
   SELECT * FROM anch
 ) U;
 
-CREATE INDEX IX_keysc_con_dt ON #keys_this_cycle(con_id, dt_key);
+CREATE INDEX IX_keys_con_dt ON #keys(con_id, dt_key);
 
-/* ---------- расчёт ставки на dt_key с приоритетом ---------- */
-IF OBJECT_ID('WORK.NS_RatesKeyDates','U') IS NOT NULL DROP TABLE WORK.NS_RatesKeyDates;
-
+/* ---------- ставка на ключевую дату с приоритетами ---------- */
+IF OBJECT_ID('tempdb..#rates_key') IS NOT NULL DROP TABLE #rates_key;
 ;WITH rk AS (
   SELECT
     x.con_id, x.cli_id, x.TSEGMENTNAME, x.cycle_no, x.win_start, x.promo_end, x.base_day, x.dt_key,
@@ -272,7 +263,7 @@ IF OBJECT_ID('WORK.NS_RatesKeyDates','U') IS NOT NULL DROP TABLE WORK.NS_RatesKe
                 END
            END
       ELSE
-           /* якорь и прочие внутриокновые (не 1-е и не EOM) */
+           /* якорь и «прочие» в окне (не 1-е и не EOM) */
            CASE
              WHEN @UseFixedPromoFromNextMonth=1
               AND x.dt_key>=@FixedPromoStart AND x.dt_key<@FixedPromoEnd THEN
@@ -295,214 +286,231 @@ IF OBJECT_ID('WORK.NS_RatesKeyDates','U') IS NOT NULL DROP TABLE WORK.NS_RatesKe
                 END
            END
     END
-  FROM #keys_this_cycle x
+  FROM #keys x
   LEFT JOIN #key k       ON k.DT_REP = x.dt_key
   JOIN      #bal_prom bp ON bp.con_id = x.con_id
 )
 SELECT
   con_id, cli_id, TSEGMENTNAME, cycle_no, win_start, promo_end, base_day,
   dt_key, CAST(rate_con AS decimal(9,4)) AS rate_con
-INTO WORK.NS_RatesKeyDates
+INTO #rates_key
 FROM rk;
 
-CREATE UNIQUE CLUSTERED INDEX IX_NS_RatesKeyDates ON WORK.NS_RatesKeyDates(con_id, dt_key);
-CREATE INDEX IX_NS_RatesKeyDates_cli ON WORK.NS_RatesKeyDates(cli_id, dt_key);
+CREATE INDEX IX_rk_con_dt ON #rates_key(con_id, dt_key);
+
+/* ---------- формирование ИНТЕРВАЛОВ ставок ---------- */
+IF OBJECT_ID('WORK.NS_RateIntervals','U') IS NOT NULL DROP TABLE WORK.NS_RateIntervals;
+
+;WITH ordered AS (
+  SELECT
+    con_id, cli_id, TSEGMENTNAME,
+    dt_from = dt_key,
+    rate_con,
+    dt_to_next =
+      LEAD(dt_key) OVER (PARTITION BY con_id ORDER BY dt_key)
+  FROM #rates_key
+),
+bounds AS (
+  SELECT
+    con_id, cli_id, TSEGMENTNAME, rate_con,
+    dt_from,
+    dt_to = DATEADD(day,-1,ISNULL(dt_to_next, DATEADD(day,1,@HorizonTo))) -- последний тянем до HorizonTo
+  FROM ordered
+)
+SELECT
+  con_id, cli_id, TSEGMENTNAME,
+  dt_from,
+  dt_to,
+  rate_con
+INTO WORK.NS_RateIntervals
+FROM bounds
+WHERE dt_from <= @HorizonTo
+  AND dt_to   >= @Anchor;
+
+CREATE UNIQUE CLUSTERED INDEX IX_NS_RateIntervals ON WORK.NS_RateIntervals(con_id, dt_from);
+CREATE INDEX IX_NS_RateIntervals_cli ON WORK.NS_RateIntervals(cli_id, dt_from);
 
 
 ⸻
 
-PART 2 — ALLOC (перелив объёмов по ключевым датам)
+PART 2 — аллокации только на ключевых датах (якорь, EOM, 1-е)
 
 /* ================================================================
-   NS-forecast — Part 2 (ALLOC)
-   Зависимости:
-     • WORK.NS_RatesKeyDates(con_id, cli_id, dt_key, rate_con, …)
-     • WORK.NS_BalPromoAnchor(con_id, cli_id, out_rub, TSEGMENTNAME)
-   Логика:
-     • События только на EOM и всех 1-х (включая base_day+1).
-     • До первого события — держим якорный сплит.
-     • После — весь Σ клиента на последнем победителе.
-     • Ставка счёта на день — последняя ключевая ≤ дата.
+   PART 2: NS ALLOC ON KEY DATES (ANCHOR + EOM + 1ST)
+   Источники:
+     • WORK.NS_BalPromoAnchor(con_id, cli_id, out_rub, tsegmentname)
+     • WORK.NS_RateIntervals(con_id, cli_id, tsegmentname, dt_from, dt_to, rate_con)
+   Выход:
+     • WORK.NS_AllocEvents(cli_id, dt_rep, con_id, out_rub, reason)
+     • WORK.Forecast_NS_Promo (ТОЛЬКО на ключевые даты: anchor, EOM, 1st)
+   Между ключевыми датами значения равны предыдущей ключевой дате
+   (поэтому отдельно не храним).
    ================================================================ */
 
+USE ALM_TEST;
 SET NOCOUNT ON;
 
-/* ------------------ sanity deps ------------------ */
-IF OBJECT_ID('WORK.NS_RatesKeyDates','U') IS NULL
-  RAISERROR('Missing WORK.NS_RatesKeyDates from Part 1.',16,1);
+/* ---------- параметры (должны совпадать с Part 1) ---------- */
+DECLARE
+    @Anchor     date = '2025-11-03',
+    @HorizonTo  date = '2026-03-31';
+
+/* ---------- проверки ---------- */
+IF OBJECT_ID('WORK.NS_RateIntervals','U') IS NULL
+  RAISERROR('Missing WORK.NS_RateIntervals from Part 1.',16,1);
 
 IF OBJECT_ID('WORK.NS_BalPromoAnchor','U') IS NULL
   RAISERROR('Missing WORK.NS_BalPromoAnchor from Part 1.',16,1);
 
-/* ------------------ source copies ---------------- */
-IF OBJECT_ID('tempdb..#rates_key') IS NOT NULL DROP TABLE #rates_key;
+/* ---------- компактные копии ---------- */
+IF OBJECT_ID('tempdb..#ri') IS NOT NULL DROP TABLE #ri;
 SELECT
   con_id   = CAST(con_id AS bigint),
   cli_id   = CAST(cli_id AS bigint),
-  dt_key   = CAST(dt_key AS date),
+  dt_from  = CAST(dt_from AS date),
+  dt_to    = CAST(dt_to   AS date),
   rate_con = CAST(rate_con AS decimal(9,4))
-INTO #rates_key
-FROM WORK.NS_RatesKeyDates;
+INTO #ri
+FROM WORK.NS_RateIntervals;
 
-CREATE INDEX IX_rk_con_dt ON #rates_key(con_id, dt_key);
-CREATE INDEX IX_rk_cli_dt ON #rates_key(cli_id, dt_key);
+CREATE INDEX IX_ri_con_span ON #ri(con_id, dt_from, dt_to);
+CREATE INDEX IX_ri_cli_span ON #ri(cli_id, dt_from, dt_to);
 
-IF OBJECT_ID('tempdb..#anchor_bal') IS NOT NULL DROP TABLE #anchor_bal;
+IF OBJECT_ID('tempdb..#ab') IS NOT NULL DROP TABLE #ab;
 SELECT
   con_id  = CAST(con_id AS bigint),
   cli_id  = CAST(cli_id AS bigint),
   out_rub = CAST(out_rub AS decimal(20,2))
-INTO #anchor_bal
+INTO #ab
 FROM WORK.NS_BalPromoAnchor;
 
-CREATE INDEX IX_ab_cli_con ON #anchor_bal(cli_id, con_id);
+CREATE INDEX IX_ab_cli ON #ab(cli_id, con_id);
 
-/* диапазон дат из ключей */
-DECLARE @StartDate date, @EndDate date;
-SELECT @StartDate = MIN(dt_key), @EndDate = MAX(dt_key) FROM #rates_key;
+/* ---------- ключевые даты (anchor + все EOM + все 1-е) ---------- */
+IF OBJECT_ID('tempdb..#keydates') IS NOT NULL DROP TABLE #keydates;
+;WITH cal AS (
+  SELECT d = @Anchor
+  UNION ALL
+  SELECT DATEADD(day,1,d) FROM cal WHERE DATEADD(day,1,d) <= @HorizonTo
+),
+eom AS (
+  SELECT d = EOMONTH(d) FROM cal
+),
+d1 AS (
+  SELECT d FROM cal WHERE DAY(d)=1
+)
+SELECT DISTINCT d
+INTO #keydates
+FROM (
+  SELECT @Anchor AS d
+  UNION
+  SELECT d FROM eom
+  UNION
+  SELECT d FROM d1
+) u;
 
-IF @StartDate IS NULL OR @EndDate IS NULL
-  RAISERROR('NS_RatesKeyDates contains no rows.',16,1);
+CREATE UNIQUE INDEX IX_keydates ON #keydates(d);
 
-/* ------------ набор клиентов и суммы на якоре ------------- */
-IF OBJECT_ID('tempdb..#clients') IS NOT NULL DROP TABLE #clients;
-SELECT DISTINCT cli_id INTO #clients FROM #anchor_bal;
-CREATE UNIQUE INDEX IX_cli ON #clients(cli_id);
-
+/* ---------- суммы клиента на якоре ---------- */
 IF OBJECT_ID('tempdb..#cli_sum') IS NOT NULL DROP TABLE #cli_sum;
 SELECT cli_id, out_rub_sum = SUM(out_rub)
 INTO #cli_sum
-FROM #anchor_bal
+FROM #ab
 GROUP BY cli_id;
+
 CREATE UNIQUE INDEX IX_clisum ON #cli_sum(cli_id);
 
-/* -------- ключевые даты: EOM и 1-е (строго из NS_RatesKeyDates) ----- */
-IF OBJECT_ID('tempdb..#d_eom') IS NOT NULL DROP TABLE #d_eom;
-SELECT DISTINCT d = rk.dt_key
-INTO #d_eom
-FROM #rates_key rk
-WHERE rk.dt_key = EOMONTH(rk.dt_key);
-
-IF OBJECT_ID('tempdb..#d_first') IS NOT NULL DROP TABLE #d_first;
-SELECT DISTINCT d = rk.dt_key
-INTO #d_first
-FROM #rates_key rk
-WHERE DAY(rk.dt_key) = 1;
-
-/* --------- календарь (ступени) -------- */
-IF OBJECT_ID('tempdb..#cal') IS NOT NULL DROP TABLE #cal;
-;WITH span AS (
-  SELECT d = @StartDate
-  UNION ALL
-  SELECT DATEADD(day,1,d) FROM span WHERE DATEADD(day,1,d) <= @EndDate
-)
-SELECT d INTO #cal FROM span OPTION (MAXRECURSION 0);
-
-CREATE UNIQUE INDEX IX_cal ON #cal(d);
-
-/* ------- кандидаты-счета на ключевые даты (по клиентам) ------ */
-IF OBJECT_ID('tempdb..#acc_candidates') IS NOT NULL DROP TABLE #acc_candidates;
+/* ---------- кандидаты-счета на каждую ключевую дату ---------- */
+IF OBJECT_ID('tempdb..#cand') IS NOT NULL DROP TABLE #cand;
 SELECT
+  kd.d       AS dt_rep,
+  ab.cli_id,
+  ab.con_id
+INTO #cand
+FROM #keydates kd
+CROSS JOIN (SELECT DISTINCT cli_id FROM #ab) C
+JOIN #ab ab ON ab.cli_id = C.cli_id;
+
+CREATE INDEX IX_cand_cli_dt ON #cand(cli_id, dt_rep);
+CREATE INDEX IX_cand_con_dt ON #cand(con_id, dt_rep);
+
+/* ---------- ставка счёта на ключевую дату из ИНТЕРВАЛОВ ---------- */
+IF OBJECT_ID('tempdb..#cand_rates') IS NOT NULL DROP TABLE #cand_rates;
+SELECT
+  c.dt_rep,
   c.cli_id,
-  ab.con_id,
-  kd.d AS dt_rep
-INTO #acc_candidates
-FROM #clients c
-JOIN #anchor_bal ab ON ab.cli_id = c.cli_id
-JOIN (
-  SELECT d FROM #d_eom
-  UNION
-  SELECT d FROM #d_first
-) kd ON 1=1;
+  c.con_id,
+  rate_on_date = ri.rate_con
+INTO #cand_rates
+FROM #cand c
+JOIN #ri ri
+  ON ri.con_id = c.con_id
+ AND c.dt_rep BETWEEN ri.dt_from AND ri.dt_to;
 
-CREATE INDEX IX_cand_cli_dt ON #acc_candidates(cli_id, dt_rep, con_id);
+CREATE INDEX IX_cr_cli_dt ON #cand_rates(cli_id, dt_rep, rate_on_date DESC, con_id);
 
-/* ставка счёта на ключевую дату = последняя ключевая ≤ дата */
-IF OBJECT_ID('tempdb..#acc_rates_on_key') IS NOT NULL DROP TABLE #acc_rates_on_key;
-SELECT
-  ac.cli_id,
-  ac.con_id,
-  ac.dt_rep,
-  rate_on_date = oa.rate_con
-INTO #acc_rates_on_key
-FROM #acc_candidates ac
-OUTER APPLY (
-  SELECT TOP (1) rk.rate_con
-  FROM #rates_key rk
-  WHERE rk.con_id = ac.con_id
-    AND rk.dt_key <= ac.dt_rep
-  ORDER BY rk.dt_key DESC
-) oa;
-
-CREATE INDEX IX_arok_cli_dt ON #acc_rates_on_key(cli_id, dt_rep, rate_on_date DESC, con_id);
-
-/* ------------------- события: EOM ------------------- */
-IF OBJECT_ID('tempdb..#evt_base') IS NOT NULL DROP TABLE #evt_base;
-;WITH ranked AS (
+/* ---------- события перелива: EOM и 1-е ---------- */
+IF OBJECT_ID('tempdb..#evt') IS NOT NULL DROP TABLE #evt;
+;WITH eom AS (
+  SELECT DISTINCT dt_rep FROM #keydates WHERE dt_rep = EOMONTH(dt_rep)
+),
+d1 AS (
+  SELECT DISTINCT dt_rep FROM #keydates WHERE DAY(dt_rep)=1
+),
+ranked_base AS (
   SELECT
-    a.cli_id, a.dt_rep, a.con_id, a.rate_on_date,
-    rn = ROW_NUMBER() OVER (
-           PARTITION BY a.cli_id, a.dt_rep
-           ORDER BY a.rate_on_date DESC, a.con_id
-         )
-  FROM #acc_rates_on_key a
-  WHERE a.dt_rep IN (SELECT d FROM #d_eom)
-    AND a.rate_on_date IS NOT NULL
+    r.cli_id, r.dt_rep, r.con_id, r.rate_on_date,
+    rn = ROW_NUMBER() OVER(PARTITION BY r.cli_id, r.dt_rep
+                           ORDER BY r.rate_on_date DESC, r.con_id)
+  FROM #cand_rates r
+  WHERE r.dt_rep IN (SELECT dt_rep FROM eom)
+),
+ranked_first AS (
+  SELECT
+    r.cli_id, r.dt_rep, r.con_id, r.rate_on_date,
+    rn = ROW_NUMBER() OVER(PARTITION BY r.cli_id, r.dt_rep
+                           ORDER BY r.rate_on_date DESC, r.con_id)
+  FROM #cand_rates r
+  WHERE r.dt_rep IN (SELECT dt_rep FROM d1)
 )
 SELECT
-  r.cli_id,
-  r.con_id,
-  r.dt_rep,
+  cli_id,
+  con_id,
+  dt_rep,
   out_rub = cs.out_rub_sum,
   reason  = CAST('EOM' AS varchar(8))
-INTO #evt_base
-FROM ranked r
-JOIN #cli_sum cs ON cs.cli_id = r.cli_id
-WHERE r.rn = 1;
+INTO #evt
+FROM ranked_base rb
+JOIN #cli_sum cs ON cs.cli_id = rb.cli_id
+WHERE rb.rn = 1
 
-CREATE INDEX IX_evtb_cli_dt ON #evt_base(cli_id, dt_rep);
+UNION ALL
 
-/* ------------------- события: 1-е ------------------- */
-IF OBJECT_ID('tempdb..#evt_first') IS NOT NULL DROP TABLE #evt_first;
-;WITH ranked AS (
-  SELECT
-    a.cli_id, a.dt_rep, a.con_id, a.rate_on_date,
-    rn = ROW_NUMBER() OVER (
-           PARTITION BY a.cli_id, a.dt_rep
-           ORDER BY a.rate_on_date DESC, a.con_id
-         )
-  FROM #acc_rates_on_key a
-  WHERE a.dt_rep IN (SELECT d FROM #d_first)
-    AND a.rate_on_date IS NOT NULL
-)
 SELECT
-  r.cli_id,
-  r.con_id,
-  r.dt_rep,
+  cli_id,
+  con_id,
+  dt_rep,
   out_rub = cs.out_rub_sum,
   reason  = CAST('D1' AS varchar(8))
-INTO #evt_first
-FROM ranked r
-JOIN #cli_sum cs ON cs.cli_id = r.cli_id
-WHERE r.rn = 1;
+FROM ranked_first rf
+JOIN #cli_sum cs ON cs.cli_id = rf.cli_id
+WHERE rf.rn = 1;
 
-CREATE INDEX IX_evtf_cli_dt ON #evt_first(cli_id, dt_rep);
+CREATE INDEX IX_evt_cli_dt ON #evt(cli_id, dt_rep);
 
-/* --------- итоговый пул событий клиента (материализация) ------ */
+/* ---------- materialize events ---------- */
 IF OBJECT_ID('WORK.NS_AllocEvents','U') IS NOT NULL DROP TABLE WORK.NS_AllocEvents;
-
-SELECT cli_id, con_id, dt_rep, out_rub, reason
+SELECT cli_id, dt_rep, con_id, out_rub, reason
 INTO WORK.NS_AllocEvents
-FROM (
-  SELECT * FROM #evt_base
-  UNION ALL
-  SELECT * FROM #evt_first
-) u;
+FROM #evt;
 
 CREATE INDEX IX_aevt_cli_dt ON WORK.NS_AllocEvents(cli_id, dt_rep);
 CREATE INDEX IX_aevt_con_dt ON WORK.NS_AllocEvents(con_id, dt_rep);
 
-/* --------- «первая дата события» по каждому клиенту ---------- */
+/* ---------- аллокация ТОЛЬКО на ключевых датах -------------- */
+/* До первой ключевой даты клиента — якорный сплит (только если anchor ∈ keydates).
+   Начиная с первой его ключевой даты — весь Σ клиента на победителе последнего события. */
+
 IF OBJECT_ID('tempdb..#first_evt') IS NOT NULL DROP TABLE #first_evt;
 SELECT cli_id, first_evt = MIN(dt_rep)
 INTO #first_evt
@@ -511,106 +519,100 @@ GROUP BY cli_id;
 
 CREATE UNIQUE INDEX IX_fe_cli ON #first_evt(cli_id);
 
-/* -------------- решётка (день × клиент) ---------------------- */
-IF OBJECT_ID('tempdb..#day_cli') IS NOT NULL DROP TABLE #day_cli;
-SELECT c.d AS dt_rep, cl.cli_id
-INTO #day_cli
-FROM #cal c
-CROSS JOIN #clients cl;
+/* Якорь как ключевая дата */
+DECLARE @HasAnchorKey bit = CASE WHEN EXISTS(SELECT 1 FROM #keydates WHERE d=@Anchor) THEN 1 ELSE 0 END;
 
-CREATE INDEX IX_daycli_cli_dt ON #day_cli(cli_id, dt_rep);
-
-/* ----------- аллокации до первого события: сплит якоря ------ */
-IF OBJECT_ID('tempdb..#alloc_pre') IS NOT NULL DROP TABLE #alloc_pre;
--- клиенты с событиями: до first_evt держим якорный сплит
+/* Аллокация на ключевых датах */
+IF OBJECT_ID('tempdb..#alloc_key') IS NOT NULL DROP TABLE #alloc_key;
+-- 1) если якорь есть в keydates и у клиента ещё не было событий — держим якорный сплит на якоре
 SELECT
-  dc.dt_rep,
+  kd.d       AS dt_rep,
   ab.cli_id,
   ab.con_id,
   ab.out_rub
-INTO #alloc_pre
-FROM #day_cli dc
-JOIN #first_evt fe ON fe.cli_id = dc.cli_id
-JOIN #anchor_bal ab ON ab.cli_id = dc.cli_id
-WHERE dc.dt_rep < fe.first_evt
+INTO #alloc_key
+FROM #keydates kd
+JOIN #ab ab ON @HasAnchorKey=1 AND kd.d=@Anchor
+LEFT JOIN #first_evt fe ON fe.cli_id = ab.cli_id
+WHERE fe.cli_id IS NULL OR fe.first_evt > @Anchor
 
 UNION ALL
--- клиенты без событий: весь горизонт держим якорный сплит
+-- 2) на любой ключевой дате >= первой даты события берём ПОСЛЕДНЕГО победителя
 SELECT
-  dc.dt_rep,
-  ab.cli_id,
-  ab.con_id,
-  ab.out_rub
-FROM #day_cli dc
-JOIN #anchor_bal ab ON ab.cli_id = dc.cli_id
-WHERE NOT EXISTS (SELECT 1 FROM #first_evt fe WHERE fe.cli_id = dc.cli_id);
-
-/* ----------- аллокации после первого события: winner ---------- */
-IF OBJECT_ID('tempdb..#alloc_post') IS NOT NULL DROP TABLE #alloc_post;
-SELECT
-  dc.dt_rep,
-  dc.cli_id,
+  kd.d       AS dt_rep,
+  cl.cli_id,
   win.con_id,
   out_rub = cs.out_rub_sum
-INTO #alloc_post
-FROM #day_cli dc
-JOIN #first_evt fe ON fe.cli_id = dc.cli_id
-  AND dc.dt_rep >= fe.first_evt
-JOIN #cli_sum cs ON cs.cli_id = dc.cli_id
+FROM #keydates kd
+JOIN (SELECT DISTINCT cli_id FROM #ab) cl ON 1=1
+JOIN #cli_sum cs ON cs.cli_id = cl.cli_id
+LEFT JOIN #first_evt fe
+  ON fe.cli_id = cl.cli_id
 OUTER APPLY (
-  SELECT TOP (1) ae.con_id
-  FROM WORK.NS_AllocEvents ae
-  WHERE ae.cli_id = dc.cli_id
-    AND ae.dt_rep <= dc.dt_rep
-  ORDER BY ae.dt_rep DESC, ae.con_id
-) win;
+  SELECT TOP (1) e.con_id
+  FROM WORK.NS_AllocEvents e
+  WHERE e.cli_id = cl.cli_id
+    AND e.dt_rep <= kd.d
+  ORDER BY e.dt_rep DESC, e.con_id
+) win
+WHERE win.con_id IS NOT NULL   -- есть уже «последний победитель»
+  AND kd.d >= fe.first_evt;    -- после появления первой даты события
 
-/* ------------------- общий дневной пул ----------------------- */
-IF OBJECT_ID('tempdb..#alloc_daily') IS NOT NULL DROP TABLE #alloc_daily;
-SELECT * INTO #alloc_daily FROM #alloc_pre;
-INSERT #alloc_daily (dt_rep, cli_id, con_id, out_rub)
-SELECT dt_rep, cli_id, con_id, out_rub FROM #alloc_post;
+CREATE INDEX IX_alloc_key_dt ON #alloc_key(dt_rep);
+CREATE INDEX IX_alloc_key_con_dt ON #alloc_key(con_id, dt_rep);
 
-CREATE INDEX IX_ad_dt ON #alloc_daily(dt_rep);
-CREATE INDEX IX_ad_con_dt ON #alloc_daily(con_id, dt_rep);
-
-/* ставка счёта на день = последняя ключевая ≤ дата */
-IF OBJECT_ID('tempdb..#rates_daily') IS NOT NULL DROP TABLE #rates_daily;
+/* ---------- ставка на ключевую дату (по интервалам) ---------- */
+IF OBJECT_ID('tempdb..#rates_keydates') IS NOT NULL DROP TABLE #rates_keydates;
 SELECT
-  ad.dt_rep,
-  ad.con_id,
-  rate_con = oa.rate_con
-INTO #rates_daily
-FROM #alloc_daily ad
-OUTER APPLY (
-  SELECT TOP (1) rk.rate_con
-  FROM #rates_key rk
-  WHERE rk.con_id = ad.con_id
-    AND rk.dt_key <= ad.dt_rep
-  ORDER BY rk.dt_key DESC
-) oa;
+  a.dt_rep,
+  a.con_id,
+  rate_con = ri.rate_con
+INTO #rates_keydates
+FROM #alloc_key a
+JOIN #ri ri
+  ON ri.con_id = a.con_id
+ AND a.dt_rep BETWEEN ri.dt_from AND ri.dt_to;
 
-CREATE INDEX IX_rd_con_dt ON #rates_daily(con_id, dt_rep);
+CREATE INDEX IX_rkd_con_dt ON #rates_keydates(con_id, dt_rep);
 
-/* ------------------- итоговая агрегация ---------------------- */
+/* ---------- итог: агрегат ТОЛЬКО на ключевые даты ---------- */
 IF OBJECT_ID('WORK.Forecast_NS_Promo','U') IS NOT NULL DROP TABLE WORK.Forecast_NS_Promo;
 
 SELECT
-  ad.dt_rep,
-  out_rub_total = SUM(ad.out_rub),
-  rate_avg      = SUM(ad.out_rub * CAST(rd.rate_con AS decimal(9,4))) / NULLIF(SUM(ad.out_rub),0)
+  a.dt_rep,
+  out_rub_total = SUM(a.out_rub),
+  rate_avg      = SUM(a.out_rub * CAST(r.rate_con AS decimal(9,4))) / NULLIF(SUM(a.out_rub),0)
 INTO WORK.Forecast_NS_Promo
-FROM #alloc_daily ad
-JOIN #rates_daily rd
-  ON rd.con_id = ad.con_id
- AND rd.dt_rep = ad.dt_rep
-GROUP BY ad.dt_rep;
+FROM #alloc_key a
+JOIN #rates_keydates r
+  ON r.con_id = a.con_id
+ AND r.dt_rep = a.dt_rep
+GROUP BY a.dt_rep;
 
-Что изменено по сути:
-	•	Part 1 теперь всегда даёт «1-е нового окна» (base_day+1) в NS_RatesKeyDates — без этого второй шаг не видит перезапуск промо.
-	•	Part 1 сохраняет WORK.NS_BalPromoAnchor.
-	•	Part 2 при выборе победителя фильтрует rate_on_date IS NOT NULL, чтобы не было «тихих» пустых рангов.
-	•	Нигде нет обращений к sys.*.
-	•	Ступенчатая дневная лента: между событиями держится последний победитель; «внутримесячные» дни не пересчитываются.
+/* ---------- контрольки (коротко) ---------- */
+PRINT N'=== Events (top-50) ===';
+SELECT TOP (50) * FROM WORK.NS_AllocEvents ORDER BY cli_id, dt_rep;
 
-Запускай строго: Part 1 → Part 2 (с одинаковыми параметрами @Anchor/@HorizonTo). Если понадобится — добавлю лёгкую «контрольку» сравнения Σобъёма и выборку победителей по любому cli_id.
+PRINT N'=== Forecast (key dates only, top-200) ===';
+SELECT TOP (200) * FROM WORK.Forecast_NS_Promo ORDER BY dt_rep;
+
+DECLARE @AnchorTotal decimal(20,2) = (SELECT SUM(out_rub) FROM #ab);
+PRINT N'=== Σ(out_rub) vs Anchor on key dates ===';
+SELECT TOP (200)
+  f.dt_rep,
+  f.out_rub_total,
+  diff_vs_anchor = CAST(f.out_rub_total - @AnchorTotal AS decimal(20,2)),
+  f.rate_avg
+FROM WORK.Forecast_NS_Promo f
+ORDER BY f.dt_rep;
+
+
+⸻
+
+Почему это оптимально
+	•	Part 1 хранит только интервалы (обычно считанные записи на счёт за горизонт), а не посуточку.
+	•	Part 2 считает только на ключевые даты (anchor/EOM/1st). Между ними всё по определению «ступенька» от последней ключевой точки — можно восстановить «на лету» при необходимости (вью/запросом), не кладя в таблицу.
+	•	Все джоины — по компактным наборам с узкими индексами; верхний bound по датам между dt_from/dt_to даёт гарантированно индексируемый seek.
+	•	Никаких sys.*.
+
+Если захочешь — добавлю лёгкую вьюшку vw_Forecast_NS_Promo_Daily, которая будет «размазывать» ключевые значения на каждый день только на чтение, без хранения.
