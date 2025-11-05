@@ -1,5 +1,5 @@
 /* ============================================================
-   PART 1: NS (prod_id = 654) — RATE INTERVALS BY ACCOUNT
+   PART 1: NS (prod_id = 654) — RATE INTERVALS BY ACCOUNT (FIX)
    Пишет:
      • WORK.NS_BalPromoAnchor(con_id, cli_id, out_rub, tsegmentname)
      • WORK.NS_RateIntervals(con_id, cli_id, tsegmentname, dt_from, dt_to, rate_con)
@@ -122,7 +122,7 @@ WHERE out_rub IS NOT NULL
 
 CREATE UNIQUE CLUSTERED INDEX IX_bal_prom ON #bal_prom(con_id);
 
-/* ---------- нулевые договоры к якорю (0 объём, промо ставка по сегменту) ---------- */
+/* ---------- нулевые договоры к якорю ---------- */
 IF OBJECT_ID('tempdb..#z0') IS NOT NULL DROP TABLE #z0;
 SELECT
   CAST(z.con_id AS bigint) AS con_id,
@@ -174,48 +174,67 @@ SELECT * INTO #cycles FROM seq OPTION (MAXRECURSION 0);
 
 CREATE UNIQUE CLUSTERED INDEX IX_cycles ON #cycles(con_id, cycle_no);
 
-/* ---------- ключевые даты по КАЖДОМУ циклу ---------- */
+/* ---------- календарь без рекурсий: WHILE ---------- */
+IF OBJECT_ID('tempdb..#cal_small') IS NOT NULL DROP TABLE #cal_small;
+CREATE TABLE #cal_small (d date PRIMARY KEY);
+INSERT #cal_small VALUES (@Anchor);
+WHILE (SELECT MAX(d) FROM #cal_small) < @HorizonTo
+BEGIN
+  INSERT #cal_small
+  SELECT DATEADD(day,1,MAX(d)) FROM #cal_small;
+END
+
+/* ---------- ключевые даты по КАЖДОМУ циклу (без рекурсий) ---------- */
 IF OBJECT_ID('tempdb..#keys') IS NOT NULL DROP TABLE #keys;
-;WITH cal AS (
-  SELECT d = @Anchor
-  UNION ALL
-  SELECT DATEADD(day,1,d) FROM cal WHERE DATEADD(day,1,d) <= @HorizonTo
-),
-eom_in AS (
-  SELECT c.con_id, c.cli_id, c.TSEGMENTNAME, c.cycle_no, c.win_start, c.promo_end, c.base_day,
-         k = EOMONTH(x.d)
-  FROM #cycles c
-  JOIN cal x ON x.d BETWEEN c.win_start AND c.base_day
-),
-d1_in AS (
-  SELECT c.con_id, c.cli_id, c.TSEGMENTNAME, c.cycle_no, c.win_start, c.promo_end, c.base_day,
-         k = x.d
-  FROM #cycles c
-  JOIN cal x ON x.d BETWEEN c.win_start AND c.base_day
-  WHERE DAY(x.d)=1
-),
-d1_new AS (
-  SELECT c.con_id, c.cli_id, c.TSEGMENTNAME, c.cycle_no, c.win_start, c.promo_end, c.base_day,
-         k = DATEADD(day,1,c.base_day)
-  FROM #cycles c
-  WHERE DATEADD(day,1,c.base_day) <= @HorizonTo
-),
-anch AS (
-  SELECT c.con_id, c.cli_id, c.TSEGMENTNAME, c.cycle_no, c.win_start, c.promo_end, c.base_day,
-         k = @Anchor
-  FROM #cycles c
-  WHERE @Anchor BETWEEN c.win_start AND c.base_day
-)
-SELECT DISTINCT con_id, cli_id, TSEGMENTNAME, cycle_no, win_start, promo_end, base_day, k AS dt_key
+
+-- EOM внутри окна
+IF OBJECT_ID('tempdb..#eom_in') IS NOT NULL DROP TABLE #eom_in;
+SELECT DISTINCT
+  c.con_id, c.cli_id, c.TSEGMENTNAME, c.cycle_no, c.win_start, c.promo_end, c.base_day,
+  dt_key = EOMONTH(x.d)
+INTO #eom_in
+FROM #cycles c
+JOIN #cal_small x ON x.d BETWEEN c.win_start AND c.base_day;
+
+-- 1-е числа внутри окна
+IF OBJECT_ID('tempdb..#d1_in') IS NOT NULL DROP TABLE #d1_in;
+SELECT DISTINCT
+  c.con_id, c.cli_id, c.TSEGMENTNAME, c.cycle_no, c.win_start, c.promo_end, c.base_day,
+  dt_key = x.d
+INTO #d1_in
+FROM #cycles c
+JOIN #cal_small x
+  ON x.d BETWEEN c.win_start AND c.base_day
+WHERE DAY(x.d)=1;
+
+-- 1-е нового окна
+IF OBJECT_ID('tempdb..#d1_new') IS NOT NULL DROP TABLE #d1_new;
+SELECT DISTINCT
+  c.con_id, c.cli_id, c.TSEGMENTNAME, c.cycle_no, c.win_start, c.promo_end, c.base_day,
+  dt_key = DATEADD(day,1,c.base_day)
+INTO #d1_new
+FROM #cycles c
+WHERE DATEADD(day,1,c.base_day) <= @HorizonTo;
+
+-- якорь, если попадает в окно
+IF OBJECT_ID('tempdb..#anch') IS NOT NULL DROP TABLE #anch;
+SELECT DISTINCT
+  c.con_id, c.cli_id, c.TSEGMENTNAME, c.cycle_no, c.win_start, c.promo_end, c.base_day,
+  dt_key = @Anchor
+INTO #anch
+FROM #cycles c
+WHERE @Anchor BETWEEN c.win_start AND c.base_day;
+
+SELECT DISTINCT con_id, cli_id, TSEGMENTNAME, cycle_no, win_start, promo_end, base_day, dt_key
 INTO #keys
 FROM (
-  SELECT * FROM eom_in
+  SELECT * FROM #eom_in
   UNION
-  SELECT * FROM d1_in
+  SELECT * FROM #d1_in
   UNION
-  SELECT * FROM d1_new
+  SELECT * FROM #d1_new
   UNION
-  SELECT * FROM anch
+  SELECT * FROM #anch
 ) U;
 
 CREATE INDEX IX_keys_con_dt ON #keys(con_id, dt_key);
@@ -294,8 +313,7 @@ IF OBJECT_ID('WORK.NS_RateIntervals','U') IS NOT NULL DROP TABLE WORK.NS_RateInt
     con_id, cli_id, TSEGMENTNAME,
     dt_from = dt_key,
     rate_con,
-    dt_to_next =
-      LEAD(dt_key) OVER (PARTITION BY con_id ORDER BY dt_key)
+    dt_to_next = LEAD(dt_key) OVER (PARTITION BY con_id ORDER BY dt_key)
   FROM #rates_key
 ),
 bounds AS (
@@ -317,7 +335,6 @@ WHERE dt_from <= @HorizonTo
 
 CREATE UNIQUE CLUSTERED INDEX IX_NS_RateIntervals ON WORK.NS_RateIntervals(con_id, dt_from);
 CREATE INDEX IX_NS_RateIntervals_cli ON WORK.NS_RateIntervals(cli_id, dt_from);
-
 ------
 
 /* ================================================================
