@@ -383,55 +383,65 @@ Sub FwdKR_unsmoothed()
     
     With Excel.WorksheetFunction
         'timeline & discount factors
+        'timeline
         Cells(2, 1).Value = andate
         Cells(3, 1).Value = andate + 1
         Range("A2:A3").AutoFill Destination:=Range("A2:A" & (2 + maxdate - andate)), Type:=xlFillDefault
+        'discount rates
         Cells(2, 2).FormulaR1C1 = _
             "=IF(Key_rate!RC[-1]<=MIN(KRS!R2C1:R14C1),KRS!R2C9,IF(Key_rate!RC[-1]>=MAX(KRS!R2C1:R14C1),KRS!R14C9,INDEX(KRS!R2C9:R14C9," & _
             "MATCH(Key_rate!RC[-1],KRS!R2C1:R14C1,1),1)+(Key_rate!RC[-1]-INDEX(KRS!R2C1:R14C1,MATCH(Key_rate!RC[-1],KRS!R2C1:R14C1,1),1))/" & _
             "(INDEX(KRS!R2C1:R14C1,MATCH(Key_rate!RC[-1],KRS!R2C1:R14C1,1)+1,1)-INDEX(KRS!R2C1:R14C1,MATCH(Key_rate!RC[-1],KRS!R2C1" & _
             ":R14C1,1),1))*(INDEX(KRS!R2C9:R14C9,MATCH(Key_rate!RC[-1],KRS!R2C1:R14C1,1)+1,1)-INDEX(KRS!R2C9:R14C9,MATCH(Key_rate!RC[-1],KRS!R2C1:R14C1,1),1))))"
+        'discount factors
         Cells(2, 3).FormulaR1C1 = "=EXP(-RC[-1]*YEARFRAC(R2C1,RC[-2],1))"
         
         Range(Cells(2, 2), Cells(2, 3)).AutoFill Destination:=Range(Cells(2, 2), Cells(2 + maxdate - andate, 3)), Type:=xlFillDefault
         
+        'fill arrays with KRS data
         Worksheets("KRS").Activate
         n_swap = .Count(Range(Range("A2"), Range("A2").End(xlDown)))
         ReDim swap(1 To 3, 1 To n_swap) As Variant
         For i = 1 To n_swap
-            swap(1, i) = CLng(Cells(1 + i, 1).Value)
-            swap(2, i) = Cells(1 + i, 10).Value
-            swap(3, i) = swap(1, i) - andate + 1
+            swap(1, i) = CLng(Cells(1 + i, 1).Value) 'termination (maturity) date
+           swap(2, i) = Cells(1 + i, 10).Value 'swap rate
+            swap(3, i) = swap(1, i) - andate + 1 'position of swap termination date in dates column (on the "Key_rate" sheet)
         Next i
         
+        'KR changes dates
         Worksheets("KR_change_dates").Activate
         Set meetings = Range(Range("A2"), Range("A2").End(xlDown))
         meeting_1 = .Index(meetings, .Match(andate, meetings, 1) + 1)
         
         Worksheets("Key_rate").Activate
-        pos_1 = .Match(meeting_1, Range(Range("A2"), Range("A2").End(xlDown)), 0)
+        'Set current key rate till the first change date
+        pos_1 = .Match(meeting_1, Range(Range("A2"), Range("A2").End(xlDown)), 0) 'position of the first KR change date in timeline
         Range("D2").AutoFill Destination:=Range("D2:D" & (3 + pos_1)), Type:=xlFillDefault
         
         meetings_num = .Match(maxdate, meetings, 1) - .Match(andate, meetings, 1)
         ReDim meetings_active(1 To 2, 1 To meetings_num) As Variant
         For i = 1 To meetings_num
-           meetings_active(1, i) = CLng(.Index(meetings, .Match(andate, meetings, 1) + i))
-            meetings_active(2, i) = .Match(meetings_active(1, i), Range(Range("A2"), Range("A2").End(xlDown)), 0)
+           meetings_active(1, i) = CLng(.Index(meetings, .Match(andate, meetings, 1) + i)) 'meeting date
+            meetings_active(2, i) = .Match(meetings_active(1, i), Range(Range("A2"), Range("A2").End(xlDown)), 0) 'meeting date position
         Next i
         
+        'Set constant key rates for each constant rate period
         If meetings_active(1, meetings_num) <> swap(1, n_swap) Then
             For i = 1 To meetings_num
-                Dim pos As Integer
-                If meetings_active(1, i) < swap(1, 1) Then
+                If meetings_active(1, i) < swap(1, 1) Then 'to fix match error
                     pos = 1
                 Else
                     pos = .Match(meetings_active(1, i), .Index(swap, 1, 0), 1) + 1
                 End If
+                'set key rates at the first day of constant rate period
+                'if meeting date coincides with swap maturity date and isn't a maximum maturity, refer to next from found swap's average KR
                 If (meetings_active(1, i) = swap(1, pos)) And (pos < n_swap) Then
                     Cells(1 + meetings_active(2, i), 5).FormulaR1C1 = "=KRS!R" & (2 + pos) & "C15"
                 Else
+                    'otherwise refer to found swap's average KR
                     Cells(1 + meetings_active(2, i), 5).FormulaR1C1 = "=KRS!R" & (1 + pos) & "C15"
                 End If
+                'expand constant rate to whole period
                 Cells(1 + meetings_active(2, i), 4).Formula = "=R" & (1 + meetings_active(2, i)) & "C5"
                 If i = meetings_num Then
                     Cells(1 + meetings_active(2, i), 4).AutoFill Destination:=Range(Cells(1 + meetings_active(2, i), 4), Cells(2 + maxdate - andate, 4)), Type:=xlFillDefault
@@ -441,17 +451,20 @@ Sub FwdKR_unsmoothed()
             Next i
         Else
             For i = 1 To meetings_num - 1
-                Dim pos2 As Integer
-                If meetings_active(1, i) < swap(1, 1) Then
-                    pos2 = 1
+                If meetings_active(1, i) < swap(1, 1) Then 'to fix match error
+                    pos = 1
                 Else
-                    pos2 = .Match(meetings_active(1, i), .Index(swap, 1, 0), 1) + 1
+                    pos = .Match(meetings_active(1, i), .Index(swap, 1, 0), 1) + 1
                 End If
-                If (meetings_active(1, i) = swap(1, pos2)) And (pos2 < n_swap) Then
-                    Cells(1 + meetings_active(2, i), 5).FormulaR1C1 = "=KRS!R" & (2 + pos2) & "C15"
+                'set key rates at the first day of constant rate period
+                'if meeting date coincides with swap maturity date and isn't a maximum maturity, refer to next from found swap's average KR
+                If (meetings_active(1, i) = swap(1, pos)) And (pos < n_swap) Then
+                    Cells(1 + meetings_active(2, i), 5).FormulaR1C1 = "=KRS!R" & (2 + pos) & "C15"
                 Else
-                    Cells(1 + meetings_active(2, i), 5).FormulaR1C1 = "=KRS!R" & (1 + pos2) & "C15"
+                    'otherwise refer to found swap's average KR
+                    Cells(1 + meetings_active(2, i), 5).FormulaR1C1 = "=KRS!R" & (1 + pos) & "C15"
                 End If
+                'expand constant rate to whole period
                 Cells(1 + meetings_active(2, i), 4).Formula = "=R" & (1 + meetings_active(2, i)) & "C5"
                 If i = meetings_num Then
                     Cells(1 + meetings_active(2, i), 4).AutoFill Destination:=Range(Cells(1 + meetings_active(2, i), 4), Cells(2 + maxdate - andate, 4)), Type:=xlFillDefault
@@ -459,30 +472,36 @@ Sub FwdKR_unsmoothed()
                     Cells(1 + meetings_active(2, i), 4).AutoFill Destination:=Range(Cells(1 + meetings_active(2, i), 4), Cells(meetings_active(2, i + 1), 4)), Type:=xlFillDefault
                 End If
             Next i
+            
             Cells(1 + meetings_active(2, meetings_num), 5).FormulaR1C1 = "=KRS!R14C15"
             Cells(1 + meetings_active(2, meetings_num), 4).FormulaR1C1 = "=KRS!R14C15"
+            
         End If
         
+        'Calculation of swap rates as a function of KR dynamics
         Worksheets("Key_rate").Activate
         For i = 1 To n_swap
-            Cells(1 + swap(3, i), 8).FormulaR1C1 = "=KRS!R" & (1 + i) & "C10"
-            Cells(1 + swap(3, i), 9).FormulaR1C1 = "=KRS!R" & (1 + i) & "C11"
+            Cells(1 + swap(3, i), 8).FormulaR1C1 = "=KRS!R" & (1 + i) & "C10" 'Inserting actual swap rates
+            Cells(1 + swap(3, i), 9).FormulaR1C1 = "=KRS!R" & (1 + i) & "C11" 'Inserting calculated swap rates
         Next i
         
+        'fitting swap rates
         Worksheets("KRS").Activate
         For i = 1 To n_swap
-            Dim cells_to_change As String
             cells_to_change = "O" & (1 + i)
-            SolverOk SetCell:=Cells(1 + i, 16), MaxMinVal:=3, ValueOf:=0, ByChange:=cells_to_change, Engine:=1, EngineDesc:="GRG Nonlinear"
+            SolverOk SetCell:=Cells(1 + i, 16), MaxMinVal:=3, ValueOf:=0, ByChange:= _
+                cells_to_change, Engine:=1, EngineDesc:="GRG Nonlinear"
             SolverOptions Convergence:=0.00004
             SolverSolve userFinish:=True
+ 
         Next i
+        
     End With
     
     Application.ScreenUpdating = True
     
 End Sub
-
+ 
 Sub FwdKR_smoothed()
     Dim curve_type As Integer
     Dim kr         As Range
@@ -496,22 +515,34 @@ Sub FwdKR_smoothed()
     
     Application.ScreenUpdating = False
     With Application.WorksheetFunction
+        'Step 1: Definition of conventional fwd rate dynamics
+        'type 1 - upward-sloping
+       'type 2 - downward-sloping
+        'type 3 - U-shaped
+        'type 4 - hump-shaped
+        'type 5 - hump-shaped with further growth (mixed hump-to-U-shaped)
         kr_start = kr(1).Value
         kr_end = kr(kr.Count).Value
         kr_min = .Min(kr)
         kr_max = .Max(kr)
         
         Select Case True
-            Case (kr_start = kr_min) And (kr_end = kr_max): curve_type = 1
-            Case (kr_start = kr_max) And (kr_end = kr_min): curve_type = 2
-            Case (kr_min <= kr_start) And (kr_min <= kr_end): curve_type = 3
-            Case (kr_max >= kr_start) And (kr_max >= kr_end): curve_type = 4
+            Case (kr_start = kr_min) And (kr_end = kr_max)
+                curve_type = 1
+            Case (kr_start = kr_max) And (kr_end = kr_min)
+                curve_type = 2
+            Case (kr_min <= kr_start) And (kr_min <= kr_end)
+                curve_type = 3
+            Case (kr_max >= kr_start) And (kr_max >= kr_end)
+                curve_type = 4
+            
+            
         End Select
     End With
     
     Application.ScreenUpdating = True
 End Sub
-
+ 
 Sub AdjustDiagram()
     Dim kr_unsmoothed As Range
     Dim kr_smoothed   As Range
@@ -539,9 +570,11 @@ Sub AdjustDiagram()
         ActiveChart.FullSeriesCollection(1).XValues = dates
         ActiveChart.FullSeriesCollection(1).values = kr_unsmoothed
         
+        ActiveChart.Axes(xlCategory).Select
         ActiveChart.Axes(xlCategory).MinimumScale = date_start
         ActiveChart.Axes(xlCategory).MaximumScale = date_end
        
+        ActiveChart.Axes(xlValue).Select
         ActiveChart.Axes(xlValue).MinimumScale = .RoundDown((kr_min - 0.0001) / 0.005, 0) * 0.005
         ActiveChart.Axes(xlValue).MaximumScale = .RoundUp((kr_max + 0.0001) / 0.005, 0) * 0.005
     End With
@@ -549,7 +582,7 @@ Sub AdjustDiagram()
     Application.ScreenUpdating = True
     
 End Sub
-
+ 
 Sub ExecuteAllSteps()
  
 Call DownloadData
@@ -568,3 +601,5 @@ Sub ExecuteAll_and_load()
  
 Call ExecuteAllSteps
 End Sub
+
+![Uploading image.png…]()
