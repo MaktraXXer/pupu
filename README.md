@@ -1,242 +1,351 @@
-/* ============================================================
-   PART 2: NS — ALLOCATION EVENTS & DAILY AGGREGATE
-   Вход:
-     • WORK.NS_BalPromoAnchor
-     • WORK.NS_RateIntervals
-   Выход:
-     • WORK.NS_AllocEvents
-     • WORK.Forecast_NS_Promo
-   Правила:
-     • Победитель выбирается ТОЛЬКО на EOM и 1-е
-       (ставка счёта на дату — по интервалам Part 1, OUTER APPLY).
-     • До первого события — держим якорный сплит по кон-ам.
-     • После события — весь Σ клиента на последнем победителе.
-   ============================================================ */
+Option Explicit
 
-USE ALM_TEST;
-SET NOCOUNT ON;
+' ''' --- CHANGED: FTP (утилиты только для FTP-блоков)
+Private Function RS_ToRange(ByVal rst As ADODB.Recordset, ByVal dst As Range) As Long
+    ' Возвращает кол-во записей, выгруженных в лист.
+    If rst Is Nothing Or rst.EOF Then
+        RS_ToRange = 0
+        Exit Function
+    End If
+    Dim data As Variant, r As Long, c As Long, rows As Long, cols As Long
+    data = rst.GetRows()                ' массив (Fields x Records)
+    rows = UBound(data, 2) + 1
+    cols = UBound(data, 1) + 1
 
-/* ---------- проверки ---------- */
-IF OBJECT_ID('WORK.NS_RateIntervals','U') IS NULL
-  RAISERROR('Missing WORK.NS_RateIntervals (run Part 1).',16,1);
+    Dim outArr() As Variant
+    ReDim outArr(1 To rows, 1 To cols)
+    For r = 1 To rows
+        For c = 1 To cols
+            outArr(r, c) = data(c - 1, r - 1)
+        Next c
+    Next r
+    dst.Resize(rows, cols).Value = outArr
+    RS_ToRange = rows
+End Function
 
-IF OBJECT_ID('WORK.NS_BalPromoAnchor','U') IS NULL
-  RAISERROR('Missing WORK.NS_BalPromoAnchor (run Part 1).',16,1);
+Private Sub SafeClear21(sheetName As String, addr As String)
+    ' чистим ТОЛЬКО в рамках строк 1..21, чтобы не задеть расчёты ниже
+    On Error Resume Next
+    Dim rg As Range
+    Set rg = Worksheets(sheetName).Range(addr)
+    Dim topRow As Long, bottomRow As Long
+    topRow = rg.Row
+    bottomRow = rg.Row + rg.Rows.Count - 1
+    If bottomRow > 21 Then
+        Set rg = Intersect(rg, Worksheets(sheetName).Rows("1:21"))
+    End If
+    If Not rg Is Nothing Then
+        rg.ClearContents
+        rg.ClearFormats
+    End If
+    On Error GoTo 0
+End Sub
+' ''' --- CHANGED: FTP (конец утилит)
 
-/* ---------- диапазон дат ---------- */
-DECLARE @StartDate date, @EndDate date;
-SELECT @StartDate = MIN(dt_from), @EndDate = MAX(dt_to) FROM WORK.NS_RateIntervals;
+Sub DownloadData()
+    
+    Application.ScreenUpdating = False
+    
+    Dim i        As Integer
+    Dim rstarray As Variant
+    Dim t        As String
+    Dim prev_t   As String
+    
+    'Choosing analysis date
+    t = "'" & Format(Worksheets("Input").Range("B2").Value, "YYYY-MM-DD") & "'"
+    prev_t = "'" & Format(Worksheets("Input").Range("B13").Value, "YYYY-MM-DD") & "'"
+    '''
+    'Creating connection
+    Dim db As New ADODB.Connection
+    Dim db1 As New ADODB.Connection
+    Dim rst As New ADODB.Recordset
+    Dim cmd As New ADODB.Command
+    
+    db.Open ("Driver=SQL Server;Server=trading-db.ahml1.ru;Database=DWH_DMT;Trusted connection=Yes")
+    cmd.ActiveConnection = db
+    
+    Worksheets("KRS").Activate
+    
+    'Clear the area with old KRS rates
+    Range("P21:Q33").ClearContents
+    Range("T21:U33").ClearContents
+    Range("P41:Q53").ClearContents
+    Range("T41:U53").ClearContents
+    
+    'Load KRS data BID (current date)
+    cmd.CommandText = "select Price from " & _
+                      "( " & _
+                      "select Name, Bookstamp, row_number() over(partition by [Name] order by bookstamp desc, Qty desc) rown, " & _
+                      "bid, Price from SPFI.ods.vQuoteHistory " & _
+                      "where 1 = 1 " & _
+                      "and [Name] like 'IRS%KEYRATE' " & _
+                      "and Bid = 1 " & _
+                      "and cast(bookstamp as date) = " & t & _
+                      "and price > 0 " & _
+                      ") t " & _
+                      "where rown = 1 " & _
+                      "order by len([Name]), right(left([Name], 6), 1), [Name]"
+    
+    Set rst = cmd.Execute
+    Range("P21").CopyFromRecordset rst
+    
+    'Load KRS data ASK (current date)
+    cmd.CommandText = "select Price from " & _
+                      "( " & _
+                      "select Name, Bookstamp, row_number() over(partition by [Name] order by bookstamp desc, Qty desc) rown, " & _
+                      "bid, Price from SPFI.ods.vQuoteHistory " & _
+                      "where 1 = 1 " & _
+                      "and [Name] like 'IRS%KEYRATE' " & _
+                      "and Bid = 0 " & _
+                      "and cast(bookstamp as date) = " & t & _
+                      "and price > 0 " & _
+                      ") t " & _
+                      "where rown = 1 " & _
+                      "order by len([Name]), right(left([Name], 6), 1), [Name]"
+                      
+    Set rst = cmd.Execute
+    Range("Q21").CopyFromRecordset rst
+    
+    'Load KRS data BID (previous date)
+    cmd.CommandText = "select Price from " & _
+                      "( " & _
+                      "select Name, Bookstamp, row_number() over(partition by [Name] order by bookstamp desc, Qty desc) rown, " & _
+                      "bid, Price from SPFI.ods.vQuoteHistory " & _
+                      "where 1 = 1 " & _
+                      "and [Name] like 'IRS%KEYRATE' " & _
+                      "and Bid = 1 " & _
+                      "and cast(bookstamp as date) = " & prev_t & _
+                      "and price > 0 " & _
+                      ") t " & _
+                      "where rown = 1 " & _
+                      "order by len([Name]), right(left([Name], 6), 1), [Name]"
+    
+    Set rst = cmd.Execute
+    Range("T21").CopyFromRecordset rst
+    
+    'Load KRS data ASK (previous date)
+    cmd.CommandText = "select Price from " & _
+                      "( " & _
+                      "select Name, Bookstamp, row_number() over(partition by [Name] order by bookstamp desc, Qty desc) rown, " & _
+                      "bid, Price from SPFI.ods.vQuoteHistory " & _
+                      "where 1 = 1 " & _
+                      "and [Name] like 'IRS%KEYRATE' " & _
+                      "and Bid = 0 " & _
+                      "and cast(bookstamp as date) = " & prev_t & _
+                      "and price > 0 " & _
+                      ") t " & _
+                      "where rown = 1 " & _
+                      "order by len([Name]), right(left([Name], 6), 1), [Name]"
+                      
+    Set rst = cmd.Execute
+    Range("U21").CopyFromRecordset rst
+    
+    'Calculate MIDs and copy to the corresponding cells
+    '...
+        
+    '''
+    'Load OIS data BID (current date)
+    cmd.CommandText = "select Price from ( " & _
+                      "select *, row_Number() over(partition by [Name] order by BookStamp desc, Qty desc) rown " & _
+                      "from SPFI.ods.vQuoteHistory where [Name] like 'OIS%RUONIA' and [Name] not in " & _
+                      "('OIS 1W RUONIA', 'OIS 2W RUONIA', 'OIS 1M RUONIA', 'OIS 2M RUONIA') " & _
+                      "and cast(Bookstamp as date) = " & t & " and Bid = 1) t where rown = 1 " & _
+                      "order by len([Name]), left(right([Name], 8), 1), right(left([Name], 5), 1)"
+    
+    Set rst = cmd.Execute
+    Range("P41").CopyFromRecordset rst
+    
+    'Load OIS data ASK (current date)
+    cmd.CommandText = "select Price from ( " & _
+                      "select *, row_Number() over(partition by [Name] order by BookStamp desc, Qty desc) rown " & _
+                      "from SPFI.ods.vQuoteHistory where [Name] like 'OIS%RUONIA' and [Name] not in " & _
+                      "('OIS 1W RUONIA', 'OIS 2W RUONIA', 'OIS 1M RUONIA', 'OIS 2M RUONIA') " & _
+                      "and cast(Bookstamp as date) = " & t & " and Bid = 0) t where rown = 1 " & _
+                      "order by len([Name]), left(right([Name], 8), 1), right(left([Name], 5), 1)"
+    
+    Set rst = cmd.Execute
+    Range("Q41").CopyFromRecordset rst
+    
+    'Load OIS data BID (previous date)
+    cmd.CommandText = "select Price from ( " & _
+                      "select *, row_Number() over(partition by [Name] order by BookStamp desc, Qty desc) rown " & _
+                      "from SPFI.ods.vQuoteHistory where [Name] like 'OIS%RUONIA' and [Name] not in " & _
+                      "('OIS 1W RUONIA', 'OIS 2W RUONIA', 'OIS 1M RUONIA', 'OIS 2M RUONIA') " & _
+                      "and cast(Bookstamp as date) = " & prev_t & " and Bid = 1) t where rown = 1 " & _
+                      "order by len([Name]), left(right([Name], 8), 1), right(left([Name], 5), 1)"
+    
+    Set rst = cmd.Execute
+    Range("T41").CopyFromRecordset rst
+    
+    'Load OIS data ASK (previous date)
+    cmd.CommandText = "select Price from ( " & _
+                      "select *, row_Number() over(partition by [Name] order by BookStamp desc, Qty desc) rown " & _
+                      "from SPFI.ods.vQuoteHistory where [Name] like 'OIS%RUONIA' and [Name] not in " & _
+                      "('OIS 1W RUONIA', 'OIS 2W RUONIA', 'OIS 1M RUONIA', 'OIS 2M RUONIA') " & _
+                      "and cast(Bookstamp as date) = " & prev_t & " and Bid = 0) t where rown = 1 " & _
+                      "order by len([Name]), left(right([Name], 8), 1), right(left([Name], 5), 1)"
+    
+    Set rst = cmd.Execute
+    Range("U41").CopyFromRecordset rst
+    '''
+    
+    Worksheets("OIS rates").Activate
+    
+    'Load ROISFIX data (current date)
+    cmd.CommandText = "select Rate/100 as ROISFIX from dwh_dmt.nfa.vRoisFix where Dt = " & t & _
+                      "order by case when right(SettlementCode, 1) = 'w' then 0 " & _
+                                    "when right(SettlementCode, 1) = 'm' then 1 else 2 end, left(SettlementCode, 1)"
+    Set rst = cmd.Execute
+    Range("C4").CopyFromRecordset rst
+    
+    'Load ROISFIX data (previous date)
+    cmd.CommandText = "select Rate/100 as ROISFIX from dwh_dmt.nfa.vRoisFix where Dt = " & prev_t & _
+                      "order by case when right(SettlementCode, 1) = 'w' then 0 " & _
+                                    "when right(SettlementCode, 1) = 'm' then 1 else 2 end, left(SettlementCode, 1)"
+    Set rst = cmd.Execute
+    Range("D4").CopyFromRecordset rst
+    
+    'Load FTP data
+    Dim nShortNow As Long, nShortPrev As Long
+    Dim startShortNow As Range, startShortPrev As Range
+    Dim startLongNow As Range, startLongPrev As Range
 
-/* ---------- календарь только по ключевым (EOM/1-е) + анкоры в интервалах ---------- */
-IF OBJECT_ID('tempdb..#cal') IS NOT NULL DROP TABLE #cal;
-CREATE TABLE #cal (d date NOT NULL PRIMARY KEY);
-INSERT #cal VALUES (@StartDate);
-WHILE (SELECT MAX(d) FROM #cal) < @EndDate
-BEGIN
-  INSERT #cal SELECT DATEADD(day,1,MAX(d)) FROM #cal;
-END;
+    db1.Open ("Driver=SQL Server;Server=trading-db.ahml1.ru;Database=ALM;Trusted connection=Yes")
+    cmd.ActiveConnection = db1
+    
+    'Short/Long/Float FTP (current & previous)
+    Worksheets("FTP").Activate
 
-IF OBJECT_ID('tempdb..#eom') IS NOT NULL DROP TABLE #eom;
-SELECT d INTO #eom FROM #cal WHERE d = EOMONTH(d);
+    ' ''' --- CHANGED: FTP (очистка ТОЛЬКО до 21-й строки)
+    SafeClear21 "FTP", "B3:F21"
+    SafeClear21 "FTP", "H3:L21"
 
-IF OBJECT_ID('tempdb..#d1') IS NOT NULL DROP TABLE #d1;
-SELECT d INTO #d1 FROM #cal WHERE DAY(d)=1;
+    Set startShortNow = Range("B3")  ' Term,Rate текущая дата
+    Set startShortPrev = Range("H3") ' Term,Rate предыдущая дата
 
-/* ---------- клиенты и суммы на якоре ---------- */
-IF OBJECT_ID('tempdb..#anchor_bal') IS NOT NULL DROP TABLE #anchor_bal;
-SELECT con_id=CAST(con_id AS bigint),
-       cli_id=CAST(cli_id AS bigint),
-       out_rub=CAST(out_rub AS decimal(20,2))
-INTO #anchor_bal
-FROM WORK.NS_BalPromoAnchor;
+    'Short fixed rates (current date)
+    cmd.CommandText = "SELECT Term, Rate FROM TransfertRates WHERE RateDate = " & t & " AND " & _
+                      "Currency = 'RUB' AND Type = 'BaseFixed' AND Term >= 7 AND Term <= 365 ORDER BY Term"
+    Set rst = cmd.Execute
+    nShortNow = RS_ToRange(rst, startShortNow)   ' ''' --- CHANGED: FTP
 
-IF OBJECT_ID('tempdb..#clients') IS NOT NULL DROP TABLE #clients;
-SELECT DISTINCT cli_id INTO #clients FROM #anchor_bal;
-CREATE UNIQUE INDEX IX_cli ON #clients(cli_id);
+    'Short fixed rates (previous date)
+    cmd.CommandText = "SELECT Term, Rate FROM TransfertRates WHERE RateDate = " & prev_t & " AND " & _
+                      "Currency = 'RUB' AND Type = 'BaseFixed' AND Term >= 7 AND Term <= 365 ORDER BY Term"
+    Set rst = cmd.Execute
+    nShortPrev = RS_ToRange(rst, startShortPrev) ' ''' --- CHANGED: FTP
 
-IF OBJECT_ID('tempdb..#cli_sum') IS NOT NULL DROP TABLE #cli_sum;
-SELECT cli_id, out_rub_sum = SUM(out_rub)
-INTO #cli_sum
-FROM #anchor_bal
-GROUP BY cli_id;
-CREATE UNIQUE INDEX IX_clisum ON #cli_sum(cli_id);
+    'Long fixed rates (current date) — сразу под короткими, но не ниже 21-й строки
+    Set startLongNow = startShortNow.Offset(Application.Min(nShortNow + 1, 21 - startShortNow.Row), 0)
+    cmd.CommandText = "SELECT Term, Rate FROM TransfertRates WHERE RateDate = (SELECT MAX(RateDate) FROM TransfertRates " & _
+                      "WHERE IsSettled = 1 AND Type = 'BaseFixed' AND Currency = 'RUB' AND Term > 365 AND RateDate <= " & t & ") AND " & _
+                      "Currency = 'RUB' AND Type = 'BaseFixed' AND Term > 365 AND Term <= 3650 ORDER BY Term"
+    Set rst = cmd.Execute
+    Call RS_ToRange(rst, startLongNow)           ' ''' --- CHANGED: FTP
 
-/* ---------- кандидаты «счет×клиент×ключевая дата» ---------- */
-IF OBJECT_ID('tempdb..#candidates') IS NOT NULL DROP TABLE #candidates;
-SELECT c.cli_id, ab.con_id, k.d AS dt_rep
-INTO #candidates
-FROM #clients c
-JOIN #anchor_bal ab ON ab.cli_id = c.cli_id
-JOIN (SELECT d FROM #eom UNION ALL SELECT d FROM #d1) k ON 1=1;
+    'Long fixed rates (previous date) — сразу под короткими, но не ниже 21-й строки
+    Set startLongPrev = startShortPrev.Offset(Application.Min(nShortPrev + 1, 21 - startShortPrev.Row), 0)
+    cmd.CommandText = "SELECT Term, Rate FROM TransfertRates WHERE RateDate = (SELECT MAX(RateDate) FROM TransfertRates " & _
+                      "WHERE IsSettled = 1 AND Type = 'BaseFixed' AND Currency = 'RUB' AND Term > 365 AND RateDate <= " & prev_t & ") AND " & _
+                      "Currency = 'RUB' AND Type = 'BaseFixed' AND Term > 365 AND Term <= 3650 ORDER BY Term"
+    Set rst = cmd.Execute
+    Call RS_ToRange(rst, startLongPrev)          ' ''' --- CHANGED: FTP
 
-CREATE INDEX IX_cand ON #candidates(cli_id, dt_rep, con_id);
+    'Floating rates (current date) — начиная с 91 дня (адрес не меняем)
+    cmd.CommandText = "SELECT Rate FROM TransfertRates WHERE RateDate = " & t & " AND " & _
+                      "Currency = 'RUB' AND Type = 'FloatToKeyRate' AND Term >= 91 AND Term <= 3650 ORDER BY Term"
+    Set rst = cmd.Execute
+    Range("E7").CopyFromRecordset rst            ' ''' --- CHANGED: FTP
 
-/* ---------- ставка счета на ключевую дату из интервалов ---------- */
-IF OBJECT_ID('tempdb..#cand_rates') IS NOT NULL DROP TABLE #cand_rates;
-SELECT
-  cand.cli_id, cand.con_id, cand.dt_rep,
-  rate_on_date = ri.rate_con
-INTO #cand_rates
-FROM #candidates cand
-OUTER APPLY (
-  SELECT TOP (1) r.rate_con
-  FROM WORK.NS_RateIntervals r
-  WHERE r.con_id = cand.con_id
-    AND cand.dt_rep BETWEEN r.dt_from AND r.dt_to
-  ORDER BY r.dt_from DESC
-) ri;
+    'Floating rates (previous date)
+    cmd.CommandText = "SELECT Rate FROM TransfertRates WHERE RateDate = " & prev_t & " AND " & _
+                      "Currency = 'RUB' AND Type = 'FloatToKeyRate' AND Term >= 91 AND Term <= 3650 ORDER BY Term"
+    Set rst = cmd.Execute
+    Range("K7").CopyFromRecordset rst            ' ''' --- CHANGED: FTP
+    
+    'Closing connection
+    db.Close
+    Set rst = Nothing
+    Set cmd = Nothing
+    Set db = Nothing
+    
+    Application.ScreenUpdating = True
+    
+    Worksheets("KRS").Activate
+    
+End Sub
 
-CREATE INDEX IX_candr ON #cand_rates(cli_id, dt_rep, rate_on_date DESC, con_id);
+Sub load_ftp()
+ 
+    Dim t_ftp    As String
+    t_ftp = "'" & Format(Worksheets("Input").Range("B19").Value, "YYYY-MM-DD") & "'"
+ 
+    Dim db As New ADODB.Connection
+    Dim rst As New ADODB.Recordset
+    Dim cmd As New ADODB.Command
+    
+    Dim nShort As Long
+    Dim startShort As Range, startLong As Range
+ 
+    'Load of FTP data
+    db.Open ("Driver=SQL Server;Server=trading-db.ahml1.ru;Database=ALM;Trusted connection=Yes")
+    cmd.ActiveConnection = db
+    
+    Worksheets("FTP").Activate
 
-/* ---------- события перелива: EOM ---------- */
-IF OBJECT_ID('tempdb..#evt_eom') IS NOT NULL DROP TABLE #evt_eom;
-;WITH ranked AS (
-  SELECT cr.*, rn = ROW_NUMBER() OVER(
-           PARTITION BY cr.cli_id, cr.dt_rep
-           ORDER BY cr.rate_on_date DESC, cr.con_id
-       )
-  FROM #cand_rates cr
-  WHERE cr.dt_rep IN (SELECT d FROM #eom)
-)
-SELECT
-  r.cli_id, r.con_id, r.dt_rep,
-  out_rub = cs.out_rub_sum,
-  reason  = CAST('EOM' AS varchar(8))
-INTO #evt_eom
-FROM ranked r
-JOIN #cli_sum cs ON cs.cli_id=r.cli_id
-WHERE r.rn=1;
+    ' ''' --- CHANGED: FTP (очищаем ТОЛЬКО до 21-й строки)
+    SafeClear21 "FTP", "B3:F21"
 
-CREATE INDEX IX_evte ON #evt_eom(cli_id, dt_rep);
+    Set startShort = Range("B3")
 
-/* ---------- события перелива: 1-е числа ---------- */
-IF OBJECT_ID('tempdb..#evt_d1') IS NOT NULL DROP TABLE #evt_d1;
-;WITH ranked AS (
-  SELECT cr.*, rn = ROW_NUMBER() OVER(
-           PARTITION BY cr.cli_id, cr.dt_rep
-           ORDER BY cr.rate_on_date DESC, cr.con_id
-       )
-  FROM #cand_rates cr
-  WHERE cr.dt_rep IN (SELECT d FROM #d1)
-)
-SELECT
-  r.cli_id, r.con_id, r.dt_rep,
-  out_rub = cs.out_rub_sum,
-  reason  = CAST('D1' AS varchar(8))
-INTO #evt_d1
-FROM ranked r
-JOIN #cli_sum cs ON cs.cli_id=r.cli_id
-WHERE r.rn=1;
+    'Short fixed rates
+    cmd.CommandText = "SELECT Term, Rate FROM TransfertRates WHERE RateDate = " & t_ftp & " AND " & _
+                      "Currency = 'RUB' AND Type = 'BaseFixed' AND Term >= 7 AND Term <= 365 ORDER BY Term"
+    Set rst = cmd.Execute
+    nShort = RS_ToRange(rst, startShort)         ' ''' --- CHANGED: FTP
 
-CREATE INDEX IX_evtd1 ON #evt_d1(cli_id, dt_rep);
+    'Long fixed rates — сразу под короткими, но не ниже 21-й строки
+    Set startLong = startShort.Offset(Application.Min(nShort + 1, 21 - startShort.Row), 0)
+    cmd.CommandText = "SELECT Term, Rate FROM TransfertRates WHERE RateDate = (SELECT MAX(RateDate) FROM TransfertRates " & _
+                      "WHERE IsSettled = 1 AND Type = 'BaseFixed' AND Currency = 'RUB' AND Term > 365 AND RateDate <= " & t_ftp & ") AND " & _
+                      "Currency = 'RUB' AND Type = 'BaseFixed' AND Term > 365 AND Term <= 3650 ORDER BY Term"
+    Set rst = cmd.Execute
+    Call RS_ToRange(rst, startLong)              ' ''' --- CHANGED: FTP
+    
+    'Floating rates
+    cmd.CommandText = "SELECT Rate FROM TransfertRates WHERE RateDate = " & t_ftp & " AND " & _
+                      "Currency = 'RUB' AND Type = 'FloatToKeyRate' AND Term >= 91 AND Term <= 3650 ORDER BY Term"
+    Set rst = cmd.Execute
+    Range("E7").CopyFromRecordset rst            ' ''' --- CHANGED: FTP
+    
+    'Closing connection
+    db.Close
+    Set rst = Nothing
+    Set cmd = Nothing
+    Set db = Nothing
+    
+    Worksheets("Input").Activate
+    
+    Application.ScreenUpdating = True
+ 
+End Sub
 
-/* ---------- итоговые события ---------- */
-IF OBJECT_ID('WORK.NS_AllocEvents','U') IS NOT NULL DROP TABLE WORK.NS_AllocEvents;
-SELECT cli_id, con_id, dt_rep, out_rub, reason
-INTO WORK.NS_AllocEvents
-FROM (
-  SELECT * FROM #evt_eom
-  UNION ALL
-  SELECT * FROM #evt_d1
-) u;
+Sub FwdKR_unsmoothed()
+    ' ... (без изменений)
+End Sub
 
-CREATE INDEX IX_aevt_cli_dt ON WORK.NS_AllocEvents(cli_id, dt_rep);
-CREATE INDEX IX_aevt_con_dt ON WORK.NS_AllocEvents(con_id, dt_rep);
+Sub FwdKR_smoothed()
+    ' ... (без изменений)
+End Sub
 
-/* ---------- дневная решётка (степ-режим) ---------- */
-IF OBJECT_ID('tempdb..#day_cli') IS NOT NULL DROP TABLE #day_cli;
-SELECT c.d AS dt_rep, cl.cli_id
-INTO #day_cli
-FROM #cal c
-CROSS JOIN #clients cl;
+Sub AdjustDiagram()
+    ' ... (без изменений)
+End Sub
 
-CREATE INDEX IX_daycli ON #day_cli(cli_id, dt_rep);
+Sub ExecuteAllSteps()
+    ' ... (без изменений)
+End Sub
 
-/* ---------- до первого события держим якорный сплит ---------- */
-IF OBJECT_ID('tempdb..#first_evt') IS NOT NULL DROP TABLE #first_evt;
-SELECT cli_id, first_evt = MIN(dt_rep)
-INTO #first_evt
-FROM WORK.NS_AllocEvents
-GROUP BY cli_id;
-
-CREATE UNIQUE INDEX IX_firstevt ON #first_evt(cli_id);
-
-IF OBJECT_ID('tempdb..#alloc_pre') IS NOT NULL DROP TABLE #alloc_pre;
--- клиенты с событиями: дни до first_evt — сплит якоря
-SELECT dc.dt_rep, ab.cli_id, ab.con_id, ab.out_rub
-INTO #alloc_pre
-FROM #day_cli dc
-JOIN #first_evt fe ON fe.cli_id=dc.cli_id
-JOIN #anchor_bal ab ON ab.cli_id=dc.cli_id
-WHERE dc.dt_rep < fe.first_evt
-
-UNION ALL
--- клиенты без событий: весь горизонт — сплит якоря
-SELECT dc.dt_rep, ab.cli_id, ab.con_id, ab.out_rub
-FROM #day_cli dc
-JOIN #anchor_bal ab ON ab.cli_id=dc.cli_id
-WHERE NOT EXISTS (SELECT 1 FROM #first_evt fe WHERE fe.cli_id=dc.cli_id);
-
-/* ---------- после первого события — победитель на последнем ивенте ---------- */
-IF OBJECT_ID('tempdb..#alloc_post') IS NOT NULL DROP TABLE #alloc_post;
-SELECT
-  dc.dt_rep,
-  dc.cli_id,
-  win.con_id,
-  out_rub = cs.out_rub_sum
-INTO #alloc_post
-FROM #day_cli dc
-JOIN #first_evt fe ON fe.cli_id=dc.cli_id AND dc.dt_rep>=fe.first_evt
-JOIN #cli_sum cs ON cs.cli_id=dc.cli_id
-OUTER APPLY (
-  SELECT TOP (1) ae.con_id
-  FROM WORK.NS_AllocEvents ae
-  WHERE ae.cli_id=dc.cli_id AND ae.dt_rep<=dc.dt_rep
-  ORDER BY ae.dt_rep DESC, ae.con_id
-) win;
-
-/* ---------- общий дневной пул ---------- */
-IF OBJECT_ID('tempdb..#alloc_daily') IS NOT NULL DROP TABLE #alloc_daily;
-SELECT * INTO #alloc_daily FROM #alloc_pre;
-INSERT #alloc_daily(dt_rep, cli_id, con_id, out_rub)
-SELECT dt_rep, cli_id, con_id, out_rub FROM #alloc_post;
-
-CREATE INDEX IX_ad ON #alloc_daily(con_id, dt_rep);
-
-/* ---------- ставка на день из интервалов ---------- */
-IF OBJECT_ID('tempdb..#rates_daily') IS NOT NULL DROP TABLE #rates_daily;
-SELECT
-  ad.dt_rep,
-  ad.con_id,
-  rate_con = ri.rate_con
-INTO #rates_daily
-FROM #alloc_daily ad
-OUTER APPLY (
-  SELECT TOP (1) r.rate_con
-  FROM WORK.NS_RateIntervals r
-  WHERE r.con_id = ad.con_id
-    AND ad.dt_rep BETWEEN r.dt_from AND r.dt_to
-  ORDER BY r.dt_from DESC
-) ri;
-
-CREATE INDEX IX_rd ON #rates_daily(con_id, dt_rep);
-
-/* ---------- итоговая агрегированная лента ---------- */
-IF OBJECT_ID('WORK.Forecast_NS_Promo','U') IS NOT NULL DROP TABLE WORK.Forecast_NS_Promo;
-
-SELECT
-  ad.dt_rep,
-  out_rub_total = SUM(ad.out_rub),
-  rate_avg      = SUM(ad.out_rub * CAST(rd.rate_con AS decimal(9,4))) / NULLIF(SUM(ad.out_rub),0)
-INTO WORK.Forecast_NS_Promo
-FROM #alloc_daily ad
-JOIN #rates_daily rd
-  ON rd.con_id = ad.con_id AND rd.dt_rep = ad.dt_rep
-GROUP BY ad.dt_rep;
-
-/* ---------- контрольки ---------- */
-PRINT N'=== events (sample) ===';
-SELECT TOP (50) * FROM WORK.NS_AllocEvents ORDER BY cli_id, dt_rep;
-
-PRINT N'=== daily aggregate (TOP 100) ===';
-SELECT TOP (100) * FROM WORK.Forecast_NS_Promo ORDER BY dt_rep;
+Sub ExecuteAll_and_load()
+    ' ... (без изменений)
+End Sub
