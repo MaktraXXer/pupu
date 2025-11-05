@@ -1,16 +1,10 @@
 /* ============================================================
-   PART 1: NS (prod_id = 654) — RATE INTERVALS BY ACCOUNT (FIX)
-   Пишет:
+   PART 1: NS (prod_id = 654) — RATE INTERVALS BY ACCOUNT
+   Результат:
      • WORK.NS_BalPromoAnchor(con_id, cli_id, out_rub, tsegmentname)
-     • WORK.NS_RateIntervals(con_id, cli_id, tsegmentname, dt_from, dt_to, rate_con)
-   Ключевые даты по каждому ЦИКЛУ договора c дедупликацией:
-     - @Anchor (если попадает в окно цикла)
-     - все EOM внутри окна
-     - 1-е числа внутри окна
-     - 1-е НОВОГО окна (= base_day + 1), если ≤ @HorizonTo
-   При коллизии одного и того же dt_key берём строго один вариант:
-     pri=1: base_day (=EOM базового месяца)  >  pri=2: 1-е  >  pri=3: прочие (якорь)
-   Между ключевыми датами — постоянная ставка (интервалы).
+     • WORK.NS_RateIntervals(con_id, cli_id, tsegmentname,
+                             dt_from, dt_to, rate_con)
+   Ключевые даты: @Anchor, все EOM и все 1-е в диапазоне.
    ============================================================ */
 
 USE ALM_TEST;
@@ -22,15 +16,15 @@ DECLARE
     @Anchor     date         = '2025-11-03',
     @HorizonTo  date         = '2026-03-31',
     @BaseRate   decimal(9,4) = 0.0450,  -- базовая ставка в base_day/EOM
-    @UseFixedPromoFromNextMonth bit = 0, -- фикс-промо только в месяце, следующем за якорем
-    @UseHardPromoSpread bit         = 0; -- жёсткие спреды вместо расчётных
+    @UseFixedPromoFromNextMonth bit = 0,
+    @UseHardPromoSpread bit         = 0;
 
-/* окно фикс-промо: ровно месяц после якоря */
-DECLARE @FixedPromoStart date = DATEADD(day,1,EOMONTH(@Anchor));   -- 1-е след. месяца
-DECLARE @FixedPromoEnd   date = DATEADD(month,1,@FixedPromoStart); -- 1-е через месяц
+/* окно фикс-промо: 1 месяц после якоря */
+DECLARE @FixedPromoStart date = DATEADD(day,1,EOMONTH(@Anchor));
+DECLARE @FixedPromoEnd   date = DATEADD(month,1,@FixedPromoStart);
 DECLARE @HardSpreadStart date = @Anchor;
 
-/* ---------- ключевая ставка ЦБ (TERM=1) ---------- */
+/* ---------- ключевая (TERM=1) ---------- */
 IF OBJECT_ID('tempdb..#key') IS NOT NULL DROP TABLE #key;
 SELECT DT_REP, KEY_RATE
 INTO   #key
@@ -145,7 +139,7 @@ INSERT #bal_prom(con_id,cli_id,out_rub,rate_anchor,dt_open,TSEGMENTNAME)
 SELECT con_id,cli_id,out_rub,rate_anchor,dt_open,TSEGMENTNAME
 FROM #z0;
 
-/* ---------- сохраняем компактный сплит якоря ---------- */
+/* ---------- сохраняем сплит якоря ---------- */
 IF OBJECT_ID('WORK.NS_BalPromoAnchor','U') IS NOT NULL DROP TABLE WORK.NS_BalPromoAnchor;
 SELECT con_id, cli_id, out_rub, TSEGMENTNAME
 INTO WORK.NS_BalPromoAnchor
@@ -176,85 +170,86 @@ SELECT * INTO #cycles FROM seq OPTION (MAXRECURSION 0);
 
 CREATE UNIQUE CLUSTERED INDEX IX_cycles ON #cycles(con_id, cycle_no);
 
-/* ---------- календарь (WHILE), без рекурсий ---------- */
-IF OBJECT_ID('tempdb..#cal_small') IS NOT NULL DROP TABLE #cal_small;
-CREATE TABLE #cal_small (d date PRIMARY KEY);
-INSERT #cal_small VALUES (@Anchor);
-WHILE (SELECT MAX(d) FROM #cal_small) < @HorizonTo
+/* ---------- календарь ключевых дат через WHILE ---------- */
+IF OBJECT_ID('tempdb..#cal') IS NOT NULL DROP TABLE #cal;
+CREATE TABLE #cal (d date NOT NULL PRIMARY KEY);
+INSERT #cal VALUES (@Anchor);
+WHILE (SELECT MAX(d) FROM #cal) < @HorizonTo
 BEGIN
-  INSERT #cal_small
-  SELECT DATEADD(day,1,MAX(d)) FROM #cal_small;
+  INSERT #cal SELECT DATEADD(day,1,MAX(d)) FROM #cal;
 END
 
-/* ---------- сырой пул ключевых дат по циклам ---------- */
+/* ---------- создаём пул ключевых дат (#keys_raw) ЗАРАНЕЕ ---------- */
 IF OBJECT_ID('tempdb..#keys_raw') IS NOT NULL DROP TABLE #keys_raw;
--- EOM внутри окна
-INSERT INTO #keys_raw
-SELECT DISTINCT
-  c.con_id, c.cli_id, c.TSEGMENTNAME, c.cycle_no, c.win_start, c.promo_end, c.base_day,
-  dt_key = EOMONTH(x.d),
-  pri    = 1  -- приоритет base_day/EOM
-FROM #cycles c
-JOIN #cal_small x ON x.d BETWEEN c.win_start AND c.base_day
-WHERE EOMONTH(x.d) = c.base_day;
+CREATE TABLE #keys_raw(
+  con_id       bigint      NOT NULL,
+  cli_id       bigint      NOT NULL,
+  TSEGMENTNAME nvarchar(40) NULL,
+  cycle_no     int         NOT NULL,
+  win_start    date        NOT NULL,
+  promo_end    date        NOT NULL,
+  base_day     date        NOT NULL,
+  dt_key       date        NOT NULL,
+  pri          tinyint     NOT NULL  -- 1=EOM/base_day, 2=1st, 3=anchor/other
+);
 
--- 1-е числа внутри окна
-INSERT INTO #keys_raw
+/* --- EOM (base_day) --- */
+INSERT INTO #keys_raw(con_id,cli_id,TSEGMENTNAME,cycle_no,win_start,promo_end,base_day,dt_key,pri)
 SELECT DISTINCT
   c.con_id, c.cli_id, c.TSEGMENTNAME, c.cycle_no, c.win_start, c.promo_end, c.base_day,
-  dt_key = x.d,
-  pri    = 2
+  c.base_day AS dt_key, 1 AS pri
 FROM #cycles c
-JOIN #cal_small x ON x.d BETWEEN c.win_start AND c.base_day
+WHERE c.base_day BETWEEN @Anchor AND @HorizonTo;
+
+/* --- 1-е внутри окна --- */
+INSERT INTO #keys_raw(con_id,cli_id,TSEGMENTNAME,cycle_no,win_start,promo_end,base_day,dt_key,pri)
+SELECT DISTINCT
+  c.con_id, c.cli_id, c.TSEGMENTNAME, c.cycle_no, c.win_start, c.promo_end, c.base_day,
+  x.d AS dt_key, 2 AS pri
+FROM #cycles c
+JOIN #cal x ON x.d BETWEEN c.win_start AND c.base_day
 WHERE DAY(x.d)=1;
 
--- 1-е нового окна
-INSERT INTO #keys_raw
+/* --- 1-е нового окна (base_day+1) --- */
+INSERT INTO #keys_raw(con_id,cli_id,TSEGMENTNAME,cycle_no,win_start,promo_end,base_day,dt_key,pri)
 SELECT DISTINCT
-  c.con_id, c.cli_id, c.TSEGMENTNAME, c.cycle_no, c.win_start, c.promo_end, c.base_day,
-  dt_key = DATEADD(day,1,c.base_day),
-  pri    = 2  -- тоже 1-е число
+  c.con_id, c.cli_id, c.TSEGMENTNAME,
+  c.cycle_no+1 AS cycle_no,
+  DATEADD(day,1,c.base_day) AS win_start,
+  DATEADD(day,-1,EOMONTH(DATEADD(month,1,DATEADD(day,1,c.base_day)))) AS promo_end,
+  EOMONTH(DATEADD(month,1,DATEADD(day,1,c.base_day))) AS base_day,
+  DATEADD(day,1,c.base_day) AS dt_key,
+  2 AS pri
 FROM #cycles c
-WHERE DATEADD(day,1,c.base_day) <= @HorizonTo;
+WHERE DATEADD(day,1,c.base_day) BETWEEN @Anchor AND @HorizonTo;
 
--- якорь, если попадает в окно
-INSERT INTO #keys_raw
+/* --- якорь, если он попадает внутри окна --- */
+INSERT INTO #keys_raw(con_id,cli_id,TSEGMENTNAME,cycle_no,win_start,promo_end,base_day,dt_key,pri)
 SELECT DISTINCT
   c.con_id, c.cli_id, c.TSEGMENTNAME, c.cycle_no, c.win_start, c.promo_end, c.base_day,
-  dt_key = @Anchor,
-  pri    = CASE WHEN @Anchor = c.base_day THEN 1 ELSE 3 END  -- если якорь совпал с base_day — pri=1
+  @Anchor AS dt_key,
+  CASE WHEN @Anchor=c.base_day THEN 1 ELSE 3 END AS pri
 FROM #cycles c
 WHERE @Anchor BETWEEN c.win_start AND c.base_day;
 
--- объявление таблицы #keys_raw (нужно после первого INSERT SELECT)
-IF @@ROWCOUNT >= 0 AND OBJECT_ID('tempdb..#keys_raw') IS NULL
-BEGIN
-    CREATE TABLE #keys_raw(
-      con_id bigint, cli_id bigint, TSEGMENTNAME nvarchar(40),
-      cycle_no int, win_start date, promo_end date, base_day date,
-      dt_key date, pri tinyint
-    );
-END
-
-/* ---------- выбираем ровно ОДНУ строку на (con_id, dt_key) ---------- */
+/* ---------- дедуп по (con_id, dt_key) по приоритету ---------- */
 IF OBJECT_ID('tempdb..#keys') IS NOT NULL DROP TABLE #keys;
-;WITH picked AS (
+;WITH pick AS (
   SELECT *,
          rn = ROW_NUMBER() OVER(
-               PARTITION BY con_id, dt_key
-               ORDER BY pri ASC, cycle_no DESC, con_id
-         )
+                PARTITION BY con_id, dt_key
+                ORDER BY pri ASC, cycle_no DESC, con_id
+              )
   FROM #keys_raw
 )
-SELECT
-  con_id, cli_id, TSEGMENTNAME, cycle_no, win_start, promo_end, base_day, dt_key
+SELECT con_id, cli_id, TSEGMENTNAME, cycle_no, win_start, promo_end, base_day, dt_key
 INTO #keys
-FROM picked
-WHERE rn = 1;
+FROM pick
+WHERE rn=1;
 
 CREATE UNIQUE INDEX IX_keys_unique ON #keys(con_id, dt_key);
 
-/* ---------- ставка на ключевую дату с приоритетами ---------- */
+/* ---------- вычисляем ставку на ключевую дату ---------- */
 IF OBJECT_ID('tempdb..#rates_key') IS NOT NULL DROP TABLE #rates_key;
 ;WITH rk AS (
   SELECT
@@ -285,7 +280,6 @@ IF OBJECT_ID('tempdb..#rates_key') IS NOT NULL DROP TABLE #rates_key;
                 END
            END
       ELSE
-           /* «прочие» (например, якорь, если не base_day и не 1-е) */
            CASE
              WHEN @UseFixedPromoFromNextMonth=1
               AND x.dt_key>=@FixedPromoStart AND x.dt_key<@FixedPromoEnd THEN
@@ -320,7 +314,7 @@ FROM rk;
 
 CREATE UNIQUE INDEX IX_rk_unique ON #rates_key(con_id, dt_key);
 
-/* ---------- формирование ИНТЕРВАЛОВ ставок ---------- */
+/* ---------- превращаем ключевые точки в интервалы ---------- */
 IF OBJECT_ID('WORK.NS_RateIntervals','U') IS NOT NULL DROP TABLE WORK.NS_RateIntervals;
 
 ;WITH ordered AS (
@@ -335,14 +329,12 @@ bounds AS (
   SELECT
     con_id, cli_id, TSEGMENTNAME, rate_con,
     dt_from,
-    dt_to = DATEADD(day,-1,ISNULL(dt_to_next, DATEADD(day,1,@HorizonTo))) -- последний тянем до HorizonTo
+    dt_to = DATEADD(day,-1,ISNULL(dt_to_next, DATEADD(day,1,@HorizonTo)))
   FROM ordered
 )
 SELECT
   con_id, cli_id, TSEGMENTNAME,
-  dt_from,
-  dt_to,
-  rate_con
+  dt_from, dt_to, rate_con
 INTO WORK.NS_RateIntervals
 FROM bounds
 WHERE dt_from <= @HorizonTo
