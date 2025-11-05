@@ -1,5 +1,6 @@
 /* ══════════════════════════════════════════════════════════════
    NS-forecast — Part 2 (FIX-promo-roll, prod_id = 654)
+   Надёжная финальная склейка через «маску спец-дней»
 ═══════════════════════════════════════════════════════════════*/
 USE ALM_TEST;
 GO
@@ -108,7 +109,7 @@ FROM rate_calc
 WHERE out_rub IS NOT NULL
   AND dt_open BETWEEN @OpenFrom AND @OpenTo;
 
-/* 1a) Нулевые договоры */
+/* 1a) Нулевые договоры (включаем, но объём = 0) */
 IF OBJECT_ID('tempdb..#z0') IS NOT NULL DROP TABLE #z0;
 SELECT
     CAST(z.con_id AS bigint) AS con_id,
@@ -125,10 +126,9 @@ WHERE z.dt_open <= @Anchor
 INSERT #bal_prom(con_id, cli_id, out_rub, rate_anchor, dt_open, TSEGMENTNAME)
 SELECT con_id, cli_id, out_rub, rate_anchor, dt_open, TSEGMENTNAME FROM #z0;
 
-/* Σ на Anchor */
+/* Σ на Anchor + Σ по клиенту */
 DECLARE @PromoTotal decimal(20,2) = (SELECT SUM(out_rub) FROM #bal_prom);
 
-/* Σ по клиенту (для перелива) */
 IF OBJECT_ID('tempdb..#cli_sum') IS NOT NULL DROP TABLE #cli_sum;
 SELECT cli_id, SUM(out_rub) AS out_rub_sum
 INTO   #cli_sum
@@ -186,7 +186,7 @@ FROM   #cycles c
 JOIN   #cal d       ON d.d BETWEEN c.win_start AND c.base_day
 LEFT   JOIN #key k_open ON k_open.DT_REP = c.win_start
 JOIN   #bal_prom bp ON bp.con_id = c.con_id
-WHERE  DAY(d.d) <> 1;
+WHERE  DAY(d.d) <> 1;  -- 1-е числа делаем отдельно
 
 /* ── 4) base_day — полный перелив Σ клиента ────────────────── */
 IF OBJECT_ID('tempdb..#base_dates') IS NOT NULL DROP TABLE #base_dates;
@@ -275,7 +275,7 @@ cand AS (
 )
 SELECT * INTO #day1_candidates FROM cand;
 
-/* ── 6) 1-е числа — полный перелив Σ клиента ──────────────── */
+/* ── 6) 1-е числа — одиночный «победитель» на Σ клиента ───── */
 IF OBJECT_ID('tempdb..#firstday_assigned') IS NOT NULL DROP TABLE #firstday_assigned;
 ;WITH ranked AS (
     SELECT c.*,
@@ -294,7 +294,7 @@ FROM ranked r
 JOIN #cli_sum cs ON cs.cli_id = r.cli_id
 WHERE r.rn = 1;
 
-/* ── 6.5) Carry-forward: ставка 1-го до promo_end ──────────── */
+/* ── 6.5) Carry-forward: со 2-го по promo_end — ставка 1-го ─ */
 IF OBJECT_ID('tempdb..#carry_forward') IS NOT NULL DROP TABLE #carry_forward;
 ;WITH bind AS (
     SELECT f.cli_id, f.con_id, f.TSEGMENTNAME, f.dt_rep AS first_day, f.rate_con AS rate_on_first,
@@ -311,45 +311,59 @@ days AS (
 )
 SELECT
     con_id       = MIN(d.con_id),
-    cli_id       = d.cli_id,                 -- FIX: qualify cli_id
+    cli_id       = d.cli_id,
     TSEGMENTNAME = MIN(d.TSEGMENTNAME),
     out_rub      = MAX(cs.out_rub_sum),
     dt_rep       = d.dt_rep,
     rate_con     = MAX(d.rate_on_first)
 INTO #carry_forward
 FROM days d
-JOIN #cli_sum cs ON cs.cli_id = d.cli_id      -- FIX: qualify join column
-GROUP BY d.cli_id, d.dt_rep;                  -- FIX: qualify in GROUP BY
+JOIN #cli_sum cs ON cs.cli_id = d.cli_id
+GROUP BY d.cli_id, d.dt_rep;
 
-/* ── 7) Финальная promo-лента ──────────────────────────────── */
+/* ── 7) Собираем ЕДИНУЮ «маску спец-дней» ──────────────────── */
+IF OBJECT_ID('tempdb..#special_all') IS NOT NULL DROP TABLE #special_all;
+SELECT con_id, cli_id, TSEGMENTNAME, out_rub, dt_rep, rate_con
+INTO   #special_all
+FROM (
+    SELECT * FROM #daily_base_adj
+    UNION ALL
+    SELECT * FROM #firstday_assigned
+    UNION ALL
+    SELECT * FROM #carry_forward
+) s;
+
+-- Гарантия, что по (cli_id, dt_rep) у нас максимум одна запись
+CREATE UNIQUE CLUSTERED INDEX UX_special_cli_day ON #special_all(cli_id, dt_rep);
+
+/* ── 8) Финальная промо-лента: dp без спец-дней + спец-дни ── */
 IF OBJECT_ID('WORK.Forecast_NS_Promo','U') IS NOT NULL DROP TABLE WORK.Forecast_NS_Promo;
 
+WITH dp_clean AS (
+    SELECT dp.con_id, dp.cli_id, dp.TSEGMENTNAME, dp.out_rub, dp.dt_rep, dp.rate_con
+    FROM   #daily_pre dp
+    LEFT   JOIN #special_all sp
+           ON sp.cli_id = dp.cli_id AND sp.dt_rep = dp.dt_rep
+    WHERE  sp.cli_id IS NULL              -- KEY: никаких dp там, где есть special
+),
+final_union AS (
+    SELECT con_id, cli_id, TSEGMENTNAME, out_rub, dt_rep, rate_con FROM dp_clean
+    UNION ALL
+    SELECT con_id, cli_id, TSEGMENTNAME, out_rub, dt_rep, rate_con FROM #special_all
+)
 SELECT
     dt_rep,
     out_rub_total = SUM(out_rub),
     rate_avg      = SUM(out_rub * rate_con) / NULLIF(SUM(out_rub),0)
 INTO WORK.Forecast_NS_Promo
-FROM (
-    SELECT dp.con_id, dp.cli_id, dp.TSEGMENTNAME, dp.out_rub, dp.dt_rep, dp.rate_con
-    FROM   #daily_pre dp
-    WHERE  NOT EXISTS (SELECT 1 FROM #base_dates bd WHERE bd.cli_id = dp.cli_id AND bd.dt_rep = dp.dt_rep)
-       AND NOT EXISTS (SELECT 1 FROM #firstday_assigned fa WHERE fa.cli_id = dp.cli_id AND fa.dt_rep = dp.dt_rep)
-       AND NOT EXISTS (SELECT 1 FROM #carry_forward cf WHERE cf.cli_id = dp.cli_id AND cf.dt_rep = dp.dt_rep)
-
-    UNION ALL
-    SELECT con_id, cli_id, TSEGMENTNAME, out_rub, dt_rep, rate_con FROM #daily_base_adj
-    UNION ALL
-    SELECT con_id, cli_id, TSEGMENTNAME, out_rub, dt_rep, rate_con FROM #firstday_assigned
-    UNION ALL
-    SELECT con_id, cli_id, TSEGMENTNAME, out_rub, dt_rep, rate_con FROM #carry_forward
-) u
+FROM final_union
 GROUP BY dt_rep;
 
-/* ── 8) Контрольки ─────────────────────────────────────────── */
+/* ── 9) Контрольки ─────────────────────────────────────────── */
 PRINT N'=== spreads at Anchor ===';  SELECT * FROM WORK.NS_Spreads;
 
 PRINT N'=== sanity: Σ объёма по дням vs Σ на Anchor ===';
-SELECT TOP (400)
+SELECT TOP (500)
        f.dt_rep,
        f.out_rub_total,
        diff_vs_anchor = CAST(f.out_rub_total - @PromoTotal AS decimal(20,2)),
@@ -357,9 +371,10 @@ SELECT TOP (400)
 FROM WORK.Forecast_NS_Promo f
 ORDER BY f.dt_rep;
 
--- Быстрые проверки (ожидаемо пусто):
--- SELECT cli_id, dt_rep, COUNT(*) cnt FROM #firstday_assigned GROUP BY cli_id, dt_rep HAVING COUNT(*) > 1;
--- SELECT cli_id, dt_rep, COUNT(*) cnt FROM #carry_forward    GROUP BY cli_id, dt_rep HAVING COUNT(*) > 1;
+-- Самопроверки уникальности (должны быть пустыми):
+-- SELECT cli_id, dt_rep, COUNT(*) cnt FROM #special_all GROUP BY cli_id, dt_rep HAVING COUNT(*)>1;
+-- SELECT cli_id, dt_rep, COUNT(*) cnt FROM #firstday_assigned GROUP BY cli_id, dt_rep HAVING COUNT(*)>1;
+-- SELECT cli_id, dt_rep, COUNT(*) cnt FROM #carry_forward    GROUP BY cli_id, dt_rep HAVING COUNT(*)>1;
 
 GO
 
