@@ -78,3 +78,88 @@ Sub Export_Email_Params()
     MsgBox "данные за " & Format(dtRep, "dd.mm.yyyy") & " успешно импортированы", _
            vbInformation, "Импорт завершён"
 End Sub
+
+
+Option Explicit
+
+' === ОСНОВНОЙ МАКРОС ДЛЯ КНОПКИ ===
+Sub Export_Email_Params()
+    Dim wsEmail As Worksheet
+    Dim wsInput As Worksheet
+    Dim dtRep As Date
+    Dim i As Long
+    Dim termStr As String
+    
+    Dim valRois As Variant
+    Dim valSwapMid As Variant
+    Dim valSwapBid As Variant
+    
+    Dim sql As String
+    
+    Application.ScreenUpdating = False
+    
+    Set wsEmail = ThisWorkbook.Worksheets("Email")
+    Set wsInput = ThisWorkbook.Worksheets("Input")
+    
+    ' Дата из Input!B2
+    dtRep = wsInput.Range("B2").Value
+    
+    ' 1) Удаляем старые записи по этой дате
+    sql = "DELETE FROM [ALM_TEST].[alm_report].[EmailCurveRates] " & _
+          "WHERE [date] = '" & Format(dtRep, "yyyy-MM-dd") & "'"
+    Call sql_function(GetConStr1(), sql, True)
+    
+    ' 2) Проходим по строкам 5–16 и пишем ROISFIX, SWAP_MID, SWAP_BID
+    For i = 5 To 16
+        termStr = Trim$(CStr(wsEmail.Cells(i, "B").Value))  ' B5:B16 — срочность как текст
+        
+        If termStr <> "" Then
+            ' ----- ROISFIX (E) -----
+            valRois = wsEmail.Cells(i, "E").Value
+            Call InsertEmailValue(dtRep, termStr, "ROISFIX", valRois, True)
+            
+            ' ----- SWAP MID (F) -----
+            valSwapMid = wsEmail.Cells(i, "F").Value
+            Call InsertEmailValue(dtRep, termStr, "SWAP_MID", valSwapMid, True)
+            
+            ' ----- SWAP BID (G) -----
+            valSwapBid = wsEmail.Cells(i, "G").Value
+            Call InsertEmailValue(dtRep, termStr, "SWAP_BID", valSwapBid, True)
+        End If
+    Next i
+    
+    Application.ScreenUpdating = True
+    MsgBox "Загрузка параметров с листа Email завершена.", vbInformation
+End Sub
+
+' === ВСТАВКА ОДНОЙ ЗАПИСИ С УЧЁТОМ /100 И NULL ===
+Private Sub InsertEmailValue(dtRep As Date, _
+                             termStr As String, _
+                             category As String, _
+                             cellValue As Variant, _
+                             divideBy100 As Boolean)
+    Dim sql As String
+    Dim valExpr As String
+    Dim v As Double
+    
+    ' Пустая ячейка → NULL
+    If IsEmpty(cellValue) Or cellValue = "" Then
+        valExpr = "NULL"
+    Else
+        v = CDbl(cellValue)
+        If divideBy100 Then
+            v = v / 100#
+        End If
+        ' Точка как десятичный разделитель
+        valExpr = Replace(CStr(v), ",", ".")
+    End If
+    
+    sql = "INSERT INTO [ALM_TEST].[alm_report].[EmailCurveRates] " & _
+          "([date], termdays, category, value) VALUES (" & _
+          "'" & Format(dtRep, "yyyy-MM-dd") & "', " & _
+          "'" & Replace(termStr, "'", "''") & "', " & _
+          "'" & category & "', " & _
+          valExpr & ")"
+    
+    Call sql_function(GetConStr1(), sql, True)
+End Sub
