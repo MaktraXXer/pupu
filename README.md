@@ -1,26 +1,60 @@
 import pandas as pd
-from datetime import datetime, date
+import pyodbc
+from datetime import datetime
 
-df = pd.read_excel('a.xlsx', engine='openpyxl', dtype=str)  # читаем всё как строки
+# ===== 1. Читаем Excel =====
+excel_path = r"C:\путь\к\файлу\a.xlsx"  # поправь путь
 
-def safe_parse(x):
-    if x is None or str(x).strip() == '':
-        return None
-    s = str(x).strip()
-    # если yyyy-mm-dd или yyyy-mm-dd hh:mm:ss
-    try:
-        return datetime.fromisoformat(s.split()[0]).date()
-    except:
-        pass
-    # если dd.mm.yyyy
-    if '.' in s:
-        try:
-            d, m, y = map(int, s.split('.')[0:3])
-            return date(y, m, d)
-        except:
-            pass
-    # иначе — возвращаем как строку (или None), либо логируем как ошибку
-    return None
+df = pd.read_excel(excel_path)
 
-df['DT_FROM'] = df['DT_FROM'].apply(safe_parse)
-df['DT_TO']   = df['DT_TO'].apply(safe_parse)
+# На всякий случай приведём имена колонок к верхнему регистру
+df.columns = [c.strip().upper() for c in df.columns]
+
+# TERM и VAL приведём к нужным типам (если ещё не привели)
+df["TERM"] = df["TERM"].astype(int)
+df["VAL"]  = (
+    df["VAL"]
+    .astype(str)
+    .str.replace('%', '', regex=False)
+    .str.replace(',', '.', regex=False)
+    .astype(float)
+)
+
+# ===== 2. Подключаемся к SQL Server =====
+server   = 'trading-db.ahml1.ru'
+database = 'ALM_TEST'
+
+conn = pyodbc.connect(
+    'DRIVER={ODBC Driver 17 for SQL Server};'
+    f'SERVER={server};'
+    f'DATABASE={database};'
+    'Trusted_Connection=yes;'
+)
+cursor = conn.cursor()
+
+# ===== 3. INSERT в alm_history.option_rates =====
+insert_sql = """
+INSERT INTO alm_history.option_rates
+    (dt_from, dt_to, term, cur, rate_type, value, load_dt)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+"""
+
+now_dt = datetime.now()
+
+for row in df.itertuples(index=False):
+    values = (
+        getattr(row, "DT_FROM"),      # dt_from (date/datetime, как прочитал Excel)
+        getattr(row, "DT_TO"),        # dt_to
+        int(getattr(row, "TERM")),    # term
+        str(getattr(row, "CUR")).strip(),         # cur
+        str(getattr(row, "RATE_TYPE")).strip(),   # rate_type
+        float(getattr(row, "VAL")),               # value
+        now_dt                                     # load_dt (текущее время)
+    )
+    cursor.execute(insert_sql, values)
+
+conn.commit()
+cursor.close()
+conn.close()
+
+print("Готово, данные загружены в alm_history.option_rates.")
