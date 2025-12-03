@@ -1,94 +1,81 @@
-/* ============================================================
-   СПИСОК ПРОДУКТОВ МАРКЕТПЛЕЙСОВ
-   ============================================================ */
-DECLARE @mp TABLE (prod_name nvarchar(100) PRIMARY KEY);
-INSERT INTO @mp(prod_name)
-VALUES
- (N'Надёжный прайм'), (N'Надёжный VIP'), (N'Надёжный премиум'),
- (N'Надёжный промо'), (N'Надёжный старт'),
- (N'Надёжный Т2'), (N'Надёжный T2'),
- (N'Надёжный Мегафон'), (N'Надёжный процент'),
- (N'Надёжный'), (N'ДОМа надёжно'), (N'Всё в ДОМ');
+# -*- coding: utf-8 -*-
 
-/* ============================================================
-   ПАРАМЕТР
-   ============================================================ */
-DECLARE @dt_rep date = '2025-11-23';
+import pandas as pd
+import pyodbc
+from datetime import datetime
 
-/* ============================================================
-   ШАГ 1.
-   КЛИЕНТЫ, У КОТОРЫХ В ЭТОМ СНИМКЕ ЕСТЬ ЖИВЫЕ МАРКЕТПЛЕЙС-ВКЛАДЫ
-   ============================================================ */
+# ===== 1. Читаем Excel =====
+excel_path = r"C:\путь\к\файлу\a.xlsx"  # поменяй на свой путь
 
-IF OBJECT_ID('tempdb..#cli_mp_now') IS NOT NULL DROP TABLE #cli_mp_now;
+# Предполагаем, что в файле есть столбцы:
+# DT_FROM, DT_TO, TERM, CUR, RATE_TYPE, VAL
+df = pd.read_excel(excel_path)
 
-SELECT DISTINCT
-      t.cli_id
-INTO #cli_mp_now
-FROM ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
-WHERE t.dt_rep       = @dt_rep
-  AND t.section_name = N'Срочные'
-  AND t.block_name   = N'Привлечение ФЛ'
-  AND t.acc_role     = N'LIAB'
-  AND t.cur          = '810'
-  AND t.out_rub IS NOT NULL AND t.out_rub >= 0
-  AND t.dt_close > t.dt_rep                -- живые
-  AND EXISTS (SELECT 1 FROM @mp m WHERE m.prod_name = t.prod_name);
+# Приводим названия к ожидаемым (на всякий случай, если там разные регистры)
+df.columns = [c.strip().upper() for c in df.columns]
 
-/* ============================================================
-   ШАГ 2.
-   СНИМОК ЭТИХ ЖЕ КЛИЕНТОВ, НО ВКЛАДЫ — НЕ МАРКЕТПЛЕЙСЫ
-   ============================================================ */
+# Обработка столбца со значением ставки
+# Если в Excel значения вида "-0.225%" как текст:
+if df["VAL"].dtype == "object":
+    df["VAL"] = (
+        df["VAL"]
+        .astype(str)
+        .str.replace('%', '', regex=False)
+        .str.replace(',', '.', regex=False)
+        .astype(float)
+        # при необходимости раскомментируй, если хочешь хранить долю, а не проценты:
+        # / 100
+    )
 
-IF OBJECT_ID('tempdb..#base2') IS NOT NULL DROP TABLE #base2;
+# Убедимся, что даты в формате datetime/date
+df["DT_FROM"] = pd.to_datetime(df["DT_FROM"]).dt.date
+df["DT_TO"]   = pd.to_datetime(df["DT_TO"]).dt.date
+df["TERM"]    = df["TERM"].astype(int)
 
-SELECT
-      t.cli_id,
-      t.con_id,
-      CAST(t.dt_close AS date) AS dt_close_d,
-      t.out_rub
-INTO #base2
-FROM ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
-WHERE t.dt_rep       = @dt_rep
-  AND t.section_name = N'Срочные'
-  AND t.block_name   = N'Привлечение ФЛ'
-  AND t.acc_role     = N'LIAB'
-  AND t.cur          = '810'
-  AND t.out_rub IS NOT NULL AND t.out_rub >= 0
-  AND t.dt_close > t.dt_rep                    -- живые
-  AND t.cli_id IN (SELECT cli_id FROM #cli_mp_now)
-  AND NOT EXISTS (SELECT 1 FROM @mp m WHERE m.prod_name = t.prod_name);
 
-/* ============================================================
-   ШАГ 3.
-   КАЛЕНДАРЬ ДО МАКСИМАЛЬНОГО dt_close
-   ============================================================ */
-IF OBJECT_ID('tempdb..#cal') IS NOT NULL DROP TABLE #cal;
+# ===== 2. Подключаемся к SQL Server =====
+server   = 'trading-db.ahml1.ru'
+database = 'ALM_TEST'
 
-DECLARE @d_end date;
-SELECT @d_end = ISNULL(MAX(dt_close_d), @dt_rep) FROM #base2;
-
-;WITH cal AS (
-    SELECT @dt_rep AS d
-    UNION ALL
-    SELECT DATEADD(DAY, 1, d)
-    FROM cal
-    WHERE d < @d_end
+conn = pyodbc.connect(
+    'DRIVER={ODBC Driver 17 for SQL Server};'
+    f'SERVER={server};'
+    f'DATABASE={database};'
+    'Trusted_Connection=yes;'
 )
-SELECT d INTO #cal FROM cal OPTION (MAXRECURSION 0);
 
-/* ============================================================
-   ШАГ 4.
-   ИТОГОВЫЙ ВЫВОД:
-   ТОЛЬКО КОЛ-ВО ВЫХОДОВ И СУММА ВЫХОДОВ
-   ============================================================ */
+cursor = conn.cursor()
 
-SELECT
-      c.d AS [date],
-      COUNT(CASE WHEN b.dt_close_d = c.d THEN 1 END) AS cnt_deposits_exit,
-      SUM(CASE WHEN b.dt_close_d = c.d THEN b.out_rub END) AS sum_out_rub_exit
-FROM #cal c
-LEFT JOIN #base2 b
-       ON b.dt_close_d = c.d
-GROUP BY c.d
-ORDER BY c.d;
+# ===== 3. Готовим INSERT =====
+# id — IDENTITY, его не указываем.
+# load_dt задаём текущим временем Python (можно и дефолт getdate() оставить, тогда колонку не вставлять).
+insert_sql = """
+INSERT INTO alm_history.option_rates
+    (dt_from, dt_to, term, cur, rate_type, value, load_dt)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+"""
+
+now_dt = datetime.now()
+
+# ===== 4. Загрузка данных =====
+for _, row in df.iterrows():
+    values = [
+        row["DT_FROM"],      # dt_from
+        row["DT_TO"],        # dt_to
+        int(row["TERM"]),    # term
+        str(row["CUR"]).strip(),         # cur
+        str(row["RATE_TYPE"]).strip(),   # rate_type
+        float(row["VAL"]),               # value
+        now_dt                            # load_dt
+    ]
+    try:
+        cursor.execute(insert_sql, values)
+    except Exception as e:
+        print("Error on row:", row.to_dict())
+        print("Error:", e)
+
+conn.commit()
+cursor.close()
+conn.close()
+
+print("Загрузка завершена.")
