@@ -6,7 +6,7 @@
 Особенности:
 - Спрашиваем отдельно про импорт каждой валюты (RUB / CNY / EUR / USD) по каждому файлу.
 - Печатаем, найден ли лист по каждой валюте, + отладочные сообщения.
-- Рублёвый лист ищем по подстроке 'rub' в названии листа (без учёта регистра).
+- Рублёвый лист ищем просто по подстроке 'rub' в названии листа (без учёта регистра).
 - НЕТ:
     * расчёта ТОП-10,
     * пересчёта Т-Банка – ставки берём как есть.
@@ -128,7 +128,6 @@ def clean_bank_name(name: str) -> str:
     if s in ("Т Банк", "Тинькофф"):
         s = "ТБанк"
 
-    # Дом.РФ AS IS → Дом.РФ (AS IS уже убрали)
     return s
 
 
@@ -156,9 +155,12 @@ def find_any_sheet_with_substring(path: str, substring: str) -> str | None:
     substring уже задаём в нижнем регистре.
     """
     wb = load_workbook(path, read_only=True, data_only=True)
+    print(f"[SHEETS] Листы в файле: {wb.sheetnames}")
     for nm in wb.sheetnames:
         if substring in nm.lower():
+            print(f"[SHEETS] Найден лист '{nm}' по подстроке '{substring}'")
             return nm
+    print(f"[SHEETS] Лист с подстрокой '{substring}' не найден")
     return None
 
 
@@ -302,25 +304,20 @@ def parse_usd(path: str) -> pd.DataFrame:
 def parse_rub(path: str) -> pd.DataFrame:
     """
     Новый парсер RUB с максимумом отладочных принтов.
-    Правило поиска листа:
-      - лист считается рублёвым, если в имени есть подстрока 'rub' (в любом регистре).
-    Структура:
-      - строка с 'Банк' в колонке B — строка заголовка (header_row).
-      - банки: B[header_row+1 : stop_row), где stop_row —
-        первая строка, где B == 'Банк ДОМ.РФ TO BE' или 'Макс.ср.ставка ТОП3', или пустая.
-      - сроки: C[header_row] вправо до '3 года' включительно, нормализуем по normalize_term_label.
+
+    ВАЖНО:
+    - ищем лист ПРОСТО по подстроке 'rub' в имени;
+    - НЕ сканируем 'банк' с первой строки — считаем, что таблица начинается с 3-й строки (Excel),
+      то есть заголовок 'Банк' стоит в B3, сроки в C3.., банки в B4.. ;
+    - поэтому:
+        header_row = 2 (0-based, Excel-строка 3),
+        bank_rows начинаются с row=3 (Excel-строка 4).
     """
 
     print("\n[RUB] === Парсинг RUB ===")
 
     # 1. ищем лист с подстрокой 'rub'
-    wb = load_workbook(path, read_only=True, data_only=True)
-    rub_sheet_name = None
-    for nm in wb.sheetnames:
-        if "rub" in nm.lower():
-            rub_sheet_name = nm
-            break
-
+    rub_sheet_name = find_any_sheet_with_substring(path, "rub")
     print(f"[RUB] Поиск листа с подстрокой 'rub' → найден: {rub_sheet_name}")
     if rub_sheet_name is None:
         return pd.DataFrame()
@@ -329,24 +326,22 @@ def parse_rub(path: str) -> pd.DataFrame:
     nrows, ncols = df.shape
     print(f"[RUB] Размер листа '{rub_sheet_name}': {nrows} строк, {ncols} столбцов")
 
-    print("[RUB] Печать первых 6 строк и 8 столбцов для проверки:")
-    print(df.iloc[:6, :8])
+    print("[RUB] Печать первых 6 строк и 10 столбцов для проверки:")
+    print(df.iloc[:6, :10])
 
-    # 2. ищем header_row – строку, где в колонке B есть 'банк'
-    header_row = None
-    for r in range(nrows):
-        val = df.iat[r, 1]  # колонка B
-        if isinstance(val, str) and "банк" in val.lower():
-            header_row = r
-            print(f"[RUB] Найден заголовок 'Банк' в строке {r+1} (Excel)")
-            break
+    # 2. ЖЁСТКО: заголовок в строке 3 Excel → индекс 2 (0-based)
+    header_row = 2        # Excel-строка 3
+    bank_col = 1          # колонка B
+    first_bank_row = 3    # Excel-строка 4 (0-based 3)
 
-    if header_row is None:
-        print("[RUB] НЕ НАШЁЛ строку с 'Банк' в колонке B – выхожу.")
+    if header_row >= nrows:
+        print(f"[RUB] header_row={header_row} вне диапазона, выхожу.")
         return pd.DataFrame()
 
-    # 3. диапазон банков: B[header_row+1 .. stop_row)
-    first_bank_row = header_row + 1
+    print(f"[RUB] Считаем, что заголовок 'Банк' в строке {header_row+1} (Excel).")
+    print(f"[RUB] Ячейка B{header_row+1} = '{df.iat[header_row, bank_col]}'")
+
+    # 3. диапазон банков: B4.. до спец-строки или пустой строки
     stop_labels = {
         "банк дом.рф to be",
         "макс.ср.ставка топ3",
@@ -355,9 +350,9 @@ def parse_rub(path: str) -> pd.DataFrame:
 
     bank_rows: list[int] = []
     for r in range(first_bank_row, nrows):
-        cell = df.iat[r, 1]
+        cell = df.iat[r, bank_col]
         if cell is None or (isinstance(cell, float) and pd.isna(cell)):
-            print(f"[RUB] Строка {r+1}: пустая ячейка в B – считаем концом списка банков.")
+            print(f"[RUB] Строка {r+1}: пустая в B – считаем концом списка банков.")
             break
 
         s_norm = str(cell).strip().lower()
@@ -374,7 +369,7 @@ def parse_rub(path: str) -> pd.DataFrame:
         print("[RUB] Не удалось определить список банков – выхожу.")
         return pd.DataFrame()
 
-    # 4. сроки: от C[header_row] вправо до '3 года'
+    # 4. сроки: от C3 (header_row) вправо до '3 года'
     terms_cols: dict[int, int] = {}
     print(f"[RUB] Читаем сроки в строке заголовка {header_row+1} (Excel), начиная с колонки C")
 
@@ -393,7 +388,7 @@ def parse_rub(path: str) -> pd.DataFrame:
         terms_cols[c] = days
         last_term_col = c
 
-        # если это '3 года' – всё, дальше не нужны
+        # если это '3 года' – дальше не нужны
         if isinstance(label, str) and "3 год" in label.lower():
             print(f"[RUB]   встретили '3 года' в колонке {c} – дальше не читаем сроки.")
             break
@@ -407,7 +402,7 @@ def parse_rub(path: str) -> pd.DataFrame:
     # 5. собираем ставки
     rows_out = []
     for r in bank_rows:
-        bank_cell = df.iat[r, 1]
+        bank_cell = df.iat[r, bank_col]
         bank = clean_bank_name(bank_cell)
         print(f"[RUB] Обработка строки {r+1}: банк_raw='{bank_cell}' → банк='{bank}'")
 
@@ -589,8 +584,6 @@ def append_data_to_existing_excel(data_df: pd.DataFrame,
     Аппенд в существующий Excel на лист sheet_name.
     Предполагается, что заголовки уже есть в первой строке.
     """
-    from openpyxl import load_workbook
-
     print(f"[APPEND] Открываем файл: {excel_file_path}")
     wb = load_workbook(excel_file_path)
 
