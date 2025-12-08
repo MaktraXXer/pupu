@@ -11,51 +11,138 @@ VALUES
  (N'Надёжный'), (N'ДОМа надёжно'), (N'Всё в ДОМ');
 
 /* ============================================================
-   ПЕРИОДЫ
+   ПАРАМЕТРЫ
    ============================================================ */
-DECLARE @start_rep date = '2025-11-23';   -- первый снимок
-DECLARE @end_rep   date = '2025-12-05';   -- последний снимок
-DECLARE @end_exit  date = '2025-12-06';   -- выходы считаем до 06.12
+DECLARE @dt_rep1 date = '2025-11-23';   -- снимок для выходов
+DECLARE @dt_rep2 date = '2025-12-06';   -- снимок для открытий
+DECLARE @d_from  date = '2025-11-24';
+DECLARE @d_to    date = '2025-12-06';
 
 /* ============================================================
-   ТАБЛИЦА ДЛЯ НАКОПЛЕНИЯ ВСЕХ CLIENT_ID
+   ШАГ 1.
+   МАРКЕТ-ВКЛАДЫ, КОТОРЫЕ ДОЛЖНЫ ВЫЙТИ 24–06 ДЕКАБРЯ
    ============================================================ */
-IF OBJECT_ID('tempdb..#all_clients') IS NOT NULL DROP TABLE #all_clients;
-CREATE TABLE #all_clients (cli_id bigint PRIMARY KEY);
+
+IF OBJECT_ID('tempdb..#mp_exits') IS NOT NULL DROP TABLE #mp_exits;
+
+SELECT
+      t.cli_id,
+      t.con_id,
+      CAST(t.dt_close AS date) AS dt_close_d,
+      t.out_rub
+INTO #mp_exits
+FROM ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
+WHERE t.dt_rep       = @dt_rep1
+  AND t.section_name = N'Срочные'
+  AND t.block_name   = N'Привлечение ФЛ'
+  AND t.acc_role     = N'LIAB'
+  AND t.cur          = '810'
+  AND t.dt_close > t.dt_rep
+  AND CAST(t.dt_close AS date) BETWEEN @d_from AND @d_to
+  AND EXISTS (SELECT 1 FROM @mp m WHERE m.prod_name = t.prod_name);
 
 /* ============================================================
-   ШАГ 1–X.
-   ЦИКЛ ПО СНИМКАМ БАЛАНСА С 23.11 ДО 05.12
-   ДЛЯ КАЖДОГО СНИМКА ИЩЕМ КЛИЕНТОВ С ПЛАНОВЫМИ ВЫХОДАМИ
+   ШАГ 1A.
+   СПИСОК КЛИЕНТОВ
    ============================================================ */
-DECLARE @dt_rep date = @start_rep;
+IF OBJECT_ID('tempdb..#cli_mp_exit') IS NOT NULL DROP TABLE #cli_mp_exit;
 
-WHILE @dt_rep <= @end_rep
-BEGIN
-    DECLARE @from_exit date = DATEADD(day, 1, @dt_rep);  -- окно = со следующего дня
-    DECLARE @to_exit   date = @end_exit;                  -- до 06.12 включительно
-
-    INSERT INTO #all_clients (cli_id)
-    SELECT DISTINCT
-          t.cli_id
-    FROM ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
-    WHERE t.dt_rep       = @dt_rep
-      AND t.section_name = N'Срочные'
-      AND t.block_name   = N'Привлечение ФЛ'
-      AND t.acc_role     = N'LIAB'
-      AND t.cur          = '810'
-      AND t.out_rub IS NOT NULL AND t.out_rub >= 0
-      AND t.dt_close > t.dt_rep
-      AND CAST(t.dt_close AS date) BETWEEN @from_exit AND @to_exit
-      AND EXISTS (SELECT 1 FROM @mp m WHERE m.prod_name = t.prod_name)
-      AND NOT EXISTS (SELECT 1 FROM #all_clients c WHERE c.cli_id = t.cli_id); -- не добавляем дубль
-
-    SET @dt_rep = DATEADD(day, 1, @dt_rep);
-END;
+SELECT DISTINCT cli_id
+INTO #cli_mp_exit
+FROM #mp_exits;
 
 /* ============================================================
-   ИТОГ: СПИСОК ВСЕХ УНИКАЛЬНЫХ КЛИЕНТОВ
+   === SELECT 1 ===
+   ВЫХОДЫ МАРКЕТ-ВКЛАДОВ (24–06)
    ============================================================ */
-SELECT cli_id
-FROM #all_clients
-ORDER BY cli_id;
+
+SELECT
+      dt_close_d AS [date],
+      COUNT(*)   AS cnt_market_exits,
+      SUM(out_rub) AS sum_market_exits
+FROM #mp_exits
+GROUP BY dt_close_d
+ORDER BY dt_close_d;
+
+/* ============================================================
+   ШАГ 2.
+   СНИМОК НА 06.12.2025:
+   ОТКРЫТИЯ **НЕ МАРКЕТ**-ВКЛАДОВ ЭТИМИ КЛИЕНТАМИ (24–06)
+   ============================================================ */
+
+IF OBJECT_ID('tempdb..#nonmp_open') IS NOT NULL DROP TABLE #nonmp_open;
+
+SELECT
+      t.cli_id,
+      t.con_id,
+      CAST(t.dt_open AS date) AS dt_open_d,
+      t.out_rub
+INTO #nonmp_open
+FROM ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
+WHERE t.dt_rep       = @dt_rep2
+  AND t.section_name = N'Срочные'
+  AND t.block_name   = N'Привлечение ФЛ'
+  AND t.acc_role     = N'LIAB'
+  AND t.cur          = '810'
+  AND t.cli_id IN (SELECT cli_id FROM #cli_mp_exit)
+  AND CAST(t.dt_open AS date) BETWEEN @d_from AND @d_to
+  AND NOT EXISTS (SELECT 1 FROM @mp m WHERE m.prod_name = t.prod_name);
+
+/* Убираем дубли */
+;WITH agg_nonmp AS (
+    SELECT
+          dt_open_d,
+          con_id,
+          MIN(cli_id) AS cli_id,
+          SUM(out_rub) AS out_rub
+    FROM #nonmp_open
+    GROUP BY dt_open_d, con_id
+)
+SELECT
+      dt_open_d AS [date],
+      COUNT(*)  AS cnt_nonmp_open,
+      SUM(out_rub) AS sum_nonmp_open
+FROM agg_nonmp
+GROUP BY dt_open_d
+ORDER BY dt_open_d;
+
+/* ============================================================
+   === SELECT 3 ===
+   ОТКРЫТИЯ МАРКЕТ-ВКЛАДОВ ЭТИМИ ЖЕ КЛИЕНТАМИ (24–06)
+   ============================================================ */
+
+IF OBJECT_ID('tempdb..#mp_open') IS NOT NULL DROP TABLE #mp_open;
+
+SELECT
+      t.cli_id,
+      t.con_id,
+      CAST(t.dt_open AS date) AS dt_open_d,
+      t.out_rub
+INTO #mp_open
+FROM ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
+WHERE t.dt_rep       = @dt_rep2
+  AND t.section_name = N'Срочные'
+  AND t.block_name   = N'Привлечение ФЛ'
+  AND t.acc_role     = N'LIAB'
+  AND t.cur          = '810'
+  AND t.cli_id IN (SELECT cli_id FROM #cli_mp_exit)
+  AND CAST(t.dt_open AS date) BETWEEN @d_from AND @d_to
+  AND EXISTS (SELECT 1 FROM @mp m WHERE m.prod_name = t.prod_name);
+
+/* Убираем дубли */
+;WITH agg_mp AS (
+    SELECT
+          dt_open_d,
+          con_id,
+          MIN(cli_id) AS cli_id,
+          SUM(out_rub) AS out_rub
+    FROM #mp_open
+    GROUP BY dt_open_d, con_id
+)
+SELECT
+      dt_open_d AS [date],
+      COUNT(*)  AS cnt_mp_open,
+      SUM(out_rub) AS sum_mp_open
+FROM agg_mp
+GROUP BY dt_open_d
+ORDER BY dt_open_d;
