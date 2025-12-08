@@ -11,72 +11,51 @@ VALUES
  (N'Надёжный'), (N'ДОМа надёжно'), (N'Всё в ДОМ');
 
 /* ============================================================
-   ПАРАМЕТРЫ
+   ПЕРИОДЫ
    ============================================================ */
-DECLARE @dt_rep1   date = '2025-11-23';  -- снимок 23 ноября
-DECLARE @dt_rep2   date = '2025-12-06';  -- снимок 6 декабря
-DECLARE @d_from    date = '2025-11-24';  -- окно 24.11–06.12
-DECLARE @d_to      date = '2025-12-06';
+DECLARE @start_rep date = '2025-11-23';   -- первый снимок
+DECLARE @end_rep   date = '2025-12-05';   -- последний снимок
+DECLARE @end_exit  date = '2025-12-06';   -- выходы считаем до 06.12
 
 /* ============================================================
-   ШАГ 1.
-   КЛИЕНТЫ, У КОТОРЫХ В СНИМКЕ 23.11.2025
-   С 24.11 ПО 06.12 ПЛАНОВО ВЫХОДЯТ ВКЛАДЫ МАРКЕТПЛЕЙСОВ
+   ТАБЛИЦА ДЛЯ НАКОПЛЕНИЯ ВСЕХ CLIENT_ID
    ============================================================ */
-IF OBJECT_ID('tempdb..#cli_mp_exit') IS NOT NULL DROP TABLE #cli_mp_exit;
-
-SELECT DISTINCT
-      t.cli_id
-INTO #cli_mp_exit
-FROM ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
-WHERE t.dt_rep       = @dt_rep1
-  AND t.section_name = N'Срочные'
-  AND t.block_name   = N'Привлечение ФЛ'
-  AND t.acc_role     = N'LIAB'
-  AND t.cur          = '810'
-  AND t.out_rub IS NOT NULL AND t.out_rub >= 0
-  AND t.dt_close > t.dt_rep
-  AND CAST(t.dt_close AS date) BETWEEN @d_from AND @d_to
-  AND EXISTS (SELECT 1 FROM @mp m WHERE m.prod_name = t.prod_name);
+IF OBJECT_ID('tempdb..#all_clients') IS NOT NULL DROP TABLE #all_clients;
+CREATE TABLE #all_clients (cli_id bigint PRIMARY KEY);
 
 /* ============================================================
-   ШАГ 2.
-   СНИМОК НА 06.12.2025:
-   ВКЛАДЫ НЕ МАРКЕТПЛЕЙСОВ, ОТКРЫТЫЕ 24.11–06.12 ЭТИМИ КЛИЕНТАМИ
+   ШАГ 1–X.
+   ЦИКЛ ПО СНИМКАМ БАЛАНСА С 23.11 ДО 05.12
+   ДЛЯ КАЖДОГО СНИМКА ИЩЕМ КЛИЕНТОВ С ПЛАНОВЫМИ ВЫХОДАМИ
    ============================================================ */
-IF OBJECT_ID('tempdb..#base_open') IS NOT NULL DROP TABLE #base_open;
+DECLARE @dt_rep date = @start_rep;
 
-SELECT
-      t.cli_id,
-      t.con_id,
-      CAST(t.dt_open AS date) AS dt_open_d,
-      t.out_rub
-INTO #base_open
-FROM ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
-WHERE t.dt_rep       = @dt_rep2
-  AND t.section_name = N'Срочные'
-  AND t.block_name   = N'Привлечение ФЛ'
-  AND t.acc_role     = N'LIAB'
-  AND t.cur          = '810'
-  AND t.out_rub IS NOT NULL AND t.out_rub >= 0
-  AND t.cli_id IN (SELECT cli_id FROM #cli_mp_exit)
-  AND CAST(t.dt_open AS date) BETWEEN @d_from AND @d_to
-  AND NOT EXISTS (SELECT 1 FROM @mp m WHERE m.prod_name = t.prod_name);
+WHILE @dt_rep <= @end_rep
+BEGIN
+    DECLARE @from_exit date = DATEADD(day, 1, @dt_rep);  -- окно = со следующего дня
+    DECLARE @to_exit   date = @end_exit;                  -- до 06.12 включительно
 
-/* На всякий случай убираем дубли по одному договору в снимке */
-;WITH by_con AS (
-    SELECT
-          dt_open_d,
-          con_id,
-          MIN(cli_id)  AS cli_id,
-          SUM(out_rub) AS out_rub
-    FROM #base_open
-    GROUP BY dt_open_d, con_id
-)
-SELECT
-      dt_open_d      AS [open_date],
-      COUNT(*)       AS cnt_deposits_open,
-      SUM(out_rub)   AS sum_out_rub_open
-FROM by_con
-GROUP BY dt_open_d
-ORDER BY dt_open_d;
+    INSERT INTO #all_clients (cli_id)
+    SELECT DISTINCT
+          t.cli_id
+    FROM ALM.ALM.vw_balance_rest_all t WITH (NOLOCK)
+    WHERE t.dt_rep       = @dt_rep
+      AND t.section_name = N'Срочные'
+      AND t.block_name   = N'Привлечение ФЛ'
+      AND t.acc_role     = N'LIAB'
+      AND t.cur          = '810'
+      AND t.out_rub IS NOT NULL AND t.out_rub >= 0
+      AND t.dt_close > t.dt_rep
+      AND CAST(t.dt_close AS date) BETWEEN @from_exit AND @to_exit
+      AND EXISTS (SELECT 1 FROM @mp m WHERE m.prod_name = t.prod_name)
+      AND NOT EXISTS (SELECT 1 FROM #all_clients c WHERE c.cli_id = t.cli_id); -- не добавляем дубль
+
+    SET @dt_rep = DATEADD(day, 1, @dt_rep);
+END;
+
+/* ============================================================
+   ИТОГ: СПИСОК ВСЕХ УНИКАЛЬНЫХ КЛИЕНТОВ
+   ============================================================ */
+SELECT cli_id
+FROM #all_clients
+ORDER BY cli_id;
