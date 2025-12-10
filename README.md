@@ -5,32 +5,35 @@ SET NOCOUNT ON;
 -- Параметры периода
 -------------------------------------------------------
 DECLARE @StartDate date = '2023-08-01';  -- начиная с августа 2023
-DECLARE @EndDate   date = '2025-11-30';  -- до конца ноября 2025
+DECLARE @EndDate   date = '2025-11-30';  -- по конец ноября 2025
 
 -------------------------------------------------------
--- 1. Календарь "концов месяца" по фактическим снимкам
+-- 1. Календарь: концы месяцев (без обращения к VW_balance_rest_all)
 -------------------------------------------------------
 IF OBJECT_ID('tempdb..#Calendar') IS NOT NULL
     DROP TABLE #Calendar;
 
-;WITH MonthMax AS (
-    SELECT
-          YEAR(dt_rep)  AS y
-        , MONTH(dt_rep) AS m
-        , MAX(dt_rep)   AS dt_rep
-    FROM [ALM].[ALM].[VW_balance_rest_all] v WITH (NOLOCK)
-    WHERE v.dt_rep BETWEEN @StartDate AND @EndDate
-    GROUP BY YEAR(dt_rep), MONTH(dt_rep)
+;WITH Months AS (
+    SELECT DATEFROMPARTS(YEAR(@StartDate), MONTH(@StartDate), 1) AS month_start
+    UNION ALL
+    SELECT DATEADD(MONTH, 1, month_start)
+    FROM Months
+    WHERE DATEADD(MONTH, 1, month_start) <= DATEFROMPARTS(YEAR(@EndDate), MONTH(@EndDate), 1)
 )
 SELECT
-      mm.dt_rep                                            AS dt_rep              -- фактический снимок
-    , DATEFROMPARTS(mm.y, mm.m, 1)                         AS month_start         -- первое число месяца
-    , EOMONTH(DATEFROMPARTS(mm.y, mm.m, 1))                AS month_end           -- календарный конец месяца
+      EOMONTH(month_start) AS dt_rep      -- конец месяца
+    , month_start          AS month_start -- первое число месяца
+    , EOMONTH(month_start) AS month_end   -- календарный конец месяца
 INTO #Calendar
-FROM MonthMax mm;
+FROM Months
+OPTION (MAXRECURSION 300);
 
 -------------------------------------------------------
--- 2. Агрегация по портфелю
+-- 2. Агрегация по портфелю на даты из календаря
+--    dt_rep              : дата снимка (конец месяца)
+--    portfolio_volume    : весь портфель на эту дату
+--    opened_volume       : объём вкладов, открытых в этом месяце
+--    client_rate_of_opened : СВ ставка по "нормальным" ставкам среди открытых в месяце
 -------------------------------------------------------
 SELECT
       c.dt_rep
@@ -50,8 +53,11 @@ SELECT
             END
         )
 
-    -- г) средневзвешенная ставка по открытым в этом месяце
-    --    WAVG только по строкам с нормальной ставкой и объёмом
+    -- г) средневзвешенная клиентская ставка по открытым в этом месяце
+    --    В WAVG учитываем только строки:
+    --      * dt_open в этом месяце
+    --      * rate_con IS NOT NULL и > 0
+    --      * out_rub > 0
     , client_rate_of_opened =
         SUM(
             CASE
