@@ -1,146 +1,108 @@
-Нужно сделать универсальную (по всем Cur, IS_PDR) вьюху, но при этом сохранить “атомарную” разбивку, чтобы JOIN был корректный даже если периоды по разным базовым срокам меняются в разные даты.
+Option Explicit
 
-Ниже — именно такая вьюха: она
-	•	локально объявляет базовые сроки,
-	•	делает атомарные интервалы по каждой паре (Cur, IS_PDR) на базе всех дат изменений по любым базовым срокам,
-	•	дозаполняет пропущенные базовые сроки нулём,
-	•	интерполирует Term=1..7300,
-	•	ставит 0 на Term=7301..10000.
+' Загружает историю ТС ДВС из листа "история ТС" (A:C) в таблицу ALM_TEST.alm_report.trf_dvs_history
+' 1) очищает таблицу (TRUNCATE)
+' 2) вставляет все строки (dt_rep, rate_trf_fix, rate_trf_float)
+'
+' Ожидаемый формат на листе "история ТС":
+'   A: Дата (Date)
+'   B: ТС фикс (может быть 17.95% или 0.1795)
+'   C: ТС флоат (может быть 17.32% или 0.1732)
 
-USE [ALM];
-GO
+Public Sub Upload_TRF_DVS_History()
+    Dim wb As Workbook, sht As Worksheet
+    Dim lastRow As Long, r As Long
 
-CREATE OR ALTER VIEW info.VW_liquidity_rates_interpolated
-AS
-WITH base_terms AS (
-    SELECT v.Term
-    FROM (VALUES
-        (1),(7),(14),(31),(61),(91),(122),(151),(181),(274),
-        (365),(731),(1095),(1460),(1825),(2190),(2555),(2920),
-        (3285),(3650),(5475),(7300)
-    ) v(Term)
-),
-src AS (
-    -- дедуп по ключу (если дублей нет — просто не мешает)
-    SELECT
-        dt_from, dt_to, Term, Cur, IS_PDR, CAST(Value AS float) AS Value,
-        ROW_NUMBER() OVER (
-            PARTITION BY dt_from, dt_to, Term, Cur, IS_PDR
-            ORDER BY ReplicationDate DESC, Load_dt DESC, id DESC
-        ) AS rn
-    FROM info.man_liquidity_rates WITH (NOLOCK)
-),
-fact AS (
-    SELECT dt_from, dt_to, Term, Cur, IS_PDR, Value
-    FROM src
-    WHERE rn = 1
-),
-breaks AS (
-    -- все границы периодов по каждой (Cur, IS_PDR) с учётом ВСЕХ базовых сроков
-    SELECT Cur, IS_PDR, dt_from AS bdt
-    FROM fact
-    UNION
-    SELECT Cur, IS_PDR, DATEADD(day, 1, dt_to) AS bdt
-    FROM fact
-),
-breaks2 AS (
-    SELECT Cur, IS_PDR, bdt,
-           LEAD(bdt) OVER (PARTITION BY Cur, IS_PDR ORDER BY bdt) AS bdt_next
-    FROM (SELECT DISTINCT Cur, IS_PDR, bdt FROM breaks) x
-),
-atomic AS (
-    -- атомарные интервалы [dt_from, dt_to], непересекающиеся внутри (Cur, IS_PDR)
-    SELECT
-        Cur,
-        IS_PDR,
-        bdt AS dt_from,
-        DATEADD(day, -1, bdt_next) AS dt_to
-    FROM breaks2
-    WHERE bdt_next IS NOT NULL
-      AND bdt <= DATEADD(day, -1, bdt_next)
-),
-base_grid AS (
-    -- на каждый атомарный интервал и каждый базовый срок берём действующее значение, иначе 0
-    SELECT
-        a.dt_from, a.dt_to, a.Cur, a.IS_PDR,
-        bt.Term,
-        ISNULL(f.Value, 0.0) AS Value
-    FROM atomic a
-    CROSS JOIN base_terms bt
-    LEFT JOIN fact f
-        ON  f.Cur    = a.Cur
-        AND f.IS_PDR = a.IS_PDR
-        AND f.Term   = bt.Term
-        -- важно: для атомарного интервала достаточно проверять любую дату внутри, берём dt_from
-        AND a.dt_from >= f.dt_from
-        AND a.dt_from <= f.dt_to
-),
-segments AS (
-    -- сегменты между базовыми сроками внутри каждого атомарного интервала
-    SELECT
-        bg.dt_from, bg.dt_to, bg.Cur, bg.IS_PDR,
-        bg.Term, bg.Value,
-        LEAD(bg.Term,  1, 7301)     OVER (PARTITION BY bg.dt_from, bg.dt_to, bg.Cur, bg.IS_PDR ORDER BY bg.Term) AS TermNext,
-        LEAD(bg.Value, 1, bg.Value) OVER (PARTITION BY bg.dt_from, bg.dt_to, bg.Cur, bg.IS_PDR ORDER BY bg.Term) AS ValueNext
-    FROM base_grid bg
-),
-interp_1_7300 AS (
-    -- интерполяция на все сроки 1..7300
-    SELECT
-        s.dt_from,
-        s.dt_to,
-        t.val_ AS Term,
-        s.Cur,
-        s.IS_PDR,
-        CAST(
-            CASE
-                WHEN s.TermNext = s.Term THEN s.Value
-                ELSE s.Value
-                     + ( (t.val_ - s.Term) * 1.0 * (s.ValueNext - s.Value)
-                         / NULLIF(s.TermNext - s.Term, 0) )
-            END
-        AS float) AS Value
-    FROM segments s
-    INNER JOIN info.vw_counter t WITH (NOLOCK)
-        ON t.val_ >= s.Term
-       AND t.val_ <  s.TermNext
-       AND t.val_ BETWEEN 1 AND 7300
-),
-zeros_7301_10000 AS (
-    -- сроки >7300 до 10000 = 0, на тех же атомарных интервалах
-    SELECT
-        a.dt_from,
-        a.dt_to,
-        t.val_ AS Term,
-        a.Cur,
-        a.IS_PDR,
-        CAST(0.0 AS float) AS Value
-    FROM atomic a
-    INNER JOIN info.vw_counter t WITH (NOLOCK)
-        ON t.val_ BETWEEN 7301 AND 10000
-)
-SELECT * FROM interp_1_7300
-UNION ALL
-SELECT * FROM zeros_7301_10000;
-GO
+    Dim dtRep As Date
+    Dim rateFix As Double, rateFloat As Double
 
-Почему JOIN будет корректный при твоих условиях
-	•	Ты гарантируешь отсутствие пересечений внутри одного базового срока (Term).
-	•	Но периоды могут отличаться между сроками (31 меняется чаще, 61 реже) — поэтому мы и строим atomic по всем границам сразу.
-	•	В результате для фиксированных (Cur, IS_PDR) атомарные интервалы не пересекаются, значит на любую дату dt_open попадёт ровно один интервал, и JOIN не размножит строки.
+    Dim sql As String
+    Dim cnt As Long
 
-Как использовать (и не грузить БД)
+    Set wb = ActiveWorkbook
+    Set sht = wb.Sheets("история ТС")
 
-Обязательно фильтруй по Cur и IS_PDR в запросе к сделкам (как ты и планируешь) — это критично без индекса на исходнике:
+    lastRow = sht.Cells(sht.Rows.Count, "A").End(xlUp).Row
+    If lastRow < 2 Then
+        MsgBox "На листе 'история ТС' нет данных (ожидаю строки начиная со 2).", vbExclamation
+        Exit Sub
+    End If
 
-SELECT d.*, ISNULL(v.Value,0.0) AS liq_rate
-FROM dbo.deals d
-LEFT JOIN info.VW_liquidity_rates_interpolated v
-  ON v.Cur    = d.Cur
- AND v.IS_PDR = d.IS_PDR
- AND v.Term   = d.Term
- AND d.dt_open >= v.dt_from
- AND d.dt_open <= v.dt_to
-WHERE d.Cur='810' AND d.IS_PDR=1;
+    ' 1) Очистка таблицы
+    sql = "TRUNCATE TABLE [ALM_TEST].[alm_report].[trf_dvs_history];"
+    Call sql_exec(GetConStr_ALM_TEST(), sql)
 
-Если понадобится “ещё легче” без индекса на исходнике — тогда уже только материализация витрины в отдельную таблицу (индексировать её обычно можно), но для “редко и точечно” эта версия вьюхи — правильная по логике и максимально простая по интерфейсу джоина.
+    ' 2) Вставка данных (одним батчем)
+    sql = "INSERT INTO [ALM_TEST].[alm_report].[trf_dvs_history] ([dt_rep],[rate_trf_fix],[rate_trf_float]) VALUES " & vbCrLf
+
+    cnt = 0
+    For r = 2 To lastRow
+        If Trim(CStr(sht.Cells(r, "A").Value)) <> "" Then
+            dtRep = CDate(sht.Cells(r, "A").Value)
+
+            rateFix = ParsePercentToDecimal(sht.Cells(r, "B").Value)
+            rateFloat = ParsePercentToDecimal(sht.Cells(r, "C").Value)
+
+            If cnt > 0 Then sql = sql & "," & vbCrLf
+            sql = sql & "('" & Format(dtRep, "yyyy-mm-dd") & "', " & DblToSql(rateFix) & ", " & DblToSql(rateFloat) & ")"
+
+            cnt = cnt + 1
+        End If
+    Next r
+
+    sql = sql & ";"
+
+    If cnt > 0 Then
+        Call sql_exec(GetConStr_ALM_TEST(), sql)
+        MsgBox "Готово. Загружено строк: " & cnt, vbInformation
+    Else
+        MsgBox "Нет строк для загрузки (пустой столбец A).", vbExclamation
+    End If
+
+    Set sht = Nothing
+    Set wb = Nothing
+End Sub
+
+' --- Helpers ---
+
+' Подключение (как у тебя, Integrated Security).
+' Если у тебя в GetConStr() нет Initial Catalog, можно явно указать ALM_TEST.
+Public Function GetConStr_ALM_TEST() As String
+    GetConStr_ALM_TEST = "Provider=SQLOLEDB.1;Data Source=trading-db.ahml1.ru;Integrated Security=SSPI;Initial Catalog=ALM_TEST;"
+End Function
+
+' Выполнение non-select SQL (TRUNCATE/INSERT/UPDATE/DELETE)
+Public Sub sql_exec(ByVal ConStr As String, ByVal strSQL As String)
+    Dim cn As Object
+    Set cn = CreateObject("ADODB.Connection")
+    cn.ConnectionString = ConStr
+    cn.Open
+    cn.Execute strSQL
+    cn.Close
+    Set cn = Nothing
+End Sub
+
+' Приведение процента из Excel к доле:
+'  - если пришло 17.95% (0.1795) -> вернет 0.1795
+'  - если пришло 17.95 (без %) -> вернет 0.1795 (эвристика: >1 => /100)
+'  - если пришло 0.1795 -> вернет 0.1795
+Private Function ParsePercentToDecimal(ByVal v As Variant) As Double
+    Dim x As Double
+
+    If IsEmpty(v) Or Trim(CStr(v)) = "" Then
+        ParsePercentToDecimal = 0#
+        Exit Function
+    End If
+
+    x = CDbl(v)
+
+    ' В Excel процент может быть уже долей (0.1795) или числом 17.95 (если формат общий/числовой)
+    If x > 1# Then x = x / 100#
+
+    ParsePercentToDecimal = x
+End Function
+
+' Double -> SQL (точка как разделитель)
+Private Function DblToSql(ByVal x As Double) As String
+    DblToSql = Replace(Format$(x, "0.##############"), ",", ".")
+End Function
