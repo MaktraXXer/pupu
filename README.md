@@ -1,121 +1,48 @@
-DECLARE @Cur NVARCHAR(100) = '810';   -- '810' / 'all' / '840' / ...
-DECLARE @dt_old DATE = '2025-10-01';
-DECLARE @dt_new DATE = '2025-10-05';
-DECLARE @product NVARCHAR(100) = 'SA'; -- 'SA' / 'deposit' / 'all'
-DECLARE @specific_cli_id NVARCHAR(100) = '0'; -- '0' if no specific client
-;
+DECLARE @dt_start DATE = '2025-10-01';
+DECLARE @dt_end   DATE = '2025-10-31';  -- inclusive
+DECLARE @threshold_rub BIGINT = 3000000000; -- 3 млрд
 
-WITH
-old AS(
+;WITH base AS (
     SELECT
-        dt_rep,
-        cli_id,
-        SUM(CASE
-                WHEN @Cur IN ('810','all') THEN OUT_RUB
-                ELSE OUT_CUR
-            END)/1000000.0 AS [всего_остаток_млн__старое],
-
-        SUM(CASE WHEN section_name = 'Срочные' THEN
-            CASE
-                WHEN @Cur IN ('810','all') THEN OUT_RUB
-                ELSE OUT_CUR
-            END END)/1000000.0 AS [Вклады_млн__старое],
-
-        SUM(CASE WHEN section_name = 'До востребования' THEN
-            CASE
-                WHEN @Cur IN ('810','all') THEN OUT_RUB
-                ELSE OUT_CUR
-            END END)/1000000.0 AS [ДВС_млн__старое],
-
-        SUM(CASE WHEN section_name = 'Накопительный счёт' THEN
-            CASE
-                WHEN @Cur IN ('810','all') THEN OUT_RUB
-                ELSE OUT_CUR
-            END END)/1000000.0 AS [Накоп_счет_млн__старое]
-    FROM [ALM].[ALM].[balance_rest_all] WITH (NOLOCK)
-    WHERE dt_rep = @dt_old
-      AND od_flag = 1
-      AND block_name = 'Привлечение ФЛ'
-      AND SECTION_NAME NOT IN ('Аккредитивы', 'Аккредитив под строительство', 'Брокерское обслуживание')
-      AND (@Cur = 'all' OR CUR = @Cur)  -- если all, фильтра нет; иначе фильтр по CUR
-    GROUP BY dt_rep, cli_id
+        b.dt_rep,
+        b.cli_id,
+        SUM(b.out_rub) AS sum_rub
+    FROM [ALM].[ALM].[balance_rest_all] b WITH (NOLOCK)
+    WHERE b.dt_rep >= @dt_start
+      AND b.dt_rep <= @dt_end
+      AND b.cur = '810'
+      AND b.section_name IN (N'До востребования', N'Накопительный счёт')
+      AND b.od_flag = 1
+      AND b.block_name = N'Привлечение ФЛ'
+    GROUP BY b.dt_rep, b.cli_id
 ),
-new AS(
+qualified AS (
     SELECT
         dt_rep,
         cli_id,
-        SUM(CASE
-                WHEN @Cur IN ('810','all') THEN OUT_RUB
-                ELSE OUT_CUR
-            END)/1000000.0 AS [всего_остаток_млн__новое],
-
-        SUM(CASE WHEN section_name = 'Срочные' THEN
-            CASE
-                WHEN @Cur IN ('810','all') THEN OUT_RUB
-                ELSE OUT_CUR
-            END END)/1000000.0 AS [Вклады_млн__новое],
-
-        SUM(CASE WHEN section_name = 'До востребования' THEN
-            CASE
-                WHEN @Cur IN ('810','all') THEN OUT_RUB
-                ELSE OUT_CUR
-            END END)/1000000.0 AS [ДВС_млн__новое],
-
-        SUM(CASE WHEN section_name = 'Накопительный счёт' THEN
-            CASE
-                WHEN @Cur IN ('810','all') THEN OUT_RUB
-                ELSE OUT_CUR
-            END END)/1000000.0 AS [Накоп_счет_млн__новое]
-    FROM [ALM].[ALM].[balance_rest_all] WITH (NOLOCK)
-    WHERE dt_rep = @dt_new
-      AND od_flag = 1
-      AND block_name = 'Привлечение ФЛ'
-      AND SECTION_NAME NOT IN ('Аккредитивы', 'Аккредитив под строительство', 'Брокерское обслуживание')
-      AND (@Cur = 'all' OR CUR = @Cur)
-    GROUP BY dt_rep, cli_id
+        sum_rub
+    FROM base
+    WHERE sum_rub >= @threshold_rub
+),
+agg AS (
+    SELECT
+        dt_rep,
+        SUM(sum_rub) AS out_rub,
+        STRING_AGG(CONVERT(NVARCHAR(30), cli_id), N';') AS multiple_cli_id
+    FROM qualified
+    GROUP BY dt_rep
 )
 SELECT
-    COALESCE(n.cli_id, o.cli_id) AS cli_id,
-    o.всего_остаток_млн__старое,
-    n.всего_остаток_млн__новое,
-    n.всего_остаток_млн__новое - COALESCE(o.всего_остаток_млн__старое, 0) AS [Дельта_общий_остаток],
-
-    o.Вклады_млн__старое,
-    n.Вклады_млн__новое,
-    n.Вклады_млн__новое - COALESCE(o.Вклады_млн__старое, 0) AS [Дельта_вклады],
-
-    o.ДВС_млн__старое,
-    n.ДВС_млн__новое,
-    n.ДВС_млн__новое - COALESCE(o.ДВС_млн__старое, 0) AS [Дельта_ДВС],
-
-    o.Накоп_счет_млн__старое,
-    n.Накоп_счет_млн__новое,
-    n.Накоп_счет_млн__новое - COALESCE(o.Накоп_счет_млн__старое, 0) AS [Дельта_накоп]
-FROM new n
-FULL OUTER JOIN old o
-    ON n.cli_id = o.cli_id
-WHERE
-    (
-      (CASE WHEN @product = 'SA' THEN n.Накоп_счет_млн__новое
-            WHEN @product = 'deposit' THEN n.Вклады_млн__новое
-            WHEN @product = 'all' THEN n.всего_остаток_млн__новое END) IS NOT NULL
-      OR
-      (CASE WHEN @product = 'SA' THEN o.Накоп_счет_млн__старое
-            WHEN @product = 'deposit' THEN o.Вклады_млн__старое
-            WHEN @product = 'all' THEN o.всего_остаток_млн__старое END) IS NOT NULL
-    )
-    AND COALESCE(n.cli_id, o.cli_id) = CASE WHEN @specific_cli_id = '0'
-                                           THEN COALESCE(n.cli_id, o.cli_id)
-                                           ELSE @specific_cli_id END
-ORDER BY
-    ABS(
-        (CASE WHEN @product = 'SA' THEN n.Накоп_счет_млн__новое
-              WHEN @product = 'deposit' THEN n.Вклады_млн__новое
-              WHEN @product = 'all' THEN n.всего_остаток_млн__новое END)
-        - COALESCE(
-            (CASE WHEN @product = 'SA' THEN o.Накоп_счет_млн__старое
-                  WHEN @product = 'deposit' THEN o.Вклады_млн__старое
-                  WHEN @product = 'all' THEN o.всего_остаток_млн__старое END), 0
-        )
-    ) DESC
-OFFSET 0 ROWS FETCH NEXT 20 ROWS ONLY;
+    d.dt_rep,
+    COALESCE(a.out_rub, 0) AS out_rub,
+    a.multiple_cli_id
+FROM (
+    -- генератор календаря дат в диапазоне
+    SELECT DATEADD(DAY, v.number, @dt_start) AS dt_rep
+    FROM master..spt_values v
+    WHERE v.[type] = 'P'
+      AND v.number BETWEEN 0 AND DATEDIFF(DAY, @dt_start, @dt_end)
+) d
+LEFT JOIN agg a
+    ON a.dt_rep = d.dt_rep
+ORDER BY d.dt_rep;
