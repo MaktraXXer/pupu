@@ -22,7 +22,7 @@ Sub sendControlling()
 
    Dim sendMain As Boolean        ' AH10 (RUB, как раньше)
    Dim sendCNY As Boolean         ' AK10 (CNY)
-   Dim sendUSD As Boolean         ' AN10 (USD)  ' если это не USD — просто поменяй текст ниже
+   Dim sendUSD As Boolean         ' AN10 (USD)
    Dim sendOptions As Boolean     ' AH12 (опции)
    Dim sendLiqUL As Boolean       ' AH14 (ликвидность ЮЛ)
 
@@ -31,6 +31,8 @@ Sub sendControlling()
    Dim usdText As String
    Dim optText As String
    Dim liqUlText As String
+
+   Dim optCur As String           ' НОВОЕ: валюта для текста опций из B1
 
    On Error GoTo ErrorHandler
    Application.ScreenUpdating = False
@@ -52,6 +54,20 @@ Sub sendControlling()
    End With
 
    '========================
+   ' Листы / диапазоны
+   '========================
+   Set reportSheet = Worksheets("Шаблон")
+   Set optSheet = Worksheets("Опции вклады ФЛ в любой валюте")
+   Set liqUlSheet = Worksheets("Ставка ликвидности депозиты ЮЛ")
+
+   Set RngMain = reportSheet.Range("AP43:AY44")   ' RUB
+   Set RngCNY = reportSheet.Range("BB43:BK44")    ' CNY
+   Set RngUSD = reportSheet.Range("BM43:BV44")    ' USD
+
+   Set RngOpt = optSheet.Range("A5:J7")           ' опции
+   Set RngLiqUl = liqUlSheet.Range("A5:K6")       ' ЮЛ
+
+   '========================
    ' Тексты
    '========================
    If sendMain = False Then
@@ -66,28 +82,16 @@ Sub sendControlling()
 
    cnyText = "Также прошу установить следующие доплаты за ликвидность по безопциональным вкладам ФЛ в юанях (см. таблицу ниже):"
    usdText = "Также прошу установить следующие доплаты за ликвидность по безопциональным вкладам ФЛ в долларах США (см. таблицу ниже):"
-   ' если AN10 — это не USD, поменяй строку выше (например, "в евро")
 
-   optText = "Также прошу установить платы за опции по вкладам ФЛ в рублях (см. таблицу ниже):"
+   ' НОВОЕ: валюта опций берется из B1 листа "Опции вклады ФЛ в любой валюте"
+   optCur = Trim(CStr(optSheet.Range("B1").Value))
+   If optCur <> "" Then
+       optText = "Также прошу установить платы за опции по вкладам ФЛ в валюте " & optCur & " (см. таблицу ниже):"
+   Else
+       optText = "Также прошу установить платы за опции по вкладам ФЛ (см. таблицу ниже):"
+   End If
+
    liqUlText = "Также прошу установить доплаты за ликвидность по депозитам ЮЛ c правом досрочного расторжения, НСО в рублях (см. таблицу ниже):"
-
-   '========================
-   ' Листы / диапазоны
-   '========================
-   Set reportSheet = Worksheets("Шаблон")
-   Set optSheet = Worksheets("Опции вклады ФЛ rub")
-   Set liqUlSheet = Worksheets("Ставка ликвидности депозиты ЮЛ")
-
-   Set RngMain = reportSheet.Range("AP43:AY44")   ' RUB (как раньше)
-
-   ' CNY / USD блоки на "Шаблон"
-   Set RngCNY = reportSheet.Range("BB43:BK44")    ' CNY (как ты написал)
-   Set RngUSD = reportSheet.Range("BL43:BU44")    ' USD (предположил соседний диапазон)
-   ' если у тебя USD тоже BB43:BK44 — поменяй строку выше на:
-   ' Set RngUSD = reportSheet.Range("BB43:BK44")
-
-   Set RngOpt = optSheet.Range("A5:J7")           ' опции (как раньше)
-   Set RngLiqUl = liqUlSheet.Range("A5:K6")       ' ЮЛ (как раньше)
 
    '========================
    ' Outlook
@@ -127,7 +131,7 @@ Sub sendControlling()
    End If
 
    '========================
-   ' 3) CNY (если AK10=True) — после рублей, до опций
+   ' 3) CNY (если AK10=True) - после рублей, до опций
    '========================
    If sendCNY Then
        sel.TypeText cnyText
@@ -142,7 +146,7 @@ Sub sendControlling()
    End If
 
    '========================
-   ' 4) USD (если AN10=True) — после CNY, до опций
+   ' 4) USD (если AN10=True) - после CNY, до опций
    '========================
    If sendUSD Then
        sel.TypeText usdText
