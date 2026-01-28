@@ -1,93 +1,203 @@
-DECLARE @dt_rep date = '2025-08-31';
+Option Explicit
 
-IF OBJECT_ID('tempdb..#base') IS NOT NULL DROP TABLE #base;
-IF OBJECT_ID('tempdb..#cal')  IS NOT NULL DROP TABLE #cal;
-IF OBJECT_ID('tempdb..#seg')  IS NOT NULL DROP TABLE #seg;
+Sub sendControlling()
 
--- 1) База: портфель на @dt_rep (cur=810) + con_id + MonthlyCONV_ForecastKeyRate из снапа @dt_rep
-SELECT
-    t.con_id,
-    t.cur,
-    CAST(t.dt_close AS date) AS dt_close_d,
-    t.out_rub,
-    t.rate_con,
-    t.rate_trf,
-    s.MonthlyCONV_ForecastKeyRate
-INTO #base
-FROM alm.[ALM].[vw_balance_rest_all] t WITH (NOLOCK)
-LEFT JOIN (
-    SELECT
-        con_id,
-        MAX(MonthlyCONV_ForecastKeyRate) AS MonthlyCONV_ForecastKeyRate
-    FROM [ALM_TEST].[WORK].[DepositInterestsRateSnap] WITH (NOLOCK)
-    WHERE dt_rep = @dt_rep
-    GROUP BY con_id
-) s
-    ON s.con_id = t.con_id
-WHERE t.dt_rep       = @dt_rep
-  AND t.AP           = N'Пассив'
-  AND t.section_name = N'Срочные'
-  AND t.block_name   = N'Привлечение ФЛ'
-  AND t.cur          = '810'
-  AND t.acc_role     = N'LIAB'
-  AND t.out_rub      IS NOT NULL
-  AND t.tprod_name   = N'Вклады ФЛ'
-  AND t.dt_close     > @dt_rep;              -- завязали на @dt_rep
+   Dim reportSheet As Worksheet
+   Dim optSheet As Worksheet
+   Dim liqUlSheet As Worksheet
 
--- 2) dt_end: до какой даты считать амортизацию (включительно)
---    По умолчанию: max(dt_close) в портфеле на @dt_rep, но не раньше @dt_rep
-DECLARE @dt_end date;
-SELECT @dt_end = ISNULL(MAX(dt_close_d), @dt_rep) FROM #base;
+   Dim RngMain As Range
+   Dim RngCNY As Range
+   Dim RngUSD As Range
+   Dim RngOpt As Range
+   Dim RngLiqUl As Range
 
--- Если хочешь руками ограничивать горизонт (пример):
--- DECLARE @dt_end date = '2025-12-31';
--- (тогда убери SELECT выше)
+   Dim OutApp As Object
+   Dim OutMail As Object
+   Dim wEditor As Object
+   Dim sel As Object
 
--- 3) Календарь от @dt_rep до @dt_end (включительно)
-;WITH cal AS (
-    SELECT @dt_rep AS d
-    UNION ALL
-    SELECT DATEADD(DAY, 1, d) FROM cal WHERE d < @dt_end
-)
-SELECT d INTO #cal FROM cal
-OPTION (MAXRECURSION 0);
+   Dim t As String
+   Dim emailto As String
 
--- 4) "Сегменты" (тут один cur, оставим общий вид)
-SELECT DISTINCT cur INTO #seg FROM #base;
+   Dim sendMain As Boolean        ' AH10 (RUB, как раньше)
+   Dim sendCNY As Boolean         ' AK10 (CNY)
+   Dim sendUSD As Boolean         ' AN10 (USD)  ' если это не USD — просто поменяй текст ниже
+   Dim sendOptions As Boolean     ' AH12 (опции)
+   Dim sendLiqUL As Boolean       ' AH14 (ликвидность ЮЛ)
 
--- 5) Амортизация: объём, который "выбывает" В КАЖДУЮ ДАТУ (dt_close_d = date),
---    считаем только в диапазоне [@dt_rep; @dt_end]
-SELECT
-    c.d AS [date],
-    s.cur AS cur,
+   Dim mainText As String
+   Dim cnyText As String
+   Dim usdText As String
+   Dim optText As String
+   Dim liqUlText As String
 
-    COALESCE(SUM(CASE WHEN b.dt_close_d = c.d THEN b.out_rub END), 0) AS amort_out_rub,
+   On Error GoTo ErrorHandler
+   Application.ScreenUpdating = False
 
-    CAST(
-        SUM(CASE WHEN b.dt_close_d = c.d AND b.rate_trf IS NOT NULL THEN b.out_rub * b.rate_trf END)
-        / NULLIF(SUM(CASE WHEN b.dt_close_d = c.d AND b.rate_trf IS NOT NULL THEN b.out_rub END), 0)
-        AS DECIMAL(12,6)
-    ) AS amort_rate_trf_srvz,
+   '========================
+   ' Дата
+   '========================
+   t = Format(Worksheets("Шаблон").Range("B2").Value, "DD.MM.YYYY")
 
-    CAST(
-        SUM(CASE WHEN b.dt_close_d = c.d AND b.rate_con IS NOT NULL THEN b.out_rub * b.rate_con END)
-        / NULLIF(SUM(CASE WHEN b.dt_close_d = c.d AND b.rate_con IS NOT NULL THEN b.out_rub END), 0)
-        AS DECIMAL(12,6)
-    ) AS amort_rate_con_srvz,
+   '========================
+   ' Флаги
+   '========================
+   With Worksheets("Формат для отправок")
+      sendMain = CBool(.Range("AH10").Value)
+      sendCNY = CBool(.Range("AK10").Value)
+      sendUSD = CBool(.Range("AN10").Value)
+      sendOptions = CBool(.Range("AH12").Value)
+      sendLiqUL = CBool(.Range("AH14").Value)
+   End With
 
-    CAST(
-        SUM(CASE WHEN b.dt_close_d = c.d AND b.MonthlyCONV_ForecastKeyRate IS NOT NULL
-                 THEN b.out_rub * b.MonthlyCONV_ForecastKeyRate END)
-        / NULLIF(SUM(CASE WHEN b.dt_close_d = c.d AND b.MonthlyCONV_ForecastKeyRate IS NOT NULL
-                          THEN b.out_rub END), 0)
-        AS DECIMAL(12,6)
-    ) AS amort_MonthlyCONV_ForecastKeyRate_srvz
+   '========================
+   ' Тексты
+   '========================
+   If sendMain = False Then
+       mainText = "Роман, добрый день!" & vbCrLf & _
+                  "Прикрепляю ставки на " & t & "." & vbCrLf & _
+                  "Доплаты за ликвидность по безопциональным вкладам ФЛ в рублях не меняются."
+   Else
+       mainText = "Роман, добрый день!" & vbCrLf & _
+                  "Прикрепляю ставки на " & t & "." & vbCrLf & _
+                  "Прошу установить следующие доплаты за ликвидность по безопциональным вкладам ФЛ в рублях (см. таблицу ниже):"
+   End If
 
-FROM #cal c
-CROSS JOIN #seg s
-LEFT JOIN #base b
-    ON b.cur = s.cur
-GROUP BY c.d, s.cur
-ORDER BY c.d, s.cur;
+   cnyText = "Также прошу установить следующие доплаты за ликвидность по безопциональным вкладам ФЛ в юанях (см. таблицу ниже):"
+   usdText = "Также прошу установить следующие доплаты за ликвидность по безопциональным вкладам ФЛ в долларах США (см. таблицу ниже):"
+   ' если AN10 — это не USD, поменяй строку выше (например, "в евро")
 
-Если тебе нужно, чтобы @dt_end задавался явно параметром (а не как max dt_close), скажи какую дату/горизонт хочешь по умолчанию (например, EOMONTH(@dt_rep, 12) или фикс “+365 дней”).
+   optText = "Также прошу установить платы за опции по вкладам ФЛ в рублях (см. таблицу ниже):"
+   liqUlText = "Также прошу установить доплаты за ликвидность по депозитам ЮЛ c правом досрочного расторжения, НСО в рублях (см. таблицу ниже):"
+
+   '========================
+   ' Листы / диапазоны
+   '========================
+   Set reportSheet = Worksheets("Шаблон")
+   Set optSheet = Worksheets("Опции вклады ФЛ rub")
+   Set liqUlSheet = Worksheets("Ставка ликвидности депозиты ЮЛ")
+
+   Set RngMain = reportSheet.Range("AP43:AY44")   ' RUB (как раньше)
+
+   ' CNY / USD блоки на "Шаблон"
+   Set RngCNY = reportSheet.Range("BB43:BK44")    ' CNY (как ты написал)
+   Set RngUSD = reportSheet.Range("BL43:BU44")    ' USD (предположил соседний диапазон)
+   ' если у тебя USD тоже BB43:BK44 — поменяй строку выше на:
+   ' Set RngUSD = reportSheet.Range("BB43:BK44")
+
+   Set RngOpt = optSheet.Range("A5:J7")           ' опции (как раньше)
+   Set RngLiqUl = liqUlSheet.Range("A5:K6")       ' ЮЛ (как раньше)
+
+   '========================
+   ' Outlook
+   '========================
+   Set OutApp = CreateObject("Outlook.Application")
+   Set OutMail = OutApp.CreateItem(0)
+
+   emailto = "roman.alekhin@domrf.ru;aleksandr.lavrinenko@domrf.ru;alina.borisova@domrf.ru"
+
+   With OutMail
+       .To = emailto
+       .CC = "olga.karnaukhova@domrf.ru"
+       .Subject = "ЕТС на " & t
+       .Display
+   End With
+
+   Set wEditor = OutApp.ActiveInspector.WordEditor
+   Set sel = wEditor.Application.Selection
+
+   '========================
+   ' 1) Основной текст
+   '========================
+   sel.TypeText mainText
+   sel.TypeParagraph
+   sel.TypeParagraph
+
+   '========================
+   ' 2) RUB таблица (если AH10=True)
+   '========================
+   If sendMain Then
+       reportSheet.Activate
+       RngMain.Copy
+       sel.Paste
+       sel.Collapse 0
+       sel.TypeParagraph
+       sel.TypeParagraph
+   End If
+
+   '========================
+   ' 3) CNY (если AK10=True) — после рублей, до опций
+   '========================
+   If sendCNY Then
+       sel.TypeText cnyText
+       sel.TypeParagraph
+
+       reportSheet.Activate
+       RngCNY.Copy
+       sel.Paste
+       sel.Collapse 0
+       sel.TypeParagraph
+       sel.TypeParagraph
+   End If
+
+   '========================
+   ' 4) USD (если AN10=True) — после CNY, до опций
+   '========================
+   If sendUSD Then
+       sel.TypeText usdText
+       sel.TypeParagraph
+
+       reportSheet.Activate
+       RngUSD.Copy
+       sel.Paste
+       sel.Collapse 0
+       sel.TypeParagraph
+       sel.TypeParagraph
+   End If
+
+   '========================
+   ' 5) Опции (если AH12=True)
+   '========================
+   If sendOptions Then
+       sel.TypeText optText
+       sel.TypeParagraph
+
+       optSheet.Activate
+       RngOpt.Copy
+       sel.Paste
+       sel.Collapse 0
+       sel.TypeParagraph
+       sel.TypeParagraph
+   End If
+
+   '========================
+   ' 6) Ликвидность ЮЛ (если AH14=True)
+   '========================
+   If sendLiqUL Then
+       sel.TypeText liqUlText
+       sel.TypeParagraph
+
+       liqUlSheet.Activate
+       RngLiqUl.Copy
+       sel.Paste
+       sel.Collapse 0
+       sel.TypeParagraph
+   End If
+
+Cleanup:
+   Application.ScreenUpdating = True
+   Set reportSheet = Nothing
+   Set optSheet = Nothing
+   Set liqUlSheet = Nothing
+   Set OutApp = Nothing
+   Set OutMail = Nothing
+   Set wEditor = Nothing
+   Set sel = Nothing
+   Exit Sub
+
+ErrorHandler:
+   MsgBox "Ошибка №" & Err.Number & ": " & Err.Description, vbCritical
+   GoTo Cleanup
+
+End Sub
