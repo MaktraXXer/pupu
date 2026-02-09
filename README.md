@@ -33,13 +33,14 @@ WHERE 1=1
 
 
 DROP TABLE IF EXISTS #cli_seg;
+
 SELECT
       dt_rep
     , cli_id
     , CASE
         WHEN MAX(CASE WHEN TSEGMENTNAME IN (N'ДЧБО') THEN 1 ELSE 0 END) = 1 THEN N'ДЧБО'
         ELSE N'Розница'
-      END AS client_segment
+      END AS [client_segment]
 INTO #cli_seg
 FROM #t
 GROUP BY dt_rep, cli_id;
@@ -51,7 +52,7 @@ DROP TABLE IF EXISTS #exit_clients;
 SELECT DISTINCT
       t.dt_rep
     , t.cli_id
-    , s.client_segment
+    , s.[client_segment]
 INTO #exit_clients
 FROM #t t
 JOIN #cli_seg s
@@ -67,7 +68,7 @@ DROP TABLE IF EXISTS #client;
 SELECT
       t.dt_rep
     , t.cli_id
-    , ec.client_segment
+    , ec.[client_segment]
     -- базовые балансы на дату @dt_rep (по всем продуктам клиента которые не так интересны)
     , SUM(CASE WHEN t.SECTION_NAME = N'Срочные ' AND t.is_floatrate = 1 THEN t.OUT_RUB ELSE 0 END) AS out_float_term_rub
     , SUM(CASE WHEN t.SECTION_NAME = N'Накопительный счёт' THEN t.OUT_RUB ELSE 0 END)             AS out_savings_total_rub
@@ -95,9 +96,8 @@ FROM #t t
 JOIN #exit_clients ec
   ON ec.dt_rep = t.dt_rep
  AND ec.cli_id = t.cli_id
-WHERE 1=1
-  AND ec.client_segment IN (N'ДЧБО', N'Розница')
-GROUP BY t.dt_rep, t.cli_id, ec.client_segment;
+GROUP BY t.dt_rep, t.cli_id, ec.[client_segment];
+
 
 /*Сохраняем
 */
