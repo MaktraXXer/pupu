@@ -6,8 +6,8 @@ SELECT
       0 AS sort_
     , N'ИТОГО 31.01 (балансы + плановые выходы)' AS row_type
     , CAST(NULL AS date) AS exit_day
-    , MIN(dt_rep) AS dt_rep
-    , COUNT(*)    AS clients_cnt
+    , d.dt_rep AS dt_rep
+    , COUNT(*) AS clients_cnt
 
     , SUM(out_savings_total_rub) / 1e9 AS ns_31jan_rub_bln
     , SUM(out_demand_total_rub)  / 1e9 AS dvs_31jan_rub_bln
@@ -22,7 +22,9 @@ SELECT
     , CAST(NULL AS float) AS promo_day_rub_bln
     , CAST(NULL AS float) AS nonpromo_day_rub_bln
     , CAST(NULL AS float) AS total_day_rub_bln
-FROM [WORK].[temp_client_exit_0201_0205]
+FROM [WORK].[temp_client_exit_0201_0205] c
+CROSS JOIN (SELECT DISTINCT dt_rep FROM [WORK].[temp_client_exit_0201_0205]) d
+GROUP BY d.dt_rep
 
 UNION ALL
 
@@ -30,8 +32,8 @@ SELECT
       1 AS sort_
     , N'ДЕТАЛИЗАЦИЯ ПО ДНЯМ (плановые выходы)' AS row_type
     , v.exit_day
-    , MIN(c.dt_rep) AS dt_rep
-    , COUNT(*)      AS clients_cnt
+    , d.dt_rep AS dt_rep
+    , COUNT(*) AS clients_cnt
 
     , CAST(NULL AS float) AS ns_31jan_rub_bln
     , CAST(NULL AS float) AS dvs_31jan_rub_bln
@@ -46,6 +48,7 @@ SELECT
     , SUM(v.nonpromo_rub) / 1e9 AS nonpromo_day_rub_bln
     , (SUM(v.promo_rub) + SUM(v.nonpromo_rub)) / 1e9 AS total_day_rub_bln
 FROM [WORK].[temp_client_exit_0201_0205] c
+CROSS JOIN (SELECT DISTINCT dt_rep FROM [WORK].[temp_client_exit_0201_0205]) d
 CROSS APPLY (VALUES
       ('2026-02-01', c.promo_exit_d1_rub, c.nonpromo_exit_d1_rub)
     , ('2026-02-02', c.promo_exit_d2_rub, c.nonpromo_exit_d2_rub)
@@ -53,5 +56,5 @@ CROSS APPLY (VALUES
     , ('2026-02-04', c.promo_exit_d4_rub, c.nonpromo_exit_d4_rub)
     , ('2026-02-05', c.promo_exit_d5_rub, c.nonpromo_exit_d5_rub)
 ) v(exit_day, promo_rub, nonpromo_rub)
-GROUP BY v.exit_day
+GROUP BY d.dt_rep, v.exit_day
 ORDER BY sort_, exit_day;
