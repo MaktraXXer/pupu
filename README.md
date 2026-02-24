@@ -1,81 +1,93 @@
-Если после внедрения фильтра CPR за 12.2025 почти не изменился или даже вырос, значит происходит одно из двух:
-
-1) Исключения реально НЕ применились (самое частое)
-
-Проверь это напрямую:
-
-A. Остались ли “исключённые” con_id в декабрьском payment_period? (должно быть 0)
-
-select count(*) as cnt_left
-from cpr_report_new r
-where r.payment_period = date'2025-12-31'
-  and exists (
-      select 1
-      from cpr_exclusions e
-      where e.con_id = r.con_id
-        and e.excl_reason = 'SECURITIZATION'
-        and last_day(e.excl_date) = r.payment_period
-  );
-
-Если cnt_left > 0, то причина обычно одна из:
-	•	в cpr_exclusions другой excl_reason (пробелы/регистр),
-	•	con_id в exclusions другого типа/формата,
-	•	excl_date не в декабре 2025 (например, 18.12 vs 19.12 — это ок; но если вообще другой месяц, то фильтр не сработает),
-	•	в exclusions лежат “не те” старые con_id (не совпадают с con_id из mort_od на 30.11.2025).
-
-B. Есть ли вообще эти con_id в базе для декабрьского расчёта? (они должны быть в cpr_report_new за dt_rep=2025-11-30 ДО фильтра; сейчас можно проверять через mort_od)
-
+/* ============================================================
+   1) CPR только по секьюритизированному пулу (по каждому payment_period)
+   Логика: договор относится к секьюритизации в тот payment_period,
+   который равен last_day(excl_date).
+   ============================================================ */
+with excl_by_payment_period as (
+    select e.con_id,
+           last_day(e.excl_date) as payment_period
+    from cpr_exclusions e
+    where e.excl_reason = 'SECURITIZATION'
+)
 select
-  count(*) as cnt_in_mort_od_1130
-from mort_od mo
-where mo.dt_rep = date'2025-11-30'
-  and exists (
-      select 1
-      from cpr_exclusions e
-      where e.con_id = mo.con_id
-        and e.excl_reason = 'SECURITIZATION'
-        and last_day(e.excl_date) = date'2025-12-31'
-  );
-
-Если cnt_in_mort_od_1130 = 0, значит exclusions заполнены не теми con_id (или событие не так определяется).
-
-⸻
-
-2) Фильтр применился, но рост CPR объясним математически
-
-Ты сейчас делаешь Вариант A: убираешь строки целиком ⇒ одновременно убираешь и знаменатель (od_after_plan), и числитель (premat_payment) по этим con_id.
-
-Если секьюритизированный портфель был “низко-CPR” (большой баланс, мало досрочек), то после его удаления:
-	•	общий sum(od_after_plan) резко упадёт,
-	•	а sum(premat_payment) по остальным договорам останется,
-	•	доля premat/od_after_plan вырастет ⇒ CPR может вырасти.
-
-Это не означает, что фильтр “не работает”. Это означает, что секьюритизированный кусок был “стабилизатором” CPR.
-
-Проверь вклад исключённых в декабрь:
-
-select
-  sum(r.od_after_plan) as excl_od_after_plan,
-  sum(r.premat_payment) as excl_premat,
-  case when sum(r.od_after_plan) = 0 then null
-       else round(100 * sum(r.premat_payment)/sum(r.od_after_plan), 4)
-  end as excl_smm_pct
+    r.payment_period as dt_rep,
+    case when r.agg_prod_name is null then 'Ипотека Прочее' else r.agg_prod_name end as prod_name,
+    sum(r.od_after_plan) as od_after_plan,
+    sum(r.od) as od,
+    sum(r.premat_payment) as premat,
+    case
+        when sum(r.od_after_plan) <= 0 then 0
+        else round(100 * (1 - power(1 - sum(r.premat_payment)/sum(r.od_after_plan), 12)), 2)
+    end as cpr
 from cpr_report_new r
-where r.payment_period = date'2025-12-31'
+where r.payment_period between date'2024-01-01' and date'2025-12-31'
   and exists (
       select 1
-      from cpr_exclusions e
+      from excl_by_payment_period e
       where e.con_id = r.con_id
-        and e.excl_reason = 'SECURITIZATION'
-        and last_day(e.excl_date) = r.payment_period
-  );
+        and e.payment_period = r.payment_period
+  )
+group by
+    r.payment_period,
+    case when r.agg_prod_name is null then 'Ипотека Прочее' else r.agg_prod_name end
+order by
+    case when prod_name = 'Семейная ипотека' then 0
+         when prod_name = 'Льготная ипотека' then 1
+         when prod_name = 'ИТ ипотека' then 2
+         when prod_name = 'Дальневосточная ипотека' then 3
+         when prod_name = 'Первичная ипотека' then 4
+         when prod_name = 'Вторичка' then 5
+         when prod_name = 'Рефинансирование' then 6
+         when prod_name = 'Военная ипотека' then 7
+         when prod_name = 'ИЖС' then 8
+         when prod_name = 'Ипотека Прочее' then 9
+         else 10 end,
+    r.payment_period;
 
-(Если у тебя фильтр уже выкинул их из cpr_report_new, этот запрос вернёт 0 — тогда делай аналогичный расчёт через временный прогон без фильтра или через mort_od + pay отдельно.)
 
-⸻
 
-Практический вывод
-	•	Если пункт (1) показывает, что исключения не применились — чиним заполнение cpr_exclusions или ключи (это самый вероятный сценарий).
-	•	Если пункт (1) ок, но пункт (2) показывает, что секьюритизированные имели низкий SMM, то Вариант A действительно может повысить CPR. Тогда, если цель именно “убрать искусственную досрочку от продажи”, корректнее становится Вариант B: оставлять их в знаменателе за декабрь, но занулять/исключать только premat_payment в декабре (то есть вычистить “ложный” числитель, не ломая базу экспозиции месяца).
-
-Если скажешь результат проверки cnt_left и cnt_in_mort_od_1130, я коротко скажу, что именно у тебя происходит и какую правку лучше выбрать (A или B) под вашу бизнес-методику.
+/* ============================================================
+   2) CPR по НЕсекьюритизированному пулу (по каждому payment_period)
+   То есть "весь портфель МИНУС секьюритизированные con_id
+   в соответствующий payment_period".
+   ============================================================ */
+with excl_by_payment_period as (
+    select e.con_id,
+           last_day(e.excl_date) as payment_period
+    from cpr_exclusions e
+    where e.excl_reason = 'SECURITIZATION'
+)
+select
+    r.payment_period as dt_rep,
+    case when r.agg_prod_name is null then 'Ипотека Прочее' else r.agg_prod_name end as prod_name,
+    sum(r.od_after_plan) as od_after_plan,
+    sum(r.od) as od,
+    sum(r.premat_payment) as premat,
+    case
+        when sum(r.od_after_plan) <= 0 then 0
+        else round(100 * (1 - power(1 - sum(r.premat_payment)/sum(r.od_after_plan), 12)), 2)
+    end as cpr
+from cpr_report_new r
+where r.payment_period between date'2024-01-01' and date'2025-12-31'
+  and not exists (
+      select 1
+      from excl_by_payment_period e
+      where e.con_id = r.con_id
+        and e.payment_period = r.payment_period
+  )
+group by
+    r.payment_period,
+    case when r.agg_prod_name is null then 'Ипотека Прочее' else r.agg_prod_name end
+order by
+    case when prod_name = 'Семейная ипотека' then 0
+         when prod_name = 'Льготная ипотека' then 1
+         when prod_name = 'ИТ ипотека' then 2
+         when prod_name = 'Дальневосточная ипотека' then 3
+         when prod_name = 'Первичная ипотека' then 4
+         when prod_name = 'Вторичка' then 5
+         when prod_name = 'Рефинансирование' then 6
+         when prod_name = 'Военная ипотека' then 7
+         when prod_name = 'ИЖС' then 8
+         when prod_name = 'Ипотека Прочее' then 9
+         else 10 end,
+    r.payment_period;
