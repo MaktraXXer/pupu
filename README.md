@@ -1,227 +1,133 @@
-/* ============================================================================
-   ВАРИАНТ A (правильный): исключаем и знаменатель, и числитель
-   - Скрипт 1 (mort_od) НЕ трогаем
-   - В скрипте 2 исключаем из CPR те con_id, которые попали под секьюритизацию
-     ТОЛЬКО в том платёжном периоде, в котором была секьюритизация
-     (payment_period = last_day(excl_date))
-   - Таблица исключений постоянная: cpr_exclusions(con_id, excl_date, excl_reason)
-   ============================================================================ */
+drop table cpr_report_new;
 
+create table cpr_report_new as
 
---------------------------------------------------------------------------------
--- ШАГ 0 (ОДИН РАЗ): создаём таблицу исключений
--- Если таблица уже есть — этот шаг пропускаем вручную.
---------------------------------------------------------------------------------
-CREATE TABLE cpr_exclusions (
-    con_id       NUMBER       NOT NULL,
-    excl_date    DATE         NOT NULL,
-    excl_reason  VARCHAR2(64) NOT NULL,
-    CONSTRAINT pk_cpr_exclusions PRIMARY KEY (con_id, excl_date, excl_reason)
-);
-
-COMMENT ON TABLE  cpr_exclusions IS 'Исключения из расчёта CPR (например, секьюритизация).';
-COMMENT ON COLUMN cpr_exclusions.con_id      IS 'CON_ID договора на балансе банка ДО события.';
-COMMENT ON COLUMN cpr_exclusions.excl_date   IS 'Дата события (например, дата секьюритизации).';
-COMMENT ON COLUMN cpr_exclusions.excl_reason IS 'Причина исключения (SECURITIZATION и т.п.).';
-
-
---------------------------------------------------------------------------------
--- ШАГ 1 (КАЖДЫЙ ЗАПУСК / ПО МЕРЕ ПОЯВЛЕНИЯ НОВЫХ СДЕЛОК):
--- ДОзаполняем таблицу исключений через MERGE (без dynamic SQL)
--- Пример для события 19.12.2025
---------------------------------------------------------------------------------
-MERGE INTO cpr_exclusions t
-USING (
-    SELECT
-        r.con_id                         AS con_id,
-        DATE '2025-12-19'                AS excl_date,
-        'SECURITIZATION'                 AS excl_reason
-    FROM dds.con_rel r
-    WHERE r.con_rel_type = 'SECURITIZATION'
-      AND r.con_id_rel IN (
-            SELECT c.con_id
-            FROM dds.contract c
-            WHERE c.bal_holder   = 'DOM'
-              AND c.dt_first_act = DATE '2025-12-19'
-      )
-) s
-ON (
-    t.con_id      = s.con_id
-AND t.excl_date   = s.excl_date
-AND t.excl_reason = s.excl_reason
-)
-WHEN NOT MATCHED THEN
-  INSERT (con_id, excl_date, excl_reason)
-  VALUES (s.con_id, s.excl_date, s.excl_reason);
-
-COMMIT;
-
-
---------------------------------------------------------------------------------
--- ШАГ 2: Пересоздаём cpr_report_new с учётом исключений
--- Вручную:
---   1) DROP TABLE cpr_report_new;
---   2) CREATE TABLE cpr_report_new AS ... (ниже)
---------------------------------------------------------------------------------
-DROP TABLE cpr_report_new PURGE;
-
-CREATE TABLE cpr_report_new AS
-WITH
-/* 1) Ставки рефинансирования помесячно */
-refin_rates AS (
-    SELECT
-        LAST_DAY(TO_DATE(TO_CHAR(dt_rep, 'YYYY-MM'), 'YYYY-MM')) AS period,
-        ROUND(AVG(refin_rate), 4) AS refin_rate
-    FROM man_refin_rates
-    GROUP BY LAST_DAY(TO_DATE(TO_CHAR(dt_rep, 'YYYY-MM'), 'YYYY-MM'))
+with refin_rates as (
+select last_day(to_date(to_char(dt_rep, 'YYYY-MM'), 'YYYY-MM')) period,
+       round(avg(refin_rate), 4) refin_rate
+from man_refin_rates -- Справочник с историческими ставками рефинансирования ипотеки на рынке
+group by last_day(to_date(to_char(dt_rep, 'YYYY-MM'), 'YYYY-MM'))
 ),
 
-/* 2) Таблица исключений, развёрнутая в "платёжный период", который исключаем */
-excl_by_payment_period AS (
-    SELECT
-        e.con_id,
-        LAST_DAY(e.excl_date) AS payment_period,
-        e.excl_reason
-    FROM cpr_exclusions e
-    WHERE e.excl_reason = 'SECURITIZATION'
+/* Таблица исключений, развернутая в "платёжный период", который нужно исключить
+   Логика: событие с датой excl_date исключаем в месяце payment_period = last_day(excl_date)
+   (то есть для секьюритизации 2025-12-19 исключаем расчёт за payment_period = 2025-12-31) */
+excl_by_payment_period as (
+select e.con_id,
+       last_day(e.excl_date) as payment_period,
+       e.excl_reason
+from cpr_exclusions e
+where e.excl_reason = 'SECURITIZATION'
 ),
 
-/* 3) Базовые признаки из mort_od + расчёт стимула */
-initial_table AS (
-    SELECT
-        mo.con_id,
-        mo.dt_rep,
-        mo.dt_open_fact,
-        mo.dt_close_plan,
-        mo.dt_close_fact,
-        ROUND((mo.dt_rep - mo.dt_open_fact) / 365, 2) AS age,
-        -mo.out_rub AS od,
-        mo.con_rate,
-        mo.agg_prod_name,
-        mo.segment_name,
-        ROUND((mo.dt_close_plan - mo.dt_rep) / 365, 2) AS term,
-        (TO_NUMBER(TO_CHAR(mo.dt_close_plan, 'yyyy'), '9999') - TO_NUMBER(TO_CHAR(mo.dt_rep, 'yyyy'), '9999')) * 12
-        + (TO_NUMBER(TO_CHAR(mo.dt_close_plan, 'mm'), '99') - TO_NUMBER(TO_CHAR(mo.dt_rep, 'mm'), '99')) AS term_months,
-        CASE
-            WHEN mo.con_rate < 0.03 THEN '0. <3%'
-            WHEN mo.con_rate BETWEEN 0.03 AND 0.06 THEN '1. 3-6%'
-            WHEN mo.con_rate BETWEEN 0.06 AND 0.09 THEN '2. 6-9%'
-            WHEN mo.con_rate BETWEEN 0.09 AND 0.12 THEN '3. 9-12%'
-            WHEN mo.con_rate BETWEEN 0.12 AND 0.15 THEN '4. 12-15%'
-            WHEN mo.con_rate BETWEEN 0.15 AND 0.18 THEN '5. 15-18%'
-            WHEN mo.con_rate BETWEEN 0.18 AND 0.21 THEN '6. 18-21%'
-            WHEN mo.con_rate > 0.21 THEN '7. >21%'
-            ELSE '8. undefined rate'
-        END AS rate_group,
-        CASE
-            WHEN mo.agg_prod_name IN ('Семейная ипотека', 'Льготная ипотека', 'ИТ ипотека', 'Дальневосточная ипотека') THEN 1
-            ELSE 0
-        END AS subsidy,
-        LAST_DAY(mo.dt_open_fact) AS generation,
-        rr.refin_rate,
-        ROUND(100 * (mo.con_rate - rr.refin_rate), 1) AS stimul
-    FROM mort_od mo
-    LEFT JOIN refin_rates rr
-        ON LAST_DAY(ADD_MONTHS(rr.period, 1)) = mo.dt_rep
-    WHERE 1 = 1
-      AND mo.con_rate IS NOT NULL
-      AND mo.con_rate > 0
-      AND mo.out_rub IS NOT NULL
-      AND mo.acc_role = 'DUE'
+initial_table as ( -- Берём нужные признаки из mort_od, добавляем доп. переменные со сроками, группами по размеру ставки и т. д.
+select con_id,
+       dt_rep,
+       dt_open_fact,
+       dt_close_plan,
+       dt_close_fact,
+       round((dt_rep - dt_open_fact)/365, 2) as age,
+       -out_rub as od,
+       con_rate,
+       agg_prod_name,
+       segment_name,
+       round((dt_close_plan - dt_rep)/365, 2) as term,
+       (to_number(to_char(dt_close_plan, 'yyyy'), '9999') - to_number(to_char(dt_rep, 'yyyy'), '9999'))*12 +
+                                              (to_number(to_char(dt_close_plan, 'mm'), '99') - to_number(to_char(dt_rep, 'mm'), '99')) term_months,
+       case when con_rate < 0.03 then '0. <3%'
+            when con_rate between 0.03 and 0.06 then '1. 3-6%'
+            when con_rate between 0.06 and 0.09 then '2. 6-9%'
+            when con_rate between 0.09 and 0.12 then '3. 9-12%'
+            when con_rate between 0.12 and 0.15 then '4. 12-15%'
+            when con_rate between 0.15 and 0.18 then '5. 15-18%'
+            when con_rate between 0.18 and 0.21 then '6. 18-21%'
+            when con_rate > 0.21 then '7. >21%'
+            else '8. undefined rate' end rate_group,
+       case when agg_prod_name in ('Семейная ипотека', 'Льготная ипотека', 'ИТ ипотека', 'Дальневосточная ипотека') then 1
+            else 0 end as subsidy,
+       last_day(dt_open_fact) as generation,
+       refin_rate,
+       round(100*(con_rate - refin_rate), 1) as stimul -- Стимул к рефинансированию
+from mort_od
+left join refin_rates
+          on last_day(add_months(refin_rates.period, 1)) = mort_od.dt_rep
+where 1 = 1
+      and con_rate is not null
+      and con_rate > 0
+      and out_rub is not null
+      and acc_role = 'DUE'
 ),
 
-/* 4) Добавляем age_group + аннуитетные компоненты */
-prelim_table AS (
-    SELECT
-        it.*,
-        CASE
-            WHEN age <= 1 THEN '0-1Y'
-            WHEN age BETWEEN 1 AND 2 THEN '1-2Y'
-            WHEN age BETWEEN 2 AND 3 THEN '2-3Y'
-            WHEN age BETWEEN 3 AND 4 THEN '3-4Y'
-            WHEN age BETWEEN 4 AND 5 THEN '4-5Y'
-            WHEN age BETWEEN 5 AND 6 THEN '5-6Y'
-            WHEN age BETWEEN 6 AND 7 THEN '6-7Y'
-            WHEN age BETWEEN 7 AND 8 THEN '7-8Y'
-            WHEN age BETWEEN 8 AND 9 THEN '8-9Y'
-            WHEN age > 9 THEN '9Y+'
-            ELSE 'undefined'
-        END AS age_group,
-        CASE
-            WHEN age <= 1 THEN 0
-            WHEN age BETWEEN 1 AND 2 THEN 1
-            WHEN age BETWEEN 2 AND 3 THEN 2
-            WHEN age BETWEEN 3 AND 4 THEN 3
-            WHEN age BETWEEN 4 AND 5 THEN 4
-            WHEN age BETWEEN 5 AND 6 THEN 5
-            WHEN age BETWEEN 6 AND 7 THEN 6
-            WHEN age BETWEEN 7 AND 8 THEN 7
-            WHEN age BETWEEN 8 AND 9 THEN 8
-            ELSE 9
-        END AS age_group_id,
-        CASE
-            WHEN term_months > 0 THEN ROUND(od / (1 - POWER(1 + con_rate/12, -term_months)) * (con_rate/12), 2)
-            ELSE 0
-        END AS annuity,
-        CASE
-            WHEN term_months > 0 THEN ROUND(od * con_rate/12, 2)
-            ELSE 0
-        END AS interest_pay,
-        CASE
-            WHEN term_months > 0 THEN
-                ROUND(od / (1 - POWER(1 + con_rate/12, -term_months)) * (con_rate/12), 2)
-                - ROUND(od * con_rate/12, 2)
-            ELSE 0
-        END AS od_plan_payment
-    FROM initial_table it
+prelim_table as ( -- Добавляем группы по выдержке кредита, вычисляем аннуитетные платежи в разбивке на платёж процентов и платёж долга
+select initial_table.*,
+       case when age <= 1 then '0-1Y'
+            when age between 1 and 2 then '1-2Y'
+            when age between 2 and 3 then '2-3Y'
+            when age between 3 and 4 then '3-4Y'
+            when age between 4 and 5 then '4-5Y'
+            when age between 5 and 6 then '5-6Y'
+            when age between 6 and 7 then '6-7Y'
+            when age between 7 and 8 then '7-8Y'
+            when age between 8 and 9 then '8-9Y'
+            when age > 9 then '9Y+'
+            else 'undefined'
+       end age_group,
+       case when age <= 1 then 0
+            when age between 1 and 2 then 1
+            when age between 2 and 3 then 2
+            when age between 3 and 4 then 3
+            when age between 4 and 5 then 4
+            when age between 5 and 6 then 5
+            when age between 6 and 7 then 6
+            when age between 7 and 8 then 7
+            when age between 8 and 9 then 8
+            else 9
+       end age_group_id,
+       case when term_months > 0 then round(od / (1 - power(1 + con_rate/12, -term_months)) * (con_rate/12), 2)
+            else 0 end annuity,
+       case when term_months > 0 then round(od * con_rate/12, 2)
+            else 0 end interest_pay,
+       case when term_months > 0 then round(od / (1 - power(1 + con_rate/12, -term_months)) * (con_rate/12), 2) - round(od * con_rate/12, 2)
+            else 0 end od_plan_payment
+from initial_table
 ),
 
-/* 5) Остаток после планового платежа */
-final_bal AS (
-    SELECT
-        pt.*,
-        pt.od AS od_before_plan,
-        CASE
-            WHEN pt.od - pt.od_plan_payment < 0 THEN 0
-            ELSE pt.od - pt.od_plan_payment
-        END AS od_after_plan
-    FROM prelim_table pt
+final_bal as ( -- Для расчёта CPR нам нужен остаток долга ПОСЛЕ планового платежа долга
+select prelim_table.*,
+       od as od_before_plan,
+       case when od - od_plan_payment < 0 then 0 else od - od_plan_payment end as od_after_plan
+from prelim_table
 ),
 
-/* 6) Досрочные платежи по договорам помесячно */
-pay AS (
-    SELECT
-        co.con_id,
-        LAST_DAY(co.dt_oper) AS dt,
-        SUM(co.vl_rub) AS premat_pay
-    FROM dds.con_oper co
-    WHERE 1 = 1
-      AND co.cur = '810'
-      AND co.oper_type = 'PAYMENT_PREMAT'
-      AND co.con_id IN (SELECT con_id FROM final_bal)
-    GROUP BY co.con_id, LAST_DAY(co.dt_oper)
+pay as ( -- Собираем помесячные досрочные платежи по договорам
+select con_id,
+       last_day(dt_oper) dt,
+       sum(vl_rub) premat_pay
+from dds.con_oper
+where 1 = 1
+      and cur = '810'
+      and oper_type = 'PAYMENT_PREMAT'
+      and con_id in (select con_id from final_bal)
+group by con_id, last_day(dt_oper)
 )
 
-SELECT
-    fb.*,
-    LAST_DAY(ADD_MONTHS(fb.dt_rep, 1)) AS payment_period,
-    CASE
-        WHEN COALESCE(p.premat_pay, 0) >= fb.od_after_plan THEN fb.od_after_plan
-        ELSE COALESCE(p.premat_pay, 0)
-    END AS premat_payment,
-    params.b0
-      + params.b1 * ATAN(params.b2 + params.b3 * fb.stimul)
-      + params.b4 * ATAN(params.b5 + params.b6 * fb.stimul) AS model_cpr
-FROM final_bal fb
-LEFT JOIN pay p
-    ON p.dt = LAST_DAY(ADD_MONTHS(fb.dt_rep, 1))
-   AND p.con_id = fb.con_id
-LEFT JOIN s_curve_params params
-    ON fb.age_group_id = params.period
+select final_bal.*,
+       last_day(add_months(final_bal.dt_rep, 1)) as payment_period,
+       case when coalesce(pay.premat_pay, 0) >= od_after_plan then od_after_plan else coalesce(pay.premat_pay, 0) end premat_payment,
+       params.b0 + params.b1 * ATAN(params.b2 + params.b3 * stimul) + params.b4 * ATAN(params.b5 + params.b6 * stimul) model_cpr -- Модельный CPR по модели Ценового центра
+from final_bal
+left join pay
+          on 1 = 1
+             and last_day(add_months(final_bal.dt_rep, 1)) = pay.dt
+             and final_bal.con_id = pay.con_id
+left join s_curve_params params -- Справочник с параметрами модели Ценового центра
+          on final_bal.age_group_id = params.period
 /* КЛЮЧЕВОЕ: исключаем con_id только в тот payment_period, когда была секьюритизация */
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM excl_by_payment_period e
-    WHERE e.con_id = fb.con_id
-      AND e.payment_period = LAST_DAY(ADD_MONTHS(fb.dt_rep, 1))
-);
+where not exists (
+    select 1
+    from excl_by_payment_period e
+    where e.con_id = final_bal.con_id
+      and e.payment_period = last_day(add_months(final_bal.dt_rep, 1))
+)
+order by final_bal.con_id,
+         final_bal.dt_rep;
