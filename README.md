@@ -3,9 +3,8 @@
    Только НЕсекьюритизированные
    Только продукты: Семейная / Льготная / ИТ / Дальневосточная ипотека
 
-   Примечание:
-   - сортируем по premat_payment (убывание)
-   - при равенстве можно добивать od_after_plan / con_id
+   Дополнительно: выводим CPR по договору (на базе SMM = premat_payment/od_after_plan)
+   CPR_con = 100 * (1 - (1 - SMM)^12)
    ============================================================ */
 
 with secur_cohort as (
@@ -32,7 +31,11 @@ base as (
         r.term_months,
         r.od_after_plan,
         r.od,
-        r.premat_payment
+        r.premat_payment,
+        case
+            when r.od_after_plan <= 0 then 0
+            else round(100 * (1 - power(1 - (r.premat_payment / r.od_after_plan), 12)), 6)
+        end as cpr_con
     from cpr_report_new r
     where r.payment_period = date'2025-12-31'
       and r.agg_prod_name in ('Семейная ипотека', 'Льготная ипотека', 'ИТ ипотека', 'Дальневосточная ипотека')
@@ -61,7 +64,8 @@ from (
         term,
         term_months,
         od_after_plan,
-        premat_payment
+        premat_payment,
+        cpr_con
     from base
     order by premat_payment desc, od_after_plan desc, con_id
 )
