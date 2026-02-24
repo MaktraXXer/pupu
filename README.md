@@ -1,94 +1,75 @@
 /* ============================================================
-   1) Историческая CPR-динамика по "когорте" секьюритизированных con_id
-      (те же con_id, которые потом секьюритизировали), по каждому payment_period
-   Важно: НЕ привязываем к месяцу секьюритизации, просто берём список con_id.
-   При желании можно сузить по конкретной дате секьюритизации (см. комментарий).
+   ТОП-20 ДОГОВОРОВ по CPR (убывание) за декабрь 2025 (payment_period=31.12.2025)
+   Только НЕсекьюритизированные (con_id отсутствует в cpr_exclusions по SECURITIZATION)
+   Только продукты: Семейная / Льготная / ИТ / Дальневосточная ипотека
+
+   Важно:
+   - CPR на уровне договора считаем из его SMM:
+       SMM = premat_payment / od_after_plan
+       CPR = 100 * (1 - (1 - SMM)^12)
+   - Если od_after_plan = 0, CPR считаем 0 (чтобы не делить на 0)
    ============================================================ */
 
 with secur_cohort as (
     select distinct e.con_id
     from cpr_exclusions e
     where e.excl_reason = 'SECURITIZATION'
-    -- если нужно строго под сделку 19.12.2025, раскомментируй:
-    -- and e.excl_date = date'2025-12-19'
+),
+
+base as (
+    select
+        r.con_id,
+        r.payment_period,
+        r.agg_prod_name,
+        r.segment_name,
+        r.dt_rep,
+        r.dt_open_fact,
+        r.dt_close_plan,
+        r.dt_close_fact,
+        r.con_rate,
+        r.refin_rate,
+        r.stimul,
+        r.age,
+        r.term,
+        r.term_months,
+        r.od_after_plan,
+        r.od,
+        r.premat_payment,
+        case
+            when r.od_after_plan <= 0 then 0
+            else round(100 * (1 - power(1 - (r.premat_payment / r.od_after_plan), 12)), 6)
+        end as cpr_con
+    from cpr_report_new r
+    where r.payment_period = date'2025-12-31'
+      and r.agg_prod_name in ('Семейная ипотека', 'Льготная ипотека', 'ИТ ипотека', 'Дальневосточная ипотека')
+      and not exists (
+          select 1
+          from secur_cohort s
+          where s.con_id = r.con_id
+      )
 )
-select
-    r.payment_period as dt_rep,
-    case when r.agg_prod_name is null then 'Ипотека Прочее' else r.agg_prod_name end as prod_name,
-    sum(r.od_after_plan) as od_after_plan,
-    sum(r.od) as od,
-    sum(r.premat_payment) as premat,
-    case when sum(r.od_after_plan) <= 0 then 0
-         else round(100 * (1 - power(1 - sum(r.premat_payment)/sum(r.od_after_plan), 12)), 2)
-    end as CPR
-from cpr_report_new r
-where r.payment_period between date'2024-01-01' and date'2025-12-31'
-  and exists (
-      select 1
-      from secur_cohort s
-      where s.con_id = r.con_id
-  )
-group by
-    r.payment_period,
-    case when r.agg_prod_name is null then 'Ипотека Прочее' else r.agg_prod_name end
-order by
-    case when prod_name = 'Семейная ипотека' then 0
-         when prod_name = 'Льготная ипотека' then 1
-         when prod_name = 'ИТ ипотека' then 2
-         when prod_name = 'Дальневосточная ипотека' then 3
-         when prod_name = 'Первичная ипотека' then 4
-         when prod_name = 'Вторичка' then 5
-         when prod_name = 'Рефинансирование' then 6
-         when prod_name = 'Военная ипотека' then 7
-         when prod_name = 'ИЖС' then 8
-         when prod_name = 'Ипотека Прочее' then 9
-         else 10 end,
-    r.payment_period;
 
-
-
-/* ============================================================
-   2) Историческая CPR-динамика по "когорте" НЕсекьюритизированных con_id
-      (все con_id, которых нет в cpr_exclusions по SECURITIZATION),
-      по каждому payment_period
-   ============================================================ */
-
-with secur_cohort as (
-    select distinct e.con_id
-    from cpr_exclusions e
-    where e.excl_reason = 'SECURITIZATION'
-    -- если нужно строго под сделку 19.12.2025, раскомментируй:
-    -- and e.excl_date = date'2025-12-19'
+select *
+from (
+    select
+        con_id,
+        agg_prod_name,
+        segment_name,
+        payment_period,
+        dt_rep,
+        dt_open_fact,
+        dt_close_plan,
+        dt_close_fact,
+        con_rate,
+        refin_rate,
+        stimul,
+        age,
+        term,
+        term_months,
+        od_after_plan,
+        premat_payment,
+        cpr_con
+    from base
+    order by cpr_con desc, premat_payment desc, od_after_plan desc
 )
-select
-    r.payment_period as dt_rep,
-    case when r.agg_prod_name is null then 'Ипотека Прочее' else r.agg_prod_name end as prod_name,
-    sum(r.od_after_plan) as od_after_plan,
-    sum(r.od) as od,
-    sum(r.premat_payment) as premat,
-    case when sum(r.od_after_plan) <= 0 then 0
-         else round(100 * (1 - power(1 - sum(r.premat_payment)/sum(r.od_after_plan), 12)), 2)
-    end as CPR
-from cpr_report_new r
-where r.payment_period between date'2024-01-01' and date'2025-12-31'
-  and not exists (
-      select 1
-      from secur_cohort s
-      where s.con_id = r.con_id
-  )
-group by
-    r.payment_period,
-    case when r.agg_prod_name is null then 'Ипотека Прочее' else r.agg_prod_name end
-order by
-    case when prod_name = 'Семейная ипотека' then 0
-         when prod_name = 'Льготная ипотека' then 1
-         when prod_name = 'ИТ ипотека' then 2
-         when prod_name = 'Дальневосточная ипотека' then 3
-         when prod_name = 'Первичная ипотека' then 4
-         when prod_name = 'Вторичка' then 5
-         when prod_name = 'Рефинансирование' then 6
-         when prod_name = 'Военная ипотека' then 7
-         when prod_name = 'ИЖС' then 8
-         when prod_name = 'Ипотека Прочее' then 9
-         else 10 end,
-    r.payment_period;
+where rownum <= 20;
