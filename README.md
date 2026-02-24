@@ -1,13 +1,11 @@
 /* ============================================================
-   ТОП-20 ДОГОВОРОВ по CPR (убывание) за декабрь 2025 (payment_period=31.12.2025)
-   Только НЕсекьюритизированные (con_id отсутствует в cpr_exclusions по SECURITIZATION)
+   ТОП-20 ДОГОВОРОВ по сумме досрочки (premat_payment) за декабрь 2025
+   Только НЕсекьюритизированные
    Только продукты: Семейная / Льготная / ИТ / Дальневосточная ипотека
 
-   Важно:
-   - CPR на уровне договора считаем из его SMM:
-       SMM = premat_payment / od_after_plan
-       CPR = 100 * (1 - (1 - SMM)^12)
-   - Если od_after_plan = 0, CPR считаем 0 (чтобы не делить на 0)
+   Примечание:
+   - сортируем по premat_payment (убывание)
+   - при равенстве можно добивать od_after_plan / con_id
    ============================================================ */
 
 with secur_cohort as (
@@ -34,11 +32,7 @@ base as (
         r.term_months,
         r.od_after_plan,
         r.od,
-        r.premat_payment,
-        case
-            when r.od_after_plan <= 0 then 0
-            else round(100 * (1 - power(1 - (r.premat_payment / r.od_after_plan), 12)), 6)
-        end as cpr_con
+        r.premat_payment
     from cpr_report_new r
     where r.payment_period = date'2025-12-31'
       and r.agg_prod_name in ('Семейная ипотека', 'Льготная ипотека', 'ИТ ипотека', 'Дальневосточная ипотека')
@@ -67,9 +61,8 @@ from (
         term,
         term_months,
         od_after_plan,
-        premat_payment,
-        cpr_con
+        premat_payment
     from base
-    order by cpr_con desc, premat_payment desc, od_after_plan desc
+    order by premat_payment desc, od_after_plan desc, con_id
 )
 where rownum <= 20;
