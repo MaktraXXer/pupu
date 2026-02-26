@@ -1,118 +1,79 @@
-/* ============================================================
-   ТОП-5 сделок (con_id) по каждой программе за декабрь 2025,
-   которые дают наибольший вклад в CPR (в терминах ΔCPR),
-   + выводим дополнительные поля из cpr_report_new:
-     con_rate, age, term, refin_rate, stimul
-   ============================================================ */
+DECLARE @DateFrom date = '2026-02-01';
+DECLARE @DateTo   date = CONVERT(date, GETDATE()-2);
 
-with base as (
-    select
-        r.con_id,
-        case when r.agg_prod_name is null then 'Ипотека Прочее' else r.agg_prod_name end as prod_name,
-        r.od_after_plan,
-        r.premat_payment,
-        r.con_rate,
-        r.age,
-        r.term,
-        r.refin_rate,
-        r.stimul
-    from cpr_report_new r
-    where r.payment_period = date'2025-12-31'
-),
-
-agg as (
-    select
-        prod_name,
-        sum(od_after_plan) as T,
-        sum(premat_payment) as P
-    from base
-    group by prod_name
-),
-
-scored as (
-    select
-        b.prod_name,
-        b.con_id,
-        b.od_after_plan as t_i,
-        b.premat_payment as p_i,
-        b.con_rate,
-        b.age,
-        b.term,
-        b.refin_rate,
-        b.stimul,
-        a.T,
-        a.P,
-
-        /* CPR договора (если od_after_plan=0 => 0) */
-        case
-            when b.od_after_plan <= 0 then 0
-            else 100 * (1 - power(1 - (b.premat_payment / b.od_after_plan), 12))
-        end as cpr_con,
-
-        /* CPR_total по программе */
-        case
-            when a.T <= 0 then 0
-            else 100 * (1 - power(1 - (a.P / a.T), 12))
-        end as cpr_total,
-
-        /* CPR_without_i по программе */
-        case
-            when (a.T - b.od_after_plan) <= 0 then null
-            else 100 * (1 - power(1 - ((a.P - b.premat_payment) / (a.T - b.od_after_plan)), 12))
-        end as cpr_wo_i,
-
-        /* delta CPR = CPR_total - CPR_without_i */
-        case
-            when (a.T - b.od_after_plan) <= 0 then null
-            when a.T <= 0 then 0
-            else
-                (100 * (1 - power(1 - (a.P / a.T), 12)))
-                -
-                (100 * (1 - power(1 - ((a.P - b.premat_payment) / (a.T - b.od_after_plan)), 12)))
-        end as delta_cpr
-
-    from base b
-    join agg a
-      on a.prod_name = b.prod_name
-),
-
-ranked as (
-    select
-        s.*,
-        row_number() over (
-            partition by s.prod_name
-            order by s.delta_cpr desc nulls last, s.p_i desc, s.t_i asc, s.con_id
-        ) as rn
-    from scored s
+;WITH prod_ref AS (
+    SELECT 'Надёжный прайм' AS prod_name UNION ALL
+    SELECT 'Надёжный VIP' UNION ALL
+    SELECT 'Надёжный премиум' UNION ALL
+    SELECT 'Надёжный промо' UNION ALL
+    SELECT 'Надёжный старт' UNION ALL
+    SELECT 'Надёжный Т2' UNION ALL
+    SELECT 'Надёжный Мегафон' UNION ALL
+    SELECT 'Могучий' UNION ALL
+    SELECT 'ДОМа надёжно' UNION ALL
+    SELECT 'Всё в ДОМ'
 )
+SELECT
+    t.dt_rep,
+    SUM(t.out_rub) AS out_rub_total,
 
-select
-    prod_name,
-    con_id,
-    round(t_i, 2) as od_after_plan,
-    round(p_i, 2) as premat_payment,
-    round(con_rate, 6) as con_rate,
-    round(age, 2) as age,
-    round(term, 2) as term,
-    round(refin_rate, 6) as refin_rate,
-    round(stimul, 1) as stimul,
-    round(cpr_con, 6) as cpr_con,
-    round(cpr_total, 6) as cpr_total,
-    round(cpr_wo_i, 6) as cpr_without_i,
-    round(delta_cpr, 6) as delta_cpr
-from ranked
-where rn <= 5
-order by
-    case when prod_name = 'Семейная ипотека' then 0
-         when prod_name = 'Льготная ипотека' then 1
-         when prod_name = 'ИТ ипотека' then 2
-         when prod_name = 'Дальневосточная ипотека' then 3
-         when prod_name = 'Первичная ипотека' then 4
-         when prod_name = 'Вторичка' then 5
-         when prod_name = 'Рефинансирование' then 6
-         when prod_name = 'Военная ипотека' then 7
-         when prod_name = 'ИЖС' then 8
-         when prod_name = 'Ипотека Прочее' then 9
-         else 10 end,
-    prod_name,
-    rn;
+    -- твоя средневзвешенная ETS-ставка (как было)
+    SUM(
+        CASE
+            WHEN t.rate_trf IS NOT NULL AND t.rate_con IS NOT NULL THEN
+                (
+                    CASE
+                        WHEN t.rate_trf >= t.rate_con
+                            THEN (t.rate_trf + 0.0048)/0.9525
+                        ELSE
+                            CASE
+                                WHEN pr.prod_name IS NULL
+                                    THEN (t.rate_con + 0.0010 + 0.0048)/0.9525
+                                ELSE (t.rate_trf + 0.0048)/0.9525
+                            END
+                    END
+                ) * t.out_rub
+            ELSE 0
+        END
+    )
+    / NULLIF(
+        SUM(CASE WHEN t.rate_trf IS NOT NULL AND t.rate_con IS NOT NULL THEN t.out_rub END),
+        0
+      ) AS rate_ets_wavg,
+
+    -- НОВОЕ: средневзвешенный AVG_KEY_RATE по объёму
+    SUM(
+        CASE
+            WHEN c.avg_key_rate IS NOT NULL THEN c.avg_key_rate * t.out_rub
+            ELSE 0
+        END
+    )
+    / NULLIF(
+        SUM(CASE WHEN c.avg_key_rate IS NOT NULL THEN t.out_rub END),
+        0
+      ) AS avg_key_rate_wavg,
+
+    -- (опционально) контроль качества матчинга
+    SUM(CASE WHEN t.termdays IS NULL THEN t.out_rub ELSE 0 END) AS out_rub_term_null,
+    SUM(CASE WHEN t.termdays IS NOT NULL AND c.avg_key_rate IS NULL THEN t.out_rub ELSE 0 END) AS out_rub_no_cache_match
+
+FROM alm.[ALM].[vw_balance_rest_all] AS t WITH (NOLOCK)
+LEFT JOIN prod_ref pr
+       ON pr.prod_name = t.prod_name_res
+LEFT JOIN WORK.ForecastKey_Cache c WITH (NOLOCK)
+       ON c.dt_rep = CONVERT(date, t.dt_open)   -- дата открытия = dt_rep прогноза
+      AND c.term  = t.termdays                  -- срочность
+
+WHERE
+    t.dt_rep BETWEEN @DateFrom AND @DateTo
+    AND CONVERT(date, t.dt_open) = t.dt_rep     -- только «новые в этот же день»
+    AND t.section_name = N'Срочные'
+    AND t.block_name   = N'Привлечение ФЛ'
+    AND t.od_flag      = 1
+    AND t.is_floatrate = 0
+    AND t.cur          = '810'
+    AND t.out_rub IS NOT NULL
+
+GROUP BY t.dt_rep
+ORDER BY t.dt_rep
+OPTION (RECOMPILE);
