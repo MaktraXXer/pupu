@@ -1,27 +1,37 @@
 Option Explicit
 
-Sub monte_carlo_fast_safe()
+Sub calc_matrix_fast_safe()
 
-    Dim ws As Worksheet
-    Set ws = Worksheets("График погашения")
+    Dim wsG As Worksheet, wsU As Worksheet, wsR As Worksheet, wsC As Worksheet
+    Set wsG = Worksheets("График погашения")
+    Set wsU = Worksheets("matrix uprfont")
+    Set wsR = Worksheets("matrix running")
+    Set wsC = Worksheets("matrix cpr")
 
-    Dim startIdx As Long, endIdx As Long, n As Long, i As Long, idx As Long
+    Dim min_row As Long, max_row As Long, min_col As Long, max_col As Long
+    Dim nRow As Long, nCol As Long
+    Dim i As Long, k As Long, rr As Long, cc As Long
+
     Dim calcMode As XlCalculation, eventsState As Boolean
     Dim statusBarState As Variant
 
-    ' границы сценариев
-    startIdx = ws.Range("Q5").Value
-    endIdx = ws.Range("Q6").Value
-    n = endIdx - startIdx + 1
-    If n <= 0 Then Exit Sub
+    ' границы матрицы
+    min_row = wsG.Range("G5").Value
+    max_row = wsG.Range("G6").Value
+    min_col = wsG.Range("G7").Value
+    max_col = wsG.Range("G8").Value
 
-    ' ускоряем Excel, но пересчёт книги делаем явно на каждой итерации
+    nRow = max_row - min_row + 1
+    nCol = max_col - min_col + 1
+    If nRow <= 0 Or nCol <= 0 Then Exit Sub
+
+    ' ускоряем Excel, но пересчёт книги делаем явно (как и раньше)
     With Application
         .ScreenUpdating = False
         eventsState = .EnableEvents
-        .EnableEvents = False          ' важно: гасит Worksheet_Calculate / Workbook_SheetCalculate
+        .EnableEvents = False
         statusBarState = .StatusBar
-        .StatusBar = "MC: подготовка..."
+        .StatusBar = "Matrix: подготовка..."
         calcMode = .Calculation
         .Calculation = xlCalculationManual
         .CalculateBeforeSave = False
@@ -29,36 +39,53 @@ Sub monte_carlo_fast_safe()
 
     On Error GoTo CLEANUP
 
-    ' включаем режим Монте-Карло (как у тебя)
-    ws.Range("D2").Value = False
+    ' буферы результатов, чтобы писать на листы одним блоком
+    Dim arrUp() As Variant, arrRun() As Variant, arrCpr() As Variant
+    ReDim arrUp(1 To nRow, 1 To nCol)
+    ReDim arrRun(1 To nRow, 1 To nCol)
+    ReDim arrCpr(1 To nRow, 1 To nCol)
 
-    ' буфер результатов (B10,B11,B12)
-    Dim outArr() As Variant
-    ReDim outArr(1 To n, 1 To 3)
+    ' локальные ссылки на входы/выходы (меньше обращений к Excel)
+    Dim rngB4 As Range, rngB6 As Range, rngUp As Range, rngRun As Range, rngCprCell As Range
+    Set rngB4 = wsG.Range("B4")
+    Set rngB6 = wsG.Range("B6")
+    Set rngUp = wsG.Range("B10")
+    Set rngRun = wsG.Range("B11")
+    Set rngCprCell = wsG.Range("B12")
 
-    For i = startIdx To endIdx
-        idx = i - startIdx + 1
+    Dim rVal As Variant, tVal As Variant
 
-        ws.Range("Q8").Value = i
+    For i = min_row To max_row
+        rr = i - min_row + 1
+        rVal = wsU.Cells(i, 2).Value   ' значение для B4 (строка)
 
-        ' полный пересчёт всей книги (сохраняем твою логику "всё обновилось")
-        Application.Calculate
+        For k = min_col To max_col
+            cc = k - min_col + 1
+            tVal = wsU.Cells(2, k).Value ' значение для B6 (столбец)
 
-        outArr(idx, 1) = ws.Range("B10").Value
-        outArr(idx, 2) = ws.Range("B11").Value
-        outArr(idx, 3) = ws.Range("B12").Value
+            rngB4.Value = rVal
+            rngB6.Value = tVal
 
-        If (idx Mod 50) = 0 Or idx = n Then
-            Application.StatusBar = "MC: " & idx & " / " & n
+            ' полный пересчёт книги (сохраняем логику обновления всех листов)
+            Application.Calculate
+
+            arrUp(rr, cc) = rngUp.Value
+            arrRun(rr, cc) = rngRun.Value
+            arrCpr(rr, cc) = rngCprCell.Value
+        Next k
+
+        If (rr Mod 5) = 0 Or rr = nRow Then
+            Application.StatusBar = "Matrix: " & rr & " / " & nRow
         End If
     Next i
 
-    ' запись одним блоком
-    ws.Range(ws.Cells(14 + startIdx, 56), ws.Cells(14 + endIdx, 58)).Value = outArr
+    ' запись результатов одним блоком (это основной выигрыш по скорости записи)
+    wsU.Range(wsU.Cells(min_row, min_col), wsU.Cells(max_row, max_col)).Value = arrUp
+    wsR.Range(wsR.Cells(min_row, min_col), wsR.Cells(max_row, max_col)).Value = arrRun
+    wsC.Range(wsC.Cells(min_row, min_col), wsC.Cells(max_row, max_col)).Value = arrCpr
 
 CLEANUP:
-    On Error Resume Next
-    ws.Range("D2").Value = True
+    Application.CutCopyMode = False
 
     With Application
         .Calculation = calcMode
@@ -66,12 +93,11 @@ CLEANUP:
         .StatusBar = statusBarState
         .ScreenUpdating = True
     End With
-    On Error GoTo 0
 
     If Err.Number <> 0 Then
         MsgBox "Ошибка: " & Err.Description, vbExclamation
     Else
-        MsgBox "Цикл по Монте-Карло прошёлся для данного уровня параметров!", vbInformation
+        MsgBox "Расчет завершен", vbInformation
     End If
 
 End Sub
