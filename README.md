@@ -2,38 +2,35 @@ Option Explicit
 
 Sub calc_matrix_with_montecarlo()
 
-    Dim wsG As Worksheet, wsU As Worksheet, wsR As Worksheet, wsC As Worksheet
+    Dim wsG As Worksheet, wsUp As Worksheet, wsRun As Worksheet, wsCpr As Worksheet
     Set wsG = Worksheets("График погашения")
-    Set wsU = Worksheets("MC upfront")
-    Set wsR = Worksheets("MC running")
-    Set wsC = Worksheets("MC cpr")
+    Set wsUp = Worksheets("MC upfront")
+    Set wsRun = Worksheets("MC running")
+    Set wsCpr = Worksheets("MC cpr")
 
-    ' Лист-источник для входных значений (как раньше использовался "matrix uprfont")
-    ' Здесь предполагается, что входы лежат на листе "MC upfront":
-    '   - в колонке 2 по строкам (i) — значения для B4
-    '   - в строке 2 по столбцам (k) — значения для B6
-    ' Если у тебя отдельный лист для сетки входов — просто замени wsIn.
+    ' Лист-источник сетки входов (как раньше "matrix uprfont"):
+    ' - колонка 2 по строкам i -> значение для B4
+    ' - строка 2 по столбцам k -> значение для B6 (decr_term)
+    ' Если сетка входов лежит на другом листе — поменяй здесь.
     Dim wsIn As Worksheet
     Set wsIn = Worksheets("MC upfront")
 
+    ' Границы матрицы теперь из K5:K8
     Dim min_row As Long, max_row As Long, min_col As Long, max_col As Long
-    Dim startSc As Long, endSc As Long, nSc As Long
-
-    ' Границы матрицы теперь из столбца K
     min_row = wsG.Range("K5").Value
     max_row = wsG.Range("K6").Value
     min_col = wsG.Range("K7").Value
     max_col = wsG.Range("K8").Value
-
     If max_row < min_row Or max_col < min_col Then Exit Sub
 
-    ' Диапазон сценариев Монте-Карло
+    ' Диапазон сценариев Монте-Карло из Q5:Q6 (например 0..999)
+    Dim startSc As Long, endSc As Long, nSc As Long
     startSc = wsG.Range("Q5").Value
     endSc = wsG.Range("Q6").Value
     nSc = endSc - startSc + 1
     If nSc <= 0 Then Exit Sub
 
-    ' Настройки Excel для ускорения (пересчёт всей книги сохраняем)
+    ' Ускоряем Excel (пересчёт всей книги сохраняем!)
     Dim calcMode As XlCalculation, eventsState As Boolean, statusBarState As Variant
     With Application
         .ScreenUpdating = False
@@ -48,7 +45,7 @@ Sub calc_matrix_with_montecarlo()
 
     On Error GoTo CLEANUP
 
-    ' Ссылки на часто используемые ячейки
+    ' Часто используемые ячейки
     Dim rngB4 As Range, rngB6 As Range, rngD2 As Range, rngQ8 As Range
     Dim rngE10 As Range, rngE11 As Range, rngE12 As Range
     Set rngB4 = wsG.Range("B4")
@@ -69,54 +66,62 @@ Sub calc_matrix_with_montecarlo()
     ReDim arrRun(1 To nRow, 1 To nCol)
     ReDim arrCpr(1 To nRow, 1 To nCol)
 
-    Dim i As Long, k As Long, rr As Long, cc As Long
-    Dim sc As Long, rVal As Variant, tVal As Variant
-
     ' Переключаемся на прогноз Монте-Карло
     rngD2.Value = False
+
+    Dim i As Long, k As Long, rr As Long, cc As Long
+    Dim sc As Long, idxSc As Long
+    Dim rVal As Variant, tVal As Variant
+
+    Dim outSc() As Variant
+    ReDim outSc(1 To nSc, 1 To 3)
 
     For i = min_row To max_row
         rr = i - min_row + 1
 
-        ' Значение для B4 берём из колонки 2 строки i
+        ' значение для B4 из сетки
         rVal = wsIn.Cells(i, 2).Value
 
         For k = min_col To max_col
             cc = k - min_col + 1
 
-            ' Значение для B6 берём из строки 2 столбца k
+            ' значение для B6 (decr_term) из сетки
             tVal = wsIn.Cells(2, k).Value
 
-            ' Устанавливаем входы
             rngB4.Value = rVal
             rngB6.Value = tVal
 
-            ' Прогон по Монте-Карло (с полным пересчётом книги на каждом сценарии)
+            ' --- прогон Монте-Карло: считаем B10:B12 на каждом сценарии и пишем в BD:BF
             For sc = startSc To endSc
+                idxSc = sc - startSc + 1
+
                 rngQ8.Value = sc
                 Application.Calculate
+
+                outSc(idxSc, 1) = wsG.Range("B10").Value
+                outSc(idxSc, 2) = wsG.Range("B11").Value
+                outSc(idxSc, 3) = wsG.Range("B12").Value
             Next sc
 
-            ' После цикла берём итоговые средние E10:E12
+            wsG.Range(wsG.Cells(14 + startSc, 56), wsG.Cells(14 + endSc, 58)).Value = outSc
+
+            ' --- теперь E10:E12 корректно отражают средние по BD:BF
             arrUp(rr, cc) = rngE10.Value
             arrRun(rr, cc) = rngE11.Value
             arrCpr(rr, cc) = rngE12.Value
 
         Next k
 
-        If (rr Mod 1) = 0 Or rr = nRow Then
-            Application.StatusBar = "MC Matrix: строка " & rr & " / " & nRow
-        End If
+        Application.StatusBar = "MC Matrix: строка " & rr & " / " & nRow
     Next i
 
-    ' Записываем результаты матрицами
-    wsU.Range(wsU.Cells(min_row, min_col), wsU.Cells(max_row, max_col)).Value = arrUp
-    wsR.Range(wsR.Cells(min_row, min_col), wsR.Cells(max_row, max_col)).Value = arrRun
-    wsC.Range(wsC.Cells(min_row, min_col), wsC.Cells(max_row, max_col)).Value = arrCpr
+    ' Записываем результаты в новые матрицы
+    wsUp.Range(wsUp.Cells(min_row, min_col), wsUp.Cells(max_row, max_col)).Value = arrUp
+    wsRun.Range(wsRun.Cells(min_row, min_col), wsRun.Cells(max_row, max_col)).Value = arrRun
+    wsCpr.Range(wsCpr.Cells(min_row, min_col), wsCpr.Cells(max_row, max_col)).Value = arrCpr
 
 CLEANUP:
     On Error Resume Next
-    ' Возвращаемся обратно на свопы
     rngD2.Value = True
 
     With Application
