@@ -1,157 +1,198 @@
-Option Explicit
+# CIR++ (Монте-Карло для прогнозирования РОНЯ) — описание реализации
 
-Sub calc_matrix_with_montecarlo()
+## Термины (единая терминология)
 
-    Dim wsG As Worksheet, wsUp As Worksheet, wsRun As Worksheet, wsCpr As Worksheet
-    Dim wsIn As Worksheet
+- **РОНЯ (RUONIA)** — исторический ряд фактической ставки (для калибровки динамики).
+- **OIS-кривая РОНЯ** — текущие рыночные котировки OIS на дату расчёта (для задания “сегодняшней кривой”).
+- **Непрерывная ставка дисконтирования** `z(t)` — zero-ставка в continuous compounding, построенная из OIS-кривой. В коде это функция `ZCYC(t)`.
+- **`x(t)`** — стохастическая часть CIR.
+- **`r(t)`** — итоговая модельная короткая ставка (то, что симулируем).
+- Параметры CIR: **`a`**, **`θ`**, **`s`**.
+- **`φ(t)`** — детерминированный сдвиг (часть “++”).
 
-    Set wsG = Worksheets("График погашения")
-    Set wsUp = Worksheets("MC upfront")
-    Set wsRun = Worksheets("MC running")
-    Set wsCpr = Worksheets("MC cpr")
+---
 
-    ' Лист-источник сетки входов:
-    ' - колонка 2 по строкам i -> значение для B4
-    ' - строка 2 по столбцам k -> значение для B6 (decr_term)
-    Set wsIn = Worksheets("MC upfront")
+## 1) CIR++ — короткая суть (как в статье)
 
-    ' Границы матрицы из K5:K8 (жёстко приводим к числам)
-    Dim min_row As Long, max_row As Long, min_col As Long, max_col As Long
-    min_row = CLng(wsG.Range("K5").Value)
-    max_row = CLng(wsG.Range("K6").Value)
-    min_col = CLng(wsG.Range("K7").Value)
-    max_col = CLng(wsG.Range("K8").Value)
-    If max_row < min_row Or max_col < min_col Then Exit Sub
+Модель задаёт короткую ставку как:
 
-    ' Диапазон сценариев Монте-Карло из Q5:Q6 (например 0..999)
-    Dim startSc As Long, endSc As Long, nSc As Long
-    startSc = CLng(wsG.Range("Q5").Value)
-    endSc = CLng(wsG.Range("Q6").Value)
-    nSc = endSc - startSc + 1
-    If nSc <= 0 Then Exit Sub
+$$
+r(t)=x(t)+\phi(t),
+$$
 
-    ' Ускоряем Excel (пересчёт всей книги сохраняем!)
-    Dim calcMode As XlCalculation, eventsState As Boolean, statusBarState As Variant
-    With Application
-        .ScreenUpdating = False
-        eventsState = .EnableEvents
-        .EnableEvents = False
+где:
 
-        ' Сбрасываем строку состояния, чтобы не "залипали" старые значения
-        .StatusBar = False
-        statusBarState = .StatusBar
+- $x(t)$ — “случайная” часть (CIR),
+- $\phi(t)$ — “детерминированная” поправка, чтобы модель совпала с рынком в момент $t=0$.
 
-        .StatusBar = "MC Matrix: подготовка..."
-        calcMode = .Calculation
-        .Calculation = xlCalculationManual
-        .CalculateBeforeSave = False
-    End With
+Стохастическая часть задаётся CIR:
 
-    On Error GoTo CLEANUP
+$$
+dx(t)=a(\theta-x(t))dt+s\sqrt{x(t)}\,dW(t).
+$$
 
-    ' Часто используемые ячейки
-    Dim rngB4 As Range, rngB6 As Range, rngD2 As Range, rngQ8 As Range
-    Dim rngE10 As Range, rngE11 As Range, rngE12 As Range
-    Set rngB4 = wsG.Range("B4")
-    Set rngB6 = wsG.Range("B6")
-    Set rngD2 = wsG.Range("D2")
-    Set rngQ8 = wsG.Range("Q8")
-    Set rngE10 = wsG.Range("E10")
-    Set rngE11 = wsG.Range("E11")
-    Set rngE12 = wsG.Range("E12")
+**Смысл параметров:**
 
-    ' Размеры матрицы
-    Dim nRow As Long, nCol As Long
-    nRow = max_row - min_row + 1
-    nCol = max_col - min_col + 1
+- **`a`** — скорость возврата к $\theta$ (чем больше `a`, тем быстрее возвращаемся к среднему).
+- **`θ`** — долгосрочный уровень.
+- **`s`** — масштаб случайных колебаний (волатильность процесса).
+- **`φ(t)`** подбирают так, чтобы модель точно воспроизводила текущую term-structure в момент $t=0$. В статье это записывают через форварды:
 
-    ' Буферы результатов матрицы (запишем одним блоком)
-    Dim arrUp() As Variant, arrRun() As Variant, arrCpr() As Variant
-    ReDim arrUp(1 To nRow, 1 To nCol)
-    ReDim arrRun(1 To nRow, 1 To nCol)
-    ReDim arrCpr(1 To nRow, 1 To nCol)
+$$
+\phi(t)=f^{mkt}(0,t)-f^{CIR}(0,t).
+$$
 
-    ' Буфер результатов сценариев Монте-Карло (B10:B12) -> BD:BF
-    Dim outSc() As Variant
-    ReDim outSc(1 To nSc, 1 To 3)
+> Дополнение из методички: параметры часто калибруют по истории в “реальной” мере, где дрейф может включать рыночную цену риска $\lambda$, а дальнейшее ценообразование — в риск-нейтральной мере.
 
-    ' Переключаемся на прогноз Монте-Карло
-    rngD2.Value = False
+---
 
-    ' Переменные циклов
-    Dim i As Long, k As Long, rr As Long, cc As Long
-    Dim sc As Long, idxSc As Long
-    Dim rVal As Variant, tVal As Variant
+## 2) Шаг 0–1 (очень коротко)
 
-    ' Явно показываем, какие границы реально взяты (для контроля)
-    Application.StatusBar = "MC Matrix: rows " & min_row & "-" & max_row & _
-                            " (nRow=" & nRow & "), cols " & min_col & "-" & max_col & _
-                            ", scenarios " & startSc & "-" & endSc
-    DoEvents
+- **Шаг 0:** загружаем историю РОНЯ и текущие OIS-котировки РОНЯ на дату расчёта.
+- **Шаг 1:** из OIS строим дисконт-факторы $DF(T)$, переводим их в непрерывные ставки дисконтирования:
 
-    For i = min_row To max_row
-        rr = i - min_row + 1
+$$
+z(T)=-\ln DF(T)/T,
+$$
 
-        ' Значение для B4 из сетки
-        rVal = wsIn.Cells(i, 2).Value
+и делаем из точек функцию $z(t)$ (это `ZCYC(t)`).
 
-        For k = min_col To max_col
-            cc = k - min_col + 1
+---
 
-            ' Значение для B6 (decr_term) из сетки
-            tVal = wsIn.Cells(2, k).Value
+## 3) Шаг 2 — калибровка `(a, θ, s)` по истории РОНЯ (подробно и просто)
 
-            rngB4.Value = rVal
-            rngB6.Value = tVal
+**Цель:** подобрать `(a, θ, s)`, чтобы динамика РОНЯ “в среднем” была похожа на CIR.
 
-            ' Прогон Монте-Карло: считаем B10:B12 на каждом сценарии и пишем в BD:BF
-            For sc = startSc To endSc
-                idxSc = sc - startSc + 1
+### 3.1. Что берут из истории
 
-                rngQ8.Value = sc
-                Application.Calculate
+Берут месячный шаг $dt=1/12$ и пары:
 
-                outSc(idxSc, 1) = wsG.Range("B10").Value
-                outSc(idxSc, 2) = wsG.Range("B11").Value
-                outSc(idxSc, 3) = wsG.Range("B12").Value
-            Next sc
+- $r_t$ — ставка в текущем месяце,
+- $r_{t-1}$ — ставка в прошлом месяце.
 
-            ' Записываем результаты сценариев в BD:BF одним блоком
-            wsG.Range(wsG.Cells(14 + startSc, 56), wsG.Cells(14 + endSc, 58)).Value = outSc
+### 3.2. Отделяем “дрейф” от “шума”
 
-            ' Теперь E10:E12 корректно отражают средние по BD:BF
-            arrUp(rr, cc) = rngE10.Value
-            arrRun(rr, cc) = rngE11.Value
-            arrCpr(rr, cc) = rngE12.Value
-        Next k
+По CIR:
 
-        ' Прогресс по строкам матрицы
-        Application.StatusBar = "MC Matrix: строка " & rr & " / " & nRow
-        DoEvents
-    Next i
+$$
+r_t-r_{t-1} \approx a(\theta-r_{t-1})dt + s\sqrt{r_{t-1}}\Delta W_t.
+$$
 
-    ' Записываем итоговые матрицы одним блоком
-    wsUp.Range(wsUp.Cells(min_row, min_col), wsUp.Cells(max_row, max_col)).Value = arrUp
-    wsRun.Range(wsRun.Cells(min_row, min_col), wsRun.Cells(max_row, max_col)).Value = arrRun
-    wsCpr.Range(wsCpr.Cells(min_row, min_col), wsCpr.Cells(max_row, max_col)).Value = arrCpr
+Остаток (то, что остаётся после вычитания дрейфа):
 
-CLEANUP:
-    On Error Resume Next
-    rngD2.Value = True
+$$
+u_t=(r_t-r_{t-1})-a(\theta-r_{t-1})dt \approx s\sqrt{r_{t-1}}\Delta W_t.
+$$
 
-    With Application
-        .Calculation = calcMode
-        .EnableEvents = eventsState
-        .StatusBar = False
-        .StatusBar = statusBarState
-        .ScreenUpdating = True
-    End With
-    On Error GoTo 0
+### 3.3. Нормируем на $\sqrt{r_{t-1}}$
 
-    If Err.Number <> 0 Then
-        MsgBox "Ошибка: " & Err.Description, vbExclamation
-    Else
-        MsgBox "Расчет MC-матрицы завершен", vbInformation
-    End If
+$$
+\tilde u_t=\frac{u_t}{\sqrt{r_{t-1}}} \approx s\,\Delta W_t.
+$$
 
-End Sub
+### 3.4. Минимизируем ошибку
+
+Берут:
+
+$$
+\text{Error}(a,\theta,s)=\sum_t(\tilde u_t)^2,
+$$
+
+и находят параметры, при которых `Error` минимальна.
+
+### 3.5. Ограничение Феллера (роль `s`)
+
+Накладывают:
+
+$$
+2a\theta - s^2 \ge \varepsilon.
+$$
+
+Чем больше `s`, тем сложнее выполнить условие — поэтому `s` реально “держит” оптимизацию в допустимой области.
+
+### 3.6. Почему важна стартовая точка `(a0, θ0, s0)`
+
+Оптимизация нелинейная + есть ограничение, поэтому разные старты могут приводить к разным локальным решениям.
+
+### 3.7. Двухшаговая схема
+
+1. **Шаг A:** находят $(\hat a,\hat\theta,\hat s)$, минимизируя `Error` при ограничении Феллера.
+2. **Шаг B:** уточняют `s`, чтобы он совпал с “фактическим” разбросом $\tilde u_t$ из истории.
+
+Почему тут появляется $dt$:
+
+$$
+\Delta W_t \sim \mathcal N(0,dt)\Rightarrow \mathrm{Std}(\Delta W_t)=\sqrt{dt}.
+$$
+
+Если $\tilde u_t \approx s\Delta W_t$, то
+
+$$
+\mathrm{Std}(\tilde u)\approx s\sqrt{dt}
+\Rightarrow
+s \approx \frac{\widehat{\mathrm{Std}}(\tilde u)}{\sqrt{dt}}.
+$$
+
+---
+
+## 4) Шаг 3 — строим `φ(t)`, чтобы модель совпала с OIS-кривой в момент 0
+
+**Цель:** заставить модель соответствовать “сегодняшнему рынку”, не меняя найденные по истории `(a, θ, s)`.
+
+1. Из непрерывной ставки дисконтирования $z(t)$ получаем рыночный мгновенный форвард:
+
+$$
+f^{mkt}(0,t)=z(t)+t\,\frac{dz(t)}{dt}.
+$$
+
+2. С теми же `(a, θ, s)` считаем форвард, который даёт **чистый CIR**:
+
+$$
+f^{CIR}(0,t).
+$$
+
+3. Берём разницу:
+
+$$
+\phi(t)=f^{mkt}(0,t)-f^{CIR}(0,t).
+$$
+
+**Результат:** детерминированная кривая $\phi(t)$ на всём горизонте.
+
+---
+
+## 5) Шаг 4 — генерируем 1000 траекторий `r(t)` (Монте-Карло)
+
+1. Генерируем приращения броуновского движения:
+
+$$
+\Delta W_t = \sqrt{dt}\,\varepsilon_t,\quad \varepsilon_t\sim\mathcal N(0,1).
+$$
+
+2. Симулируем `x(t)` по схеме Эйлера:
+
+$$
+x_{t+dt}=x_t + a(\theta-x_t)dt + s\sqrt{x_t}\Delta W_t.
+$$
+
+3. Получаем итоговую ставку:
+
+$$
+r(t)=x(t)+\phi(t).
+$$
+
+4. Чтобы не уйти в отрицательные значения:
+
+$$
+r(t)\ge \varepsilon.
+$$
+
+**Результат:** матрица траекторий размера $(T+1)\times n_{sim}$:  
+строки — время (месяцы), столбцы — сценарии (1…1000).
+
+---
+
+## 6) Шаг 5 — что делают с результатом
+
+- Проверяют графиком (sanity check).
+- Выгружают траектории в Excel для дальнейших расчётов.
