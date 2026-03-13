@@ -1,214 +1,128 @@
-import numpy as np
-import pandas as pd
-from scipy.optimize import minimize
+r = ZCYC
 
-# --- CIR parameters calibration (multi-start, Variant 2) ----------------------
-# Требования:
-# - оставить дальнейшие блоки как есть (они используют opt_ats['a'], opt_ats['theta'], opt_ats['s'])
-# - сделать калибровку устойчивой к стартовой точке
-# - выбрать лучший запуск по "финальному" качеству после шага B (вариант 2)
+# мгновенный форвард f(0, t) по рынку (из непрерывной ставки дисконтирования z(t))
+def f_market(t):
+    return r(t) + 0.5 * t * (r(t + eps) - r(t - eps)) / eps
 
-# Настройки
-time_field = 'dt'
-rate_field = 'ruonia'
-constr_mul = 2.0  # Феллер: 2*a*theta - s^2 >= eps
-method = 'SLSQP'
-bounds = ((0, None), (0, None), (0, None))
+# центральная производная мгновенного форварда (в текущей версии не используется)
+def df_market(t):
+    return 0.5 * (f_market(t + eps) - f_market(t - eps)) / eps
 
-# 1) Подготовка рядов r_t и r_{t-1}
-rates = rate_hist.copy()
-rates = rates[[time_field, rate_field]].dropna()
-rates = rates.sort_values(time_field).set_index(time_field)
-rs = pd.Series(rates[rate_field], dtype=float)
+# Discount factor calculator (в текущей версии не используется)
+def df(t):
+    return np.exp(-ZCYC(t * dt) * t * dt)
 
-series_shift = 1
-r1 = rs.shift(series_shift).iloc[series_shift:].to_numpy(dtype=float)  # r_{t-1}
-r = rs.iloc[series_shift:].to_numpy(dtype=float)                      # r_t
-N = len(r)
+# Forward rate calculator (в текущей версии не используется)
+def forward_rate(t0, t1, path):
+    if t0 == t1:
+        return 0
+    erpath = np.exp(path * dt)
+    erpath = erpath[t0:t1]
+    return np.log(np.prod(erpath)) / (dt * (t1 - t0))
 
-# Защита от нулей/отрицательных значений в sqrt (для нормировки)
-r1_safe = np.maximum(r1, eps)
-r1s = np.sqrt(r1_safe)
 
-# 2) Функции ошибки и статистики (как в исходной логике)
-def dw_term(ats):
-    a, theta, s = ats
-    # (r_t - r_{t-1}) - a(theta - r_{t-1})dt
-    return (r - r1) - (a * theta - a * r1) * dt
+def MC_simulations(T, n_sim, a=opt_ats['a'], theta=opt_ats['theta'], s=opt_ats['s'], debug=True):
 
-def error_A(ats):
-    # Error на шаге A: sum( (dw/sqrt(r_{t-1}))^2 )
-    return np.sum((dw_term(ats) / r1s) ** 2)
+    T1 = T + 1
 
-def mean_u(ats):
-    # среднее нормированного остатка
-    u = dw_term(ats) / r1s
-    return float(np.mean(u))
+    # X(t) = x(t) + phi(t)   (CIR++)
+    xs = np.zeros((T1, n_sim))
+    X = np.zeros((T1, n_sim))
 
-def std_u_sample(ats):
-    # выборочное std нормированного остатка u_t = dw/sqrt(r_{t-1})
-    u = dw_term(ats) / r1s
-    # ddof=1 как у выборочной дисперсии
-    return float(np.std(u, ddof=1))
+    # сетка времени (в годах)
+    t = np.zeros(T1)
+    for i in range(T):
+        t[i + 1] = t[i] + dt
 
-def s_from_history(a, theta):
-    # Шаг B: s ≈ Std(u)/sqrt(dt)
-    # где u = dw/sqrt(r_{t-1}), а Std(u) ≈ s*sqrt(dt)
-    # Также гарантируем s>=0
-    # Здесь dw считаем с s=0 (не влияет на dw), поэтому используем ats=(a,theta,0)
-    u_std = std_u_sample((a, theta, 0.0))
-    return max(u_std / np.sqrt(dt), 0.0)
+    # рыночные значения на сетке
+    rt = np.zeros(T1)
+    f_mkt = np.zeros(T1)
 
-def feller_ok(a, theta, s):
-    return (constr_mul * a * theta - s * s) >= eps
+    rt[0] = ZCYC(eps)
+    f_mkt[0] = rt[0]
 
-# 3) Оптимизация шага A для одного старта
-def run_step_A(ats0):
-    constr = ({'type': 'ineq',
-               'fun': lambda x: constr_mul * x[0] * x[1] - x[2] * x[2] - eps},)
+    for i in range(1, T1):
+        rt[i] = ZCYC(t[i])
+        f_mkt[i] = f_market(t[i])
 
-    opt = minimize(
-        fun=error_A,
-        x0=np.array(ats0, dtype=float),
-        method=method,
-        bounds=bounds,
-        constraints=constr,
-        options={'maxiter': 10**6}
-    )
+    # стартовая ставка модели r(0) ~ z(0)
+    X[0, :] = rt[0]
 
-    a_hat, theta_hat, s_hat = opt.x
-    return {
-        'success': bool(opt.success),
-        'message': str(opt.message),
-        'a': float(a_hat),
-        'theta': float(theta_hat),
-        's_A': float(s_hat),            # s из шага A
-        'error_A': float(opt.fun),
-        'nit': int(getattr(opt, 'nit', -1))
-    }
+    # x0 для формулы f_cir (как было)
+    x0 = f_mkt[0]
 
-# 4) Multi-start: как генерируем стартовые точки
-def build_start_points(M=60, seed=42):
-    rng = np.random.default_rng(seed)
+    # ------------------------------------------------------------------------------------------------------------------
+    # CIR++: расчёт phi(t) = f_mkt(t) - f_cir(t)
+    # ------------------------------------------------------------------------------------------------------------------
 
-    # базовые оценки из данных
-    theta_base = float(np.mean(rs))
-    theta_base = max(theta_base, 1e-4)
+    ss = s**2
+    h = np.sqrt(a**2 + 2.0 * ss)
+    h2 = 2.0 * h
+    a_h = a + h
 
-    # грубая оценка a по лаг-1 корреляции (если адекватно считается)
-    rs_shift = rs.shift(1).dropna()
-    rs_now = rs.iloc[1:]
-    if len(rs_shift) > 10:
-        rho1 = float(np.corrcoef(rs_now.to_numpy(), rs_shift.to_numpy())[0, 1])
-        rho1 = np.clip(rho1, 1e-6, 0.999999)  # чтобы log не взорвался
-        a_base = float(-np.log(rho1) / dt)
-        a_base = np.clip(a_base, 0.05, 5.0)
-    else:
-        a_base = 1.0
+    exp_ht = np.exp(h * t)
+    exp_ht_1 = exp_ht - 1.0
+    denominator = h2 + a_h * exp_ht_1
 
-    # грубая оценка s из дисперсии приращений
-    dr = rs.diff().dropna().to_numpy(dtype=float)
-    sigma_dr = float(np.std(dr, ddof=1)) if len(dr) > 10 else 0.01
-    s_base = sigma_dr / (np.sqrt(theta_base) * np.sqrt(dt))
-    s_base = float(np.clip(s_base, 1e-4, 2.0))
+    # !!! ИЗМЕНЕНИЕ: было atheta = a + theta, стало a_theta = a * theta (канонический CIR дрейф)
+    # было:
+    # atheta = a + theta
+    # стало:
+    a_theta = a * theta
 
-    # детерминированная сетка (устойчива и воспроизводима)
-    a_grid = np.array([0.1, 0.3, 0.7, 1.5, 3.0, a_base])
-    theta_grid = theta_base * np.array([0.5, 0.8, 1.0, 1.2, 1.5])
-    s_mult = np.array([0.6, 0.8, 1.0, 1.2, 1.5])
+    # !!! ИЗМЕНЕНИЕ: в формуле f_cir используем a_theta вместо atheta (чтобы согласовать с CIR дрейфом)
+    const_part = (2.0 * a_theta * exp_ht_1) / denominator
+    x_part = (h2 * h2 * exp_ht) / (denominator ** 2)
+    f_cir = const_part + x0 * x_part
 
-    starts = []
-    for a0 in a_grid:
-        for th0 in theta_grid:
-            # выбираем несколько s0, которые стараются быть допустимыми по Феллеру
-            for m in s_mult:
-                s0 = s_base * m
-                # если не проходит Феллер — “подрежем” s0 до 0.8*sqrt(2*a*theta)
-                s_max = 0.8 * np.sqrt(max(constr_mul * a0 * th0, 0.0))
-                if s0 > s_max:
-                    s0 = max(s_max, 1e-6)
-                starts.append((float(a0), float(th0), float(s0)))
+    phi = f_mkt - f_cir
 
-    # добавим случайные старты до M (если нужно)
-    while len(starts) < M:
-        a0 = float(np.exp(rng.uniform(np.log(0.05), np.log(5.0))))
-        th0 = float(theta_base * rng.uniform(0.5, 1.5))
-        # ставим s0 как долю от sqrt(2*a*theta), чтобы почти наверняка пройти Феллер
-        s0 = float(rng.uniform(0.3, 0.9) * np.sqrt(max(constr_mul * a0 * th0, 0.0)))
-        s0 = max(s0, 1e-6)
-        starts.append((a0, th0, s0))
+    # --- ОТЛАДКА (проверка согласованности стартов)
+    # Показываем: x0 (используется в f_cir), phi(0), r(0), и то, каким стартом реально начинает CIR-часть xs(0)
+    if debug:
+        xs0_preview = float(X[0, 0] - phi[0])
+        print("DEBUG CIR++")
+        print(f"  a={a:.8f}, theta={theta:.8f}, s={s:.8f}")
+        print(f"  r0 (=ZCYC(eps))     = {rt[0]:.8f}")
+        print(f"  x0 (in f_cir)       = {x0:.8f}")
+        print(f"  phi0                = {phi[0]:.8f}")
+        print(f"  xs0 (=r0-phi0)      = {xs0_preview:.8f}")
+        print(f"  f_mkt[0]            = {f_mkt[0]:.8f}")
+        print(f"  f_cir[0]            = {f_cir[0]:.8f}")
+        print("  note: если x0 заметно != xs0, стоит отдельно согласовать старт x0.")
 
-    # если стартов слишком много — обрежем
-    if len(starts) > M:
-        starts = starts[:M]
+    # ------------------------------------------------------------------------------------------------------------------
+    # БЛОКИ ИЗ ОРИГИНАЛА, КОТОРЫЕ УБРАЛ:
+    #
+    # 1) A(t), B(t) (аффинная структура) — нигде дальше не используется в симуляции:
+    #    A = (h2 * exp(0.5*(a+h)*t) / denominator) ** (2 * atheta / ss)
+    #    B = 2 * (exp_ht - 1) / denominator
+    #
+    # Их можно вернуть при необходимости, но для генерации траекторий X они не нужны.
+    # ------------------------------------------------------------------------------------------------------------------
 
-    return starts
+    # случайные числа
+    dz = np.random.normal(size=(T, n_sim))
 
-# 5) Вариант 2: для каждого старта делаем A -> B, считаем финальную ошибку, выбираем лучший
-def multi_start_calibrate(M=60, seed=42, verbose=True):
-    starts = build_start_points(M=M, seed=seed)
+    # старт CIR-части x(0) = r(0) - phi(0)
+    xs[0, :] = X[0, :] - phi[0]
 
-    results = []
-    for j, ats0 in enumerate(starts, start=1):
-        resA = run_step_A(ats0)
+    # MC симуляция CIR++
+    # !!! ИЗМЕНЕНИЕ: дрейф в симуляции теперь канонический: (a*theta - a*x)*dt
+    for i in range(1, T1):
+        dz_per_dt = dz[i - 1, :] / np.sqrt(period_num)  # == sqrt(dt)*N(0,1)
 
-        # Если оптимизация не сошлась — всё равно можно сохранить для анализа, но как кандидата не брать
-        if not resA['success']:
-            resA['s_final'] = np.nan
-            resA['error_final'] = np.inf
-            results.append(resA)
-            continue
+        # защита от отрицательных значений под корнем
+        x_prev = np.maximum(xs[i - 1, :], 0.0)
 
-        a_hat = resA['a']
-        theta_hat = resA['theta']
+        dz_part = s * np.sqrt(x_prev) * dz_per_dt
 
-        # Шаг B: уточняем s по истории
-        s_final = s_from_history(a_hat, theta_hat)
+        # было:
+        # xs[i] = xs[i-1] + (atheta - a*xs[i-1])*dt + dz_part
+        # стало:
+        xs[i, :] = xs[i - 1, :] + (a_theta - a * xs[i - 1, :]) * dt + dz_part
 
-        # проверка Феллера после шага B (важно!)
-        if not feller_ok(a_hat, theta_hat, s_final):
-            # если нарушили — считаем этот запуск плохим
-            resA['s_final'] = float(s_final)
-            resA['error_final'] = np.inf
-            results.append(resA)
-            continue
+        # итоговая ставка r(t) = x(t) + phi(t), ограничиваем снизу
+        X[i, :] = np.maximum(xs[i, :] + phi[i], eps)
 
-        # финальная ошибка уже на (a,theta,s_final)
-        err_final = error_A((a_hat, theta_hat, s_final))
-
-        resA['s_final'] = float(s_final)
-        resA['error_final'] = float(err_final)
-        results.append(resA)
-
-        if verbose and (j % 10 == 0 or j == len(starts)):
-            print(f"[multi-start] {j}/{len(starts)} done. best_error_final={min(r['error_final'] for r in results):.6g}")
-
-    # выбираем лучший по минимальному error_final (это и есть вариант 2)
-    best = min(results, key=lambda d: d['error_final'])
-
-    # доп. табличка топ-5 для sanity
-    results_sorted = sorted(results, key=lambda d: d['error_final'])
-    top5 = results_sorted[:5]
-
-    if verbose:
-        print("\nTop-5 by final error (after step B):")
-        for i, r_ in enumerate(top5, 1):
-            print(f"{i}) a={r_['a']:.6g}, theta={r_['theta']:.6g}, s_final={r_['s_final']:.6g}, "
-                  f"error_final={r_['error_final']:.6g}, error_A={r_['error_A']:.6g}, success={r_['success']}")
-
-        print("\nChosen best (variant 2):")
-        print(f"a={best['a']:.6g}, theta={best['theta']:.6g}, s={best['s_final']:.6g}, error_final={best['error_final']:.6g}")
-
-    return best, results
-
-# --- Запуск калибровки
-best, all_runs = multi_start_calibrate(M=60, seed=42, verbose=True)
-
-# --- Итоговый словарь, который ожидают дальнейшие блоки (оставляем имя opt_ats)
-opt_ats = {
-    'a': best['a'],
-    'theta': best['theta'],
-    's': best['s_final'],
-}
-
-print("\nFinal opt_ats:", opt_ats)
+    return X
