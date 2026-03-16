@@ -1,203 +1,125 @@
-USE [ALM];
-SET NOCOUNT ON;
+DECLARE @dt_from_rep date = '2026-02-05';
+DECLARE @dt_to_rep   date = '2026-03-14';
 
-/* ============================================
-   ПАРАМЕТРЫ
-   ============================================ */
-DECLARE @MondayStart date = '2026-03-09';   -- обязательно понедельник
-DECLARE @FactEndDate date = '2026-03-14';   -- фактическая дата конца неполной недели
+/* список вкладов маркетплейсов */
+DECLARE @mp TABLE (
+    prod_name nvarchar(200) NOT NULL PRIMARY KEY
+);
 
-/* ============================================
-   ПРОВЕРКИ
-   ============================================ */
-IF (DATEDIFF(day, '19000101', @MondayStart) % 7) <> 0
-BEGIN
-    RAISERROR(N'@MondayStart должен быть понедельником.', 16, 1);
-    RETURN;
-END;
+INSERT INTO @mp(prod_name)
+VALUES
+    (N'Надёжный прайм'),
+    (N'Надёжный VIP'),
+    (N'Надёжный премиум'),
+    (N'Надёжный промо'),
+    (N'Надёжный старт'),
+    (N'Надёжный Т2'),
+    (N'Надёжный Мегафон'),
+    (N'Могучий'),
+    (N'Надёжный'),
+    (N'Всё в ДОМ'),
+    (N'ДОМа Надёжно');
 
-DECLARE @ReliableDate date = DATEADD(day, -2, CAST(GETDATE() AS date));
-
-IF @FactEndDate > @ReliableDate
-BEGIN
-    RAISERROR(N'@FactEndDate не может быть больше GETDATE()-2.', 16, 1);
-    RETURN;
-END;
-
-IF @FactEndDate <= @MondayStart
-BEGIN
-    RAISERROR(N'@FactEndDate должен быть больше @MondayStart.', 16, 1);
-    RETURN;
-END;
-
-DECLARE @WeekFrom date = DATEADD(day, 1, @MondayStart);  -- вторник
-DECLARE @WeekTo   date = @FactEndDate;                   -- фактический конец
-
-IF OBJECT_ID('tempdb..#bal') IS NOT NULL DROP TABLE #bal;
-IF OBJECT_ID('tempdb..#clients_scope') IS NOT NULL DROP TABLE #clients_scope;
-
-/* ============================================
-   ЗАГРУЗКА ДВУХ СРЕЗОВ БАЛАНСА:
-   стартовый понедельник + фактический конец
-   ============================================ */
-SELECT
-      CAST(t.dt_rep AS date)            AS dt_rep
-    , CAST(t.cli_id AS bigint)          AS cli_id
-    , CAST(t.con_id AS bigint)          AS con_id
-    , CAST(t.dt_open AS date)           AS dt_open
-    , CAST(t.dt_close_plan AS date)     AS dt_close_plan
-    , CAST(t.section_name AS nvarchar(50)) AS section_name
-    , CAST(t.out_rub AS decimal(38,6))  AS out_rub
-    , CAST(t.rate_con AS decimal(18,6)) AS rate_con
-    , CAST(ISNULL(t.is_floatrate,0) AS bit) AS is_floatrate
-    , CAST(t.PROD_NAME_res AS nvarchar(255)) AS PROD_NAME_res
-    , CAST(t.TSEGMENTNAME AS nvarchar(255))  AS TSEGMENTNAME
-INTO #bal
-FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
-WHERE t.dt_rep IN (@MondayStart, @FactEndDate)
-  AND t.section_name IN (N'Срочные', N'Накопительный счёт')
-  AND t.block_name = N'Привлечение ФЛ'
-  AND t.acc_role   = N'LIAB'
-  AND t.cur        = '810'
-  AND t.od_flag    = 1
-  AND t.out_rub IS NOT NULL
-  AND t.out_rub >= 0;
-
-CREATE CLUSTERED INDEX CIX_#bal
-    ON #bal (dt_rep, section_name, cli_id, con_id);
-
-CREATE NONCLUSTERED INDEX IX_#bal_exit
-    ON #bal (dt_rep, section_name, dt_close_plan, cli_id)
-    INCLUDE (con_id, out_rub, rate_con, dt_open);
-
-CREATE NONCLUSTERED INDEX IX_#bal_open
-    ON #bal (dt_rep, section_name, dt_open, cli_id)
-    INCLUDE (con_id, out_rub, rate_con, dt_close_plan);
-
-CREATE NONCLUSTERED INDEX IX_#bal_ns
-    ON #bal (section_name, dt_rep, cli_id)
-    INCLUDE (out_rub);
-
-/* ============================================
-   КЛИЕНТЫ В СКОУПЕ: есть выходящий вклад
-   ============================================ */
-SELECT DISTINCT
-    b.cli_id
-INTO #clients_scope
-FROM #bal b
-WHERE b.dt_rep = @MondayStart
-  AND b.section_name = N'Срочные'
-  AND b.dt_close_plan >= @WeekFrom
-  AND b.dt_close_plan <= @WeekTo;
-
-CREATE UNIQUE CLUSTERED INDEX CIX_#clients_scope
-    ON #clients_scope(cli_id);
-
-/* ============================================
-   ИТОГОВЫЙ РАСЧЁТ
-   ============================================ */
-;WITH deposits_to_exit AS
-(
+WITH base AS (
     SELECT
-          b.cli_id
-        , b.con_id
-        , b.out_rub
-        , b.rate_con
-    FROM #bal b
-    WHERE b.dt_rep = @MondayStart
-      AND b.section_name = N'Срочные'
-      AND b.dt_close_plan >= @WeekFrom
-      AND b.dt_close_plan <= @WeekTo
+          t.dt_rep
+        , LTRIM(RTRIM(t.SECTION_NAME)) AS SECTION_NAME
+        , t.OUT_RUB
+        , CAST(t.dt_open AS date)      AS dt_open
+        , t.rate_con
+        , t.termdays
+        , ISNULL(t.is_floatrate, 0)    AS is_floatrate
+        , t.PROD_NAME_RES              AS PROD_NAME
+    FROM [ALM].[ALM].[VW_balance_rest_all] t WITH (NOLOCK)
+    WHERE 1 = 1
+      AND t.dt_rep >= @dt_from_rep
+      AND t.dt_rep <= @dt_to_rep
+      AND t.OUT_RUB IS NOT NULL
+      AND t.od_flag = 1
+      AND t.block_name = N'Привлечение ФЛ'
+      AND t.cur = '810'
+      AND LTRIM(RTRIM(t.SECTION_NAME)) IN (N'Накопительный счёт', N'До востребования', N'Срочные')
 ),
-opened_deposits AS
-(
+enriched AS (
     SELECT
-          b.cli_id
-        , b.con_id
-        , b.out_rub
-        , b.rate_con
-    FROM #bal b
-    INNER JOIN #clients_scope c
-        ON b.cli_id = c.cli_id
-    WHERE b.dt_rep = @FactEndDate
-      AND b.section_name = N'Срочные'
-      AND b.dt_open >= @WeekFrom
-      AND b.dt_open <= @WeekTo
+          b.*
+        , CASE
+            WHEN EXISTS (
+                SELECT 1
+                FROM @mp m
+                WHERE m.prod_name = b.PROD_NAME
+            ) THEN 1
+            ELSE 0
+          END AS is_mp
+    FROM base b
 ),
-ns_by_date AS
-(
+labeled AS (
     SELECT
-          b.dt_rep
-        , b.cli_id
-        , SUM(b.out_rub) AS ns_out_rub
-    FROM #bal b
-    INNER JOIN #clients_scope c
-        ON b.cli_id = c.cli_id
-    WHERE b.section_name = N'Накопительный счёт'
-    GROUP BY
-          b.dt_rep
-        , b.cli_id
-),
-agg_exit AS
-(
-    SELECT
-          COUNT(DISTINCT cli_id) AS cnt_cli_exit
-        , COUNT(DISTINCT con_id) AS cnt_con_exit
-        , SUM(out_rub) AS vol_exit
-        , CAST(
-            SUM(CASE WHEN rate_con IS NOT NULL THEN out_rub * rate_con END)
-            / NULLIF(SUM(CASE WHEN rate_con IS NOT NULL THEN out_rub END), 0)
-            AS decimal(18,6)
-          ) AS wavg_rate_exit
-    FROM deposits_to_exit
-),
-agg_open AS
-(
-    SELECT
-          COUNT(DISTINCT cli_id) AS cnt_cli_open
-        , COUNT(DISTINCT con_id) AS cnt_con_open
-        , SUM(out_rub) AS vol_open
-        , CAST(
-            SUM(CASE WHEN rate_con IS NOT NULL THEN out_rub * rate_con END)
-            / NULLIF(SUM(CASE WHEN rate_con IS NOT NULL THEN out_rub END), 0)
-            AS decimal(18,6)
-          ) AS wavg_rate_open
-    FROM opened_deposits
-),
-agg_ns AS
-(
-    SELECT
-          COUNT(DISTINCT c.cli_id) AS cnt_cli_scope
-        , SUM(CASE WHEN n.dt_rep = @MondayStart THEN n.ns_out_rub ELSE 0 END) AS ns_start_vol
-        , SUM(CASE WHEN n.dt_rep = @FactEndDate THEN n.ns_out_rub ELSE 0 END) AS ns_end_vol
-    FROM #clients_scope c
-    LEFT JOIN ns_by_date n
-        ON c.cli_id = n.cli_id
+          e.dt_rep
+        , e.OUT_RUB
+        , CASE
+            /* НС + ДВС вместе */
+            WHEN e.SECTION_NAME IN (N'Накопительный счёт', N'До востребования') THEN 1
+
+            /* дальше только Срочные могли остаться либо ошибка */
+            WHEN e.SECTION_NAME <> N'Срочные' THEN 99
+
+            /* выпишем маркетплейсы сразу, не интересна динамика новых маркетов */
+            WHEN e.is_mp = 1 THEN 7
+
+            /* 2 категория - 01.10–05.11.2025, 0.163–0.17, 85–110, fixed, НЕ маркетплейсы */
+            WHEN e.dt_open BETWEEN '2025-10-01' AND '2025-11-05'
+             AND e.rate_con BETWEEN 0.163 AND 0.17
+             AND e.termdays BETWEEN 85 AND 110
+             AND e.is_floatrate = 0
+            THEN 2
+
+            /* 3 категория - 06.11–31.12.2025, 0.163–0.17, 55–110, fixed, НЕ маркетплейсы */
+            WHEN e.dt_open BETWEEN '2025-11-06' AND '2025-12-31'
+             AND e.rate_con BETWEEN 0.163 AND 0.17
+             AND e.termdays BETWEEN 55 AND 110
+             AND e.is_floatrate = 0
+            THEN 3
+
+            /* 4 - остальные до 31.12.2025, НЕ маркетплейсы */
+            WHEN e.dt_open <= '2025-12-31' THEN 4
+
+            /* 8 - РК МАРТ: та же фильтрация, что и пункт 5, но открыты с 01.03.2026 */
+            WHEN e.dt_open >= '2026-03-01'
+             AND e.rate_con BETWEEN 0.158 AND 0.16
+             AND e.termdays BETWEEN 55 AND 110
+             AND e.is_floatrate = 0
+            THEN 8
+
+            /* 5 - с 01.01.2026 по 29.02.2026 fixed 0.158–0.16 55–110, НЕ маркетплейсы */
+            WHEN e.dt_open BETWEEN '2026-01-01' AND '2026-02-28'
+             AND e.rate_con BETWEEN 0.158 AND 0.16
+             AND e.termdays BETWEEN 55 AND 110
+             AND e.is_floatrate = 0
+            THEN 5
+
+            /* 6 - с 01.01.2026, НЕ маркетплейсы, но не попало в 5 и 8 */
+            WHEN e.dt_open >= '2026-01-01' THEN 6
+
+            ELSE 99
+          END AS bucket_id
+    FROM enriched e
 )
 SELECT
-      @MondayStart AS week_start_monday
-    , @FactEndDate AS fact_end_date
-    , @WeekFrom AS week_from_tuesday
-    , @WeekTo   AS week_to_fact_date
-
-    , ISNULL(ns.cnt_cli_scope, 0) AS cnt_cli_scope
-
-    , ISNULL(ex.cnt_con_exit, 0) AS cnt_con_exit
-    , ISNULL(ex.vol_exit, 0)     AS vol_exit_deposits_rub
-    , ex.wavg_rate_exit          AS wavg_con_rate_exit
-
-    , ISNULL(op.cnt_con_open, 0) AS cnt_con_open
-    , ISNULL(op.vol_open, 0)     AS vol_opened_deposits_rub
-    , op.wavg_rate_open          AS wavg_con_rate_open
-
-    , ISNULL(ns.ns_start_vol, 0) AS ns_balance_start_rub
-    , ISNULL(ns.ns_end_vol, 0)   AS ns_balance_end_rub
-    , ISNULL(ns.ns_end_vol, 0) - ISNULL(ns.ns_start_vol, 0) AS ns_balance_delta_rub
-FROM agg_exit ex
-CROSS JOIN agg_open op
-CROSS JOIN agg_ns ns;
-
-/*
-DROP TABLE #clients_scope;
-DROP TABLE #bal;
-*/
+      dt_rep
+    , bucket_id
+    , CASE bucket_id
+        WHEN 1 THEN N'1) НС + ДВС'
+        WHEN 2 THEN N'2) 01.10–05.11.2025 fixed 0.163–0.17 85–110 НЕ маркетплейсы'
+        WHEN 3 THEN N'3) 06.11–31.12.2025 fixed 0.163–0.17 55–110 НЕ маркетплейсы'
+        WHEN 4 THEN N'4) До 31.12.2025 прочие НЕ маркетплейсы'
+        WHEN 5 THEN N'5) 01.01–29.02.2026 fixed 0.158–0.16 55–110 НЕ маркетплейсы'
+        WHEN 6 THEN N'6) С 01.01.2026 прочие НЕ маркетплейсы'
+        WHEN 7 THEN N'7) Маркетплейсы (список)'
+        WHEN 8 THEN N'8) РК МАРТ: с 01.03.2026 fixed 0.158–0.16 55–110 НЕ маркетплейсы'
+        ELSE N'99) НЕ РАЗОБРАНО'
+      END AS bucket_name
+    , SUM(OUT_RUB) / 1e9 AS out_rub_bln
+FROM labeled
+GROUP BY dt_rep, bucket_id
+ORDER BY dt_rep, bucket_id;
