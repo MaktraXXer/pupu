@@ -1,128 +1,206 @@
-r = ZCYC
+USE [ALM];
+SET NOCOUNT ON;
 
-# мгновенный форвард f(0, t) по рынку (из непрерывной ставки дисконтирования z(t))
-def f_market(t):
-    return r(t) + 0.5 * t * (r(t + eps) - r(t - eps)) / eps
+/* =========================================================
+   ПАРАМЕТРЫ
+   начало недели = первый понедельник
+   конец недели  = следующий понедельник
+   логика недели = вторник .. следующий понедельник
+   ========================================================= */
+DECLARE @MondayStart date = '2026-02-23';
+DECLARE @MondayEnd   date = '2026-03-02';
 
-# центральная производная мгновенного форварда (в текущей версии не используется)
-def df_market(t):
-    return 0.5 * (f_market(t + eps) - f_market(t - eps)) / eps
+DECLARE @WeekFrom date = DATEADD(day, 1, @MondayStart); -- вторник
+DECLARE @WeekTo   date = @MondayEnd;                    -- понедельник
 
-# Discount factor calculator (в текущей версии не используется)
-def df(t):
-    return np.exp(-ZCYC(t * dt) * t * dt)
+IF OBJECT_ID('tempdb..#bal') IS NOT NULL DROP TABLE #bal;
+IF OBJECT_ID('tempdb..#clients_scope') IS NOT NULL DROP TABLE #clients_scope;
 
-# Forward rate calculator (в текущей версии не используется)
-def forward_rate(t0, t1, path):
-    if t0 == t1:
-        return 0
-    erpath = np.exp(path * dt)
-    erpath = erpath[t0:t1]
-    return np.log(np.prod(erpath)) / (dt * (t1 - t0))
+/* =========================================================
+   1. ОДИН РАЗ ЧИТАЕМ БАЛАНС
+   Сразу:
+   - только 2 даты
+   - только 2 секции
+   - только нужные фильтры
+   ========================================================= */
+SELECT
+    t.dt_rep,
+    t.cli_id,
+    t.con_id,
+    CAST(t.dt_open AS date)       AS dt_open,
+    CAST(t.dt_close_plan AS date) AS dt_close_plan,
+    t.section_name,
+    t.out_rub,
+    t.rate_con,
+    ISNULL(t.is_floatrate, 0)     AS is_floatrate,
+    t.PROD_NAME_res,
+    t.TSEGMENTNAME
+INTO #bal
+FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
+WHERE 1 = 1
+    AND t.dt_rep IN (@MondayStart, @MondayEnd)
+    AND t.section_name IN (N'Срочные', N'Накопительный счёт')
+    AND t.block_name = N'Привлечение ФЛ'
+    AND t.acc_role   = N'LIAB'
+    AND t.cur        = '810'
+    AND t.od_flag    = 1
+    AND t.out_rub IS NOT NULL
+    AND t.out_rub >= 0;
 
+/* =========================================================
+   2. ИНДЕКСЫ НА #bal
+   Делаем не один абстрактный индекс, а под сценарии:
+   - выходящие вклады
+   - новые вклады
+   - остатки НС
+   ========================================================= */
 
-def MC_simulations(T, n_sim, a=opt_ats['a'], theta=opt_ats['theta'], s=opt_ats['s'], debug=True):
+/* Базовый индекс под дату/секцию/клиента */
+CREATE CLUSTERED INDEX CIX_#bal
+    ON #bal (dt_rep, section_name, cli_id, con_id);
 
-    T1 = T + 1
+/* Под поиск вкладов к выходу */
+CREATE NONCLUSTERED INDEX IX_#bal_exit
+    ON #bal (dt_rep, section_name, dt_close_plan, cli_id)
+    INCLUDE (con_id, out_rub, rate_con, dt_open);
 
-    # X(t) = x(t) + phi(t)   (CIR++)
-    xs = np.zeros((T1, n_sim))
-    X = np.zeros((T1, n_sim))
+/* Под поиск новых вкладов */
+CREATE NONCLUSTERED INDEX IX_#bal_open
+    ON #bal (dt_rep, section_name, dt_open, cli_id)
+    INCLUDE (con_id, out_rub, rate_con, dt_close_plan);
 
-    # сетка времени (в годах)
-    t = np.zeros(T1)
-    for i in range(T):
-        t[i + 1] = t[i] + dt
+/* Под НС по клиенту на дату */
+CREATE NONCLUSTERED INDEX IX_#bal_ns
+    ON #bal (section_name, dt_rep, cli_id)
+    INCLUDE (out_rub);
 
-    # рыночные значения на сетке
-    rt = np.zeros(T1)
-    f_mkt = np.zeros(T1)
+/* =========================================================
+   3. КЛИЕНТЫ ИЗ СКОУПА
+   Это клиенты, у которых на первый понедельник есть вклады,
+   выходящие по плановой дате во вторник..понедельник
+   ========================================================= */
+SELECT DISTINCT
+    b.cli_id
+INTO #clients_scope
+FROM #bal b
+WHERE 1 = 1
+    AND b.dt_rep = @MondayStart
+    AND b.section_name = N'Срочные'
+    AND b.dt_close_plan >= @WeekFrom
+    AND b.dt_close_plan <= @WeekTo;
 
-    rt[0] = ZCYC(eps)
-    f_mkt[0] = rt[0]
+CREATE UNIQUE CLUSTERED INDEX CIX_#clients_scope
+    ON #clients_scope(cli_id);
 
-    for i in range(1, T1):
-        rt[i] = ZCYC(t[i])
-        f_mkt[i] = f_market(t[i])
+/* =========================================================
+   4. ИТОГОВЫЙ РАСЧЕТ
+   ========================================================= */
+;WITH deposits_to_exit AS (
+    SELECT
+        b.cli_id,
+        b.con_id,
+        b.out_rub,
+        b.rate_con
+    FROM #bal b
+    WHERE 1 = 1
+        AND b.dt_rep = @MondayStart
+        AND b.section_name = N'Срочные'
+        AND b.dt_close_plan >= @WeekFrom
+        AND b.dt_close_plan <= @WeekTo
+),
+opened_deposits AS (
+    SELECT
+        b.cli_id,
+        b.con_id,
+        b.out_rub,
+        b.rate_con
+    FROM #bal b
+    INNER JOIN #clients_scope c
+        ON b.cli_id = c.cli_id
+    WHERE 1 = 1
+        AND b.dt_rep = @MondayEnd
+        AND b.section_name = N'Срочные'
+        AND b.dt_open >= @WeekFrom
+        AND b.dt_open <= @WeekTo
+),
+ns_by_date AS (
+    SELECT
+        b.dt_rep,
+        b.cli_id,
+        SUM(CAST(b.out_rub AS decimal(38,6))) AS ns_out_rub
+    FROM #bal b
+    INNER JOIN #clients_scope c
+        ON b.cli_id = c.cli_id
+    WHERE 1 = 1
+        AND b.section_name = N'Накопительный счёт'
+    GROUP BY
+        b.dt_rep,
+        b.cli_id
+),
+agg_exit AS (
+    SELECT
+        COUNT(DISTINCT cli_id) AS cnt_cli_exit,
+        COUNT(DISTINCT con_id) AS cnt_con_exit,
+        SUM(CAST(out_rub AS decimal(38,6))) AS vol_exit,
+        CAST(
+            SUM(CASE WHEN rate_con IS NOT NULL THEN CAST(out_rub AS decimal(38,6)) * rate_con END)
+            / NULLIF(SUM(CASE WHEN rate_con IS NOT NULL THEN CAST(out_rub AS decimal(38,6)) END), 0)
+            AS decimal(18,6)
+        ) AS wavg_rate_exit
+    FROM deposits_to_exit
+),
+agg_open AS (
+    SELECT
+        COUNT(DISTINCT cli_id) AS cnt_cli_open,
+        COUNT(DISTINCT con_id) AS cnt_con_open,
+        SUM(CAST(out_rub AS decimal(38,6))) AS vol_open,
+        CAST(
+            SUM(CASE WHEN rate_con IS NOT NULL THEN CAST(out_rub AS decimal(38,6)) * rate_con END)
+            / NULLIF(SUM(CASE WHEN rate_con IS NOT NULL THEN CAST(out_rub AS decimal(38,6)) END), 0)
+            AS decimal(18,6)
+        ) AS wavg_rate_open
+    FROM opened_deposits
+),
+agg_ns AS (
+    SELECT
+        COUNT(DISTINCT c.cli_id) AS cnt_cli_scope,
+        SUM(CASE WHEN n.dt_rep = @MondayStart THEN n.ns_out_rub ELSE 0 END) AS ns_start_vol,
+        SUM(CASE WHEN n.dt_rep = @MondayEnd   THEN n.ns_out_rub ELSE 0 END) AS ns_end_vol
+    FROM #clients_scope c
+    LEFT JOIN ns_by_date n
+        ON c.cli_id = n.cli_id
+)
+SELECT
+    @MondayStart AS week_start_monday,
+    @MondayEnd   AS week_end_monday,
+    @WeekFrom    AS week_from_tuesday,
+    @WeekTo      AS week_to_monday,
 
-    # стартовая ставка модели r(0) ~ z(0)
-    X[0, :] = rt[0]
+    ns.cnt_cli_scope                AS cnt_cli_scope,
 
-    # x0 для формулы f_cir (как было)
-    x0 = f_mkt[0]
+    ex.cnt_con_exit                 AS cnt_con_exit,
+    ex.vol_exit                     AS vol_exit_deposits_rub,
+    ex.wavg_rate_exit               AS wavg_con_rate_exit,
 
-    # ------------------------------------------------------------------------------------------------------------------
-    # CIR++: расчёт phi(t) = f_mkt(t) - f_cir(t)
-    # ------------------------------------------------------------------------------------------------------------------
+    op.cnt_con_open                 AS cnt_con_open,
+    op.vol_open                     AS vol_opened_deposits_rub,
+    op.wavg_rate_open               AS wavg_con_rate_open,
 
-    ss = s**2
-    h = np.sqrt(a**2 + 2.0 * ss)
-    h2 = 2.0 * h
-    a_h = a + h
+    ns.ns_start_vol                 AS ns_balance_start_rub,
+    ns.ns_end_vol                   AS ns_balance_end_rub,
+    ns.ns_end_vol - ns.ns_start_vol AS ns_balance_delta_rub
+FROM agg_exit ex
+CROSS JOIN agg_open op
+CROSS JOIN agg_ns ns;
 
-    exp_ht = np.exp(h * t)
-    exp_ht_1 = exp_ht - 1.0
-    denominator = h2 + a_h * exp_ht_1
+/* =========================================================
+   5. ОТЛАДОЧНЫЕ ПРОВЕРКИ
+   Их удобно оставить на время теста
+   ========================================================= */
+SELECT COUNT(*) AS rows_in_#bal FROM #bal;
+SELECT COUNT(*) AS cnt_clients_scope FROM #clients_scope;
 
-    # !!! ИЗМЕНЕНИЕ: было atheta = a + theta, стало a_theta = a * theta (канонический CIR дрейф)
-    # было:
-    # atheta = a + theta
-    # стало:
-    a_theta = a * theta
-
-    # !!! ИЗМЕНЕНИЕ: в формуле f_cir используем a_theta вместо atheta (чтобы согласовать с CIR дрейфом)
-    const_part = (2.0 * a_theta * exp_ht_1) / denominator
-    x_part = (h2 * h2 * exp_ht) / (denominator ** 2)
-    f_cir = const_part + x0 * x_part
-
-    phi = f_mkt - f_cir
-
-    # --- ОТЛАДКА (проверка согласованности стартов)
-    # Показываем: x0 (используется в f_cir), phi(0), r(0), и то, каким стартом реально начинает CIR-часть xs(0)
-    if debug:
-        xs0_preview = float(X[0, 0] - phi[0])
-        print("DEBUG CIR++")
-        print(f"  a={a:.8f}, theta={theta:.8f}, s={s:.8f}")
-        print(f"  r0 (=ZCYC(eps))     = {rt[0]:.8f}")
-        print(f"  x0 (in f_cir)       = {x0:.8f}")
-        print(f"  phi0                = {phi[0]:.8f}")
-        print(f"  xs0 (=r0-phi0)      = {xs0_preview:.8f}")
-        print(f"  f_mkt[0]            = {f_mkt[0]:.8f}")
-        print(f"  f_cir[0]            = {f_cir[0]:.8f}")
-        print("  note: если x0 заметно != xs0, стоит отдельно согласовать старт x0.")
-
-    # ------------------------------------------------------------------------------------------------------------------
-    # БЛОКИ ИЗ ОРИГИНАЛА, КОТОРЫЕ УБРАЛ:
-    #
-    # 1) A(t), B(t) (аффинная структура) — нигде дальше не используется в симуляции:
-    #    A = (h2 * exp(0.5*(a+h)*t) / denominator) ** (2 * atheta / ss)
-    #    B = 2 * (exp_ht - 1) / denominator
-    #
-    # Их можно вернуть при необходимости, но для генерации траекторий X они не нужны.
-    # ------------------------------------------------------------------------------------------------------------------
-
-    # случайные числа
-    dz = np.random.normal(size=(T, n_sim))
-
-    # старт CIR-части x(0) = r(0) - phi(0)
-    xs[0, :] = X[0, :] - phi[0]
-
-    # MC симуляция CIR++
-    # !!! ИЗМЕНЕНИЕ: дрейф в симуляции теперь канонический: (a*theta - a*x)*dt
-    for i in range(1, T1):
-        dz_per_dt = dz[i - 1, :] / np.sqrt(period_num)  # == sqrt(dt)*N(0,1)
-
-        # защита от отрицательных значений под корнем
-        x_prev = np.maximum(xs[i - 1, :], 0.0)
-
-        dz_part = s * np.sqrt(x_prev) * dz_per_dt
-
-        # было:
-        # xs[i] = xs[i-1] + (atheta - a*xs[i-1])*dt + dz_part
-        # стало:
-        xs[i, :] = xs[i - 1, :] + (a_theta - a * xs[i - 1, :]) * dt + dz_part
-
-        # итоговая ставка r(t) = x(t) + phi(t), ограничиваем снизу
-        X[i, :] = np.maximum(xs[i, :] + phi[i], eps)
-
-    return X
+/*
+DROP TABLE #clients_scope;
+DROP TABLE #bal;
+*/
