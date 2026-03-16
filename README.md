@@ -1,46 +1,3 @@
-USE [ALM_TEST];
-SET NOCOUNT ON;
-GO
-
-IF NOT EXISTS (
-    SELECT 1
-    FROM sys.schemas
-    WHERE name = N'ALM_REPORT'
-)
-BEGIN
-    EXEC('CREATE SCHEMA ALM_REPORT');
-END
-GO
-
-IF OBJECT_ID(N'ALM_REPORT.DepositWeekRollStats', N'U') IS NULL
-BEGIN
-    CREATE TABLE ALM_REPORT.DepositWeekRollStats
-    (
-        week_start_monday       date            NOT NULL,
-        week_end_monday         date            NOT NULL,
-        week_from_tuesday       date            NOT NULL,
-        week_to_monday          date            NOT NULL,
-
-        cnt_cli_scope           bigint          NULL,
-
-        cnt_con_exit            bigint          NULL,
-        vol_exit_deposits_rub   decimal(38, 6) NULL,
-        wavg_con_rate_exit      decimal(18, 6) NULL,
-
-        cnt_con_open            bigint          NULL,
-        vol_opened_deposits_rub decimal(38, 6) NULL,
-        wavg_con_rate_open      decimal(18, 6) NULL,
-
-        ns_balance_start_rub    decimal(38, 6) NULL,
-        ns_balance_end_rub      decimal(38, 6) NULL,
-        ns_balance_delta_rub    decimal(38, 6) NULL,
-
-        CONSTRAINT PK_DepositWeekRollStats
-            PRIMARY KEY CLUSTERED (week_start_monday, week_end_monday)
-    );
-END
-GO
-
 CREATE OR ALTER PROCEDURE ALM_REPORT.prc_DepositWeekRollStats_Sliding
 (
       @DateFrom   date
@@ -367,16 +324,16 @@ BEGIN
             , @CurMondayEnd
             , @WeekFrom
             , @WeekTo
-            , ns.cnt_cli_scope
-            , ex.cnt_con_exit
-            , ex.vol_exit
+            , ISNULL(ns.cnt_cli_scope, 0)
+            , ISNULL(ex.cnt_con_exit, 0)
+            , ISNULL(ex.vol_exit, 0)
             , ex.wavg_rate_exit
-            , op.cnt_con_open
-            , op.vol_open
+            , ISNULL(op.cnt_con_open, 0)
+            , ISNULL(op.vol_open, 0)
             , op.wavg_rate_open
-            , ns.ns_start_vol
-            , ns.ns_end_vol
-            , ns.ns_end_vol - ns.ns_start_vol
+            , ISNULL(ns.ns_start_vol, 0)
+            , ISNULL(ns.ns_end_vol, 0)
+            , ISNULL(ns.ns_end_vol, 0) - ISNULL(ns.ns_start_vol, 0)
         FROM agg_exit ex
         CROSS JOIN agg_open op
         CROSS JOIN agg_ns ns;
@@ -388,11 +345,26 @@ BEGIN
             TRUNCATE TABLE #bal_swap;
 
             INSERT INTO #bal_swap
-            SELECT * FROM #bal_curr;
+            (
+                  dt_rep, cli_id, con_id, dt_open, dt_close_plan, section_name,
+                  out_rub, rate_con, is_floatrate, PROD_NAME_res, TSEGMENTNAME
+            )
+            SELECT
+                  dt_rep, cli_id, con_id, dt_open, dt_close_plan, section_name,
+                  out_rub, rate_con, is_floatrate, PROD_NAME_res, TSEGMENTNAME
+            FROM #bal_curr;
 
             TRUNCATE TABLE #bal_prev;
+
             INSERT INTO #bal_prev
-            SELECT * FROM #bal_swap;
+            (
+                  dt_rep, cli_id, con_id, dt_open, dt_close_plan, section_name,
+                  out_rub, rate_con, is_floatrate, PROD_NAME_res, TSEGMENTNAME
+            )
+            SELECT
+                  dt_rep, cli_id, con_id, dt_open, dt_close_plan, section_name,
+                  out_rub, rate_con, is_floatrate, PROD_NAME_res, TSEGMENTNAME
+            FROM #bal_swap;
 
             TRUNCATE TABLE #bal_curr;
 
