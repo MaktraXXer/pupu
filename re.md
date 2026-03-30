@@ -1,221 +1,321 @@
-/* ===== ПАРАМЕТРЫ ===== */
-DECLARE @dt_rep       date         = '2026-03-14';   -- снимок баланса
-DECLARE @date_from    date         = '2026-03-01';
-DECLARE @date_to      date         = '2026-03-14';
+Да, если ты не закрывал ту же самую сессию / то же самое окно запроса и #bal, #clients_scope еще живы, то из них можно сразу вытащить нужные детальные выгрузки.
 
-DECLARE @cur          varchar(3)   = '810';
-DECLARE @section_name nvarchar(50) = N'Срочные';
-DECLARE @block_name   nvarchar(100)= N'Привлечение ФЛ';
-DECLARE @acc_role     nvarchar(10) = N'LIAB';
-DECLARE @od_only      bit          = 1;
+Важно:
+#temp таблицы существуют только в рамках текущей сессии.
+Если окно закрыто, переподключился, или запускаешь в другом окне — их уже нет.
 
-DECLARE @eps decimal(9,6) = 0.0005;  -- допуск по ставке ±0.0005
+Ниже сначала покажу, как ответить на твои вопросы из уже созданных temp-таблиц, а потом дам отдельный цельный скрипт, если хочешь сделать это заново и нормально.
 
-/* ===== Эталонные рекламные ставки с периодами действия =====
-   (01–15: старые; 16–18: новые — подставь фактические периоды при переносе) */
-IF OBJECT_ID('tempdb..#rk_rates') IS NOT NULL DROP TABLE #rk_rates;
-CREATE TABLE #rk_rates(
-    d_from date,
-    d_to   date,
-    conv_type varchar(20),   -- 'AT_THE_END' | 'NOT_AT_THE_END'
-    r      decimal(9,6)
-);
+⸻
 
-INSERT INTO #rk_rates(d_from,d_to,conv_type,r)
-VALUES
-('2026-03-01','2026-03-15','AT_THE_END',     0.160),
-('2026-03-01','2026-03-15','AT_THE_END',     0.158),
-('2026-03-01','2026-03-15','NOT_AT_THE_END', 0.158),
-('2026-03-01','2026-03-15','NOT_AT_THE_END', 0.156),
-('2026-03-16','2026-03-31','AT_THE_END',     0.160),
-('2026-03-16','2026-03-31','AT_THE_END',     0.158),
-('2026-03-16','2026-03-31','NOT_AT_THE_END', 0.158),
-('2026-03-16','2026-03-31','NOT_AT_THE_END', 0.156);
+1. Можно ли из уже созданных #bal и #clients_scope получить ответ?
 
-/* ===== Основная выборка по одному снимку @dt_rep ===== */
-WITH base AS (
+Да.
+
+Твой текущий скрипт уже содержит почти все нужные данные.
+Просто итоговый SELECT у тебя агрегированный, а деталь можно достать отдельными запросами.
+
+⸻
+
+2. Проверить, живы ли temp-таблицы
+
+IF OBJECT_ID('tempdb..#bal') IS NOT NULL
+    SELECT ' #bal exists' AS msg;
+ELSE
+    SELECT '#bal not found' AS msg;
+
+IF OBJECT_ID('tempdb..#clients_scope') IS NOT NULL
+    SELECT '#clients_scope exists' AS msg;
+ELSE
+    SELECT '#clients_scope not found' AS msg;
+
+
+⸻
+
+3. Детальная выгрузка: все вклады, которые выходили в заданный период
+
+Это список клиентов и договоров, которые на понедельничном срезе были срочными вкладами и должны были закрыться во вторник–факт.дату.
+
+DECLARE @MondayStart date = '2026-03-23';
+DECLARE @FactEndDate date = '2026-03-27';
+
+DECLARE @WeekFrom date = DATEADD(day, 1, @MondayStart);
+DECLARE @WeekTo   date = @FactEndDate;
+
+SELECT
+      b.cli_id
+    , b.con_id
+    , b.dt_rep
+    , b.dt_open
+    , b.dt_close_plan
+    , b.section_name
+    , b.out_rub
+    , b.rate_con
+    , b.is_floatrate
+    , b.PROD_NAME_res
+    , b.TSEGMENTNAME
+FROM #bal b
+WHERE b.dt_rep = @MondayStart
+  AND b.section_name = N'Срочные'
+  AND b.dt_close_plan >= @WeekFrom
+  AND b.dt_close_plan <= @WeekTo
+ORDER BY b.cli_id, b.dt_close_plan, b.con_id;
+
+
+⸻
+
+4. Детальная выгрузка: кто из этих клиентов открыл новые вклады за период
+
+Это уже только по клиентам из #clients_scope.
+
+DECLARE @MondayStart date = '2026-03-23';
+DECLARE @FactEndDate date = '2026-03-27';
+
+DECLARE @WeekFrom date = DATEADD(day, 1, @MondayStart);
+DECLARE @WeekTo   date = @FactEndDate;
+
+SELECT
+      b.cli_id
+    , b.con_id
+    , b.dt_rep
+    , b.dt_open
+    , b.dt_close_plan
+    , b.section_name
+    , b.out_rub
+    , b.rate_con
+    , b.is_floatrate
+    , b.PROD_NAME_res
+    , b.TSEGMENTNAME
+FROM #bal b
+INNER JOIN #clients_scope c
+    ON b.cli_id = c.cli_id
+WHERE b.dt_rep = @FactEndDate
+  AND b.section_name = N'Срочные'
+  AND b.dt_open >= @WeekFrom
+  AND b.dt_open <= @WeekTo
+ORDER BY b.cli_id, b.dt_open, b.con_id;
+
+
+⸻
+
+5. НС на начало и конец по этим клиентам
+
+Это по клиентам, у которых выходили вклады.
+
+DECLARE @MondayStart date = '2026-03-23';
+DECLARE @FactEndDate date = '2026-03-27';
+
+SELECT
+      b.cli_id
+    , SUM(CASE WHEN b.dt_rep = @MondayStart THEN b.out_rub ELSE 0 END) AS ns_start_rub
+    , SUM(CASE WHEN b.dt_rep = @FactEndDate THEN b.out_rub ELSE 0 END) AS ns_end_rub
+    , SUM(CASE WHEN b.dt_rep = @FactEndDate THEN b.out_rub ELSE 0 END)
+      - SUM(CASE WHEN b.dt_rep = @MondayStart THEN b.out_rub ELSE 0 END) AS ns_delta_rub
+FROM #bal b
+INNER JOIN #clients_scope c
+    ON b.cli_id = c.cli_id
+WHERE b.section_name = N'Накопительный счёт'
+GROUP BY b.cli_id
+ORDER BY b.cli_id;
+
+
+⸻
+
+6. Самая полезная сводная деталка: один ряд на клиента, с флагами и суммами
+
+Вот это, скорее всего, тебе и нужно.
+Здесь на одного клиента будет:
+	•	сколько у него выходило вкладов,
+	•	на какую сумму,
+	•	сколько открыл новых,
+	•	на какую сумму,
+	•	НС на начало,
+	•	НС на конец.
+
+DECLARE @MondayStart date = '2026-03-23';
+DECLARE @FactEndDate date = '2026-03-27';
+
+DECLARE @WeekFrom date = DATEADD(day, 1, @MondayStart);
+DECLARE @WeekTo   date = @FactEndDate;
+
+;WITH exit_agg AS
+(
     SELECT
-        CAST(t.dt_open AS date) AS dt_open_d,
-        t.con_id,
-        t.cli_id,
-        t.out_rub,
-        t.rate_con,
-        t.rate_trf,           -- ТС-ставка
-        t.conv,
-        t.termdays,
-        t.prod_name_res,
-        fk.AVG_KEY_RATE
-    FROM ALM.ALM.VW_Balance_Rest_All t WITH (NOLOCK)
-    LEFT JOIN WORK.ForecastKey_Cache fk
-        ON fk.DT_REP = CAST(t.dt_open AS date)
-       AND fk.TERM   = t.termdays
-    WHERE
-        t.dt_rep = @dt_rep
-        AND t.section_name = @section_name
-        AND t.block_name   = @block_name
-        AND (@od_only = 0 OR t.od_flag = 1)
-        AND t.cur          = @cur
-        AND t.acc_role     = @acc_role
-        AND t.out_rub IS NOT NULL
-        AND t.out_rub >= 0
-        AND t.dt_open BETWEEN @date_from AND @date_to
-        AND t.PROD_NAME_res NOT IN (
-            N'Надёжный прайм', N'Надёжный VIP', N'Надёжный премиум',
-            N'Надёжный промо', N'Надёжный старт', N'Надёжный Т2',
-            N'Надёжный Мегафон', N'Надёжный процент', N'Надёжный',
-            N'Могучий', N'ДОМа надёжно', N'Всё в ДОМ'
-        )
+          b.cli_id
+        , COUNT(DISTINCT b.con_id) AS cnt_con_exit
+        , SUM(b.out_rub) AS vol_exit_rub
+        , CAST(
+            SUM(CASE WHEN b.rate_con IS NOT NULL THEN b.out_rub * b.rate_con END)
+            / NULLIF(SUM(CASE WHEN b.rate_con IS NOT NULL THEN b.out_rub END), 0)
+            AS decimal(18,6)
+          ) AS wavg_rate_exit
+    FROM #bal b
+    WHERE b.dt_rep = @MondayStart
+      AND b.section_name = N'Срочные'
+      AND b.dt_close_plan >= @WeekFrom
+      AND b.dt_close_plan <= @WeekTo
+    GROUP BY b.cli_id
 ),
-
-/* Схлопываем договор на дату открытия + готовим веса для wavg(rate_con/rate_trf/avg_key_rate) */
-by_con AS (
+open_agg AS
+(
     SELECT
-        b.dt_open_d,
-        b.con_id,
-        MIN(b.cli_id)  AS cli_id,
-        SUM(b.out_rub) AS out_rub,
-
-        /* Ставка для классификации РК (уровень договора) */
-        MIN(b.rate_con) AS rate_con_class,
-
-        /* Нормализация conv: NULL/пусто → AT_THE_END */
-        CASE
-            WHEN MIN(NULLIF(LTRIM(RTRIM(COALESCE(b.conv,''))), '')) IS NULL
-                 THEN 'AT_THE_END'
-            ELSE UPPER(LTRIM(RTRIM(MIN(b.conv))))
-        END AS conv_norm,
-
-        MIN(b.termdays) AS termdays,
-
-        /* Весовые суммы/деноминаторы только по строкам где ставка не NULL */
-        SUM(CASE WHEN b.rate_con IS NOT NULL THEN b.out_rub * b.rate_con END) AS wsum_rate_con,
-        SUM(CASE WHEN b.rate_con IS NOT NULL THEN b.out_rub END)               AS wden_rate_con,
-
-        SUM(CASE WHEN b.rate_trf IS NOT NULL THEN b.out_rub * b.rate_trf END) AS wsum_rate_trf,
-        SUM(CASE WHEN b.rate_trf IS NOT NULL THEN b.out_rub END)               AS wden_rate_trf,
-
-        SUM(CASE WHEN b.AVG_KEY_RATE IS NOT NULL THEN b.out_rub * b.AVG_KEY_RATE END) AS wsum_avg_key_rate,
-        SUM(CASE WHEN b.AVG_KEY_RATE IS NOT NULL THEN b.out_rub END)                    AS wden_avg_key_rate
-    FROM base b
-    GROUP BY
-        b.dt_open_d,
-        b.con_id
+          b.cli_id
+        , COUNT(DISTINCT b.con_id) AS cnt_con_open
+        , SUM(b.out_rub) AS vol_open_rub
+        , CAST(
+            SUM(CASE WHEN b.rate_con IS NOT NULL THEN b.out_rub * b.rate_con END)
+            / NULLIF(SUM(CASE WHEN b.rate_con IS NOT NULL THEN b.out_rub END), 0)
+            AS decimal(18,6)
+          ) AS wavg_rate_open
+    FROM #bal b
+    INNER JOIN #clients_scope c
+        ON b.cli_id = c.cli_id
+    WHERE b.dt_rep = @FactEndDate
+      AND b.section_name = N'Срочные'
+      AND b.dt_open >= @WeekFrom
+      AND b.dt_open <= @WeekTo
+    GROUP BY b.cli_id
 ),
-
-/* Маппинг срочности */
-mapped AS (
+ns_agg AS
+(
     SELECT
-        dt_open_d,
-        con_id,
-        cli_id,
-        out_rub,
-        rate_con_class,
-        conv_norm,
-        CASE
-            WHEN (termdays >= 28   AND termdays <= 44)   THEN 31
-            WHEN (termdays >= 45   AND termdays <= 79)   THEN 61
-            WHEN (termdays >= 80   AND termdays <= 115)  THEN 91
-            WHEN (termdays >= 116  AND termdays <= 140)  THEN 124
-            WHEN (termdays >= 141  AND termdays <= 174)  THEN 151
-            WHEN (termdays >= 175  AND termdays <= 200)  THEN 181
-            WHEN (termdays >= 201  AND termdays <= 230)  THEN 212
-            WHEN (termdays >= 231  AND termdays <= 250)  THEN 243
-            WHEN (termdays >= 251  AND termdays <= 290)  THEN 274
-            WHEN (termdays >= 340  AND termdays <= 405)  THEN 365
-            WHEN (termdays >= 540  AND termdays <= 621)  THEN 550
-            WHEN (termdays >= 720  AND termdays <= 763)  THEN 750
-            WHEN (termdays >= 1090 AND termdays <= 1140) THEN 1100
-            WHEN (termdays >= 1450 AND termdays <= 1475) THEN 1460
-            WHEN (termdays >= 1795 AND termdays <= 1830) THEN 1825
-            ELSE termdays
-        END AS term_bucket,
-
-        wsum_rate_con,
-        wden_rate_con,
-        wsum_rate_trf,
-        wden_rate_trf,
-        wsum_avg_key_rate,
-        wden_avg_key_rate
-    FROM by_con
-),
-
-/* Флаг 61 РК */
-flag_61rk AS (
-    SELECT
-        m.*,
-        CASE
-            WHEN m.term_bucket <> 61 THEN 0
-            ELSE
-                CASE
-                    WHEN m.conv_norm = 'AT_THE_END'
-                         AND EXISTS (
-                             SELECT 1
-                             FROM #rk_rates rr
-                             WHERE rr.conv_type = 'AT_THE_END'
-                               AND m.dt_open_d BETWEEN rr.d_from AND rr.d_to
-                               AND ABS(m.rate_con_class - rr.r) <= @eps
-                         ) THEN 1
-                    WHEN m.conv_norm <> 'AT_THE_END'
-                         AND EXISTS (
-                             SELECT 1
-                             FROM #rk_rates rr
-                             WHERE rr.conv_type = 'NOT_AT_THE_END'
-                               AND m.dt_open_d BETWEEN rr.d_from AND rr.d_to
-                               AND ABS(m.rate_con_class - rr.r) <= @eps
-                         ) THEN 1
-                    ELSE 0
-                END
-        END AS is_61_rk
-    FROM mapped m
-),
-
-/* ====== ИТОГ "TALL" ======
-   1) Общие сроки, НО для 61 берём только НЕ-РК
-   2) Отдельной строкой — «61 РК»
-*/
-tall AS (
-    /* 1) Все сроки, при этом 61 — только НЕ-РК */
-    SELECT
-        CAST(term_bucket AS nvarchar(20)) AS [Срок, дн.],
-        dt_open_d                         AS [Дата открытия],
-        SUM(out_rub)                      AS [Объем, руб.],
-        CAST(SUM(wsum_rate_con) / NULLIF(SUM(wden_rate_con),0) AS decimal(9,6)) AS [Средневзв. ставка (клиент)],
-        CAST(SUM(wsum_rate_trf) / NULLIF(SUM(wden_rate_trf),0) AS decimal(9,6)) AS [Средневзв. ставка (ТС)],
-        CAST(SUM(wsum_avg_key_rate) / NULLIF(SUM(wden_avg_key_rate),0) AS decimal(9,6)) AS [Средневзв. прогнозный КС]
-    FROM flag_61rk
-    WHERE term_bucket <> 61
-       OR (term_bucket = 61 AND is_61_rk = 0)
-    GROUP BY
-        term_bucket,
-        dt_open_d
-
-    UNION ALL
-
-    /* 2) Спец-строка: только 61 РК */
-    SELECT
-        N'61 РК' AS [Срок, дн.],
-        f.dt_open_d AS [Дата открытия],
-        SUM(f.out_rub) AS [Объем, руб.],
-        CAST(SUM(f.wsum_rate_con) / NULLIF(SUM(f.wden_rate_con),0) AS decimal(9,6)) AS [Средневзв. ставка (клиент)],
-        CAST(SUM(f.wsum_rate_trf) / NULLIF(SUM(f.wden_rate_trf),0) AS decimal(9,6)) AS [Средневзв. ставка (ТС)],
-        CAST(SUM(f.wsum_avg_key_rate) / NULLIF(SUM(f.wden_avg_key_rate),0) AS decimal(9,6)) AS [Средневзв. прогнозный КС]
-    FROM flag_61rk f
-    WHERE f.term_bucket = 61
-      AND f.is_61_rk = 1
-    GROUP BY
-        f.dt_open_d
+          b.cli_id
+        , SUM(CASE WHEN b.dt_rep = @MondayStart THEN b.out_rub ELSE 0 END) AS ns_start_rub
+        , SUM(CASE WHEN b.dt_rep = @FactEndDate THEN b.out_rub ELSE 0 END) AS ns_end_rub
+    FROM #bal b
+    INNER JOIN #clients_scope c
+        ON b.cli_id = c.cli_id
+    WHERE b.section_name = N'Накопительный счёт'
+    GROUP BY b.cli_id
 )
-SELECT *
-FROM tall
-ORDER BY
-    [Дата открытия],
-    CASE WHEN [Срок, дн.] = N'61 РК' THEN 2147483647 ELSE TRY_CONVERT(int, [Срок, дн.]) END,
-    [Срок, дн.];
+SELECT
+      c.cli_id
+    , ISNULL(e.cnt_con_exit, 0) AS cnt_con_exit
+    , ISNULL(e.vol_exit_rub, 0) AS vol_exit_rub
+    , e.wavg_rate_exit
+    , ISNULL(o.cnt_con_open, 0) AS cnt_con_open
+    , ISNULL(o.vol_open_rub, 0) AS vol_open_rub
+    , o.wavg_rate_open
+    , ISNULL(n.ns_start_rub, 0) AS ns_start_rub
+    , ISNULL(n.ns_end_rub, 0) AS ns_end_rub
+    , ISNULL(n.ns_end_rub, 0) - ISNULL(n.ns_start_rub, 0) AS ns_delta_rub
+    , CASE WHEN ISNULL(o.cnt_con_open, 0) > 0 THEN 1 ELSE 0 END AS opened_new_dep_flag
+FROM #clients_scope c
+LEFT JOIN exit_agg e
+    ON c.cli_id = e.cli_id
+LEFT JOIN open_agg o
+    ON c.cli_id = o.cli_id
+LEFT JOIN ns_agg n
+    ON c.cli_id = n.cli_id
+ORDER BY vol_exit_rub DESC, c.cli_id;
 
-    ----------
+
+⸻
+
+7. Если нужна деталка именно “по каждому con_id клиента + НС на начало/конец рядом”
+
+Тогда можно сделать так:
+одной таблицей показать каждое исходящее con_id, а рядом клиентские НС и агрегат открытия.
+
+DECLARE @MondayStart date = '2026-03-23';
+DECLARE @FactEndDate date = '2026-03-27';
+
+DECLARE @WeekFrom date = DATEADD(day, 1, @MondayStart);
+DECLARE @WeekTo   date = @FactEndDate;
+
+;WITH exit_detail AS
+(
+    SELECT
+          b.cli_id
+        , b.con_id AS exit_con_id
+        , b.dt_open AS exit_dt_open
+        , b.dt_close_plan AS exit_dt_close_plan
+        , b.out_rub AS exit_out_rub
+        , b.rate_con AS exit_rate_con
+        , b.PROD_NAME_res AS exit_prod_name
+    FROM #bal b
+    WHERE b.dt_rep = @MondayStart
+      AND b.section_name = N'Срочные'
+      AND b.dt_close_plan >= @WeekFrom
+      AND b.dt_close_plan <= @WeekTo
+),
+open_agg AS
+(
+    SELECT
+          b.cli_id
+        , COUNT(DISTINCT b.con_id) AS cnt_con_open
+        , SUM(b.out_rub) AS vol_open_rub
+    FROM #bal b
+    INNER JOIN #clients_scope c
+        ON b.cli_id = c.cli_id
+    WHERE b.dt_rep = @FactEndDate
+      AND b.section_name = N'Срочные'
+      AND b.dt_open >= @WeekFrom
+      AND b.dt_open <= @WeekTo
+    GROUP BY b.cli_id
+),
+ns_agg AS
+(
+    SELECT
+          b.cli_id
+        , SUM(CASE WHEN b.dt_rep = @MondayStart THEN b.out_rub ELSE 0 END) AS ns_start_rub
+        , SUM(CASE WHEN b.dt_rep = @FactEndDate THEN b.out_rub ELSE 0 END) AS ns_end_rub
+    FROM #bal b
+    INNER JOIN #clients_scope c
+        ON b.cli_id = c.cli_id
+    WHERE b.section_name = N'Накопительный счёт'
+    GROUP BY b.cli_id
+)
+SELECT
+      e.cli_id
+    , e.exit_con_id
+    , e.exit_dt_open
+    , e.exit_dt_close_plan
+    , e.exit_out_rub
+    , e.exit_rate_con
+    , e.exit_prod_name
+    , ISNULL(o.cnt_con_open, 0) AS cnt_con_open_by_cli
+    , ISNULL(o.vol_open_rub, 0) AS vol_open_rub_by_cli
+    , ISNULL(n.ns_start_rub, 0) AS ns_start_rub
+    , ISNULL(n.ns_end_rub, 0) AS ns_end_rub
+    , ISNULL(n.ns_end_rub, 0) - ISNULL(n.ns_start_rub, 0) AS ns_delta_rub
+FROM exit_detail e
+LEFT JOIN open_agg o
+    ON e.cli_id = o.cli_id
+LEFT JOIN ns_agg n
+    ON e.cli_id = n.cli_id
+ORDER BY e.cli_id, e.exit_dt_close_plan, e.exit_con_id;
 
 
+⸻
 
+8. Можно ли из твоего уже выполненного скрипта понять ответ “на мои вопросы”?
+
+Да, но частично:
+
+Твой скрипт в текущем виде уже дает:
+	•	сколько было выходящих вкладов,
+	•	сколько было открытых вкладов,
+	•	общий объем,
+	•	НС на начало и конец,
+	•	но только в агрегате по всей группе.
+
+Чтобы ответить:
+	•	какие именно клиенты,
+	•	какие именно con_id,
+	•	кто из них открыл вклад,
+	•	какие НС у конкретного клиента на начало и конец,
+
+нужно делать дополнительные запросы к #bal и #clients_scope — те, что я выше написал.
+
+⸻
+
+9. Если хочешь отдельный цельный скрипт — вот нормальный вариант
+
+Он сразу формирует 3 детальные выгрузки:
+	1.	#exit_detail — выходящие вклады
+	2.	#open_detail — открытые новые вклады этих клиентов
+	3.	#client_summary — клиентская сводка с НС на начало/конец
 
 USE [ALM];
 SET NOCOUNT ON;
@@ -223,8 +323,8 @@ SET NOCOUNT ON;
 /* ============================================
    ПАРАМЕТРЫ
    ============================================ */
-DECLARE @MondayStart date = '2026-03-09';   -- обязательно понедельник
-DECLARE @FactEndDate date = '2026-03-14';   -- фактическая дата конца неполной недели
+DECLARE @MondayStart date = '2026-03-23';
+DECLARE @FactEndDate date = '2026-03-27';
 
 /* ============================================
    ПРОВЕРКИ
@@ -249,28 +349,30 @@ BEGIN
     RETURN;
 END;
 
-DECLARE @WeekFrom date = DATEADD(day, 1, @MondayStart);  -- вторник
-DECLARE @WeekTo   date = @FactEndDate;                   -- фактический конец
+DECLARE @WeekFrom date = DATEADD(day, 1, @MondayStart);
+DECLARE @WeekTo   date = @FactEndDate;
 
 IF OBJECT_ID('tempdb..#bal') IS NOT NULL DROP TABLE #bal;
 IF OBJECT_ID('tempdb..#clients_scope') IS NOT NULL DROP TABLE #clients_scope;
+IF OBJECT_ID('tempdb..#exit_detail') IS NOT NULL DROP TABLE #exit_detail;
+IF OBJECT_ID('tempdb..#open_detail') IS NOT NULL DROP TABLE #open_detail;
+IF OBJECT_ID('tempdb..#client_summary') IS NOT NULL DROP TABLE #client_summary;
 
 /* ============================================
-   ЗАГРУЗКА ДВУХ СРЕЗОВ БАЛАНСА:
-   стартовый понедельник + фактический конец
+   БАЛАНС
    ============================================ */
 SELECT
-      CAST(t.dt_rep AS date)            AS dt_rep
-    , CAST(t.cli_id AS bigint)          AS cli_id
-    , CAST(t.con_id AS bigint)          AS con_id
-    , CAST(t.dt_open AS date)           AS dt_open
-    , CAST(t.dt_close_plan AS date)     AS dt_close_plan
+      CAST(t.dt_rep AS date) AS dt_rep
+    , CAST(t.cli_id AS bigint) AS cli_id
+    , CAST(t.con_id AS bigint) AS con_id
+    , CAST(t.dt_open AS date) AS dt_open
+    , CAST(t.dt_close_plan AS date) AS dt_close_plan
     , CAST(t.section_name AS nvarchar(50)) AS section_name
-    , CAST(t.out_rub AS decimal(38,6))  AS out_rub
+    , CAST(t.out_rub AS decimal(38,6)) AS out_rub
     , CAST(t.rate_con AS decimal(18,6)) AS rate_con
     , CAST(ISNULL(t.is_floatrate,0) AS bit) AS is_floatrate
     , CAST(t.PROD_NAME_res AS nvarchar(255)) AS PROD_NAME_res
-    , CAST(t.TSEGMENTNAME AS nvarchar(255))  AS TSEGMENTNAME
+    , CAST(t.TSEGMENTNAME AS nvarchar(255)) AS TSEGMENTNAME
 INTO #bal
 FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
 WHERE t.dt_rep IN (@MondayStart, @FactEndDate)
@@ -285,20 +387,8 @@ WHERE t.dt_rep IN (@MondayStart, @FactEndDate)
 CREATE CLUSTERED INDEX CIX_#bal
     ON #bal (dt_rep, section_name, cli_id, con_id);
 
-CREATE NONCLUSTERED INDEX IX_#bal_exit
-    ON #bal (dt_rep, section_name, dt_close_plan, cli_id)
-    INCLUDE (con_id, out_rub, rate_con, dt_open);
-
-CREATE NONCLUSTERED INDEX IX_#bal_open
-    ON #bal (dt_rep, section_name, dt_open, cli_id)
-    INCLUDE (con_id, out_rub, rate_con, dt_close_plan);
-
-CREATE NONCLUSTERED INDEX IX_#bal_ns
-    ON #bal (section_name, dt_rep, cli_id)
-    INCLUDE (out_rub);
-
 /* ============================================
-   КЛИЕНТЫ В СКОУПЕ: есть выходящий вклад
+   КЛИЕНТЫ В СКОУПЕ
    ============================================ */
 SELECT DISTINCT
     b.cli_id
@@ -313,110 +403,142 @@ CREATE UNIQUE CLUSTERED INDEX CIX_#clients_scope
     ON #clients_scope(cli_id);
 
 /* ============================================
-   ИТОГОВЫЙ РАСЧЁТ
+   1. ДЕТАЛЬ ВЫХОДЯЩИХ ВКЛАДОВ
    ============================================ */
-;WITH deposits_to_exit AS
+SELECT
+      b.cli_id
+    , b.con_id
+    , b.dt_open
+    , b.dt_close_plan
+    , b.out_rub
+    , b.rate_con
+    , b.is_floatrate
+    , b.PROD_NAME_res
+    , b.TSEGMENTNAME
+INTO #exit_detail
+FROM #bal b
+WHERE b.dt_rep = @MondayStart
+  AND b.section_name = N'Срочные'
+  AND b.dt_close_plan >= @WeekFrom
+  AND b.dt_close_plan <= @WeekTo;
+
+/* ============================================
+   2. ДЕТАЛЬ НОВЫХ ВКЛАДОВ ЭТИХ КЛИЕНТОВ
+   ============================================ */
+SELECT
+      b.cli_id
+    , b.con_id
+    , b.dt_open
+    , b.dt_close_plan
+    , b.out_rub
+    , b.rate_con
+    , b.is_floatrate
+    , b.PROD_NAME_res
+    , b.TSEGMENTNAME
+INTO #open_detail
+FROM #bal b
+INNER JOIN #clients_scope c
+    ON b.cli_id = c.cli_id
+WHERE b.dt_rep = @FactEndDate
+  AND b.section_name = N'Срочные'
+  AND b.dt_open >= @WeekFrom
+  AND b.dt_open <= @WeekTo;
+
+/* ============================================
+   3. КЛИЕНТСКАЯ СВОДКА
+   ============================================ */
+;WITH exit_agg AS
 (
     SELECT
-          b.cli_id
-        , b.con_id
-        , b.out_rub
-        , b.rate_con
-    FROM #bal b
-    WHERE b.dt_rep = @MondayStart
-      AND b.section_name = N'Срочные'
-      AND b.dt_close_plan >= @WeekFrom
-      AND b.dt_close_plan <= @WeekTo
-),
-opened_deposits AS
-(
-    SELECT
-          b.cli_id
-        , b.con_id
-        , b.out_rub
-        , b.rate_con
-    FROM #bal b
-    INNER JOIN #clients_scope c
-        ON b.cli_id = c.cli_id
-    WHERE b.dt_rep = @FactEndDate
-      AND b.section_name = N'Срочные'
-      AND b.dt_open >= @WeekFrom
-      AND b.dt_open <= @WeekTo
-),
-ns_by_date AS
-(
-    SELECT
-          b.dt_rep
-        , b.cli_id
-        , SUM(b.out_rub) AS ns_out_rub
-    FROM #bal b
-    INNER JOIN #clients_scope c
-        ON b.cli_id = c.cli_id
-    WHERE b.section_name = N'Накопительный счёт'
-    GROUP BY
-          b.dt_rep
-        , b.cli_id
-),
-agg_exit AS
-(
-    SELECT
-          COUNT(DISTINCT cli_id) AS cnt_cli_exit
+          cli_id
         , COUNT(DISTINCT con_id) AS cnt_con_exit
-        , SUM(out_rub) AS vol_exit
+        , SUM(out_rub) AS vol_exit_rub
         , CAST(
             SUM(CASE WHEN rate_con IS NOT NULL THEN out_rub * rate_con END)
             / NULLIF(SUM(CASE WHEN rate_con IS NOT NULL THEN out_rub END), 0)
             AS decimal(18,6)
           ) AS wavg_rate_exit
-    FROM deposits_to_exit
+    FROM #exit_detail
+    GROUP BY cli_id
 ),
-agg_open AS
+open_agg AS
 (
     SELECT
-          COUNT(DISTINCT cli_id) AS cnt_cli_open
+          cli_id
         , COUNT(DISTINCT con_id) AS cnt_con_open
-        , SUM(out_rub) AS vol_open
+        , SUM(out_rub) AS vol_open_rub
         , CAST(
             SUM(CASE WHEN rate_con IS NOT NULL THEN out_rub * rate_con END)
             / NULLIF(SUM(CASE WHEN rate_con IS NOT NULL THEN out_rub END), 0)
             AS decimal(18,6)
           ) AS wavg_rate_open
-    FROM opened_deposits
+    FROM #open_detail
+    GROUP BY cli_id
 ),
-agg_ns AS
+ns_agg AS
 (
     SELECT
-          COUNT(DISTINCT c.cli_id) AS cnt_cli_scope
-        , SUM(CASE WHEN n.dt_rep = @MondayStart THEN n.ns_out_rub ELSE 0 END) AS ns_start_vol
-        , SUM(CASE WHEN n.dt_rep = @FactEndDate THEN n.ns_out_rub ELSE 0 END) AS ns_end_vol
-    FROM #clients_scope c
-    LEFT JOIN ns_by_date n
-        ON c.cli_id = n.cli_id
+          b.cli_id
+        , SUM(CASE WHEN b.dt_rep = @MondayStart THEN b.out_rub ELSE 0 END) AS ns_start_rub
+        , SUM(CASE WHEN b.dt_rep = @FactEndDate THEN b.out_rub ELSE 0 END) AS ns_end_rub
+    FROM #bal b
+    INNER JOIN #clients_scope c
+        ON b.cli_id = c.cli_id
+    WHERE b.section_name = N'Накопительный счёт'
+    GROUP BY b.cli_id
 )
 SELECT
-      @MondayStart AS week_start_monday
-    , @FactEndDate AS fact_end_date
-    , @WeekFrom AS week_from_tuesday
-    , @WeekTo   AS week_to_fact_date
+      c.cli_id
+    , ISNULL(e.cnt_con_exit, 0) AS cnt_con_exit
+    , ISNULL(e.vol_exit_rub, 0) AS vol_exit_rub
+    , e.wavg_rate_exit
+    , ISNULL(o.cnt_con_open, 0) AS cnt_con_open
+    , ISNULL(o.vol_open_rub, 0) AS vol_open_rub
+    , o.wavg_rate_open
+    , ISNULL(n.ns_start_rub, 0) AS ns_start_rub
+    , ISNULL(n.ns_end_rub, 0) AS ns_end_rub
+    , ISNULL(n.ns_end_rub, 0) - ISNULL(n.ns_start_rub, 0) AS ns_delta_rub
+    , CASE WHEN ISNULL(o.cnt_con_open, 0) > 0 THEN 1 ELSE 0 END AS opened_new_dep_flag
+INTO #client_summary
+FROM #clients_scope c
+LEFT JOIN exit_agg e
+    ON c.cli_id = e.cli_id
+LEFT JOIN open_agg o
+    ON c.cli_id = o.cli_id
+LEFT JOIN ns_agg n
+    ON c.cli_id = n.cli_id;
 
-    , ISNULL(ns.cnt_cli_scope, 0) AS cnt_cli_scope
+/* ============================================
+   ВЫВОДЫ
+   ============================================ */
 
-    , ISNULL(ex.cnt_con_exit, 0) AS cnt_con_exit
-    , ISNULL(ex.vol_exit, 0)     AS vol_exit_deposits_rub
-    , ex.wavg_rate_exit          AS wavg_con_rate_exit
+-- 1) Выходящие вклады
+SELECT *
+FROM #exit_detail
+ORDER BY cli_id, dt_close_plan, con_id;
 
-    , ISNULL(op.cnt_con_open, 0) AS cnt_con_open
-    , ISNULL(op.vol_open, 0)     AS vol_opened_deposits_rub
-    , op.wavg_rate_open          AS wavg_con_rate_open
+-- 2) Новые вклады тех же клиентов
+SELECT *
+FROM #open_detail
+ORDER BY cli_id, dt_open, con_id;
 
-    , ISNULL(ns.ns_start_vol, 0) AS ns_balance_start_rub
-    , ISNULL(ns.ns_end_vol, 0)   AS ns_balance_end_rub
-    , ISNULL(ns.ns_end_vol, 0) - ISNULL(ns.ns_start_vol, 0) AS ns_balance_delta_rub
-FROM agg_exit ex
-CROSS JOIN agg_open op
-CROSS JOIN agg_ns ns;
+-- 3) Сводка по клиентам
+SELECT *
+FROM #client_summary
+ORDER BY vol_exit_rub DESC, cli_id;
 
-/*
-DROP TABLE #clients_scope;
-DROP TABLE #bal;
-*/
+
+⸻
+
+10. Что лучше использовать на практике
+
+Если тебе надо быстро проверить уже выполненный запуск — используй запросы к существующим #bal и #clients_scope.
+
+Если хочешь:
+	•	сохранить логику,
+	•	потом экспортировать,
+	•	не зависеть от того, живы temp-таблицы или нет,
+
+то лучше запускать отдельный цельный скрипт из пункта 9.
+
+Если хочешь, я могу сразу сделать еще одну версию: одна итоговая деталка “1 строка = 1 клиент + список exit_con_id/open_con_id не агрегированно” или версию с выгрузкой в постоянные таблицы tempdb..##global / alm.temp_*.
