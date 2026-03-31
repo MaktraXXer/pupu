@@ -16,15 +16,14 @@ WITH bal_start AS
           t.cli_id
         , t.PROD_NAME_res
     FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
-    WHERE 1 = 1
-        AND t.dt_rep = @BalanceDateStart
-        AND t.section_name = N'Срочные'
-        AND t.block_name   = N'Привлечение ФЛ'
-        AND t.acc_role     = N'LIAB'
-        AND t.od_flag      = 1
-        AND t.cur          = '810'
-        AND t.out_rub IS NOT NULL
-        AND t.out_rub >= 0
+    WHERE t.dt_rep = @BalanceDateStart
+      AND t.section_name = N'Срочные'
+      AND t.block_name   = N'Привлечение ФЛ'
+      AND t.acc_role     = N'LIAB'
+      AND t.od_flag      = 1
+      AND t.cur          = '810'
+      AND t.out_rub IS NOT NULL
+      AND t.out_rub >= 0
 )
 SELECT
     cli_id
@@ -52,10 +51,7 @@ HAVING SUM(
            END
        ) = 0;
 
-CREATE UNIQUE CLUSTERED INDEX CIX_#clients_no_market_start
-    ON #clients_no_market_start(cli_id);
-
-/* 2. Статус клиента на 28.03: есть ФУ-вклад или нет */
+/* 2. Статус клиента на 28.03: есть ФУ или нет */
 WITH bal_end AS
 (
     SELECT
@@ -64,15 +60,14 @@ WITH bal_end AS
     FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
     INNER JOIN #clients_no_market_start c
         ON t.cli_id = c.cli_id
-    WHERE 1 = 1
-        AND t.dt_rep = @BalanceDateEnd
-        AND t.section_name = N'Срочные'
-        AND t.block_name   = N'Привлечение ФЛ'
-        AND t.acc_role     = N'LIAB'
-        AND t.od_flag      = 1
-        AND t.cur          = '810'
-        AND t.out_rub IS NOT NULL
-        AND t.out_rub >= 0
+    WHERE t.dt_rep = @BalanceDateEnd
+      AND t.section_name = N'Срочные'
+      AND t.block_name   = N'Привлечение ФЛ'
+      AND t.acc_role     = N'LIAB'
+      AND t.od_flag      = 1
+      AND t.cur          = '810'
+      AND t.out_rub IS NOT NULL
+      AND t.out_rub >= 0
 )
 SELECT
     c.cli_id,
@@ -87,33 +82,60 @@ LEFT JOIN bal_end b
     ON c.cli_id = b.cli_id
 GROUP BY c.cli_id;
 
-CREATE UNIQUE CLUSTERED INDEX CIX_#client_fu_status_end
-    ON #client_fu_status_end(cli_id);
-
-/* 3. Переводы этих клиентов в market-категории с разбивкой по статусу ФУ */
+/* 3. Сначала считаем клиентское дневное сальдо по распознанным market-переводам */
+WITH client_day AS
+(
+    SELECT
+          t.dt_rep
+        , t.spec_cat
+        , t.cli_id
+        , SUM(
+              ISNULL(t.[Распознано_НС], 0)
+            + ISNULL(t.[Распознано_СР], 0)
+            + ISNULL(t.[Распознано_ДВС], 0)
+          ) AS recognized_saldo
+    FROM ALM.EHD.VW_Transfers_FL_DET t WITH (NOLOCK)
+    INNER JOIN #client_fu_status_end s
+        ON t.cli_id = s.cli_id
+    WHERE t.dt_rep >= @DateFrom
+      AND t.dt_rep <= @DateTo
+      AND t.spec_cat IN ('BR', 'SR', 'FU')
+    GROUP BY
+          t.dt_rep
+        , t.spec_cat
+        , t.cli_id
+),
+client_day_labeled AS
+(
+    SELECT
+          d.dt_rep
+        , d.spec_cat
+        , s.fu_status
+        , CASE
+              WHEN d.recognized_saldo < 0 THEN N'Отрицательное сальдо'
+              ELSE N'Положительное/нулевое сальдо'
+          END AS saldo_sign
+        , d.cli_id
+        , d.recognized_saldo
+    FROM client_day d
+    INNER JOIN #client_fu_status_end s
+        ON d.cli_id = s.cli_id
+)
 SELECT
-      t.dt_rep
-    , t.spec_cat
-    , s.fu_status
-    , SUM(
-          ISNULL(t.[Распознано_НС], 0)
-        + ISNULL(t.[Распознано_СР], 0)
-        + ISNULL(t.[Распознано_ДВС], 0)
-      ) AS saldo_recognized
-    , SUM(ISNULL(t.amount_net, 0)) AS saldo_amount_net
-    , COUNT(DISTINCT t.cli_id) AS cnt_cli_id
-FROM ALM.EHD.VW_Transfers_FL_DET t WITH (NOLOCK)
-INNER JOIN #client_fu_status_end s
-    ON t.cli_id = s.cli_id
-WHERE 1 = 1
-    AND t.dt_rep >= @DateFrom
-    AND t.dt_rep <= @DateTo
-    AND t.spec_cat IN ('BR', 'SR', 'FU')
+      dt_rep
+    , spec_cat
+    , fu_status
+    , saldo_sign
+    , SUM(recognized_saldo) AS saldo_recognized
+    , COUNT(DISTINCT cli_id) AS cnt_cli_id
+FROM client_day_labeled
 GROUP BY
-      t.dt_rep
-    , t.spec_cat
-    , s.fu_status
+      dt_rep
+    , spec_cat
+    , fu_status
+    , saldo_sign
 ORDER BY
-      t.dt_rep
-    , t.spec_cat
-    , s.fu_status;
+      dt_rep
+    , spec_cat
+    , fu_status
+    , saldo_sign;
