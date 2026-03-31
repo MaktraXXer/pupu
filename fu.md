@@ -53,13 +53,18 @@ HAVING SUM(
 CREATE UNIQUE CLUSTERED INDEX CIX_#clients_no_market
     ON #clients_no_market(cli_id);
 
-/* 2. Переводы этих клиентов на маркетплейс-кошельки */
+/* 2. Переводы этих клиентов в market-категории */
 SELECT
       t.dt_rep
     , t.spec_cat
-    , SUM(t.[распознано_НС] + t.[распознано_СР] + t.[Распознано_ДВС]) AS saldo
+    , SUM(
+          ISNULL(t.[Распознано_НС], 0)
+        + ISNULL(t.[Распознано_СР], 0)
+        + ISNULL(t.[Распознано_ДВС], 0)
+      ) AS saldo_recognized
+    , SUM(ISNULL(t.amount_net, 0)) AS saldo_amount_net
     , COUNT(DISTINCT t.cli_id) AS cnt_cli_id
-FROM ALM.[ehd].[VW_transfers_FL_AGG_tab] t WITH (NOLOCK)
+FROM ALM.EHD.VW_Transfers_FL_DET t WITH (NOLOCK)
 INNER JOIN #clients_no_market c
     ON t.cli_id = c.cli_id
 WHERE 1 = 1
