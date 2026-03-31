@@ -82,7 +82,7 @@ LEFT JOIN bal_end b
     ON c.cli_id = b.cli_id
 GROUP BY c.cli_id;
 
-/* 3. Сначала считаем клиентское дневное сальдо по распознанным market-переводам */
+/* 3. Схлопываем платежи до dt_rep + cli_id + spec_cat */
 WITH client_day AS
 (
     SELECT
@@ -99,7 +99,11 @@ WITH client_day AS
         ON t.cli_id = s.cli_id
     WHERE t.dt_rep >= @DateFrom
       AND t.dt_rep <= @DateTo
+      AND t.direction_type <> N'Ошибка'
+      AND t.[целевая категория] = 1
       AND t.spec_cat IN ('BR', 'SR', 'FU')
+      AND t.transaction_type <> N'Внутренние переводы'
+      AND t.transit_flag = N'Не транзит'
     GROUP BY
           t.dt_rep
         , t.spec_cat
