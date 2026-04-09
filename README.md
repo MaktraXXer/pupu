@@ -1,157 +1,140 @@
-Да. Логика такая:
+/* ===== ПАРАМЕТРЫ ===== */
+DECLARE @dt_rep       date         = '2026-04-07';
+DECLARE @date_from    date         = '2026-03-01';
+DECLARE @date_to      date         = '2026-04-07';
 
-сначала на том же срезе @base_date определяем клиента на уровне cli_id:
-если у клиента есть хотя бы одна строка с TSEGMENTNAME = 'ДЧБО', то весь cli_id считаем ДЧБО.
-Иначе весь cli_id считаем розницей.
+DECLARE @cur          varchar(3)   = '810';
+DECLARE @section_name nvarchar(50) = N'Срочные';
+DECLARE @block_name   nvarchar(100)= N'Привлечение ФЛ';
+DECLARE @acc_role     nvarchar(10) = N'LIAB';
+DECLARE @od_only      bit          = 1;
 
-Ниже два отдельных запроса.
+DECLARE @eps decimal(9,6) = 0.0005;
 
-Запрос 1. Только клиенты ДЧБО
+/* ===== РК ставки ===== */
+IF OBJECT_ID('tempdb..#rk_rates') IS NOT NULL DROP TABLE #rk_rates;
+CREATE TABLE #rk_rates(
+    d_from date,
+    d_to   date,
+    conv_type varchar(20),
+    r      decimal(9,6)
+);
 
-DECLARE @base_date DATE = CAST(DATEADD(DAY, -2, GETDATE()) AS DATE);
+INSERT INTO #rk_rates(d_from,d_to,conv_type,r)
+VALUES
+('2026-03-01','2026-03-15','AT_THE_END',     0.160),
+('2026-03-01','2026-03-15','AT_THE_END',     0.158),
+('2026-03-01','2026-03-15','NOT_AT_THE_END', 0.158),
+('2026-03-01','2026-03-15','NOT_AT_THE_END', 0.156),
+('2026-03-16','2026-04-07','AT_THE_END',     0.160),
+('2026-03-16','2026-04-07','AT_THE_END',     0.158),
+('2026-03-16','2026-04-07','NOT_AT_THE_END', 0.158),
+('2026-03-16','2026-04-07','NOT_AT_THE_END', 0.156);
 
-WITH ranges AS (
-    SELECT '0-1,5' AS range_name, -100.0 AS lower_bound, 1.5 AS upper_bound
-    UNION ALL SELECT '1,5-5', 1.5, 5.0
-    UNION ALL SELECT '5-10', 5.0, 10.0
-    UNION ALL SELECT '10-100', 10.0, 100.0
-    UNION ALL SELECT '100-500', 100.0, 500.0
-    UNION ALL SELECT '500-1000', 500.0, 1000.0
-    UNION ALL SELECT '1000-5000', 1000.0, 5000.0
-    UNION ALL SELECT '5000-15000', 5000.0, 15000.0
-    UNION ALL SELECT '>15000', 15000.0, 10000000000.0
-),
-base_rows AS (
+WITH base AS (
     SELECT
+        CAST(t.dt_open AS date) AS dt_open_d,
+        t.con_id,
+        t.cli_id,
+        t.out_rub,
+        t.rate_con,
+        t.conv,
+        t.termdays
+    FROM ALM.ALM.VW_Balance_Rest_All t WITH (NOLOCK)
+    WHERE
+        t.dt_rep = @dt_rep
+        AND t.section_name = @section_name
+        AND t.block_name   = @block_name
+        AND (@od_only = 0 OR t.od_flag = 1)
+        AND t.cur          = @cur
+        AND t.acc_role     = @acc_role
+        AND t.out_rub IS NOT NULL
+        AND t.out_rub >= 0
+        AND t.dt_open BETWEEN @date_from AND @date_to
+        AND t.PROD_NAME_res NOT IN (
+            N'Надёжный прайм', N'Надёжный VIP', N'Надёжный премиум',
+            N'Надёжный промо', N'Надёжный старт', N'Надёжный Т2',
+            N'Надёжный Мегафон', N'Надёжный процент', N'Надёжный',
+            N'Могучий', N'ДОМа надёжно', N'Всё в ДОМ'
+        )
+),
+by_con AS (
+    SELECT
+        b.dt_open_d,
+        b.con_id,
+        MIN(b.cli_id) AS cli_id,
+        SUM(b.out_rub) AS out_rub,
+        MIN(b.rate_con) AS rate_con_class,
+        CASE
+            WHEN MIN(NULLIF(LTRIM(RTRIM(COALESCE(b.conv,''))), '')) IS NULL THEN 'AT_THE_END'
+            ELSE UPPER(LTRIM(RTRIM(MIN(b.conv))))
+        END AS conv_norm,
+        MIN(b.termdays) AS termdays
+    FROM base b
+    GROUP BY
+        b.dt_open_d,
+        b.con_id
+),
+mapped AS (
+    SELECT
+        dt_open_d,
+        con_id,
         cli_id,
         out_rub,
-        TSEGMENTNAME
-    FROM [ALM].[balance_rest_all] WITH (NOLOCK)
-    WHERE dt_rep = @base_date
-      AND od_flag = 1
-      AND block_name = 'Привлечение ФЛ'
-      AND section_name NOT IN (
-            'Аккредитивы',
-            'Брокерское обслуживание',
-            'Аккредитив под строительство'
-      )
-),
-client_types AS (
-    SELECT
-        cli_id,
+        rate_con_class,
+        conv_norm,
         CASE
-            WHEN MAX(CASE WHEN TSEGMENTNAME = 'ДЧБО' THEN 1 ELSE 0 END) = 1
-                THEN N'ДЧБО'
-            ELSE N'Розница'
-        END AS client_type
-    FROM base_rows
-    GROUP BY cli_id
+            WHEN termdays BETWEEN 28   AND 44   THEN 31
+            WHEN termdays BETWEEN 45   AND 79   THEN 61
+            WHEN termdays BETWEEN 80   AND 115  THEN 91
+            WHEN termdays BETWEEN 116  AND 140  THEN 124
+            WHEN termdays BETWEEN 141  AND 174  THEN 151
+            WHEN termdays BETWEEN 175  AND 200  THEN 181
+            WHEN termdays BETWEEN 201  AND 230  THEN 212
+            WHEN termdays BETWEEN 231  AND 250  THEN 243
+            WHEN termdays BETWEEN 251  AND 290  THEN 274
+            WHEN termdays BETWEEN 340  AND 405  THEN 365
+            WHEN termdays BETWEEN 540  AND 621  THEN 550
+            WHEN termdays BETWEEN 720  AND 763  THEN 750
+            WHEN termdays BETWEEN 1090 AND 1140 THEN 1100
+            WHEN termdays BETWEEN 1450 AND 1475 THEN 1460
+            WHEN termdays BETWEEN 1795 AND 1830 THEN 1825
+            ELSE termdays
+        END AS term_bucket
+    FROM by_con
 ),
-client_balances AS (
+flag_61rk AS (
     SELECT
-        b.cli_id,
-        SUM(b.out_rub) / 1000000.0 AS total_balance
-    FROM base_rows b
-    INNER JOIN client_types ct
-        ON b.cli_id = ct.cli_id
-    WHERE ct.client_type = N'ДЧБО'
-    GROUP BY b.cli_id
-),
-total_portfolio AS (
-    SELECT SUM(total_balance) AS total_sum
-    FROM client_balances
+        m.*,
+        CASE
+            WHEN m.term_bucket <> 61 THEN 0
+            WHEN m.conv_norm = 'AT_THE_END'
+                 AND EXISTS (
+                     SELECT 1
+                     FROM #rk_rates rr
+                     WHERE rr.conv_type = 'AT_THE_END'
+                       AND m.dt_open_d BETWEEN rr.d_from AND rr.d_to
+                       AND ABS(m.rate_con_class - rr.r) <= @eps
+                 ) THEN 1
+            WHEN m.conv_norm <> 'AT_THE_END'
+                 AND EXISTS (
+                     SELECT 1
+                     FROM #rk_rates rr
+                     WHERE rr.conv_type = 'NOT_AT_THE_END'
+                       AND m.dt_open_d BETWEEN rr.d_from AND rr.d_to
+                       AND ABS(m.rate_con_class - rr.r) <= @eps
+                 ) THEN 1
+            ELSE 0
+        END AS is_61_rk
+    FROM mapped m
 )
 SELECT
-    r.range_name,
-    r.lower_bound,
-    r.upper_bound,
-    COUNT(c.cli_id) AS [Кол-во],
-    COALESCE(SUM(c.total_balance), 0) AS [Сумма],
-    COALESCE(SUM(c.total_balance) / NULLIF(t.total_sum, 0), 0) AS [В% от портфеля]
-FROM ranges r
-LEFT JOIN client_balances c
-    ON c.total_balance > r.lower_bound
-   AND c.total_balance <= r.upper_bound
-CROSS JOIN total_portfolio t
-GROUP BY
-    r.range_name,
-    r.lower_bound,
-    r.upper_bound,
-    t.total_sum
-ORDER BY r.lower_bound;
-
-Запрос 2. Только клиенты розницы
-
-DECLARE @base_date DATE = CAST(DATEADD(DAY, -2, GETDATE()) AS DATE);
-
-WITH ranges AS (
-    SELECT '0-1,5' AS range_name, -100.0 AS lower_bound, 1.5 AS upper_bound
-    UNION ALL SELECT '1,5-5', 1.5, 5.0
-    UNION ALL SELECT '5-10', 5.0, 10.0
-    UNION ALL SELECT '10-100', 10.0, 100.0
-    UNION ALL SELECT '100-500', 100.0, 500.0
-    UNION ALL SELECT '500-1000', 500.0, 1000.0
-    UNION ALL SELECT '1000-5000', 1000.0, 5000.0
-    UNION ALL SELECT '5000-15000', 5000.0, 15000.0
-    UNION ALL SELECT '>15000', 15000.0, 10000000000.0
-),
-base_rows AS (
-    SELECT
-        cli_id,
-        out_rub,
-        TSEGMENTNAME
-    FROM [ALM].[balance_rest_all] WITH (NOLOCK)
-    WHERE dt_rep = @base_date
-      AND od_flag = 1
-      AND block_name = 'Привлечение ФЛ'
-      AND section_name NOT IN (
-            'Аккредитивы',
-            'Брокерское обслуживание',
-            'Аккредитив под строительство'
-      )
-),
-client_types AS (
-    SELECT
-        cli_id,
-        CASE
-            WHEN MAX(CASE WHEN TSEGMENTNAME = 'ДЧБО' THEN 1 ELSE 0 END) = 1
-                THEN N'ДЧБО'
-            ELSE N'Розница'
-        END AS client_type
-    FROM base_rows
-    GROUP BY cli_id
-),
-client_balances AS (
-    SELECT
-        b.cli_id,
-        SUM(b.out_rub) / 1000000.0 AS total_balance
-    FROM base_rows b
-    INNER JOIN client_types ct
-        ON b.cli_id = ct.cli_id
-    WHERE ct.client_type = N'Розница'
-    GROUP BY b.cli_id
-),
-total_portfolio AS (
-    SELECT SUM(total_balance) AS total_sum
-    FROM client_balances
-)
-SELECT
-    r.range_name,
-    r.lower_bound,
-    r.upper_bound,
-    COUNT(c.cli_id) AS [Кол-во],
-    COALESCE(SUM(c.total_balance), 0) AS [Сумма],
-    COALESCE(SUM(c.total_balance) / NULLIF(t.total_sum, 0), 0) AS [В% от портфеля]
-FROM ranges r
-LEFT JOIN client_balances c
-    ON c.total_balance > r.lower_bound
-   AND c.total_balance <= r.upper_bound
-CROSS JOIN total_portfolio t
-GROUP BY
-    r.range_name,
-    r.lower_bound,
-    r.upper_bound,
-    t.total_sum
-ORDER BY r.lower_bound;
-
-Если хочешь, могу еще дать третью версию: один запрос, где сразу в выходе будет столбец client_type и две выборки будут в одном результате.
+    SUM(out_rub) AS vol_61_rk_rub,
+    COUNT(DISTINCT cli_id) AS cnt_cli_61_rk,
+    CAST(
+        SUM(out_rub) / NULLIF(COUNT(DISTINCT cli_id), 0)
+        AS decimal(18,2)
+    ) AS avg_deposit_per_client_61_rk_rub
+FROM flag_61rk
+WHERE term_bucket = 61
+  AND is_61_rk = 1;
