@@ -1,3 +1,7 @@
+ты не исправил ошибку
+
+проверь меня в части того как его испрввил я
+
 USE [ALM_TEST]
 GO
 
@@ -12,7 +16,7 @@ CREATE TABLE [alm_history].[liquidity_rates_v2](
     [dt_from] [date] NOT NULL,
     [dt_to] [date] NOT NULL,
     [term] [int] NOT NULL,
-     NOT NULL,
+    [cur] [char](3) NOT NULL,
     [IS_PDR] [int] NOT NULL,
     [IS_FINANCE_LCR] [int] NOT NULL,
     [value] [float] NOT NULL,
@@ -56,6 +60,9 @@ ON [alm_history].[liquidity_rates_v2]
     [dt_to]
 )
 GO
+
+
+
 
 
 
