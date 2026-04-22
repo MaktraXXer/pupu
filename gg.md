@@ -1,21 +1,39 @@
 Option Explicit
 
-Sub monte_carlo_fast_safe_optimized_v4()
+Sub calc_matrix_with_montecarlo_fast_persist_v3()
 
-    Dim ws As Worksheet
-    Set ws = Worksheets("График погашения")
+    Dim wsG As Worksheet, wsUp As Worksheet, wsRun As Worksheet, wsCpr As Worksheet, wsIn As Worksheet
+    Set wsG = Worksheets("График погашения")
+    Set wsUp = Worksheets("MC uprfront")
+    Set wsRun = Worksheets("MC running")
+    Set wsCpr = Worksheets("MC cpr")
+    Set wsIn = Worksheets("MC uprfront")
 
-    Dim startIdx As Long, endIdx As Long, n As Long
-    startIdx = CLng(ws.Range("S5").Value2)
-    endIdx = CLng(ws.Range("S6").Value2)
-    n = endIdx - startIdx + 1
+    ' Границы матрицы
+    Dim min_row As Long, max_row As Long, min_col As Long, max_col As Long
+    min_row = CLng(wsG.Range("M5").Value2)
+    max_row = CLng(wsG.Range("M6").Value2)
+    min_col = CLng(wsG.Range("M7").Value2)
+    max_col = CLng(wsG.Range("M8").Value2)
 
-    If n <= 0 Then Exit Sub
+    If max_row < min_row Or max_col < min_col Then Exit Sub
+
+    ' Диапазон сценариев
+    Dim startSc As Long, endSc As Long, nSc As Long
+    startSc = CLng(wsG.Range("S5").Value2)
+    endSc = CLng(wsG.Range("S6").Value2)
+    nSc = endSc - startSc + 1
+
+    If nSc <= 0 Then Exit Sub
+
+    ' Размеры матрицы
+    Dim nRow As Long, nCol As Long
+    nRow = max_row - min_row + 1
+    nCol = max_col - min_col + 1
 
     ' ===== настройки =====
-    Const SKIP_FILLED_SCENARIOS As Boolean = True
-    Const WRITE_EVERY_N_SCENARIOS As Long = 25
-    Const DO_EVENTS_EVERY_N_SCENARIOS As Long = 100
+    Const SKIP_FILLED_CELLS As Boolean = True
+    Const DO_EVENTS_EVERY_N_NEW_CELLS As Long = 10
 
     ' Состояние Excel
     Dim calcMode As XlCalculation
@@ -24,36 +42,39 @@ Sub monte_carlo_fast_safe_optimized_v4()
     Dim statusBarState As Variant
     Dim displayStatusBarState As Boolean
 
-    ' Сохраняем исходные значения
-    Dim oldD2 As Variant, oldS8 As Variant
-    oldD2 = ws.Range("D2").Value2
-    oldS8 = ws.Range("S8").Value2
+    ' Сохраняем исходные значения управляющих ячеек
+    Dim oldB4 As Variant, oldB6 As Variant, oldD2 As Variant, oldS8 As Variant
+    oldB4 = wsG.Range("B4").Value2
+    oldB6 = wsG.Range("B6").Value2
+    oldD2 = wsG.Range("D2").Value2
+    oldS8 = wsG.Range("S8").Value2
 
     ' Ключевые диапазоны
-    Dim rngD2 As Range, rngS8 As Range
+    Dim rngB4 As Range, rngB6 As Range, rngD2 As Range, rngQ8 As Range
     Dim rngB10 As Range, rngB11 As Range, rngB12 As Range
-    Set rngD2 = ws.Range("D2")
-    Set rngS8 = ws.Range("S8")
-    Set rngB10 = ws.Range("B10")
-    Set rngB11 = ws.Range("B11")
-    Set rngB12 = ws.Range("B12")
+    Set rngB4 = wsG.Range("B4")
+    Set rngB6 = wsG.Range("B6")
+    Set rngD2 = wsG.Range("D2")
+    Set rngQ8 = wsG.Range("S8")
+    Set rngB10 = wsG.Range("B10")
+    Set rngB11 = wsG.Range("B11")
+    Set rngB12 = wsG.Range("B12")
 
-    ' Диапазон вывода BF:BH
-    Dim outTopRow As Long, outBottomRow As Long
-    outTopRow = 14 + startIdx
-    outBottomRow = 14 + endIdx
+    ' Предзагрузка сетки
+    Dim arrDiscounts As Variant, arrTerms As Variant
+    arrDiscounts = wsIn.Range(wsIn.Cells(min_row, 2), wsIn.Cells(max_row, 2)).Value2
+    arrTerms = wsIn.Range(wsIn.Cells(2, min_col), wsIn.Cells(2, max_col)).Value2
 
-    Dim outRange As Range
-    Set outRange = ws.Range(ws.Cells(outTopRow, 58), ws.Cells(outBottomRow, 60)) ' BF:BH
+    Dim i As Long, k As Long, sc As Long
+    Dim rr As Long, cc As Long
+    Dim rVal As Variant, tVal As Variant
 
-    ' Считываем уже имеющийся блок результатов
-    Dim outArr As Variant
-    outArr = outRange.Value2
+    Dim sumUp As Double, sumRun As Double, sumCpr As Double
+    Dim avgUp As Double, avgRun As Double, avgCpr As Double
 
-    Dim i As Long, idx As Long
-    Dim skipCnt As Long, newCnt As Long
-    skipCnt = 0
-    newCnt = 0
+    Dim savedCells As Long, skippedCells As Long
+    savedCells = 0
+    skippedCells = 0
 
     On Error GoTo CLEANUP
 
@@ -79,49 +100,69 @@ Sub monte_carlo_fast_safe_optimized_v4()
     ' Включаем режим Монте-Карло
     rngD2.Value2 = False
 
-    For i = startIdx To endIdx
-        idx = i - startIdx + 1
+    For i = 1 To nRow
+        rVal = arrDiscounts(i, 1)
+        rngB4.Value2 = rVal
 
-        ' Пропуск уже заполненных сценариев
-        If SKIP_FILLED_SCENARIOS Then
-            If Len(outArr(idx, 1)) > 0 And Len(outArr(idx, 2)) > 0 And Len(outArr(idx, 3)) > 0 Then
-                skipCnt = skipCnt + 1
-                GoTo NextScenario
+        For k = 1 To nCol
+            rr = min_row + i - 1
+            cc = min_col + k - 1
+
+            ' Пропускаем уже заполненные клетки
+            If SKIP_FILLED_CELLS Then
+                If Len(wsUp.Cells(rr, cc).Value2) > 0 _
+                   And Len(wsRun.Cells(rr, cc).Value2) > 0 _
+                   And Len(wsCpr.Cells(rr, cc).Value2) > 0 Then
+                    skippedCells = skippedCells + 1
+                    GoTo NextCell
+                End If
             End If
-        End If
 
-        rngS8.Value2 = i
+            tVal = arrTerms(1, k)
+            rngB6.Value2 = tVal
 
-        ' Полный пересчет книги
-        Application.Calculate
+            sumUp = 0#
+            sumRun = 0#
+            sumCpr = 0#
 
-        outArr(idx, 1) = rngB10.Value2
-        outArr(idx, 2) = rngB11.Value2
-        outArr(idx, 3) = rngB12.Value2
+            For sc = startSc To endSc
+                rngQ8.Value2 = sc
+                Application.Calculate
 
-        newCnt = newCnt + 1
+                sumUp = sumUp + CDbl(rngB10.Value2)
+                sumRun = sumRun + CDbl(rngB11.Value2)
+                sumCpr = sumCpr + CDbl(rngB12.Value2)
+            Next sc
 
-        ' Периодическая запись на лист без сохранения файла
-        If (newCnt Mod WRITE_EVERY_N_SCENARIOS) = 0 Then
-            outRange.Value2 = outArr
-        End If
+            avgUp = sumUp / nSc
+            avgRun = sumRun / nSc
+            avgCpr = sumCpr / nSc
 
-        If (i Mod DO_EVENTS_EVERY_N_SCENARIOS) = 0 Then
-            DoEvents
-        End If
+            ' Один раз записываем итог в матрицы
+            wsUp.Cells(rr, cc).Value2 = avgUp
+            wsRun.Cells(rr, cc).Value2 = avgRun
+            wsCpr.Cells(rr, cc).Value2 = avgCpr
 
-NextScenario:
+            savedCells = savedCells + 1
+
+            If DO_EVENTS_EVERY_N_NEW_CELLS > 0 Then
+                If (savedCells Mod DO_EVENTS_EVERY_N_NEW_CELLS) = 0 Then
+                    DoEvents
+                End If
+            End If
+
+NextCell:
+        Next k
     Next i
-
-    ' Финальная запись результатов
-    outRange.Value2 = outArr
 
 CLEANUP:
     On Error Resume Next
 
     ' Возвращаем исходные значения
+    rngB4.Value2 = oldB4
+    rngB6.Value2 = oldB6
     rngD2.Value2 = oldD2
-    rngS8.Value2 = oldS8
+    rngQ8.Value2 = oldS8
 
     With Application
         .Calculation = calcMode
@@ -136,8 +177,8 @@ CLEANUP:
     If Err.Number <> 0 Then
         MsgBox "Ошибка: " & Err.Description, vbExclamation
     Else
-        MsgBox "Цикл по Монте-Карло завершен. Новых сценариев посчитано: " & newCnt & _
-               "; пропущено заполненных: " & skipCnt, vbInformation
+        MsgBox "Расчет MC-матрицы завершен. Новых ячеек посчитано: " & savedCells & _
+               "; пропущено заполненных: " & skippedCells, vbInformation
     End If
 
 End Sub
