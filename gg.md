@@ -1,178 +1,137 @@
-IF OBJECT_ID('tempdb..#base') IS NOT NULL DROP TABLE #base;
+select * from mort_od where dt_rep=date'2026-01-31';
+drop table cpr_report_new;
 
-SELECT
-      t.dt_rep
-    , t.con_id
-    , t.cli_id
-    , t.acc_no
-    , t.termdays
-    , t.rate_con
-    , t.conv
-    , t.dt_open
-    , t.dt_close_plan
-    , t.section_name
-    , t.out_rub
-    , t.PROD_NAME_res
-    , t.TSEGMENTNAME
-INTO #base
-FROM [ALM].[ALM].[VW_balance_rest_all] t WITH (NOLOCK)
-WHERE
-    t.dt_rep IN ('2026-04-29', '2026-05-02')
-    AND t.block_name = N'Привлечение ФЛ'
-    AND t.od_flag = 1
-    AND t.cur = '810'
-    AND t.out_rub IS NOT NULL
-    AND t.out_rub >= 0
-    AND t.section_name IN (N'Срочные', N'Накопительный счёт');
+create table cpr_report_new as
 
-
-WITH deposits_opened_from_3004 AS (
-    SELECT
-          b.dt_rep
-        , b.con_id
-        , b.cli_id
-        , b.acc_no
-        , b.dt_open
-        , b.dt_close_plan
-        , b.termdays
-        , b.rate_con
-        , b.conv
-        , b.out_rub
-        , b.out_rub / 1000000.0 AS out_rub_mln
-        , b.PROD_NAME_res
-        , b.TSEGMENTNAME
-
-        -- флаг размера договора
-        , CASE 
-            WHEN b.out_rub >= 1500000 THEN 1 
-            ELSE 0 
-          END AS dep_size_ge_1_5m_flag
-
-        -- флаг попадания под промо-условия по ставке / conv / сумме
-        , CASE 
-            WHEN b.conv = 'AT_THE_END'  AND b.out_rub >= 1500000 AND b.rate_con = 0.1450 THEN 1
-            WHEN b.conv = 'AT_THE_END'  AND b.out_rub <  1500000 AND b.rate_con = 0.1430 THEN 1
-            WHEN b.conv <> 'AT_THE_END' AND b.out_rub <  1500000 AND b.rate_con = 0.1410 THEN 1
-            WHEN b.conv <> 'AT_THE_END' AND b.out_rub >= 1500000 AND b.rate_con = 0.1430 THEN 1
-            ELSE 0
-          END AS promo_rate_flag
-
-        -- расшифровка условия
-        , CASE 
-            WHEN b.conv = 'AT_THE_END'  AND b.out_rub >= 1500000 AND b.rate_con = 0.1450 
-                THEN N'AT_THE_END; >=1.5 млн; ставка 14.50%'
-            WHEN b.conv = 'AT_THE_END'  AND b.out_rub <  1500000 AND b.rate_con = 0.1430 
-                THEN N'AT_THE_END; <1.5 млн; ставка 14.30%'
-            WHEN b.conv <> 'AT_THE_END' AND b.out_rub <  1500000 AND b.rate_con = 0.1410 
-                THEN N'НЕ AT_THE_END; <1.5 млн; ставка 14.10%'
-            WHEN b.conv <> 'AT_THE_END' AND b.out_rub >= 1500000 AND b.rate_con = 0.1430 
-                THEN N'НЕ AT_THE_END; >=1.5 млн; ставка 14.30%'
-            ELSE N'Не попал под промо-условие'
-          END AS promo_rate_group
-    FROM #base b
-    WHERE
-        b.dt_rep = '2026-05-02'
-        AND b.section_name = N'Срочные'
-        AND b.dt_open >= '2026-04-30'
+with refin_rates as (
+select last_day(to_date(to_char(dt_rep, 'YYYY-MM'), 'YYYY-MM')) period,
+       round(avg(refin_rate), 4) refin_rate
+from man_refin_rates -- Справочник с историческими ставками рефинансирования ипотеки на рынке
+group by last_day(to_date(to_char(dt_rep, 'YYYY-MM'), 'YYYY-MM'))
 ),
 
-clients_with_deposits_to_close AS (
-    SELECT
-          b.cli_id
-        , COUNT(DISTINCT b.con_id) AS close_dep_cnt
-        , SUM(b.out_rub) AS close_dep_out_rub
-        , SUM(b.out_rub) / 1000000.0 AS close_dep_out_rub_mln
-    FROM #base b
-    WHERE
-        b.dt_rep = '2026-04-29'
-        AND b.section_name = N'Срочные'
-        AND b.dt_open <= '2026-04-29'
-        AND b.dt_close_plan BETWEEN '2026-04-30' AND '2026-05-02'
-    GROUP BY
-        b.cli_id
+--Таблица исключений, развернутая в "платёжный период", который нужно исключить
+--Логика: событие с датой excl_date исключаем в месяце payment_period = last_day(excl_date)
+--(то есть для секьюритизации 2025-12-19 исключаем расчёт за payment_period = 2025-12-31)
+--Судя по проверке- после секьюритизации старые айди "закрываются" потому не встречаются вовсе в статистике за будущие payment_period
+
+excl_by_payment_period as (
+select e.con_id,
+       last_day(e.excl_date) as payment_period,
+       e.excl_reason
+from cpr_exclusions e
+where e.excl_reason = 'SECURITIZATION'
 ),
 
-ns_by_client AS (
-    SELECT
-          b.cli_id
-        , SUM(CASE WHEN b.dt_rep = '2026-04-29' THEN b.out_rub ELSE 0 END) AS ns_2904
-        , SUM(CASE WHEN b.dt_rep = '2026-05-02' THEN b.out_rub ELSE 0 END) AS ns_0205
-    FROM #base b
-    WHERE
-        b.section_name = N'Накопительный счёт'
-    GROUP BY
-        b.cli_id
+initial_table as ( -- Берём нужные признаки из mort_od, добавляем доп. переменные со сроками, группами по размеру ставки и т. д.
+select con_id,
+       dt_rep,
+       dt_open_fact,
+       dt_close_plan,
+       dt_close_fact,
+       round((dt_rep - dt_open_fact)/365, 2) as age,
+       -out_rub as od,
+       con_rate,
+       agg_prod_name,
+       segment_name,
+       round((dt_close_plan - dt_rep)/365, 2) as term,
+       (to_number(to_char(dt_close_plan, 'yyyy'), '9999') - to_number(to_char(dt_rep, 'yyyy'), '9999'))*12 +
+                                              (to_number(to_char(dt_close_plan, 'mm'), '99') - to_number(to_char(dt_rep, 'mm'), '99')) term_months,
+       case when con_rate < 0.03 then '0. <3%'
+            when con_rate between 0.03 and 0.06 then '1. 3-6%'
+            when con_rate between 0.06 and 0.09 then '2. 6-9%'
+            when con_rate between 0.09 and 0.12 then '3. 9-12%'
+            when con_rate between 0.12 and 0.15 then '4. 12-15%'
+            when con_rate between 0.15 and 0.18 then '5. 15-18%'
+            when con_rate between 0.18 and 0.21 then '6. 18-21%'
+            when con_rate > 0.21 then '7. >21%'
+            else '8. undefined rate' end rate_group,
+       case when agg_prod_name in ('Семейная ипотека', 'Льготная ипотека', 'ИТ ипотека', 'Дальневосточная ипотека') then 1
+            else 0 end as subsidy,
+       last_day(dt_open_fact) as generation,
+       refin_rate,
+       round(100*(con_rate - refin_rate), 1) as stimul -- Стимул к рефинансированию
+from mort_od
+left join refin_rates
+          -- ВАЖНО: ИСПРАВЛЕНИЕ. Берём рефин за тот же месяц X, что и dt_rep (а не за X-1)
+          on refin_rates.period = mort_od.dt_rep
+where 1 = 1
+      and con_rate is not null
+      and con_rate > 0
+      and out_rub is not null
+      and acc_role = 'DUE'
+),
+
+prelim_table as ( -- Добавляем группы по выдержке кредита, вычисляем аннуитетные платежи в разбивке на платёж процентов и платёж долга
+select initial_table.*,
+       case when age <= 1 then '0-1Y'
+            when age between 1 and 2 then '1-2Y'
+            when age between 2 and 3 then '2-3Y'
+            when age between 3 and 4 then '3-4Y'
+            when age between 4 and 5 then '4-5Y'
+            when age between 5 and 6 then '5-6Y'
+            when age between 6 and 7 then '6-7Y'
+            when age between 7 and 8 then '7-8Y'
+            when age between 8 and 9 then '8-9Y'
+            when age > 9 then '9Y+'
+            else 'undefined'
+       end age_group,
+       case when age <= 1 then 0
+            when age between 1 and 2 then 1
+            when age between 2 and 3 then 2
+            when age between 3 and 4 then 3
+            when age between 4 and 5 then 4
+            when age between 5 and 6 then 5
+            when age between 6 and 7 then 6
+            when age between 7 and 8 then 7
+            when age between 8 and 9 then 8
+            else 9
+       end age_group_id,
+       case when term_months > 0 then round(od / (1 - power(1 + con_rate/12, -term_months)) * (con_rate/12), 2)
+            else 0 end annuity,
+       case when term_months > 0 then round(od * con_rate/12, 2)
+            else 0 end interest_pay,
+       case when term_months > 0 then round(od / (1 - power(1 + con_rate/12, -term_months)) * (con_rate/12), 2) - round(od * con_rate/12, 2)
+            else 0 end od_plan_payment
+from initial_table
+),
+
+final_bal as ( -- Для расчёта CPR нам нужен остаток долга ПОСЛЕ планового платежа долга
+select prelim_table.*,
+       od as od_before_plan,
+       case when od - od_plan_payment < 0 then 0 else od - od_plan_payment end as od_after_plan
+from prelim_table
+),
+
+pay as ( -- Собираем помесячные досрочные платежи по договорам
+select con_id,
+       last_day(dt_oper) dt,
+       sum(vl_rub) premat_pay
+from dds.con_oper
+where 1 = 1
+      and cur = '810'
+      and oper_type = 'PAYMENT_PREMAT'
+      and con_id in (select con_id from final_bal)
+group by con_id, last_day(dt_oper)
 )
 
-SELECT
-      d.dt_rep
-    , d.con_id
-    , d.cli_id
-    , d.acc_no
-    , d.dt_open
-    , d.dt_close_plan
-    , d.termdays
-    , d.rate_con
-    , d.conv
-    , d.out_rub
-    , d.out_rub_mln
-    , d.PROD_NAME_res
-    , d.TSEGMENTNAME
-
-    -- атрибуты самого открытого вклада
-    , d.dep_size_ge_1_5m_flag
-    , d.promo_rate_flag
-    , d.promo_rate_group
-
-    -- атрибуты клиента по вкладам к выходу, размазанные на договор
-    , CASE 
-        WHEN c.cli_id IS NOT NULL THEN 1 
-        ELSE 0 
-      END AS client_had_dep_to_close_flag
-    , ISNULL(c.close_dep_cnt, 0) AS client_close_dep_cnt
-    , ISNULL(c.close_dep_out_rub, 0) AS client_close_dep_out_rub
-    , ISNULL(c.close_dep_out_rub_mln, 0) AS client_close_dep_out_rub_mln
-
-    -- атрибуты клиента по НС, размазанные на договор
-    , ISNULL(ns.ns_2904, 0) AS client_ns_2904
-    , ISNULL(ns.ns_0205, 0) AS client_ns_0205
-    , ISNULL(ns.ns_0205, 0) - ISNULL(ns.ns_2904, 0) AS client_ns_delta
-
-    , CASE 
-        WHEN ns.cli_id IS NULL THEN 1 
-        ELSE 0 
-      END AS client_had_no_ns_flag
-
-    , CASE 
-        WHEN ISNULL(ns.ns_0205, 0) < ISNULL(ns.ns_2904, 0) THEN 1 
-        ELSE 0 
-      END AS client_ns_decrease_flag
-
-    , CASE 
-        WHEN ISNULL(ns.ns_0205, 0) > ISNULL(ns.ns_2904, 0) THEN 1 
-        ELSE 0 
-      END AS client_ns_increase_flag
-
-    , CASE 
-        WHEN ns.cli_id IS NOT NULL 
-             AND ISNULL(ns.ns_0205, 0) = ISNULL(ns.ns_2904, 0) THEN 1 
-        ELSE 0 
-      END AS client_ns_unchanged_flag
-
-    -- итоговый флаг чистого клиента по нашей логике
-    , CASE 
-        WHEN c.cli_id IS NULL
-         AND NOT (ISNULL(ns.ns_0205, 0) < ISNULL(ns.ns_2904, 0))
-            THEN 1
-        ELSE 0
-      END AS clean_client_flag
-
-FROM deposits_opened_from_3004 d
-LEFT JOIN clients_with_deposits_to_close c
-    ON c.cli_id = d.cli_id
-LEFT JOIN ns_by_client ns
-    ON ns.cli_id = d.cli_id
-ORDER BY
-      d.promo_rate_flag DESC
-    , clean_client_flag DESC
-    , d.out_rub DESC;
+select final_bal.*,
+       last_day(add_months(final_bal.dt_rep, 1)) as payment_period,
+       case when coalesce(pay.premat_pay, 0) >= od_after_plan then od_after_plan else coalesce(pay.premat_pay, 0) end premat_payment,
+       params.b0 + params.b1 * ATAN(params.b2 + params.b3 * stimul) + params.b4 * ATAN(params.b5 + params.b6 * stimul) model_cpr -- Модельный CPR по модели Ценового центра
+from final_bal
+left join pay
+          on 1 = 1
+             and last_day(add_months(final_bal.dt_rep, 1)) = pay.dt
+             and final_bal.con_id = pay.con_id
+left join s_curve_params params -- Справочник с параметрами модели Ценового центра
+          on final_bal.age_group_id = params.period
+/* КЛЮЧЕВОЕ: исключаем con_id только в тот payment_period, когда была секьюритизация */
+where not exists (
+    select 1
+    from excl_by_payment_period e
+    where e.con_id = final_bal.con_id
+      and e.payment_period = last_day(add_months(final_bal.dt_rep, 1))
+)
+order by final_bal.con_id,
+         final_bal.dt_rep;
