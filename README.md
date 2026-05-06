@@ -1,11 +1,41 @@
-Да. Ниже сильно проще: без транзакции, без параметров Command, без отдельных функций. Просто:
+Да, так проще и надежнее.
 
-* берет лист;
-* находит последнюю строку;
-* удаляет все записи из таблицы;
-* построчно делает INSERT.
+Сделаем:
 
-Поменяй только имя листа при необходимости.
+* в БД оба поля дат как DATE;
+* в VBA оба поля писать как дату без времени в формате yyyy-mm-dd.
+
+SQL: пересоздать таблицу
+
+IF OBJECT_ID('ALM_Test.testworkspace.sms_promo_messages', 'U') IS NOT NULL
+    DROP TABLE ALM_Test.testworkspace.sms_promo_messages;
+GO
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.schemas
+    WHERE name = 'testworkspace'
+)
+BEGIN
+    EXEC('CREATE SCHEMA testworkspace');
+END;
+GO
+CREATE TABLE ALM_Test.testworkspace.sms_promo_messages
+(
+    id                BIGINT IDENTITY(1,1) PRIMARY KEY,
+    messageid         BIGINT         NOT NULL,
+    msgbegindate      DATE           NULL,
+    msgbegindate_dt   DATE           NULL,
+    shippingmethod    NVARCHAR(100)  NULL,
+    kindname          NVARCHAR(500)  NULL,
+    decoding_id_state NVARCHAR(200)  NULL,
+    success           NVARCHAR(200)  NULL,
+    cli_clas_001      BIGINT         NULL,
+    cli_id            BIGINT         NULL,
+    load_dt           DATETIME       NOT NULL DEFAULT GETDATE()
+);
+GO
+
+VBA: упрощенный макрос с датами без времени
 
 Option Explicit
 Sub ImportSmsPromoMessagesToDB_Simple()
@@ -26,7 +56,7 @@ Sub ImportSmsPromoMessagesToDB_Simple()
     On Error GoTo ErrorHandler
     Application.ScreenUpdating = False
     Application.EnableEvents = False
-    Set ws = ThisWorkbook.Worksheets("Лист1")
+    Set ws = ActiveSheet
     lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
     If lastRow < 2 Then
         MsgBox "Нет данных для загрузки!", vbExclamation
@@ -37,14 +67,14 @@ Sub ImportSmsPromoMessagesToDB_Simple()
     conn.Open
     conn.Execute "DELETE FROM testworkspace.sms_promo_messages;"
     For i = 2 To lastRow
-        If Trim(ws.Cells(i, 1).Value) <> "" Then
-            messageid = Trim(ws.Cells(i, 1).Value)
-            If Trim(ws.Cells(i, 2).Value) <> "" Then
-                msgbegindate = "'" & Format(CDate(ws.Cells(i, 2).Value), "yyyy-mm-dd hh:nn:ss") & "'"
+        If Trim(CStr(ws.Cells(i, 1).Value)) <> "" Then
+            messageid = Trim(CStr(ws.Cells(i, 1).Value))
+            If Trim(CStr(ws.Cells(i, 2).Value)) <> "" And IsDate(ws.Cells(i, 2).Value) Then
+                msgbegindate = "'" & Format(CDate(ws.Cells(i, 2).Value), "yyyy-mm-dd") & "'"
             Else
                 msgbegindate = "NULL"
             End If
-            If Trim(ws.Cells(i, 3).Value) <> "" Then
+            If Trim(CStr(ws.Cells(i, 3).Value)) <> "" And IsDate(ws.Cells(i, 3).Value) Then
                 msgbegindate_dt = "'" & Format(CDate(ws.Cells(i, 3).Value), "yyyy-mm-dd") & "'"
             Else
                 msgbegindate_dt = "NULL"
@@ -53,13 +83,13 @@ Sub ImportSmsPromoMessagesToDB_Simple()
             kindname = SqlText(ws.Cells(i, 5).Value)
             decoding_id_state = SqlText(ws.Cells(i, 6).Value)
             success = SqlText(ws.Cells(i, 7).Value)
-            If Trim(ws.Cells(i, 8).Value) <> "" Then
-                cli_clas_001 = Trim(ws.Cells(i, 8).Value)
+            If Trim(CStr(ws.Cells(i, 8).Value)) <> "" Then
+                cli_clas_001 = Trim(CStr(ws.Cells(i, 8).Value))
             Else
                 cli_clas_001 = "NULL"
             End If
-            If Trim(ws.Cells(i, 9).Value) <> "" Then
-                cli_id = Trim(ws.Cells(i, 9).Value)
+            If Trim(CStr(ws.Cells(i, 9).Value)) <> "" Then
+                cli_id = Trim(CStr(ws.Cells(i, 9).Value))
             Else
                 cli_id = "NULL"
             End If
@@ -96,38 +126,14 @@ Private Function SqlText(ByVal v As Variant) As String
     If Trim(CStr(v)) = "" Then
         SqlText = "NULL"
     Else
-        SqlText = "'" & Replace(CStr(v), "'", "''") & "'"
+        SqlText = "N'" & Replace(CStr(v), "'", "''") & "'"
     End If
 End Function
 
-И SQL под него:
+Что изменил:
 
-IF NOT EXISTS (
-    SELECT 1
-    FROM sys.schemas
-    WHERE name = 'testworkspace'
-)
-BEGIN
-    EXEC('CREATE SCHEMA testworkspace');
-END;
-GO
-IF OBJECT_ID('ALM_Test.testworkspace.sms_promo_messages', 'U') IS NOT NULL
-    DROP TABLE ALM_Test.testworkspace.sms_promo_messages;
-GO
-CREATE TABLE ALM_Test.testworkspace.sms_promo_messages
-(
-    id                BIGINT IDENTITY(1,1) PRIMARY KEY,
-    messageid         BIGINT         NOT NULL,
-    msgbegindate      DATETIME       NULL,
-    msgbegindate_dt   DATE           NULL,
-    shippingmethod    NVARCHAR(100)  NULL,
-    kindname          NVARCHAR(500)  NULL,
-    decoding_id_state NVARCHAR(200)  NULL,
-    success           NVARCHAR(200)  NULL,
-    cli_clas_001      BIGINT         NULL,
-    cli_id            BIGINT         NULL,
-    load_dt           DATETIME       NOT NULL DEFAULT GETDATE()
-);
-GO
+* msgbegindate теперь тоже пишется как DATE, без времени;
+* для русского текста поставил N'...', чтобы Unicode нормально записывался;
+* типы в SQL оставил NVARCHAR, это правильно для кириллицы.
 
-Если хочешь, могу еще упростить сильнее: вообще без SqlText, одним монолитным макросом.
+Если снова будет ошибка, пришли точный текст и строку, где падает.
