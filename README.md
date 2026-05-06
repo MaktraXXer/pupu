@@ -12,6 +12,10 @@ select
         else (1 - power(1 - sum(Prepayment) / nullif(sum(TotalDebt), 0), 12))
     end as CPR
 from cpr_surface_deals
+where 1 = 1
+  and Incentive is not null
+  and TotalDebt is not null
+  and LoanRate is not null
 group by
     PreferentialType,
     LoanAge,
@@ -22,7 +26,6 @@ order by
     LoanAge,
     round(Incentive, 1),
     round(LoanRate, 1);
-
 
 
     
