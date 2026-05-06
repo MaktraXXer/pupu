@@ -1,54 +1,31 @@
-Понял. Ты прав: **в старой схеме “дата = условность”**, а статистика собиралась **по всем месячным наблюдениям сразу** (все `dt_rep` / все `payment_period`) и агрегировалась в бакеты **без группировки по дате**.
+select
+    PreferentialType,
+    LoanAge,
+    round(Incentive, 1) as Incentive,
+    round(LoanRate, 1) as LoanRate,
+    sum(Prepayment) as Prepayment,
+    sum(FullPrepayment) as FullPrepayment,
+    sum(PartialPrepayment) as PartialPrepayment,
+    sum(TotalDebt) as TotalDebt,
+    case
+        when sum(TotalDebt) <= 0 then 0
+        else (1 - power(1 - sum(Prepayment) / nullif(sum(TotalDebt), 0), 12))
+    end as CPR
+from cpr_surface_deals
+group by
+    PreferentialType,
+    LoanAge,
+    round(Incentive, 1),
+    round(LoanRate, 1)
+order by
+    PreferentialType,
+    LoanAge,
+    round(Incentive, 1),
+    round(LoanRate, 1);
 
-### 1) Годится ли `cpr_report_new` как база
 
-Да, **как “посделочное (credit×month) полотно” оно годится**, потому что в нём каждая строка уже есть связка:
 
-* **OD / TotalDebt** = `od_after_plan` на `dt_rep = X`
-* **Prepayment** = `premat_payment` за `payment_period = X+1`
-* плюс `con_rate`, `refin_rate`, `stimul`, `agg_prod_name`, `dt_open_fact`
-
-То есть это ровно “месячное наблюдение кредита”, и дальше его можно **суммировать в бакеты по всем месяцам**, как ты делал раньше.
-
-### 2) Корректно ли заменить ставки/параметры
-
-Да, единственная правка, которая требовалась для “рефин за месяц X” — это join:
-
-* **правильно (рефин за месяц X)**: `refin_rates.period = mort_od.dt_rep`
-  Тогда в строке `dt_rep=X` стимул считается по ставкам **месяца X**, а досрочка относится к **месяцу X+1** через `payment_period`. Это и есть нужная логика лага.
-
-### 3) Можно ли на этом полотне разделить full/partial
-
-Да, **можно** и это даже надёжно, потому что:
-
-* `premat_payment` у тебя уже **обрезан сверху**: `min(premat_pay, od_after_plan)`.
-  Значит:
-* **FullPrepayment**: `premat_payment = od_after_plan` (и >0)
-* **PartialPrepayment**: `0 < premat_payment < od_after_plan`
-
-То есть посделочно это определимо.
-
----
-
-## Что реально нужно сделать теперь
-
-Тебе не надо “делать отчёт по датам”. Тебе нужно:
-
-1. Сделать **новое бакет-полотно** (аналог их `ssurface`) на базе `cpr_report_new`, где будут поля:
-
-* PreferentialType (по спискам agg_prod_name)
-* LoanAge **в месяцах**
-* Incentive
-* LoanRate
-* Prepayment / Full / Partial / TotalDebt
-
-2. И второй запрос — **агрегация по бакетам по всем месяцам**, ровно как раньше (без группировки по Date).
-   А если им нужен формат “Date = as-of”, можно добавить внешний слой, но базово — “все месяцы одним скопом”.
-
-Ниже — конкретные 2 скрипта.
-
----
-
+    
 # (A) Полотно `cpr_surface_deals` (credit×month, готовое к бакетам)
 
 Ключ: LoanAge в месяцах считаем по **месяцу решения**. В вашей логике “решение в X, платёж в X+1”. Значит **ReportDate = месяц X (dt_rep)**, а LoanAge считаем от `dt_open_fact` до `dt_rep` в месяцах. Это даёт ровно “месяц, соответствующий принятию решения”.
