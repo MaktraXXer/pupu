@@ -1,113 +1,189 @@
-/* ============================================================
-   CPR_fact и CPR_model по ВСЕМ гос программам вместе
-   в разрезе бакетов ставки + строка "ВСЕ БАКЕТЫ СТАВКИ"
-   ДЛЯ КАЖДОГО payment_period в диапазоне 2024-01-01 .. 2026-02-27
+Понял. Ты прав: **в старой схеме “дата = условность”**, а статистика собиралась **по всем месячным наблюдениям сразу** (все `dt_rep` / все `payment_period`) и агрегировалась в бакеты **без группировки по дате**.
 
-   "ВСЕ БАКЕТЫ СТАВКИ" = агрегат по всем bucket_num внутри payment_period.
-   ============================================================ */
+### 1) Годится ли `cpr_report_new` как база
 
-with
-enriched as (
-    select
-        cpr.payment_period,
-        cpr.od_after_plan,
-        cpr.od,
-        cpr.premat_payment,
-        cpr.con_rate,
-        cpr.refin_rate,
-        cpr.stimul,
-        cpr.age_group_id,
-        greatest(cpr.con_rate * 100, 0) as pct,
-        case
-            when greatest(cpr.con_rate * 100, 0) < 8.75 then
-                floor((greatest(cpr.con_rate * 100, 0) + 0.25) / 0.5) + 1
-            when greatest(cpr.con_rate * 100, 0) < 10 then 19
-            when greatest(cpr.con_rate * 100, 0) < 12 then 20
-            when greatest(cpr.con_rate * 100, 0) < 15 then 21
-            when greatest(cpr.con_rate * 100, 0) < 20 then 22
-            else 23
-        end as bucket_num
-    from cpr_report_new cpr
-    where 1 = 1
-      and cpr.payment_period between date'2024-01-01' and date'2026-02-27'
-      and cpr.agg_prod_name in ('Семейная ипотека','ИТ ипотека','Дальневосточная ипотека','Льготная ипотека')
-      and cpr.stimul is not null
-      and cpr.refin_rate > 0
-      and cpr.con_rate > 0
-),
+Да, **как “посделочное (credit×month) полотно” оно годится**, потому что в нём каждая строка уже есть связка:
 
-bucket_names as (
-    select 1 as bucket_num,  'A. 0% (0.0-0.25%)'   as bucket_name from dual union all
-    select 2,  'B. 0.5% (0.25-0.75%)' from dual union all
-    select 3,  'C. 1.0% (0.75-1.25%)' from dual union all
-    select 4,  'D. 1.5% (1.25-1.75%)' from dual union all
-    select 5,  'E. 2.0% (1.75-2.25%)' from dual union all
-    select 6,  'F. 2.5% (2.25-2.75%)' from dual union all
-    select 7,  'G. 3.0% (2.75-3.25%)' from dual union all
-    select 8,  'H. 3.5% (3.25-3.75%)' from dual union all
-    select 9,  'I. 4.0% (3.75-4.25%)' from dual union all
-    select 10, 'J. 4.5% (4.25-4.75%)' from dual union all
-    select 11, 'K. 5.0% (4.75-5.25%)' from dual union all
-    select 12, 'L. 5.5% (5.25-5.75%)' from dual union all
-    select 13, 'M. 6.0% (5.75-6.25%)' from dual union all
-    select 14, 'N. 6.5% (6.25-6.75%)' from dual union all
-    select 15, 'O. 7.0% (6.75-7.25%)' from dual union all
-    select 16, 'P. 7.5% (7.25-7.75%)' from dual union all
-    select 17, 'Q. 8.0% (7.75-8.25%)' from dual union all
-    select 18, 'R. 8.5% (8.25-8.75%)' from dual union all
-    select 19, 'S. 8.75-10.0%' from dual union all
-    select 20, 'T. 10.0-12.0%' from dual union all
-    select 21, 'U. 12.0-15.0%' from dual union all
-    select 22, 'V. 15.0-20.0%' from dual union all
-    select 23, 'W. 20.0%+' from dual
-),
+* **OD / TotalDebt** = `od_after_plan` на `dt_rep = X`
+* **Prepayment** = `premat_payment` за `payment_period = X+1`
+* плюс `con_rate`, `refin_rate`, `stimul`, `agg_prod_name`, `dt_open_fact`
 
-base_with_model as (
-    select
-        e.payment_period,
-        e.bucket_num,
-        e.od_after_plan,
-        e.od,
-        e.premat_payment,
-        round(
-            e.od_after_plan
-            * (1 - power(
-                    1 - (s.b0 + s.b1 * atan(s.b2 + s.b3 * e.stimul) + s.b4 * atan(s.b5 + s.b6 * e.stimul)),
-                    1/12
-                )),
-            2
-        ) as premat_model
-    from enriched e
-    left join s_curve_params_gos s
-           on e.age_group_id = s.period
-)
+То есть это ровно “месячное наблюдение кредита”, и дальше его можно **суммировать в бакеты по всем месяцам**, как ты делал раньше.
 
+### 2) Корректно ли заменить ставки/параметры
+
+Да, единственная правка, которая требовалась для “рефин за месяц X” — это join:
+
+* **правильно (рефин за месяц X)**: `refin_rates.period = mort_od.dt_rep`
+  Тогда в строке `dt_rep=X` стимул считается по ставкам **месяца X**, а досрочка относится к **месяцу X+1** через `payment_period`. Это и есть нужная логика лага.
+
+### 3) Можно ли на этом полотне разделить full/partial
+
+Да, **можно** и это даже надёжно, потому что:
+
+* `premat_payment` у тебя уже **обрезан сверху**: `min(premat_pay, od_after_plan)`.
+  Значит:
+* **FullPrepayment**: `premat_payment = od_after_plan` (и >0)
+* **PartialPrepayment**: `0 < premat_payment < od_after_plan`
+
+То есть посделочно это определимо.
+
+---
+
+## Что реально нужно сделать теперь
+
+Тебе не надо “делать отчёт по датам”. Тебе нужно:
+
+1. Сделать **новое бакет-полотно** (аналог их `ssurface`) на базе `cpr_report_new`, где будут поля:
+
+* PreferentialType (по спискам agg_prod_name)
+* LoanAge **в месяцах**
+* Incentive
+* LoanRate
+* Prepayment / Full / Partial / TotalDebt
+
+2. И второй запрос — **агрегация по бакетам по всем месяцам**, ровно как раньше (без группировки по Date).
+   А если им нужен формат “Date = as-of”, можно добавить внешний слой, но базово — “все месяцы одним скопом”.
+
+Ниже — конкретные 2 скрипта.
+
+---
+
+# (A) Полотно `cpr_surface_deals` (credit×month, готовое к бакетам)
+
+Ключ: LoanAge в месяцах считаем по **месяцу решения**. В вашей логике “решение в X, платёж в X+1”. Значит **ReportDate = месяц X (dt_rep)**, а LoanAge считаем от `dt_open_fact` до `dt_rep` в месяцах. Это даёт ровно “месяц, соответствующий принятию решения”.
+
+```sql
+drop table cpr_surface_deals;
+
+create table cpr_surface_deals as
 select
-    b.payment_period as dt_rep,
+    /* для трассировки */
+    cpr.con_id,
+    cpr.dt_rep,
+    cpr.payment_period,
+
+    /* PreferentialType как у коллег */
     case
-        when grouping(b.bucket_num) = 1 then 'ВСЕ БАКЕТЫ СТАВКИ'
-        else bn.bucket_name
-    end as bucket_name,
-    sum(b.od_after_plan) as od_after_plan,
-    sum(b.od) as od,
-    sum(b.premat_payment) as premat_fact,
-    sum(b.premat_model) as premat_model,
+        when cpr.agg_prod_name in ('Семейная ипотека', 'Льготная ипотека', 'ИТ ипотека', 'Дальневосточная ипотека') then 1
+        else 0
+    end as PreferentialType,
+
+    /* LoanAge в месяцах на момент принятия решения (месяц X = dt_rep) */
+    (
+      (to_number(to_char(cpr.dt_rep, 'YYYY')) * 12 + to_number(to_char(cpr.dt_rep, 'MM')))
+    - (to_number(to_char(cpr.dt_open_fact, 'YYYY')) * 12 + to_number(to_char(cpr.dt_open_fact, 'MM')))
+    ) as LoanAge,
+
+    /* Incentive (п.п.) и LoanRate (% годовых) */
+    cpr.stimul as Incentive,
+    round(cpr.con_rate * 100, 1) as LoanRate,
+
+    /* Prepayment / TotalDebt */
+    cpr.premat_payment as Prepayment,
+    cpr.od_after_plan as TotalDebt,
+
+    /* Full / Partial на уровне кредит-месяц */
     case
-        when sum(b.od_after_plan) <= 0 then 0
-        else round(100 * (1 - power(1 - sum(b.premat_payment)/sum(b.od_after_plan), 12)), 2)
-    end as cpr_fact,
+        when cpr.premat_payment > 0 and cpr.premat_payment = cpr.od_after_plan then cpr.premat_payment
+        else 0
+    end as FullPrepayment,
+
     case
-        when sum(b.od_after_plan) <= 0 then 0
-        else round(100 * (1 - power(1 - sum(b.premat_model)/sum(b.od_after_plan), 12)), 2)
-    end as cpr_model
-from base_with_model b
-left join bucket_names bn
-       on b.bucket_num = bn.bucket_num
-group by grouping sets (
-    (b.payment_period, b.bucket_num, bn.bucket_name),
-    (b.payment_period)
-)
+        when cpr.premat_payment > 0 and cpr.premat_payment < cpr.od_after_plan then cpr.premat_payment
+        else 0
+    end as PartialPrepayment
+
+from cpr_report_new cpr
+where 1 = 1
+  and cpr.stimul is not null
+  and cpr.refin_rate > 0
+  and cpr.con_rate > 0
+;
+```
+
+> Важно: я **намеренно не использую Date/“первое число месяца”** здесь, потому что ты сам сказал: у вас дата условность, и “все месяцы скопом”. Если потом понадобится “Date = as-of”, это будет отдельным внешним слоем.
+
+---
+
+# (B) Бакеты “как раньше”, но уже по (PreferentialType + LoanAge + Incentive + LoanRate)
+
+Это аналог твоего старого запроса, только новые ключи + новые суммы:
+
+```sql
+select
+    PreferentialType,
+    LoanAge,
+    Incentive,
+    LoanRate,
+    sum(Prepayment) as Prepayment,
+    sum(FullPrepayment) as FullPrepayment,
+    sum(PartialPrepayment) as PartialPrepayment,
+    sum(TotalDebt) as TotalDebt,
+    case
+        when sum(TotalDebt) <= 0 then 0
+        else (1 - power(1 - sum(Prepayment) / nullif(sum(TotalDebt), 0), 12))
+    end as CPR
+from cpr_surface_deals
+group by
+    PreferentialType,
+    LoanAge,
+    Incentive,
+    LoanRate
 order by
-    b.payment_period,
-    case when bucket_name = 'ВСЕ БАКЕТЫ СТАВКИ' then 0 else 1 end,
-    b.bucket_num;
+    PreferentialType,
+    LoanAge,
+    Incentive,
+    LoanRate;
+```
+
+---
+
+## Что остаётся открытым (но не блокирует запуск)
+
+1. **LoanAge: надо ли “-1” как у их SQL?**
+   У них это было, потому что `DateFrom` у них — первый день месяца отчёта, и они смещали в месяц решения.
+   У нас месяц решения уже **dt_rep**, поэтому `-1` обычно **не нужен**.
+   Если ты всё же хочешь строго копировать их `-1`, это одна строка: `... ) - 1 as LoanAge`.
+
+2. **Incentive: теперь “рефин за 1 месяц до отчёта”**
+   В вашей схеме это уже достигается автоматически: стимул на `dt_rep = X` применяется к досрочке в `payment_period = X+1`. То есть относительно “месяца платежа” рефин действительно “на 1 месяц раньше”.
+
+---
+
+Если хочешь, следующим шагом я добавлю третий запрос, который делает **их “Date as-of”** (как в их примере `Date=2026-01-01` и берём все месяцы <= этой даты), но базовая логика “все месяцы одним скопом” — это два блока выше.
+
+
+
+
+### Как считался LoanAge в `cpr_report_new` (старое/текущее поле)
+
+В самом `cpr_report_new` “выдержка” была **в годах**:
+
+* `age = round((dt_rep - dt_open_fact)/365, 2)` — возраст кредита на дату снапшота `dt_rep` (конец месяца X)
+* `age_group_id` — корзина по годам (0..9), построенная из этого `age`
+
+То есть исторически вы группировали по **age_group_id (годы)**, а не по месяцам.
+
+### Как считается LoanAge “сейчас” для новой задачи (в месяцах)
+
+Для формата коллег нужен **LoanAge в месяцах** (datediff month). Его правильнее считать на **месяц принятия решения**, который в вашей схеме = **месяц снапшота X (`dt_rep`)**:
+
+* `LoanAge_months = months_between(dt_open_fact, dt_rep)`
+  В целых месяцах обычно так:
+  `(YYYY(dt_rep)*12 + MM(dt_rep)) - (YYYY(dt_open_fact)*12 + MM(dt_open_fact))`
+
+Если вместо `dt_rep` использовать “ReportDate = первое число месяца”, то иногда появляется `-1` (это их частный сдвиг из-за того, что у них даты стоят первым числом месяца).
+
+### Связка “месяц OD / месяц решения / месяц платежей (в т.ч. досрочных)”
+
+В ваших скриптах ключевая логика такая:
+
+* **OD / TotalDebt** берётся на **конец месяца X** (`dt_rep = last_day(X)`), и из него считается `od_after_plan`
+  → это база “на вход месяца X+1 после планового”
+* **Incentive (stimul)** считается на **месяц X** (ставка кредита и рефин за X), т.е. это **месяц принятия решения**
+* **Prepayment (premat_payment)** подтягивается за **месяц X+1** через
+  `payment_period = last_day(add_months(dt_rep, 1))`
+
+Итого:
+**решение/стимул в X → реализация досрочки в X+1**, при этом база долга берётся из снапшота X (через `od_after_plan`).
