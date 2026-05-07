@@ -1,281 +1,199 @@
-DECLARE @dt_start date = '20260101';
-DECLARE @dt_end   date = '20260503';
+declare @dt_start date = '20260101';
+declare @dt_end   date = '20260503';
 
-DROP TABLE IF EXISTS #keyrate;
+drop table if exists #keyrate;
 
-SELECT 
+select 
       [date]
-    , [rate] / 100.0 AS [rate]
-INTO #keyrate
-FROM ALM.info.VW_CBKEY_everyday
-WHERE [Date] BETWEEN @dt_start AND @dt_end;
+    , [rate] / 100.0 [rate]
+into #keyrate
+from ALM.info.VW_CBKEY_everyday 
+where [Date] between @dt_start and @dt_end;
 
 
-DROP TABLE IF EXISTS #ruonia;
+drop table if exists #ruonia;
 
-SELECT 
+select 
       [date]
-    , [rate] / 100.0 AS [rate]
-INTO #ruonia
-FROM ALM.info.VW_Ruonia_everyday
-WHERE [Date] BETWEEN @dt_start AND @dt_end;
+    , [rate] / 100.0 [rate]
+into #ruonia
+from ALM.info.VW_Ruonia_everyday
+where [Date] between @dt_start and @dt_end;
 
 
-DROP TABLE IF EXISTS #calendar;
+drop table if exists #calendar;
 
-SELECT *
-INTO #calendar
-FROM ALM.info.[VW_calendar]
-WHERE [Date] BETWEEN @dt_start AND @dt_end;
+select *
+into #calendar
+from ALM.info.[VW_calendar]
+where [Date] between @dt_start and @dt_end;
 
 
-DROP TABLE IF EXISTS #deposit;
+drop table if exists #deposit;
 
-SELECT 
-      cal.[Date]
-    , dep.[CON_ID]
-    , dep.[ACC_NO]
-    , dep.[CLI_ID]
-    , dep.[INN]
+select cal.[Date]
+                ,dep.[CON_ID]
+                ,dep.[ACC_NO]
+                ,dep.[CLI_ID]
+                ,dep.[INN]
+                ,case
+                                when CLI_ID in ('3731800', '3939590185') then 'Фед.Казна'
+                                else dep.[CLI_SHORT_NAME]
+                end                        [CLI_SHORT_NAME]
+                ,dep.[BALANCE_CUR]
+                ,dep.[CUR]
+                ,saldo.[OUT_RUB]            [BALANCE_RUB]
+                ,dep.[DT_OPEN]
+                ,dep.[DT_CLOSE]
+                ,dep.[DT_CLOSE_PLAN]
+                ,dep.[MATUR]
+                ,datediff(day, cal.[date], dep.[DT_CLOSE_PLAN]) [DURATION]
+                ,dep.[SEG_NAME]
+                ,dep.[PROD_NAME]
+                ,dep.[IS_PDR]
+                ,case 
+                                when isnull(man.[basis], man2.[basis]) is null then 0 
+                                else 1 
+                end                                                                 [IS_FLOAT]
+                ,dep.[OKVED_CODE]
+                ,dep.[OKVED_NAME]
+                ,dep.[SSVRate_Fcast]
+                ,case     
+                                when isnull(man.[basis], man2.[basis]) is not null then 
+                                                (kr.[rate] / (1 - 0.0450) - kr.[rate])
+                                else dep.[RFRate_Fcast_Int]
+                end                                                                 [FOR_Rate]
+                ,isnull(man.[basis], man2.[basis])                                  [BASIS]
+                ,case 
+                                when isnull(man.[basis], man2.[basis]) is not null then rn.[rate] 
+                end                                                                 [BASIS_RATE]
+                ,case 
+                                when  isnull(man.[basis], man2.[basis])  is not null then isnull(man.[con_spread], man2.correction) / 100.0 
+                end                                                                 [BASIS_SPREAD]
+                ,case     
+                                when isnull(man.[basis], man2.[basis]) is not null then 
+                                                (rn.[rate] + isnull(man.[con_spread], man2.correction) / 100.0 
+                                                                - (kr.[rate] / (1 - 0.0450) - kr.[rate]))
+                                else dep.[RATE]
+                end                                                                 [RATE]
+                ,case     
+                                when isnull(man.[basis], man2.[basis]) is not null then 
+                                                (select liq.fnc_IntRate((rn.[rate] + isnull(man.[con_spread], man2.correction) / 100.0
+                                                                - (kr.[rate] / (1 - 0.0450) - kr.[rate])), 'at the end', 'monthly', dep.[MATUR], 1)
+                                                ) 
+                                else [MonthlyConv_RATE]
+                end                                                                 [MonthlyConv_Rate]
+                ,dep.[KeyRate]
+                ,dep.[MonthlyConv_OISRate]
+                ,case     
+                                when isnull(man.[basis], man2.[basis]) is not null then 
+                                                (select liq.fnc_IntRate((rn.[rate] + isnull(man.[con_spread], man2.correction) / 100.0
+                                                                - (kr.[rate] / (1 - 0.0450) - kr.[rate])), 'at the end', 'monthly', dep.[MATUR], 1)
+                                                ) 
+                                else dep.[MonthlyConv_RATE] + dep.[SSVRate_Fcast]
+                end - dep.[KeyRate]                                                 [Spread_KeyRate]
+                ,case     
+                                when isnull(man.[basis], man2.[basis]) is not null then 
+                                                (select liq.fnc_IntRate((rn.[rate] + isnull(man.[con_spread], man2.correction) / 100.0
+                                                                - (kr.[rate] / (1 - 0.0450) - kr.[rate])), 'at the end', 'monthly', dep.[MATUR], 1)
+                                                ) 
+                                else MonthlyConv_RATE + dep.[SSVRate_Fcast]
+                end - [MonthlyConv_OISRate]                                         [Spread_OIS]
+                ,case
+                                when dep.TransfertRate * (1 - [RFRate_Controlling]) + isnull(lr.[Value], 0) - (case
+                                when isnull(man.[basis], man2.[basis]) is not null then 
+                                                (rn.[rate] + isnull(man.[con_spread], man2.correction) / 100.0 
+                                                                - (kr.[rate] / (1 - 0.0450) - kr.[rate]))
+                                else dep.[RATE]
+                end        + dep.SSVRate_Fcast) <= 0 then 0 
+                                else dep.TransfertRate * (1 - [RFRate_Controlling]) + isnull(lr.[Value], 0) - (case   
+                                when isnull(man.[basis], man2.[basis]) is not null then 
+                                                (rn.[rate] + isnull(man.[con_spread], man2.correction) / 100.0 
+                                                                - (kr.[rate] / (1 - 0.0450) - kr.[rate]))
+                                else dep.[RATE]
+                end        + dep.SSVRate_Fcast) 
+                end [Margin]
+                ,case
+                                when intr.[RFRate_TRF] is not null then intr.[BaseRate_TRF] + isnull(intr.[LiquidityPrefRate_TRF], 0) + intr.[RFRate_TRF] + isnull(intr.OptionRate_TRF, 0) + coalesce(intr.[liqrate_TRF], lr.[Value], 0)
+                                else (intr.[BaseRate_TRF] + isnull(intr.[LiquidityPrefRate_TRF], 0)) * (1 - dep.[RFRate_Controlling]) + isnull(intr.OptionRate_TRF, 0) + coalesce(intr.[liqrate_TRF], lr.[Value], 0)
+                end [TransfertRate_Controlling]
+                ,dep.TransfertRate * (1 - [RFRate_Controlling]) + isnull(lr.[Value], 0) [TransfertRate]
+                ,case
+                                when 
+                                                case
+                                                                when intr.[RFRate_TRF] is not null then intr.[BaseRate_TRF] + isnull(intr.[LiquidityPrefRate_TRF], 0) + intr.[RFRate_TRF] + isnull(intr.OptionRate_TRF, 0) + coalesce(intr.[liqrate_TRF], lr.[Value], 0)
+                                                                else (intr.[BaseRate_TRF] + isnull(intr.[LiquidityPrefRate_TRF], 0)) * (1 - dep.[RFRate_Controlling]) + isnull(intr.OptionRate_TRF, 0) + coalesce(intr.[liqrate_TRF], lr.[Value], 0)
+                                                end - (case          
+                                when isnull(man.[basis], man2.[basis]) is not null then 
+                                                (rn.[rate] + isnull(man.[con_spread], man2.correction) / 100.0 
+                                                                - (kr.[rate] / (1 - 0.0450) - kr.[rate]))
+                                else dep.[RATE]
+                end        + dep.SSVRate_Fcast) <= 0 then 0 
+                                else
+                                                case
+                                                                when intr.[RFRate_TRF] is not null then intr.[BaseRate_TRF] + isnull(intr.[LiquidityPrefRate_TRF], 0) + intr.[RFRate_TRF] + isnull(intr.OptionRate_TRF, 0) + coalesce(intr.[liqrate_TRF], lr.[Value], 0)
+                                                                else (intr.[BaseRate_TRF] + isnull(intr.[LiquidityPrefRate_TRF], 0)) * (1 - dep.[RFRate_Controlling]) + isnull(intr.OptionRate_TRF, 0) + coalesce(intr.[liqrate_TRF], lr.[Value], 0)
+                                                end - (case          
+                                when isnull(man.[basis], man2.[basis]) is not null then 
+                                                (rn.[rate] + isnull(man.[con_spread], man2.correction) / 100.0 
+                                                                - (kr.[rate] / (1 - 0.0450) - kr.[rate]))
+                                else dep.[RATE]
+                end        + dep.SSVRate_Fcast) 
+                end [Margin_Controlling]
+into #deposit
+from [LIQUIDITY].rep.DepositContract_LEGAL_InterestsRate dep with (nolock)
+                join #calendar cal 
+                                on dep.[DT_OPEN] <= cal.[Date]
+                               and dep.[DT_CLOSE] > cal.[Date]
 
-    , CASE
-          WHEN dep.CLI_ID IN ('3731800', '3939590185') THEN 'Фед.Казна'
-          ELSE dep.[CLI_SHORT_NAME]
-      END AS [CLI_SHORT_NAME]
+                join [LIQUIDITY].[liq].[DepositContract_Saldo] saldo with (nolock)
+                                on dep.[CON_ID] = saldo.[CON_ID]
+                               and cal.[Date] between saldo.[DT_FROM] and saldo.[DT_TO]
 
-    -- старый баланс можно оставить только для сверки
-    , dep.[BALANCE_CUR]
-    , dep.[BALANCE_RUB] AS [DEP_BALANCE_RUB]
+                left join LIQUIDITY.liq.floatrate_deals man 
+                                on dep.CON_ID = cast(man.[con_id] as varchar(255))
 
-    -- основной вес для статистики — только сальдо на дату
-    , saldo.[OUT_RUB] AS [BALANCE_RUB]
+                left join LIQUIDITY.liq.man_FloatContracts man2 
+                                on cast(man2.[con_id] as varchar(255)) = dep.[con_id]
 
-    , dep.[CUR]
-    , dep.[DT_OPEN]
-    , dep.[DT_CLOSE]
-    , dep.[DT_CLOSE_PLAN]
-    , dep.[MATUR]
-    , DATEDIFF(day, cal.[Date], dep.[DT_CLOSE_PLAN]) AS [DURATION]
-    , dep.[SEG_NAME]
-    , dep.[PROD_NAME]
-    , dep.[IS_PDR]
+                left join #keyrate kr 
+                                on cal.[Date] = kr.[date]
 
-    , CASE 
-          WHEN ISNULL(man.[basis], man2.[basis]) IS NULL THEN 0 
-          ELSE 1 
-      END AS [IS_FLOAT]
+                left join #ruonia rn 
+                                on cal.[Date] = rn.[date]
 
-    , dep.[OKVED_CODE]
-    , dep.[OKVED_NAME]
-    , dep.[SSVRate_Fcast]
+                left join alm.[info].[VW_liquidity_rates_interpolated] lr with (nolock) 
+                                on dep.DT_OPEN between lr.[dt_from] and lr.[dt_to]
+                               and lr.[Cur] = 810
+                               and dep.[CUR] = 'RUR'
+                               and isnull(dep.[IS_PDR], 0) = lr.[IS_PDR]
+                               and isnull(dep.[IS_FINANCE_LCR], 0) = lr.[IS_FINANCE_LCR]
+                               and dep.[MATUR] = lr.[Term]
 
-    , CASE     
-          WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL THEN 
-              kr.[rate] / (1 - 0.0450) - kr.[rate]
-          ELSE dep.[RFRate_Fcast_Int]
-      END AS [FOR_Rate]
+                left join LIQUIDITY.liq.InterestsRateForDeposit intr with (nolock) 
+                                on dep.[CON_ID] = intr.[CON_ID]
 
-    , ISNULL(man.[basis], man2.[basis]) AS [BASIS]
+where dep.DT_CLOSE > @dt_start
+--              and dep.[SEG_NAME] = 'Казна'
+                and dep.ISDOMRF = 0
+                and dep.[CUR] = 'RUR'
+                and saldo.[OUT_RUB] is not null
+                and saldo.[OUT_RUB] <> 0;
 
-    , CASE 
-          WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL THEN rn.[rate] 
-      END AS [BASIS_RATE]
 
-    , CASE 
-          WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL 
-              THEN ISNULL(man.[con_spread], man2.correction) / 100.0 
-      END AS [BASIS_SPREAD]
-
-    , CASE     
-          WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL THEN 
-              rn.[rate] 
-              + ISNULL(man.[con_spread], man2.correction) / 100.0
-              - (kr.[rate] / (1 - 0.0450) - kr.[rate])
-          ELSE dep.[RATE]
-      END AS [RATE]
-
-    , CASE     
-          WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL THEN 
-              LIQUIDITY.liq.fnc_IntRate(
-                    rn.[rate] 
-                    + ISNULL(man.[con_spread], man2.correction) / 100.0
-                    - (kr.[rate] / (1 - 0.0450) - kr.[rate])
-                  , 'at the end'
-                  , 'monthly'
-                  , dep.[MATUR]
-                  , 1
-              )
-          ELSE dep.[MonthlyConv_RATE]
-      END AS [MonthlyConv_Rate]
-
-    , dep.[KeyRate]
-    , dep.[MonthlyConv_OISRate]
-
-    , CASE     
-          WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL THEN 
-              LIQUIDITY.liq.fnc_IntRate(
-                    rn.[rate] 
-                    + ISNULL(man.[con_spread], man2.correction) / 100.0
-                    - (kr.[rate] / (1 - 0.0450) - kr.[rate])
-                  , 'at the end'
-                  , 'monthly'
-                  , dep.[MATUR]
-                  , 1
-              )
-          ELSE dep.[MonthlyConv_RATE] + dep.[SSVRate_Fcast]
-      END - dep.[KeyRate] AS [Spread_KeyRate]
-
-    , CASE     
-          WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL THEN 
-              LIQUIDITY.liq.fnc_IntRate(
-                    rn.[rate] 
-                    + ISNULL(man.[con_spread], man2.correction) / 100.0
-                    - (kr.[rate] / (1 - 0.0450) - kr.[rate])
-                  , 'at the end'
-                  , 'monthly'
-                  , dep.[MATUR]
-                  , 1
-              )
-          ELSE dep.[MonthlyConv_RATE] + dep.[SSVRate_Fcast]
-      END - dep.[MonthlyConv_OISRate] AS [Spread_OIS]
-
-    , CASE
-          WHEN 
-              dep.TransfertRate * (1 - dep.[RFRate_Controlling]) 
-              + ISNULL(lr.[Value], 0)
-              - (
-                    CASE     
-                        WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL THEN 
-                            rn.[rate] 
-                            + ISNULL(man.[con_spread], man2.correction) / 100.0
-                            - (kr.[rate] / (1 - 0.0450) - kr.[rate])
-                        ELSE dep.[RATE]
-                    END
-                    + dep.SSVRate_Fcast
-                ) <= 0 
-          THEN 0 
-          ELSE 
-              dep.TransfertRate * (1 - dep.[RFRate_Controlling]) 
-              + ISNULL(lr.[Value], 0)
-              - (
-                    CASE     
-                        WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL THEN 
-                            rn.[rate] 
-                            + ISNULL(man.[con_spread], man2.correction) / 100.0
-                            - (kr.[rate] / (1 - 0.0450) - kr.[rate])
-                        ELSE dep.[RATE]
-                    END
-                    + dep.SSVRate_Fcast
-                )
-      END AS [Margin]
-
-    , CASE
-          WHEN intr.[RFRate_TRF] IS NOT NULL THEN 
-              intr.[BaseRate_TRF] 
-              + ISNULL(intr.[LiquidityPrefRate_TRF], 0) 
-              + intr.[RFRate_TRF] 
-              + ISNULL(intr.OptionRate_TRF, 0) 
-              + COALESCE(intr.[liqrate_TRF], lr.[Value], 0)
-          ELSE 
-              (intr.[BaseRate_TRF] + ISNULL(intr.[LiquidityPrefRate_TRF], 0)) 
-              * (1 - dep.[RFRate_Controlling]) 
-              + ISNULL(intr.OptionRate_TRF, 0) 
-              + COALESCE(intr.[liqrate_TRF], lr.[Value], 0)
-      END AS [TransfertRate_Controlling]
-
-    , dep.TransfertRate * (1 - dep.[RFRate_Controlling]) 
-      + ISNULL(lr.[Value], 0) AS [TransfertRate]
-
-    , CASE
-          WHEN 
-              CASE
-                  WHEN intr.[RFRate_TRF] IS NOT NULL THEN 
-                      intr.[BaseRate_TRF] 
-                      + ISNULL(intr.[LiquidityPrefRate_TRF], 0) 
-                      + intr.[RFRate_TRF] 
-                      + ISNULL(intr.OptionRate_TRF, 0) 
-                      + COALESCE(intr.[liqrate_TRF], lr.[Value], 0)
-                  ELSE 
-                      (intr.[BaseRate_TRF] + ISNULL(intr.[LiquidityPrefRate_TRF], 0)) 
-                      * (1 - dep.[RFRate_Controlling]) 
-                      + ISNULL(intr.OptionRate_TRF, 0) 
-                      + COALESCE(intr.[liqrate_TRF], lr.[Value], 0)
-              END
-              - (
-                    CASE     
-                        WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL THEN 
-                            rn.[rate] 
-                            + ISNULL(man.[con_spread], man2.correction) / 100.0
-                            - (kr.[rate] / (1 - 0.0450) - kr.[rate])
-                        ELSE dep.[RATE]
-                    END
-                    + dep.SSVRate_Fcast
-                ) <= 0 
-          THEN 0 
-          ELSE
-              CASE
-                  WHEN intr.[RFRate_TRF] IS NOT NULL THEN 
-                      intr.[BaseRate_TRF] 
-                      + ISNULL(intr.[LiquidityPrefRate_TRF], 0) 
-                      + intr.[RFRate_TRF] 
-                      + ISNULL(intr.OptionRate_TRF, 0) 
-                      + COALESCE(intr.[liqrate_TRF], lr.[Value], 0)
-                  ELSE 
-                      (intr.[BaseRate_TRF] + ISNULL(intr.[LiquidityPrefRate_TRF], 0)) 
-                      * (1 - dep.[RFRate_Controlling]) 
-                      + ISNULL(intr.OptionRate_TRF, 0) 
-                      + COALESCE(intr.[liqrate_TRF], lr.[Value], 0)
-              END
-              - (
-                    CASE     
-                        WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL THEN 
-                            rn.[rate] 
-                            + ISNULL(man.[con_spread], man2.correction) / 100.0
-                            - (kr.[rate] / (1 - 0.0450) - kr.[rate])
-                        ELSE dep.[RATE]
-                    END
-                    + dep.SSVRate_Fcast
-                )
-      END AS [Margin_Controlling]
-
-INTO #deposit
-
-FROM [LIQUIDITY].rep.DepositContract_LEGAL_InterestsRate dep WITH (NOLOCK)
-
-    JOIN #calendar cal
-        ON dep.[DT_OPEN] <= cal.[Date]
-       AND dep.[DT_CLOSE] > cal.[Date]
-
-    -- ключевая замена: берём остаток по договору из сальдо на конкретную дату календаря
-    JOIN [LIQUIDITY].[liq].[DepositContract_Saldo] saldo WITH (NOLOCK)
-        ON dep.[CON_ID] = saldo.[CON_ID]
-       AND cal.[Date] BETWEEN saldo.[DT_FROM] AND saldo.[DT_TO]
-
-    LEFT JOIN LIQUIDITY.liq.floatrate_deals man 
-        ON dep.CON_ID = CAST(man.[con_id] AS varchar(255))
-
-    LEFT JOIN LIQUIDITY.liq.man_FloatContracts man2 
-        ON CAST(man2.[con_id] AS varchar(255)) = dep.[con_id]
-
-    LEFT JOIN #keyrate kr 
-        ON cal.[Date] = kr.[date]
-
-    LEFT JOIN #ruonia rn 
-        ON cal.[Date] = rn.[date]
-
-    LEFT JOIN alm.[info].[VW_liquidity_rates_interpolated] lr WITH (NOLOCK)
-        ON dep.DT_OPEN BETWEEN lr.[dt_from] AND lr.[dt_to]
-       AND lr.[Cur] = 810
-       AND dep.[CUR] = 'RUR'
-       AND ISNULL(dep.[IS_PDR], 0) = lr.[IS_PDR]
-       AND ISNULL(dep.[IS_FINANCE_LCR], 0) = lr.[IS_FINANCE_LCR]
-       AND dep.[MATUR] = lr.[Term]
-
-    LEFT JOIN LIQUIDITY.liq.InterestsRateForDeposit intr WITH (NOLOCK)
-        ON dep.[CON_ID] = intr.[CON_ID]
-
-WHERE dep.DT_CLOSE > @dt_start
-  AND dep.ISDOMRF = 0
-  AND dep.[CUR] = 'RUR'
-  AND saldo.[OUT_RUB] IS NOT NULL
-  AND saldo.[OUT_RUB] <> 0;
+select *
+                ,[Spread_KeyRate] * [BALANCE_RUB]                    [Spread_KeyRate_x_BalanceRub]
+                ,[Spread_OIS] * [BALANCE_RUB]                        [Spread_OIS_x_BalanceRub]
+                ,[DURATION] * [BALANCE_RUB]                          [DURATION_x_BalanceRub]
+                ,[MATUR] * [BALANCE_RUB]                             [MATUR_x_BalanceRub]
+                ,case
+                                when isnull([Margin_Controlling], [Margin]) = 0 then ([RATE] + [SSVRate_Fcast])
+                                else isnull([TransfertRate_Controlling], [TransfertRate]) 
+                end - [KeyRate]                                      [Spread_KeyRate_TR]
+                ,(case
+                                when isnull([Margin_Controlling], [Margin]) = 0 then ([RATE] + [SSVRate_Fcast])
+                                else isnull([TransfertRate_Controlling], [TransfertRate]) 
+                end - [KeyRate]) * [BALANCE_RUB]                     [Spread_KeyRate_TR_x_BalanceRub]
+                ,eomonth([date])                                     [Period]
+from #deposit
+where abs(Spread_KeyRate) <= 0.08;
