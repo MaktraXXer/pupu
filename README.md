@@ -1,139 +1,281 @@
-Да, так проще и надежнее.
+DECLARE @dt_start date = '20260101';
+DECLARE @dt_end   date = '20260503';
 
-Сделаем:
+DROP TABLE IF EXISTS #keyrate;
 
-* в БД оба поля дат как DATE;
-* в VBA оба поля писать как дату без времени в формате yyyy-mm-dd.
+SELECT 
+      [date]
+    , [rate] / 100.0 AS [rate]
+INTO #keyrate
+FROM ALM.info.VW_CBKEY_everyday
+WHERE [Date] BETWEEN @dt_start AND @dt_end;
 
-SQL: пересоздать таблицу
 
-IF OBJECT_ID('ALM_Test.testworkspace.sms_promo_messages', 'U') IS NOT NULL
-    DROP TABLE ALM_Test.testworkspace.sms_promo_messages;
-GO
-IF NOT EXISTS (
-    SELECT 1
-    FROM sys.schemas
-    WHERE name = 'testworkspace'
-)
-BEGIN
-    EXEC('CREATE SCHEMA testworkspace');
-END;
-GO
-CREATE TABLE ALM_Test.testworkspace.sms_promo_messages
-(
-    id                BIGINT IDENTITY(1,1) PRIMARY KEY,
-    messageid         BIGINT         NOT NULL,
-    msgbegindate      DATE           NULL,
-    msgbegindate_dt   DATE           NULL,
-    shippingmethod    NVARCHAR(100)  NULL,
-    kindname          NVARCHAR(500)  NULL,
-    decoding_id_state NVARCHAR(200)  NULL,
-    success           NVARCHAR(200)  NULL,
-    cli_clas_001      BIGINT         NULL,
-    cli_id            BIGINT         NULL,
-    load_dt           DATETIME       NOT NULL DEFAULT GETDATE()
-);
-GO
+DROP TABLE IF EXISTS #ruonia;
 
-VBA: упрощенный макрос с датами без времени
+SELECT 
+      [date]
+    , [rate] / 100.0 AS [rate]
+INTO #ruonia
+FROM ALM.info.VW_Ruonia_everyday
+WHERE [Date] BETWEEN @dt_start AND @dt_end;
 
-Option Explicit
-Sub ImportSmsPromoMessagesToDB_Simple()
-    Dim ws As Worksheet
-    Dim conn As Object
-    Dim lastRow As Long
-    Dim i As Long
-    Dim sql As String
-    Dim messageid As String
-    Dim msgbegindate As String
-    Dim msgbegindate_dt As String
-    Dim shippingmethod As String
-    Dim kindname As String
-    Dim decoding_id_state As String
-    Dim success As String
-    Dim cli_clas_001 As String
-    Dim cli_id As String
-    On Error GoTo ErrorHandler
-    Application.ScreenUpdating = False
-    Application.EnableEvents = False
-    Set ws = ActiveSheet
-    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
-    If lastRow < 2 Then
-        MsgBox "Нет данных для загрузки!", vbExclamation
-        GoTo SafeExit
-    End If
-    Set conn = CreateObject("ADODB.Connection")
-    conn.ConnectionString = "Provider=SQLOLEDB;Data Source=trading-db.ahml1.ru;Initial Catalog=ALM_TEST;Integrated Security=SSPI;"
-    conn.Open
-    conn.Execute "DELETE FROM testworkspace.sms_promo_messages;"
-    For i = 2 To lastRow
-        If Trim(CStr(ws.Cells(i, 1).Value)) <> "" Then
-            messageid = Trim(CStr(ws.Cells(i, 1).Value))
-            If Trim(CStr(ws.Cells(i, 2).Value)) <> "" And IsDate(ws.Cells(i, 2).Value) Then
-                msgbegindate = "'" & Format(CDate(ws.Cells(i, 2).Value), "yyyy-mm-dd") & "'"
-            Else
-                msgbegindate = "NULL"
-            End If
-            If Trim(CStr(ws.Cells(i, 3).Value)) <> "" And IsDate(ws.Cells(i, 3).Value) Then
-                msgbegindate_dt = "'" & Format(CDate(ws.Cells(i, 3).Value), "yyyy-mm-dd") & "'"
-            Else
-                msgbegindate_dt = "NULL"
-            End If
-            shippingmethod = SqlText(ws.Cells(i, 4).Value)
-            kindname = SqlText(ws.Cells(i, 5).Value)
-            decoding_id_state = SqlText(ws.Cells(i, 6).Value)
-            success = SqlText(ws.Cells(i, 7).Value)
-            If Trim(CStr(ws.Cells(i, 8).Value)) <> "" Then
-                cli_clas_001 = Trim(CStr(ws.Cells(i, 8).Value))
-            Else
-                cli_clas_001 = "NULL"
-            End If
-            If Trim(CStr(ws.Cells(i, 9).Value)) <> "" Then
-                cli_id = Trim(CStr(ws.Cells(i, 9).Value))
-            Else
-                cli_id = "NULL"
-            End If
-            sql = "INSERT INTO testworkspace.sms_promo_messages " & _
-                  "(messageid, msgbegindate, msgbegindate_dt, shippingmethod, kindname, decoding_id_state, success, cli_clas_001, cli_id) " & _
-                  "VALUES (" & _
-                  messageid & ", " & _
-                  msgbegindate & ", " & _
-                  msgbegindate_dt & ", " & _
-                  shippingmethod & ", " & _
-                  kindname & ", " & _
-                  decoding_id_state & ", " & _
-                  success & ", " & _
-                  cli_clas_001 & ", " & _
-                  cli_id & ");"
-            conn.Execute sql
-        End If
-    Next i
-    conn.Close
-    MsgBox "Данные загружены!", vbInformation
-SafeExit:
-    Application.ScreenUpdating = True
-    Application.EnableEvents = True
-    Exit Sub
-ErrorHandler:
-    If Not conn Is Nothing Then
-        If conn.State = 1 Then conn.Close
-    End If
-    Application.ScreenUpdating = True
-    Application.EnableEvents = True
-    MsgBox "Ошибка: " & Err.Description, vbCritical
-End Sub
-Private Function SqlText(ByVal v As Variant) As String
-    If Trim(CStr(v)) = "" Then
-        SqlText = "NULL"
-    Else
-        SqlText = "N'" & Replace(CStr(v), "'", "''") & "'"
-    End If
-End Function
 
-Что изменил:
+DROP TABLE IF EXISTS #calendar;
 
-* msgbegindate теперь тоже пишется как DATE, без времени;
-* для русского текста поставил N'...', чтобы Unicode нормально записывался;
-* типы в SQL оставил NVARCHAR, это правильно для кириллицы.
+SELECT *
+INTO #calendar
+FROM ALM.info.[VW_calendar]
+WHERE [Date] BETWEEN @dt_start AND @dt_end;
 
-Если снова будет ошибка, пришли точный текст и строку, где падает.
+
+DROP TABLE IF EXISTS #deposit;
+
+SELECT 
+      cal.[Date]
+    , dep.[CON_ID]
+    , dep.[ACC_NO]
+    , dep.[CLI_ID]
+    , dep.[INN]
+
+    , CASE
+          WHEN dep.CLI_ID IN ('3731800', '3939590185') THEN 'Фед.Казна'
+          ELSE dep.[CLI_SHORT_NAME]
+      END AS [CLI_SHORT_NAME]
+
+    -- старый баланс можно оставить только для сверки
+    , dep.[BALANCE_CUR]
+    , dep.[BALANCE_RUB] AS [DEP_BALANCE_RUB]
+
+    -- основной вес для статистики — только сальдо на дату
+    , saldo.[OUT_RUB] AS [BALANCE_RUB]
+
+    , dep.[CUR]
+    , dep.[DT_OPEN]
+    , dep.[DT_CLOSE]
+    , dep.[DT_CLOSE_PLAN]
+    , dep.[MATUR]
+    , DATEDIFF(day, cal.[Date], dep.[DT_CLOSE_PLAN]) AS [DURATION]
+    , dep.[SEG_NAME]
+    , dep.[PROD_NAME]
+    , dep.[IS_PDR]
+
+    , CASE 
+          WHEN ISNULL(man.[basis], man2.[basis]) IS NULL THEN 0 
+          ELSE 1 
+      END AS [IS_FLOAT]
+
+    , dep.[OKVED_CODE]
+    , dep.[OKVED_NAME]
+    , dep.[SSVRate_Fcast]
+
+    , CASE     
+          WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL THEN 
+              kr.[rate] / (1 - 0.0450) - kr.[rate]
+          ELSE dep.[RFRate_Fcast_Int]
+      END AS [FOR_Rate]
+
+    , ISNULL(man.[basis], man2.[basis]) AS [BASIS]
+
+    , CASE 
+          WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL THEN rn.[rate] 
+      END AS [BASIS_RATE]
+
+    , CASE 
+          WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL 
+              THEN ISNULL(man.[con_spread], man2.correction) / 100.0 
+      END AS [BASIS_SPREAD]
+
+    , CASE     
+          WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL THEN 
+              rn.[rate] 
+              + ISNULL(man.[con_spread], man2.correction) / 100.0
+              - (kr.[rate] / (1 - 0.0450) - kr.[rate])
+          ELSE dep.[RATE]
+      END AS [RATE]
+
+    , CASE     
+          WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL THEN 
+              LIQUIDITY.liq.fnc_IntRate(
+                    rn.[rate] 
+                    + ISNULL(man.[con_spread], man2.correction) / 100.0
+                    - (kr.[rate] / (1 - 0.0450) - kr.[rate])
+                  , 'at the end'
+                  , 'monthly'
+                  , dep.[MATUR]
+                  , 1
+              )
+          ELSE dep.[MonthlyConv_RATE]
+      END AS [MonthlyConv_Rate]
+
+    , dep.[KeyRate]
+    , dep.[MonthlyConv_OISRate]
+
+    , CASE     
+          WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL THEN 
+              LIQUIDITY.liq.fnc_IntRate(
+                    rn.[rate] 
+                    + ISNULL(man.[con_spread], man2.correction) / 100.0
+                    - (kr.[rate] / (1 - 0.0450) - kr.[rate])
+                  , 'at the end'
+                  , 'monthly'
+                  , dep.[MATUR]
+                  , 1
+              )
+          ELSE dep.[MonthlyConv_RATE] + dep.[SSVRate_Fcast]
+      END - dep.[KeyRate] AS [Spread_KeyRate]
+
+    , CASE     
+          WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL THEN 
+              LIQUIDITY.liq.fnc_IntRate(
+                    rn.[rate] 
+                    + ISNULL(man.[con_spread], man2.correction) / 100.0
+                    - (kr.[rate] / (1 - 0.0450) - kr.[rate])
+                  , 'at the end'
+                  , 'monthly'
+                  , dep.[MATUR]
+                  , 1
+              )
+          ELSE dep.[MonthlyConv_RATE] + dep.[SSVRate_Fcast]
+      END - dep.[MonthlyConv_OISRate] AS [Spread_OIS]
+
+    , CASE
+          WHEN 
+              dep.TransfertRate * (1 - dep.[RFRate_Controlling]) 
+              + ISNULL(lr.[Value], 0)
+              - (
+                    CASE     
+                        WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL THEN 
+                            rn.[rate] 
+                            + ISNULL(man.[con_spread], man2.correction) / 100.0
+                            - (kr.[rate] / (1 - 0.0450) - kr.[rate])
+                        ELSE dep.[RATE]
+                    END
+                    + dep.SSVRate_Fcast
+                ) <= 0 
+          THEN 0 
+          ELSE 
+              dep.TransfertRate * (1 - dep.[RFRate_Controlling]) 
+              + ISNULL(lr.[Value], 0)
+              - (
+                    CASE     
+                        WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL THEN 
+                            rn.[rate] 
+                            + ISNULL(man.[con_spread], man2.correction) / 100.0
+                            - (kr.[rate] / (1 - 0.0450) - kr.[rate])
+                        ELSE dep.[RATE]
+                    END
+                    + dep.SSVRate_Fcast
+                )
+      END AS [Margin]
+
+    , CASE
+          WHEN intr.[RFRate_TRF] IS NOT NULL THEN 
+              intr.[BaseRate_TRF] 
+              + ISNULL(intr.[LiquidityPrefRate_TRF], 0) 
+              + intr.[RFRate_TRF] 
+              + ISNULL(intr.OptionRate_TRF, 0) 
+              + COALESCE(intr.[liqrate_TRF], lr.[Value], 0)
+          ELSE 
+              (intr.[BaseRate_TRF] + ISNULL(intr.[LiquidityPrefRate_TRF], 0)) 
+              * (1 - dep.[RFRate_Controlling]) 
+              + ISNULL(intr.OptionRate_TRF, 0) 
+              + COALESCE(intr.[liqrate_TRF], lr.[Value], 0)
+      END AS [TransfertRate_Controlling]
+
+    , dep.TransfertRate * (1 - dep.[RFRate_Controlling]) 
+      + ISNULL(lr.[Value], 0) AS [TransfertRate]
+
+    , CASE
+          WHEN 
+              CASE
+                  WHEN intr.[RFRate_TRF] IS NOT NULL THEN 
+                      intr.[BaseRate_TRF] 
+                      + ISNULL(intr.[LiquidityPrefRate_TRF], 0) 
+                      + intr.[RFRate_TRF] 
+                      + ISNULL(intr.OptionRate_TRF, 0) 
+                      + COALESCE(intr.[liqrate_TRF], lr.[Value], 0)
+                  ELSE 
+                      (intr.[BaseRate_TRF] + ISNULL(intr.[LiquidityPrefRate_TRF], 0)) 
+                      * (1 - dep.[RFRate_Controlling]) 
+                      + ISNULL(intr.OptionRate_TRF, 0) 
+                      + COALESCE(intr.[liqrate_TRF], lr.[Value], 0)
+              END
+              - (
+                    CASE     
+                        WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL THEN 
+                            rn.[rate] 
+                            + ISNULL(man.[con_spread], man2.correction) / 100.0
+                            - (kr.[rate] / (1 - 0.0450) - kr.[rate])
+                        ELSE dep.[RATE]
+                    END
+                    + dep.SSVRate_Fcast
+                ) <= 0 
+          THEN 0 
+          ELSE
+              CASE
+                  WHEN intr.[RFRate_TRF] IS NOT NULL THEN 
+                      intr.[BaseRate_TRF] 
+                      + ISNULL(intr.[LiquidityPrefRate_TRF], 0) 
+                      + intr.[RFRate_TRF] 
+                      + ISNULL(intr.OptionRate_TRF, 0) 
+                      + COALESCE(intr.[liqrate_TRF], lr.[Value], 0)
+                  ELSE 
+                      (intr.[BaseRate_TRF] + ISNULL(intr.[LiquidityPrefRate_TRF], 0)) 
+                      * (1 - dep.[RFRate_Controlling]) 
+                      + ISNULL(intr.OptionRate_TRF, 0) 
+                      + COALESCE(intr.[liqrate_TRF], lr.[Value], 0)
+              END
+              - (
+                    CASE     
+                        WHEN ISNULL(man.[basis], man2.[basis]) IS NOT NULL THEN 
+                            rn.[rate] 
+                            + ISNULL(man.[con_spread], man2.correction) / 100.0
+                            - (kr.[rate] / (1 - 0.0450) - kr.[rate])
+                        ELSE dep.[RATE]
+                    END
+                    + dep.SSVRate_Fcast
+                )
+      END AS [Margin_Controlling]
+
+INTO #deposit
+
+FROM [LIQUIDITY].rep.DepositContract_LEGAL_InterestsRate dep WITH (NOLOCK)
+
+    JOIN #calendar cal
+        ON dep.[DT_OPEN] <= cal.[Date]
+       AND dep.[DT_CLOSE] > cal.[Date]
+
+    -- ключевая замена: берём остаток по договору из сальдо на конкретную дату календаря
+    JOIN [LIQUIDITY].[liq].[DepositContract_Saldo] saldo WITH (NOLOCK)
+        ON dep.[CON_ID] = saldo.[CON_ID]
+       AND cal.[Date] BETWEEN saldo.[DT_FROM] AND saldo.[DT_TO]
+
+    LEFT JOIN LIQUIDITY.liq.floatrate_deals man 
+        ON dep.CON_ID = CAST(man.[con_id] AS varchar(255))
+
+    LEFT JOIN LIQUIDITY.liq.man_FloatContracts man2 
+        ON CAST(man2.[con_id] AS varchar(255)) = dep.[con_id]
+
+    LEFT JOIN #keyrate kr 
+        ON cal.[Date] = kr.[date]
+
+    LEFT JOIN #ruonia rn 
+        ON cal.[Date] = rn.[date]
+
+    LEFT JOIN alm.[info].[VW_liquidity_rates_interpolated] lr WITH (NOLOCK)
+        ON dep.DT_OPEN BETWEEN lr.[dt_from] AND lr.[dt_to]
+       AND lr.[Cur] = 810
+       AND dep.[CUR] = 'RUR'
+       AND ISNULL(dep.[IS_PDR], 0) = lr.[IS_PDR]
+       AND ISNULL(dep.[IS_FINANCE_LCR], 0) = lr.[IS_FINANCE_LCR]
+       AND dep.[MATUR] = lr.[Term]
+
+    LEFT JOIN LIQUIDITY.liq.InterestsRateForDeposit intr WITH (NOLOCK)
+        ON dep.[CON_ID] = intr.[CON_ID]
+
+WHERE dep.DT_CLOSE > @dt_start
+  AND dep.ISDOMRF = 0
+  AND dep.[CUR] = 'RUR'
+  AND saldo.[OUT_RUB] IS NOT NULL
+  AND saldo.[OUT_RUB] <> 0;
