@@ -1,199 +1,253 @@
-declare @dt_start date = '20260101';
-declare @dt_end   date = '20260503';
+USE [ALM];
+SET NOCOUNT ON;
 
-drop table if exists #keyrate;
+DECLARE @BaseDate date = '2026-04-08'; -- дата баланса было
+DECLARE @EndDate  date = '2026-05-12'; -- дата баланса стало
 
-select 
-      [date]
-    , [rate] / 100.0 [rate]
-into #keyrate
-from ALM.info.VW_CBKEY_everyday 
-where [Date] between @dt_start and @dt_end;
+DECLARE @ExitFrom date = '2026-04-09'; -- выходы с
+DECLARE @ExitTo   date = '2026-05-12'; -- выходы по включительно
 
+DECLARE @OpenFrom date = '2026-04-09'; -- открытые с
+DECLARE @OpenTo   date = '2026-05-12'; -- открытые по включительно
 
-drop table if exists #ruonia;
-
-select 
-      [date]
-    , [rate] / 100.0 [rate]
-into #ruonia
-from ALM.info.VW_Ruonia_everyday
-where [Date] between @dt_start and @dt_end;
+IF OBJECT_ID('tempdb..#bal_base') IS NOT NULL DROP TABLE #bal_base;
+IF OBJECT_ID('tempdb..#bal_end') IS NOT NULL DROP TABLE #bal_end;
+IF OBJECT_ID('tempdb..#client_scope') IS NOT NULL DROP TABLE #client_scope;
+IF OBJECT_ID('tempdb..#client_mart') IS NOT NULL DROP TABLE #client_mart;
 
 
-drop table if exists #calendar;
-
-select *
-into #calendar
-from ALM.info.[VW_calendar]
-where [Date] between @dt_start and @dt_end;
-
-
-drop table if exists #deposit;
-
-select cal.[Date]
-                ,dep.[CON_ID]
-                ,dep.[ACC_NO]
-                ,dep.[CLI_ID]
-                ,dep.[INN]
-                ,case
-                                when CLI_ID in ('3731800', '3939590185') then 'Фед.Казна'
-                                else dep.[CLI_SHORT_NAME]
-                end                        [CLI_SHORT_NAME]
-                ,dep.[BALANCE_CUR]
-                ,dep.[CUR]
-                ,saldo.[OUT_RUB]            [BALANCE_RUB]
-                ,dep.[DT_OPEN]
-                ,dep.[DT_CLOSE]
-                ,dep.[DT_CLOSE_PLAN]
-                ,dep.[MATUR]
-                ,datediff(day, cal.[date], dep.[DT_CLOSE_PLAN]) [DURATION]
-                ,dep.[SEG_NAME]
-                ,dep.[PROD_NAME]
-                ,dep.[IS_PDR]
-                ,case 
-                                when isnull(man.[basis], man2.[basis]) is null then 0 
-                                else 1 
-                end                                                                 [IS_FLOAT]
-                ,dep.[OKVED_CODE]
-                ,dep.[OKVED_NAME]
-                ,dep.[SSVRate_Fcast]
-                ,case     
-                                when isnull(man.[basis], man2.[basis]) is not null then 
-                                                (kr.[rate] / (1 - 0.0450) - kr.[rate])
-                                else dep.[RFRate_Fcast_Int]
-                end                                                                 [FOR_Rate]
-                ,isnull(man.[basis], man2.[basis])                                  [BASIS]
-                ,case 
-                                when isnull(man.[basis], man2.[basis]) is not null then rn.[rate] 
-                end                                                                 [BASIS_RATE]
-                ,case 
-                                when  isnull(man.[basis], man2.[basis])  is not null then isnull(man.[con_spread], man2.correction) / 100.0 
-                end                                                                 [BASIS_SPREAD]
-                ,case     
-                                when isnull(man.[basis], man2.[basis]) is not null then 
-                                                (rn.[rate] + isnull(man.[con_spread], man2.correction) / 100.0 
-                                                                - (kr.[rate] / (1 - 0.0450) - kr.[rate]))
-                                else dep.[RATE]
-                end                                                                 [RATE]
-                ,case     
-                                when isnull(man.[basis], man2.[basis]) is not null then 
-                                                (select liq.fnc_IntRate((rn.[rate] + isnull(man.[con_spread], man2.correction) / 100.0
-                                                                - (kr.[rate] / (1 - 0.0450) - kr.[rate])), 'at the end', 'monthly', dep.[MATUR], 1)
-                                                ) 
-                                else [MonthlyConv_RATE]
-                end                                                                 [MonthlyConv_Rate]
-                ,dep.[KeyRate]
-                ,dep.[MonthlyConv_OISRate]
-                ,case     
-                                when isnull(man.[basis], man2.[basis]) is not null then 
-                                                (select liq.fnc_IntRate((rn.[rate] + isnull(man.[con_spread], man2.correction) / 100.0
-                                                                - (kr.[rate] / (1 - 0.0450) - kr.[rate])), 'at the end', 'monthly', dep.[MATUR], 1)
-                                                ) 
-                                else dep.[MonthlyConv_RATE] + dep.[SSVRate_Fcast]
-                end - dep.[KeyRate]                                                 [Spread_KeyRate]
-                ,case     
-                                when isnull(man.[basis], man2.[basis]) is not null then 
-                                                (select liq.fnc_IntRate((rn.[rate] + isnull(man.[con_spread], man2.correction) / 100.0
-                                                                - (kr.[rate] / (1 - 0.0450) - kr.[rate])), 'at the end', 'monthly', dep.[MATUR], 1)
-                                                ) 
-                                else MonthlyConv_RATE + dep.[SSVRate_Fcast]
-                end - [MonthlyConv_OISRate]                                         [Spread_OIS]
-                ,case
-                                when dep.TransfertRate * (1 - [RFRate_Controlling]) + isnull(lr.[Value], 0) - (case
-                                when isnull(man.[basis], man2.[basis]) is not null then 
-                                                (rn.[rate] + isnull(man.[con_spread], man2.correction) / 100.0 
-                                                                - (kr.[rate] / (1 - 0.0450) - kr.[rate]))
-                                else dep.[RATE]
-                end        + dep.SSVRate_Fcast) <= 0 then 0 
-                                else dep.TransfertRate * (1 - [RFRate_Controlling]) + isnull(lr.[Value], 0) - (case   
-                                when isnull(man.[basis], man2.[basis]) is not null then 
-                                                (rn.[rate] + isnull(man.[con_spread], man2.correction) / 100.0 
-                                                                - (kr.[rate] / (1 - 0.0450) - kr.[rate]))
-                                else dep.[RATE]
-                end        + dep.SSVRate_Fcast) 
-                end [Margin]
-                ,case
-                                when intr.[RFRate_TRF] is not null then intr.[BaseRate_TRF] + isnull(intr.[LiquidityPrefRate_TRF], 0) + intr.[RFRate_TRF] + isnull(intr.OptionRate_TRF, 0) + coalesce(intr.[liqrate_TRF], lr.[Value], 0)
-                                else (intr.[BaseRate_TRF] + isnull(intr.[LiquidityPrefRate_TRF], 0)) * (1 - dep.[RFRate_Controlling]) + isnull(intr.OptionRate_TRF, 0) + coalesce(intr.[liqrate_TRF], lr.[Value], 0)
-                end [TransfertRate_Controlling]
-                ,dep.TransfertRate * (1 - [RFRate_Controlling]) + isnull(lr.[Value], 0) [TransfertRate]
-                ,case
-                                when 
-                                                case
-                                                                when intr.[RFRate_TRF] is not null then intr.[BaseRate_TRF] + isnull(intr.[LiquidityPrefRate_TRF], 0) + intr.[RFRate_TRF] + isnull(intr.OptionRate_TRF, 0) + coalesce(intr.[liqrate_TRF], lr.[Value], 0)
-                                                                else (intr.[BaseRate_TRF] + isnull(intr.[LiquidityPrefRate_TRF], 0)) * (1 - dep.[RFRate_Controlling]) + isnull(intr.OptionRate_TRF, 0) + coalesce(intr.[liqrate_TRF], lr.[Value], 0)
-                                                end - (case          
-                                when isnull(man.[basis], man2.[basis]) is not null then 
-                                                (rn.[rate] + isnull(man.[con_spread], man2.correction) / 100.0 
-                                                                - (kr.[rate] / (1 - 0.0450) - kr.[rate]))
-                                else dep.[RATE]
-                end        + dep.SSVRate_Fcast) <= 0 then 0 
-                                else
-                                                case
-                                                                when intr.[RFRate_TRF] is not null then intr.[BaseRate_TRF] + isnull(intr.[LiquidityPrefRate_TRF], 0) + intr.[RFRate_TRF] + isnull(intr.OptionRate_TRF, 0) + coalesce(intr.[liqrate_TRF], lr.[Value], 0)
-                                                                else (intr.[BaseRate_TRF] + isnull(intr.[LiquidityPrefRate_TRF], 0)) * (1 - dep.[RFRate_Controlling]) + isnull(intr.OptionRate_TRF, 0) + coalesce(intr.[liqrate_TRF], lr.[Value], 0)
-                                                end - (case          
-                                when isnull(man.[basis], man2.[basis]) is not null then 
-                                                (rn.[rate] + isnull(man.[con_spread], man2.correction) / 100.0 
-                                                                - (kr.[rate] / (1 - 0.0450) - kr.[rate]))
-                                else dep.[RATE]
-                end        + dep.SSVRate_Fcast) 
-                end [Margin_Controlling]
-into #deposit
-from [LIQUIDITY].rep.DepositContract_LEGAL_InterestsRate dep with (nolock)
-                join #calendar cal 
-                                on dep.[DT_OPEN] <= cal.[Date]
-                               and dep.[DT_CLOSE] > cal.[Date]
-
-                join [LIQUIDITY].[liq].[DepositContract_Saldo] saldo with (nolock)
-                                on dep.[CON_ID] = saldo.[CON_ID]
-                               and cal.[Date] between saldo.[DT_FROM] and saldo.[DT_TO]
-
-                left join LIQUIDITY.liq.floatrate_deals man 
-                                on dep.CON_ID = cast(man.[con_id] as varchar(255))
-
-                left join LIQUIDITY.liq.man_FloatContracts man2 
-                                on cast(man2.[con_id] as varchar(255)) = dep.[con_id]
-
-                left join #keyrate kr 
-                                on cal.[Date] = kr.[date]
-
-                left join #ruonia rn 
-                                on cal.[Date] = rn.[date]
-
-                left join alm.[info].[VW_liquidity_rates_interpolated] lr with (nolock) 
-                                on dep.DT_OPEN between lr.[dt_from] and lr.[dt_to]
-                               and lr.[Cur] = 810
-                               and dep.[CUR] = 'RUR'
-                               and isnull(dep.[IS_PDR], 0) = lr.[IS_PDR]
-                               and isnull(dep.[IS_FINANCE_LCR], 0) = lr.[IS_FINANCE_LCR]
-                               and dep.[MATUR] = lr.[Term]
-
-                left join LIQUIDITY.liq.InterestsRateForDeposit intr with (nolock) 
-                                on dep.[CON_ID] = intr.[CON_ID]
-
-where dep.DT_CLOSE > @dt_start
---              and dep.[SEG_NAME] = 'Казна'
-                and dep.ISDOMRF = 0
-                and dep.[CUR] = 'RUR'
-                and saldo.[OUT_RUB] is not null
-                and saldo.[OUT_RUB] <> 0;
+SELECT
+      CAST(t.dt_rep AS date) AS dt_rep
+    , CAST(t.cli_id AS bigint) AS cli_id
+    , CAST(t.con_id AS bigint) AS con_id
+    , CAST(t.dt_open AS date) AS dt_open
+    , CAST(t.dt_close_plan AS date) AS dt_close_plan
+    , t.section_name
+    , CAST(t.out_rub AS decimal(38,6)) AS out_rub
+    , CAST(t.rate_con AS decimal(18,6)) AS rate_con
+    , t.conv
+    , t.termdays
+    , t.TSEGMENTNAME
+INTO #bal_base
+FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
+WHERE t.dt_rep = @BaseDate
+  AND t.section_name IN (N'Срочные', N'Накопительный счёт')
+  AND t.block_name = N'Привлечение ФЛ'
+  AND t.acc_role   = N'LIAB'
+  AND t.od_flag    = 1
+  AND t.cur        = '810'
+  AND t.out_rub IS NOT NULL
+  AND t.out_rub >= 0;
 
 
-select *
-                ,[Spread_KeyRate] * [BALANCE_RUB]                    [Spread_KeyRate_x_BalanceRub]
-                ,[Spread_OIS] * [BALANCE_RUB]                        [Spread_OIS_x_BalanceRub]
-                ,[DURATION] * [BALANCE_RUB]                          [DURATION_x_BalanceRub]
-                ,[MATUR] * [BALANCE_RUB]                             [MATUR_x_BalanceRub]
-                ,case
-                                when isnull([Margin_Controlling], [Margin]) = 0 then ([RATE] + [SSVRate_Fcast])
-                                else isnull([TransfertRate_Controlling], [TransfertRate]) 
-                end - [KeyRate]                                      [Spread_KeyRate_TR]
-                ,(case
-                                when isnull([Margin_Controlling], [Margin]) = 0 then ([RATE] + [SSVRate_Fcast])
-                                else isnull([TransfertRate_Controlling], [TransfertRate]) 
-                end - [KeyRate]) * [BALANCE_RUB]                     [Spread_KeyRate_TR_x_BalanceRub]
-                ,eomonth([date])                                     [Period]
-from #deposit
-where abs(Spread_KeyRate) <= 0.08;
+SELECT
+      CAST(t.dt_rep AS date) AS dt_rep
+    , CAST(t.cli_id AS bigint) AS cli_id
+    , CAST(t.con_id AS bigint) AS con_id
+    , CAST(t.dt_open AS date) AS dt_open
+    , CAST(t.dt_close_plan AS date) AS dt_close_plan
+    , t.section_name
+    , CAST(t.out_rub AS decimal(38,6)) AS out_rub
+    , CAST(t.rate_con AS decimal(18,6)) AS rate_con
+    , t.conv
+    , t.termdays
+    , t.TSEGMENTNAME
+INTO #bal_end
+FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
+WHERE t.dt_rep = @EndDate
+  AND t.section_name IN (N'Срочные', N'Накопительный счёт')
+  AND t.block_name = N'Привлечение ФЛ'
+  AND t.acc_role   = N'LIAB'
+  AND t.od_flag    = 1
+  AND t.cur        = '810'
+  AND t.out_rub IS NOT NULL
+  AND t.out_rub >= 0;
+
+
+SELECT DISTINCT cli_id
+INTO #client_scope
+FROM #bal_base
+WHERE section_name = N'Срочные'
+  AND dt_close_plan >= @ExitFrom
+  AND dt_close_plan <= @ExitTo;
+
+
+WITH client_flags AS
+(
+    SELECT
+          c.cli_id
+        , CASE
+              WHEN EXISTS (
+                  SELECT 1
+                  FROM #bal_base b
+                  WHERE b.cli_id = c.cli_id
+                    AND b.section_name IN (N'Срочные', N'Накопительный счёт')
+                    AND b.TSEGMENTNAME = N'ДЧБО'
+              )
+              THEN N'ДЧБО'
+              ELSE N'Розница'
+          END AS client_segment
+    FROM #client_scope c
+),
+exit_sum AS
+(
+    SELECT
+          cli_id
+        , SUM(out_rub) AS exit_td_sum
+    FROM #bal_base
+    WHERE section_name = N'Срочные'
+      AND dt_close_plan >= @ExitFrom
+      AND dt_close_plan <= @ExitTo
+    GROUP BY cli_id
+),
+ns_start AS
+(
+    SELECT
+          cli_id
+        , SUM(out_rub) AS ns_start_sum
+    FROM #bal_base
+    WHERE section_name = N'Накопительный счёт'
+    GROUP BY cli_id
+),
+ns_end AS
+(
+    SELECT
+          cli_id
+        , SUM(out_rub) AS ns_end_sum
+    FROM #bal_end
+    WHERE section_name = N'Накопительный счёт'
+    GROUP BY cli_id
+),
+opened_by_con AS
+(
+    SELECT
+          b.cli_id
+        , b.con_id
+        , SUM(b.out_rub) AS out_rub
+    FROM #bal_end b
+    INNER JOIN #client_scope c
+        ON b.cli_id = c.cli_id
+    WHERE b.section_name = N'Срочные'
+      AND b.dt_open >= @OpenFrom
+      AND b.dt_open <= @OpenTo
+    GROUP BY b.cli_id, b.con_id
+),
+opened_agg AS
+(
+    SELECT
+          cli_id
+        , SUM(out_rub) AS opened_base
+        , CAST(0 AS decimal(38,6)) AS opened_promo_2
+        , CAST(0 AS decimal(38,6)) AS opened_promo_1
+        , SUM(out_rub) AS opened_total
+    FROM opened_by_con
+    GROUP BY cli_id
+)
+SELECT
+      c.cli_id
+    , f.client_segment AS segment_flag
+
+    , CASE
+          WHEN ISNULL(e.exit_td_sum,0) < 1500000 THEN N'01. Выход < 1.5 млн'
+          WHEN ISNULL(e.exit_td_sum,0) < 5000000 THEN N'02. Выход 1.5-5 млн'
+          ELSE N'03. Выход >= 5 млн'
+      END AS exit_amount_flag
+
+    , ISNULL(e.exit_td_sum,0) AS exit_td_sum
+
+    , ISNULL(ns1.ns_start_sum,0) AS ns_start_sum
+
+    , ISNULL(o.opened_base,0) AS opened_base
+    , ISNULL(o.opened_promo_2,0) AS opened_promo_2_from_8_apr
+    , ISNULL(o.opened_promo_1,0) AS opened_promo_1_from_1_7_apr
+
+    , ISNULL(ns2.ns_end_sum,0) AS ns_end_sum
+    , ISNULL(ns2.ns_end_sum,0) - ISNULL(ns1.ns_start_sum,0) AS ns_delta
+
+    -- 1. Все открытые вклады / выходящие вклады
+    , CAST(
+        ISNULL(o.opened_total,0)
+        / NULLIF(ISNULL(e.exit_td_sum,0),0)
+      AS decimal(18,6)) AS retention_1_td_all
+
+    -- 2. Дельта НС + все открытые вклады / выходящие вклады
+    , CAST(
+        (
+            ISNULL(ns2.ns_end_sum,0) - ISNULL(ns1.ns_start_sum,0)
+            + ISNULL(o.opened_total,0)
+        )
+        / NULLIF(ISNULL(e.exit_td_sum,0),0)
+      AS decimal(18,6)) AS retention_2_td_all_plus_ns
+
+    -- 3. База + промо с 8 апреля / выходящие вклады
+    -- Теперь promo_2 = 0, поэтому показатель равен opened_base / exit_td_sum
+    , CAST(
+        (
+            ISNULL(o.opened_base,0)
+            + ISNULL(o.opened_promo_2,0)
+        )
+        / NULLIF(ISNULL(e.exit_td_sum,0),0)
+      AS decimal(18,6)) AS retention_3_td_base_plus_promo2
+
+    -- 4. Дельта НС + база + промо с 8 апреля / выходящие вклады
+    -- Теперь promo_2 = 0
+    , CAST(
+        (
+            ISNULL(ns2.ns_end_sum,0) - ISNULL(ns1.ns_start_sum,0)
+            + ISNULL(o.opened_base,0)
+            + ISNULL(o.opened_promo_2,0)
+        )
+        / NULLIF(ISNULL(e.exit_td_sum,0),0)
+      AS decimal(18,6)) AS retention_4_td_base_plus_promo2_plus_ns
+
+    -- 5. Только база / выходящие вклады
+    , CAST(
+        ISNULL(o.opened_base,0)
+        / NULLIF(ISNULL(e.exit_td_sum,0),0)
+      AS decimal(18,6)) AS retention_5_td_base
+
+    -- 6. Дельта НС + только база / выходящие вклады
+    , CAST(
+        (
+            ISNULL(ns2.ns_end_sum,0) - ISNULL(ns1.ns_start_sum,0)
+            + ISNULL(o.opened_base,0)
+        )
+        / NULLIF(ISNULL(e.exit_td_sum,0),0)
+      AS decimal(18,6)) AS retention_6_td_base_plus_ns
+
+INTO #client_mart
+FROM #client_scope c
+LEFT JOIN client_flags f
+    ON c.cli_id = f.cli_id
+LEFT JOIN exit_sum e
+    ON c.cli_id = e.cli_id
+LEFT JOIN ns_start ns1
+    ON c.cli_id = ns1.cli_id
+LEFT JOIN ns_end ns2
+    ON c.cli_id = ns2.cli_id
+LEFT JOIN opened_agg o
+    ON c.cli_id = o.cli_id;
+
+
+SELECT
+      cli_id
+    , segment_flag
+    , exit_amount_flag
+    , exit_td_sum
+    , ns_start_sum
+    , opened_base
+    , opened_promo_2_from_8_apr
+    , opened_promo_1_from_1_7_apr
+    , ns_end_sum
+    , ns_delta
+    , retention_1_td_all
+    , retention_2_td_all_plus_ns
+    , retention_3_td_base_plus_promo2
+    , retention_4_td_base_plus_promo2_plus_ns
+    , retention_5_td_base
+    , retention_6_td_base_plus_ns
+FROM #client_mart
+ORDER BY
+      segment_flag
+    , exit_amount_flag
+    , cli_id;
