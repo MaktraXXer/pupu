@@ -23,7 +23,6 @@ SELECT
       CAST(t.dt_rep AS date) AS dt_rep
     , CAST(t.cli_id AS bigint) AS cli_id
     , CAST(t.con_id AS bigint) AS con_id
-    , t.acc_no
     , CAST(t.dt_open AS date) AS dt_open
     , CAST(t.dt_close_plan AS date) AS dt_close_plan
     , t.section_name
@@ -34,7 +33,6 @@ SELECT
           ELSE UPPER(LTRIM(RTRIM(t.conv)))
       END AS conv_norm
     , t.termdays
-    , t.PROD_NAME_res
     , t.TSEGMENTNAME
 INTO #bal_base
 FROM [ALM].[ALM].[VW_balance_rest_all] t WITH (NOLOCK)
@@ -53,7 +51,6 @@ SELECT
       CAST(t.dt_rep AS date) AS dt_rep
     , CAST(t.cli_id AS bigint) AS cli_id
     , CAST(t.con_id AS bigint) AS con_id
-    , t.acc_no
     , CAST(t.dt_open AS date) AS dt_open
     , CAST(t.dt_close_plan AS date) AS dt_close_plan
     , t.section_name
@@ -64,7 +61,6 @@ SELECT
           ELSE UPPER(LTRIM(RTRIM(t.conv)))
       END AS conv_norm
     , t.termdays
-    , t.PROD_NAME_res
     , t.TSEGMENTNAME
 INTO #bal_end
 FROM [ALM].[ALM].[VW_balance_rest_all] t WITH (NOLOCK)
@@ -141,7 +137,6 @@ WITH client_segment AS (
 exit_deposits AS (
     SELECT
           b.cli_id
-        , COUNT(DISTINCT b.con_id) AS exit_dep_cnt
         , SUM(b.out_rub) AS exit_dep_sum
     FROM #bal_base b
     WHERE
@@ -151,24 +146,24 @@ exit_deposits AS (
         b.cli_id
 ),
 
-balance_base AS (
+ns_base AS (
     SELECT
           b.cli_id
-        , SUM(CASE WHEN b.section_name = N'Срочные' THEN b.out_rub ELSE 0 END) AS td_base_sum
-        , SUM(CASE WHEN b.section_name = N'Накопительный счёт' THEN b.out_rub ELSE 0 END) AS ns_base_sum
-        , SUM(b.out_rub) AS total_base_sum
+        , SUM(b.out_rub) AS ns_base_sum
     FROM #bal_base b
+    WHERE
+        b.section_name = N'Накопительный счёт'
     GROUP BY
         b.cli_id
 ),
 
-balance_end AS (
+ns_end AS (
     SELECT
           e.cli_id
-        , SUM(CASE WHEN e.section_name = N'Срочные' THEN e.out_rub ELSE 0 END) AS td_end_sum
-        , SUM(CASE WHEN e.section_name = N'Накопительный счёт' THEN e.out_rub ELSE 0 END) AS ns_end_sum
-        , SUM(e.out_rub) AS total_end_sum
+        , SUM(e.out_rub) AS ns_end_sum
     FROM #bal_end e
+    WHERE
+        e.section_name = N'Накопительный счёт'
     GROUP BY
         e.cli_id
 ),
@@ -196,10 +191,6 @@ opened_classified AS (
           o.cli_id
         , o.con_id
         , o.out_rub
-        , o.rate_con
-        , o.termdays
-        , o.dt_open
-        , o.conv_norm
 
         , CASE 
               WHEN o.termdays BETWEEN 45 AND 79
@@ -224,30 +215,6 @@ opened_classified AS (
 
               ELSE 0
           END AS new_money_rate_flag
-
-        , CASE 
-              WHEN o.termdays BETWEEN 45 AND 79
-               AND o.conv_norm = 'AT_THE_END'
-               AND o.out_rub >= 1500000
-               AND ABS(o.rate_con - 0.1450) <= @eps THEN 1
-
-              WHEN o.termdays BETWEEN 45 AND 79
-               AND o.conv_norm = 'AT_THE_END'
-               AND o.out_rub < 1500000
-               AND ABS(o.rate_con - 0.1430) <= @eps THEN 1
-
-              WHEN o.termdays BETWEEN 45 AND 79
-               AND o.conv_norm <> 'AT_THE_END'
-               AND o.out_rub < 1500000
-               AND ABS(o.rate_con - 0.1410) <= @eps THEN 1
-
-              WHEN o.termdays BETWEEN 45 AND 79
-               AND o.conv_norm <> 'AT_THE_END'
-               AND o.out_rub >= 1500000
-               AND ABS(o.rate_con - 0.1430) <= @eps THEN 1
-
-              ELSE 0
-          END AS retention_rate_flag
     FROM opened_by_con o
 ),
 
@@ -255,24 +222,16 @@ opened_agg AS (
     SELECT
           oc.cli_id
 
-        , COUNT(DISTINCT oc.con_id) AS opened_total_cnt
         , SUM(oc.out_rub) AS opened_total_sum
 
-        , COUNT(DISTINCT CASE WHEN oc.new_money_rate_flag = 1 THEN oc.con_id END) AS opened_new_money_cnt
-        , SUM(CASE WHEN oc.new_money_rate_flag = 1 THEN oc.out_rub ELSE 0 END) AS opened_new_money_sum
-
-        , COUNT(DISTINCT CASE WHEN oc.retention_rate_flag = 1 THEN oc.con_id END) AS opened_retention_cnt
-        , SUM(CASE WHEN oc.retention_rate_flag = 1 THEN oc.out_rub ELSE 0 END) AS opened_retention_sum
-
-        , COUNT(DISTINCT CASE 
-              WHEN oc.new_money_rate_flag = 0 
-               AND oc.retention_rate_flag = 0 
-              THEN oc.con_id 
-          END) AS opened_other_cnt
+        , SUM(CASE 
+              WHEN oc.new_money_rate_flag = 1 
+              THEN oc.out_rub 
+              ELSE 0 
+          END) AS opened_new_money_sum
 
         , SUM(CASE 
               WHEN oc.new_money_rate_flag = 0 
-               AND oc.retention_rate_flag = 0 
               THEN oc.out_rub 
               ELSE 0 
           END) AS opened_other_sum
@@ -293,73 +252,30 @@ sms_flags AS (
 SELECT
       c.cli_id
 
-    -- сегмент и смс
+    -- сегмент и СМС
     , seg.segment_flag
     , sms.sms_promo_flag
 
     -- флаги наличия событий
-    , CASE WHEN ISNULL(ex.exit_dep_cnt, 0) > 0 THEN 1 ELSE 0 END AS had_exit_dep_flag
-    , CASE WHEN ISNULL(op.opened_total_cnt, 0) > 0 THEN 1 ELSE 0 END AS had_opened_dep_flag
+    , CASE WHEN ISNULL(ex.exit_dep_sum, 0) > 0 THEN 1 ELSE 0 END AS had_exit_dep_flag
+    , CASE WHEN ISNULL(op.opened_total_sum, 0) > 0 THEN 1 ELSE 0 END AS had_opened_dep_flag
 
-    -- вклады к выходу
-    , ISNULL(ex.exit_dep_cnt, 0) AS exit_dep_cnt
+    -- объем вкладов к выходу
     , ISNULL(ex.exit_dep_sum, 0) AS exit_dep_sum
-    , ISNULL(ex.exit_dep_sum, 0) / 1000000.0 AS exit_dep_sum_mln
 
-    -- открытия всего
-    , ISNULL(op.opened_total_cnt, 0) AS opened_total_cnt
+    -- объем открытых вкладов
     , ISNULL(op.opened_total_sum, 0) AS opened_total_sum
-    , ISNULL(op.opened_total_sum, 0) / 1000000.0 AS opened_total_sum_mln
-
-    -- открытия по ставке новых денег
-    , ISNULL(op.opened_new_money_cnt, 0) AS opened_new_money_cnt
     , ISNULL(op.opened_new_money_sum, 0) AS opened_new_money_sum
-    , ISNULL(op.opened_new_money_sum, 0) / 1000000.0 AS opened_new_money_sum_mln
-
-    -- открытия по ставке удержания
-    , ISNULL(op.opened_retention_cnt, 0) AS opened_retention_cnt
-    , ISNULL(op.opened_retention_sum, 0) AS opened_retention_sum
-    , ISNULL(op.opened_retention_sum, 0) / 1000000.0 AS opened_retention_sum_mln
-
-    -- открытия по остальным ставкам
-    , ISNULL(op.opened_other_cnt, 0) AS opened_other_cnt
     , ISNULL(op.opened_other_sum, 0) AS opened_other_sum
-    , ISNULL(op.opened_other_sum, 0) / 1000000.0 AS opened_other_sum_mln
 
-    -- балансы на 29.04 и 13.05
-    , ISNULL(bb.td_base_sum, 0) AS td_base_sum
-    , ISNULL(be.td_end_sum, 0) AS td_end_sum
-    , ISNULL(be.td_end_sum, 0) - ISNULL(bb.td_base_sum, 0) AS td_delta
+    -- дельта НС
+    , ISNULL(ns2.ns_end_sum, 0) - ISNULL(ns1.ns_base_sum, 0) AS ns_delta
 
-    , ISNULL(bb.ns_base_sum, 0) AS ns_base_sum
-    , ISNULL(be.ns_end_sum, 0) AS ns_end_sum
-    , ISNULL(be.ns_end_sum, 0) - ISNULL(bb.ns_base_sum, 0) AS ns_delta
-
-    , ISNULL(bb.total_base_sum, 0) AS total_base_sum
-    , ISNULL(be.total_end_sum, 0) AS total_end_sum
-    , ISNULL(be.total_end_sum, 0) - ISNULL(bb.total_base_sum, 0) AS total_delta
-
-    -- флаги по НС
+    -- 1 = остаток НС уменьшился; 0 = не изменился / вырос / НС не было
     , CASE 
-          WHEN ISNULL(be.ns_end_sum, 0) < ISNULL(bb.ns_base_sum, 0) THEN 1 
+          WHEN ISNULL(ns2.ns_end_sum, 0) < ISNULL(ns1.ns_base_sum, 0) THEN 1 
           ELSE 0 
       END AS ns_decrease_flag
-
-    , CASE 
-          WHEN ISNULL(be.ns_end_sum, 0) > ISNULL(bb.ns_base_sum, 0) THEN 1 
-          ELSE 0 
-      END AS ns_increase_flag
-
-    , CASE 
-          WHEN ISNULL(be.ns_end_sum, 0) = ISNULL(bb.ns_base_sum, 0) THEN 1 
-          ELSE 0 
-      END AS ns_unchanged_flag
-
-    , CASE 
-          WHEN ISNULL(bb.ns_base_sum, 0) = 0
-           AND ISNULL(be.ns_end_sum, 0) = 0 THEN 1 
-          ELSE 0 
-      END AS had_no_ns_flag
 
 INTO #client_mart
 FROM #client_scope c
@@ -369,10 +285,10 @@ LEFT JOIN exit_deposits ex
     ON ex.cli_id = c.cli_id
 LEFT JOIN opened_agg op
     ON op.cli_id = c.cli_id
-LEFT JOIN balance_base bb
-    ON bb.cli_id = c.cli_id
-LEFT JOIN balance_end be
-    ON be.cli_id = c.cli_id
+LEFT JOIN ns_base ns1
+    ON ns1.cli_id = c.cli_id
+LEFT JOIN ns_end ns2
+    ON ns2.cli_id = c.cli_id
 LEFT JOIN sms_flags sms
     ON sms.cli_id = c.cli_id;
 
@@ -385,42 +301,14 @@ SELECT
     , had_exit_dep_flag
     , had_opened_dep_flag
 
-    , exit_dep_cnt
     , exit_dep_sum
-    , exit_dep_sum_mln
 
-    , opened_total_cnt
     , opened_total_sum
-    , opened_total_sum_mln
-
-    , opened_new_money_cnt
     , opened_new_money_sum
-    , opened_new_money_sum_mln
-
-    , opened_retention_cnt
-    , opened_retention_sum
-    , opened_retention_sum_mln
-
-    , opened_other_cnt
     , opened_other_sum
-    , opened_other_sum_mln
 
-    , td_base_sum
-    , td_end_sum
-    , td_delta
-
-    , ns_base_sum
-    , ns_end_sum
     , ns_delta
-
-    , total_base_sum
-    , total_end_sum
-    , total_delta
-
     , ns_decrease_flag
-    , ns_increase_flag
-    , ns_unchanged_flag
-    , had_no_ns_flag
 FROM #client_mart
 ORDER BY
       segment_flag
