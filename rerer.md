@@ -192,6 +192,7 @@ opened_classified AS (
         , o.con_id
         , o.out_rub
 
+        -- ставка новых денег
         , CASE 
               WHEN o.termdays BETWEEN 45 AND 79
                AND o.conv_norm = 'AT_THE_END'
@@ -215,6 +216,31 @@ opened_classified AS (
 
               ELSE 0
           END AS new_money_rate_flag
+
+        -- ставка удержания
+        , CASE 
+              WHEN o.termdays BETWEEN 45 AND 79
+               AND o.conv_norm = 'AT_THE_END'
+               AND o.out_rub >= 1500000
+               AND ABS(o.rate_con - 0.1450) <= @eps THEN 1
+
+              WHEN o.termdays BETWEEN 45 AND 79
+               AND o.conv_norm = 'AT_THE_END'
+               AND o.out_rub < 1500000
+               AND ABS(o.rate_con - 0.1430) <= @eps THEN 1
+
+              WHEN o.termdays BETWEEN 45 AND 79
+               AND o.conv_norm <> 'AT_THE_END'
+               AND o.out_rub < 1500000
+               AND ABS(o.rate_con - 0.1410) <= @eps THEN 1
+
+              WHEN o.termdays BETWEEN 45 AND 79
+               AND o.conv_norm <> 'AT_THE_END'
+               AND o.out_rub >= 1500000
+               AND ABS(o.rate_con - 0.1430) <= @eps THEN 1
+
+              ELSE 0
+          END AS retention_rate_flag
     FROM opened_by_con o
 ),
 
@@ -231,7 +257,14 @@ opened_agg AS (
           END) AS opened_new_money_sum
 
         , SUM(CASE 
-              WHEN oc.new_money_rate_flag = 0 
+              WHEN oc.retention_rate_flag = 1 
+              THEN oc.out_rub 
+              ELSE 0 
+          END) AS opened_retention_sum
+
+        , SUM(CASE 
+              WHEN oc.new_money_rate_flag = 0
+               AND oc.retention_rate_flag = 0
               THEN oc.out_rub 
               ELSE 0 
           END) AS opened_other_sum
@@ -263,9 +296,10 @@ SELECT
     -- объем вкладов к выходу
     , ISNULL(ex.exit_dep_sum, 0) AS exit_dep_sum
 
-    -- объем открытых вкладов
+    -- объем открытых вкладов по категориям
     , ISNULL(op.opened_total_sum, 0) AS opened_total_sum
     , ISNULL(op.opened_new_money_sum, 0) AS opened_new_money_sum
+    , ISNULL(op.opened_retention_sum, 0) AS opened_retention_sum
     , ISNULL(op.opened_other_sum, 0) AS opened_other_sum
 
     -- дельта НС
@@ -305,6 +339,7 @@ SELECT
 
     , opened_total_sum
     , opened_new_money_sum
+    , opened_retention_sum
     , opened_other_sum
 
     , ns_delta
