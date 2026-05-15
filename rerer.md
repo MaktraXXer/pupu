@@ -5,11 +5,12 @@ DECLARE @BaseDate date = '2026-04-29';
 DECLARE @EndDate  date = '2026-05-13';
 
 DECLARE @ExitFrom date = '2026-04-30';
-DECLARE @ExitTo   date = '2026-05-12';
+DECLARE @ExitTo   date = '2026-05-13'; -- теперь по 13 число включительно
 
 DECLARE @OpenFrom date = '2026-04-30';
-DECLARE @OpenTo   date = '2026-05-12';
+DECLARE @OpenTo   date = '2026-05-13'; -- теперь по 13 число включительно
 
+DECLARE @FlatRateFrom date = '2026-05-13'; -- дата, с которой ставка стала единой
 DECLARE @eps decimal(18,6) = 0.000005;
 
 IF OBJECT_ID('tempdb..#bal_base') IS NOT NULL DROP TABLE #bal_base;
@@ -143,13 +144,14 @@ FROM ALM_TEST.[TESTWORKSPACE].[sms_promo_messages] s WITH (NOLOCK)
 WHERE TRY_CAST(s.cli_id AS bigint) IS NOT NULL;
 
 
--- 8. Открытые вклады: раскладываем на 3 категории
+-- 8. Открытые вклады: раскладываем на 4 категории
 SELECT
       q.cli_id
     , SUM(q.out_rub) AS opened_total_sum
 
     , SUM(CASE WHEN q.open_category = N'new_money' THEN q.out_rub ELSE 0 END) AS opened_new_money_sum
     , SUM(CASE WHEN q.open_category = N'retention' THEN q.out_rub ELSE 0 END) AS opened_retention_sum
+    , SUM(CASE WHEN q.open_category = N'flat_145_from_13' THEN q.out_rub ELSE 0 END) AS opened_flat_145_sum
     , SUM(CASE WHEN q.open_category = N'other' THEN q.out_rub ELSE 0 END) AS opened_other_sum
 INTO #opened_agg
 FROM (
@@ -158,51 +160,65 @@ FROM (
         , o.con_id
         , SUM(o.out_rub) AS out_rub
         , CASE
-              -- новые деньги
-              WHEN MIN(o.termdays) BETWEEN 45 AND 79
+              -- новая отдельная группа с 13.05: единая ставка 14.5%
+              WHEN MIN(o.dt_open) >= @FlatRateFrom
+               AND MIN(o.termdays) BETWEEN 45 AND 79
+               AND ABS(MIN(o.rate_con) - 0.1450) <= @eps
+              THEN N'flat_145_from_13'
+
+              -- новые деньги, старая сетка до 13.05
+              WHEN MIN(o.dt_open) < @FlatRateFrom
+               AND MIN(o.termdays) BETWEEN 45 AND 79
                AND MIN(o.conv_norm) = 'AT_THE_END'
                AND SUM(o.out_rub) >= 1500000
                AND ABS(MIN(o.rate_con) - 0.1470) <= @eps
               THEN N'new_money'
 
-              WHEN MIN(o.termdays) BETWEEN 45 AND 79
+              WHEN MIN(o.dt_open) < @FlatRateFrom
+               AND MIN(o.termdays) BETWEEN 45 AND 79
                AND MIN(o.conv_norm) = 'AT_THE_END'
                AND SUM(o.out_rub) < 1500000
                AND ABS(MIN(o.rate_con) - 0.1450) <= @eps
               THEN N'new_money'
 
-              WHEN MIN(o.termdays) BETWEEN 45 AND 79
+              WHEN MIN(o.dt_open) < @FlatRateFrom
+               AND MIN(o.termdays) BETWEEN 45 AND 79
                AND MIN(o.conv_norm) <> 'AT_THE_END'
                AND SUM(o.out_rub) < 1500000
                AND ABS(MIN(o.rate_con) - 0.1430) <= @eps
               THEN N'new_money'
 
-              WHEN MIN(o.termdays) BETWEEN 45 AND 79
+              WHEN MIN(o.dt_open) < @FlatRateFrom
+               AND MIN(o.termdays) BETWEEN 45 AND 79
                AND MIN(o.conv_norm) <> 'AT_THE_END'
                AND SUM(o.out_rub) >= 1500000
                AND ABS(MIN(o.rate_con) - 0.1450) <= @eps
               THEN N'new_money'
 
-              -- удержание
-              WHEN MIN(o.termdays) BETWEEN 45 AND 79
+              -- удержание, старая сетка до 13.05
+              WHEN MIN(o.dt_open) < @FlatRateFrom
+               AND MIN(o.termdays) BETWEEN 45 AND 79
                AND MIN(o.conv_norm) = 'AT_THE_END'
                AND SUM(o.out_rub) >= 1500000
                AND ABS(MIN(o.rate_con) - 0.1450) <= @eps
               THEN N'retention'
 
-              WHEN MIN(o.termdays) BETWEEN 45 AND 79
+              WHEN MIN(o.dt_open) < @FlatRateFrom
+               AND MIN(o.termdays) BETWEEN 45 AND 79
                AND MIN(o.conv_norm) = 'AT_THE_END'
                AND SUM(o.out_rub) < 1500000
                AND ABS(MIN(o.rate_con) - 0.1430) <= @eps
               THEN N'retention'
 
-              WHEN MIN(o.termdays) BETWEEN 45 AND 79
+              WHEN MIN(o.dt_open) < @FlatRateFrom
+               AND MIN(o.termdays) BETWEEN 45 AND 79
                AND MIN(o.conv_norm) <> 'AT_THE_END'
                AND SUM(o.out_rub) < 1500000
                AND ABS(MIN(o.rate_con) - 0.1410) <= @eps
               THEN N'retention'
 
-              WHEN MIN(o.termdays) BETWEEN 45 AND 79
+              WHEN MIN(o.dt_open) < @FlatRateFrom
+               AND MIN(o.termdays) BETWEEN 45 AND 79
                AND MIN(o.conv_norm) <> 'AT_THE_END'
                AND SUM(o.out_rub) >= 1500000
                AND ABS(MIN(o.rate_con) - 0.1430) <= @eps
@@ -253,6 +269,7 @@ SELECT
     , ISNULL(op.opened_total_sum, 0) AS opened_total_sum
     , ISNULL(op.opened_new_money_sum, 0) AS opened_new_money_sum
     , ISNULL(op.opened_retention_sum, 0) AS opened_retention_sum
+    , ISNULL(op.opened_flat_145_sum, 0) AS opened_flat_145_sum
     , ISNULL(op.opened_other_sum, 0) AS opened_other_sum
 
     , ISNULL(ne.ns_end_sum, 0) - ISNULL(nb.ns_base_sum, 0) AS ns_delta
