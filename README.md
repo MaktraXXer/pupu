@@ -1,253 +1,338 @@
+Да. Нужно просто **создать `#ns_base/#ns_end` до `#client_scope`** и добавить в `#client_scope` третью ветку: клиенты, у которых `ns_delta <> 0`.
+
+Ниже полный рабочий скрипт с этой правкой.
+
+```sql
 USE [ALM];
 SET NOCOUNT ON;
 
-DECLARE @BaseDate date = '2026-04-08'; -- дата баланса было
-DECLARE @EndDate  date = '2026-05-12'; -- дата баланса стало
+DECLARE @BaseDate date = '2026-04-29';
+DECLARE @EndDate  date = '2026-05-13';
 
-DECLARE @ExitFrom date = '2026-04-09'; -- выходы с
-DECLARE @ExitTo   date = '2026-05-12'; -- выходы по включительно
+DECLARE @ExitFrom date = '2026-04-30';
+DECLARE @ExitTo   date = '2026-05-13';
 
-DECLARE @OpenFrom date = '2026-04-09'; -- открытые с
-DECLARE @OpenTo   date = '2026-05-12'; -- открытые по включительно
+DECLARE @OpenFrom date = '2026-04-30';
+DECLARE @OpenTo   date = '2026-05-13';
+
+DECLARE @FlatRateFrom date = '2026-05-13';
+DECLARE @eps decimal(18,6) = 0.000005;
 
 IF OBJECT_ID('tempdb..#bal_base') IS NOT NULL DROP TABLE #bal_base;
 IF OBJECT_ID('tempdb..#bal_end') IS NOT NULL DROP TABLE #bal_end;
 IF OBJECT_ID('tempdb..#client_scope') IS NOT NULL DROP TABLE #client_scope;
-IF OBJECT_ID('tempdb..#client_mart') IS NOT NULL DROP TABLE #client_mart;
+IF OBJECT_ID('tempdb..#exit_agg') IS NOT NULL DROP TABLE #exit_agg;
+IF OBJECT_ID('tempdb..#ns_base') IS NOT NULL DROP TABLE #ns_base;
+IF OBJECT_ID('tempdb..#ns_end') IS NOT NULL DROP TABLE #ns_end;
+IF OBJECT_ID('tempdb..#opened_agg') IS NOT NULL DROP TABLE #opened_agg;
+IF OBJECT_ID('tempdb..#sms_clients') IS NOT NULL DROP TABLE #sms_clients;
 
 
+-- 1. Баланс на базовую дату
 SELECT
-      CAST(t.dt_rep AS date) AS dt_rep
-    , CAST(t.cli_id AS bigint) AS cli_id
+      CAST(t.cli_id AS bigint) AS cli_id
     , CAST(t.con_id AS bigint) AS con_id
     , CAST(t.dt_open AS date) AS dt_open
     , CAST(t.dt_close_plan AS date) AS dt_close_plan
     , t.section_name
     , CAST(t.out_rub AS decimal(38,6)) AS out_rub
     , CAST(t.rate_con AS decimal(18,6)) AS rate_con
-    , t.conv
+    , CASE
+          WHEN NULLIF(LTRIM(RTRIM(COALESCE(t.conv, ''))), '') IS NULL THEN 'AT_THE_END'
+          ELSE UPPER(LTRIM(RTRIM(t.conv)))
+      END AS conv_norm
     , t.termdays
     , t.TSEGMENTNAME
 INTO #bal_base
-FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
-WHERE t.dt_rep = @BaseDate
-  AND t.section_name IN (N'Срочные', N'Накопительный счёт')
-  AND t.block_name = N'Привлечение ФЛ'
-  AND t.acc_role   = N'LIAB'
-  AND t.od_flag    = 1
-  AND t.cur        = '810'
-  AND t.out_rub IS NOT NULL
-  AND t.out_rub >= 0;
+FROM [ALM].[ALM].[VW_balance_rest_all] t WITH (NOLOCK)
+WHERE
+    t.dt_rep = @BaseDate
+    AND t.section_name IN (N'Срочные', N'Накопительный счёт')
+    AND t.block_name = N'Привлечение ФЛ'
+    AND t.acc_role = N'LIAB'
+    AND t.od_flag = 1
+    AND t.cur = '810'
+    AND t.out_rub IS NOT NULL
+    AND t.out_rub >= 0;
 
 
+-- 2. Баланс на конечную дату
 SELECT
-      CAST(t.dt_rep AS date) AS dt_rep
-    , CAST(t.cli_id AS bigint) AS cli_id
+      CAST(t.cli_id AS bigint) AS cli_id
     , CAST(t.con_id AS bigint) AS con_id
     , CAST(t.dt_open AS date) AS dt_open
     , CAST(t.dt_close_plan AS date) AS dt_close_plan
     , t.section_name
     , CAST(t.out_rub AS decimal(38,6)) AS out_rub
     , CAST(t.rate_con AS decimal(18,6)) AS rate_con
-    , t.conv
+    , CASE
+          WHEN NULLIF(LTRIM(RTRIM(COALESCE(t.conv, ''))), '') IS NULL THEN 'AT_THE_END'
+          ELSE UPPER(LTRIM(RTRIM(t.conv)))
+      END AS conv_norm
     , t.termdays
     , t.TSEGMENTNAME
 INTO #bal_end
-FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
-WHERE t.dt_rep = @EndDate
-  AND t.section_name IN (N'Срочные', N'Накопительный счёт')
-  AND t.block_name = N'Привлечение ФЛ'
-  AND t.acc_role   = N'LIAB'
-  AND t.od_flag    = 1
-  AND t.cur        = '810'
-  AND t.out_rub IS NOT NULL
-  AND t.out_rub >= 0;
+FROM [ALM].[ALM].[VW_balance_rest_all] t WITH (NOLOCK)
+WHERE
+    t.dt_rep = @EndDate
+    AND t.section_name IN (N'Срочные', N'Накопительный счёт')
+    AND t.block_name = N'Привлечение ФЛ'
+    AND t.acc_role = N'LIAB'
+    AND t.od_flag = 1
+    AND t.cur = '810'
+    AND t.out_rub IS NOT NULL
+    AND t.out_rub >= 0;
 
 
+-- 3. НС на базовую дату
+SELECT
+      b.cli_id
+    , SUM(b.out_rub) AS ns_base_sum
+INTO #ns_base
+FROM #bal_base b
+WHERE
+    b.section_name = N'Накопительный счёт'
+GROUP BY
+    b.cli_id;
+
+
+-- 4. НС на конечную дату
+SELECT
+      e.cli_id
+    , SUM(e.out_rub) AS ns_end_sum
+INTO #ns_end
+FROM #bal_end e
+WHERE
+    e.section_name = N'Накопительный счёт'
+GROUP BY
+    e.cli_id;
+
+
+-- 5. Клиенты:
+-- 1) были вклады к выходу
+-- 2) были открытые вклады
+-- 3) была дельта НС, даже если не было ни выходов, ни открытий
 SELECT DISTINCT cli_id
 INTO #client_scope
-FROM #bal_base
-WHERE section_name = N'Срочные'
-  AND dt_close_plan >= @ExitFrom
-  AND dt_close_plan <= @ExitTo;
+FROM (
+    SELECT b.cli_id
+    FROM #bal_base b
+    WHERE
+        b.section_name = N'Срочные'
+        AND b.dt_close_plan BETWEEN @ExitFrom AND @ExitTo
+
+    UNION
+
+    SELECT e.cli_id
+    FROM #bal_end e
+    WHERE
+        e.section_name = N'Срочные'
+        AND e.dt_open BETWEEN @OpenFrom AND @OpenTo
+
+    UNION
+
+    SELECT COALESCE(nb.cli_id, ne.cli_id) AS cli_id
+    FROM #ns_base nb
+    FULL JOIN #ns_end ne
+        ON ne.cli_id = nb.cli_id
+    WHERE
+        ISNULL(ne.ns_end_sum, 0) <> ISNULL(nb.ns_base_sum, 0)
+) x;
 
 
-WITH client_flags AS
-(
+-- 6. Сумма вкладов к выходу
+SELECT
+      b.cli_id
+    , SUM(b.out_rub) AS exit_dep_sum
+INTO #exit_agg
+FROM #bal_base b
+WHERE
+    b.section_name = N'Срочные'
+    AND b.dt_close_plan BETWEEN @ExitFrom AND @ExitTo
+GROUP BY
+    b.cli_id;
+
+
+-- 7. СМС
+SELECT DISTINCT
+    TRY_CAST(s.cli_id AS bigint) AS cli_id
+INTO #sms_clients
+FROM ALM_TEST.[TESTWORKSPACE].[sms_promo_messages] s WITH (NOLOCK)
+WHERE
+    s.msgbegindate_dt <= '2026-05-13'
+    AND TRY_CAST(s.cli_id AS bigint) IS NOT NULL;
+
+
+-- 8. Открытые вклады: раскладываем на 4 категории
+SELECT
+      q.cli_id
+    , SUM(q.out_rub) AS opened_total_sum
+    , SUM(CASE WHEN q.open_category = N'new_money' THEN q.out_rub ELSE 0 END) AS opened_new_money_sum
+    , SUM(CASE WHEN q.open_category = N'retention' THEN q.out_rub ELSE 0 END) AS opened_retention_sum
+    , SUM(CASE WHEN q.open_category = N'flat_145_from_13' THEN q.out_rub ELSE 0 END) AS opened_flat_145_sum
+    , SUM(CASE WHEN q.open_category = N'other' THEN q.out_rub ELSE 0 END) AS opened_other_sum
+INTO #opened_agg
+FROM (
     SELECT
-          c.cli_id
+          o.cli_id
+        , o.con_id
+        , SUM(o.out_rub) AS out_rub
         , CASE
-              WHEN EXISTS (
-                  SELECT 1
-                  FROM #bal_base b
-                  WHERE b.cli_id = c.cli_id
-                    AND b.section_name IN (N'Срочные', N'Накопительный счёт')
-                    AND b.TSEGMENTNAME = N'ДЧБО'
-              )
-              THEN N'ДЧБО'
-              ELSE N'Розница'
-          END AS client_segment
-    FROM #client_scope c
-),
-exit_sum AS
-(
-    SELECT
-          cli_id
-        , SUM(out_rub) AS exit_td_sum
-    FROM #bal_base
-    WHERE section_name = N'Срочные'
-      AND dt_close_plan >= @ExitFrom
-      AND dt_close_plan <= @ExitTo
-    GROUP BY cli_id
-),
-ns_start AS
-(
-    SELECT
-          cli_id
-        , SUM(out_rub) AS ns_start_sum
-    FROM #bal_base
-    WHERE section_name = N'Накопительный счёт'
-    GROUP BY cli_id
-),
-ns_end AS
-(
-    SELECT
-          cli_id
-        , SUM(out_rub) AS ns_end_sum
-    FROM #bal_end
-    WHERE section_name = N'Накопительный счёт'
-    GROUP BY cli_id
-),
-opened_by_con AS
-(
-    SELECT
-          b.cli_id
-        , b.con_id
-        , SUM(b.out_rub) AS out_rub
-    FROM #bal_end b
-    INNER JOIN #client_scope c
-        ON b.cli_id = c.cli_id
-    WHERE b.section_name = N'Срочные'
-      AND b.dt_open >= @OpenFrom
-      AND b.dt_open <= @OpenTo
-    GROUP BY b.cli_id, b.con_id
-),
-opened_agg AS
-(
-    SELECT
-          cli_id
-        , SUM(out_rub) AS opened_base
-        , CAST(0 AS decimal(38,6)) AS opened_promo_2
-        , CAST(0 AS decimal(38,6)) AS opened_promo_1
-        , SUM(out_rub) AS opened_total
-    FROM opened_by_con
-    GROUP BY cli_id
-)
+              -- с 13.05 единая ставка 14.5%
+              WHEN MIN(o.dt_open) >= @FlatRateFrom
+               AND MIN(o.termdays) BETWEEN 45 AND 79
+               AND ABS(MIN(o.rate_con) - 0.1450) <= @eps
+              THEN N'flat_145_from_13'
+
+              -- новые деньги до 13.05
+              WHEN MIN(o.dt_open) < @FlatRateFrom
+               AND MIN(o.termdays) BETWEEN 45 AND 79
+               AND MIN(o.conv_norm) = 'AT_THE_END'
+               AND SUM(o.out_rub) >= 1500000
+               AND ABS(MIN(o.rate_con) - 0.1470) <= @eps
+              THEN N'new_money'
+
+              WHEN MIN(o.dt_open) < @FlatRateFrom
+               AND MIN(o.termdays) BETWEEN 45 AND 79
+               AND MIN(o.conv_norm) = 'AT_THE_END'
+               AND SUM(o.out_rub) < 1500000
+               AND ABS(MIN(o.rate_con) - 0.1450) <= @eps
+              THEN N'new_money'
+
+              WHEN MIN(o.dt_open) < @FlatRateFrom
+               AND MIN(o.termdays) BETWEEN 45 AND 79
+               AND MIN(o.conv_norm) <> 'AT_THE_END'
+               AND SUM(o.out_rub) < 1500000
+               AND ABS(MIN(o.rate_con) - 0.1430) <= @eps
+              THEN N'new_money'
+
+              WHEN MIN(o.dt_open) < @FlatRateFrom
+               AND MIN(o.termdays) BETWEEN 45 AND 79
+               AND MIN(o.conv_norm) <> 'AT_THE_END'
+               AND SUM(o.out_rub) >= 1500000
+               AND ABS(MIN(o.rate_con) - 0.1450) <= @eps
+              THEN N'new_money'
+
+              -- удержание до 13.05
+              WHEN MIN(o.dt_open) < @FlatRateFrom
+               AND MIN(o.termdays) BETWEEN 45 AND 79
+               AND MIN(o.conv_norm) = 'AT_THE_END'
+               AND SUM(o.out_rub) >= 1500000
+               AND ABS(MIN(o.rate_con) - 0.1450) <= @eps
+              THEN N'retention'
+
+              WHEN MIN(o.dt_open) < @FlatRateFrom
+               AND MIN(o.termdays) BETWEEN 45 AND 79
+               AND MIN(o.conv_norm) = 'AT_THE_END'
+               AND SUM(o.out_rub) < 1500000
+               AND ABS(MIN(o.rate_con) - 0.1430) <= @eps
+              THEN N'retention'
+
+              WHEN MIN(o.dt_open) < @FlatRateFrom
+               AND MIN(o.termdays) BETWEEN 45 AND 79
+               AND MIN(o.conv_norm) <> 'AT_THE_END'
+               AND SUM(o.out_rub) < 1500000
+               AND ABS(MIN(o.rate_con) - 0.1410) <= @eps
+              THEN N'retention'
+
+              WHEN MIN(o.dt_open) < @FlatRateFrom
+               AND MIN(o.termdays) BETWEEN 45 AND 79
+               AND MIN(o.conv_norm) <> 'AT_THE_END'
+               AND SUM(o.out_rub) >= 1500000
+               AND ABS(MIN(o.rate_con) - 0.1430) <= @eps
+              THEN N'retention'
+
+              ELSE N'other'
+          END AS open_category
+    FROM #bal_end o
+    WHERE
+        o.section_name = N'Срочные'
+        AND o.dt_open BETWEEN @OpenFrom AND @OpenTo
+    GROUP BY
+          o.cli_id
+        , o.con_id
+) q
+GROUP BY
+    q.cli_id;
+
+
+-- 9. Финальная клиентская витрина
 SELECT
       c.cli_id
-    , f.client_segment AS segment_flag
 
     , CASE
-          WHEN ISNULL(e.exit_td_sum,0) < 1500000 THEN N'01. Выход < 1.5 млн'
-          WHEN ISNULL(e.exit_td_sum,0) < 5000000 THEN N'02. Выход 1.5-5 млн'
-          ELSE N'03. Выход >= 5 млн'
-      END AS exit_amount_flag
+          WHEN EXISTS (
+              SELECT 1
+              FROM #bal_base b
+              WHERE b.cli_id = c.cli_id
+                AND b.TSEGMENTNAME = N'ДЧБО'
+          )
+          OR EXISTS (
+              SELECT 1
+              FROM #bal_end e
+              WHERE e.cli_id = c.cli_id
+                AND e.TSEGMENTNAME = N'ДЧБО'
+          )
+          THEN N'ДЧБО'
+          ELSE N'Розница'
+      END AS segment_flag
 
-    , ISNULL(e.exit_td_sum,0) AS exit_td_sum
+    , CASE WHEN sms.cli_id IS NOT NULL THEN 1 ELSE 0 END AS sms_promo_flag
 
-    , ISNULL(ns1.ns_start_sum,0) AS ns_start_sum
+    , CASE WHEN ISNULL(ex.exit_dep_sum, 0) > 0 THEN 1 ELSE 0 END AS had_exit_dep_flag
+    , CASE WHEN ISNULL(op.opened_total_sum, 0) > 0 THEN 1 ELSE 0 END AS had_opened_dep_flag
 
-    , ISNULL(o.opened_base,0) AS opened_base
-    , ISNULL(o.opened_promo_2,0) AS opened_promo_2_from_8_apr
-    , ISNULL(o.opened_promo_1,0) AS opened_promo_1_from_1_7_apr
+    , CASE
+          WHEN ISNULL(ne.ns_end_sum, 0) <> ISNULL(nb.ns_base_sum, 0) THEN 1
+          ELSE 0
+      END AS had_ns_delta_flag
 
-    , ISNULL(ns2.ns_end_sum,0) AS ns_end_sum
-    , ISNULL(ns2.ns_end_sum,0) - ISNULL(ns1.ns_start_sum,0) AS ns_delta
+    , ISNULL(ex.exit_dep_sum, 0) AS exit_dep_sum
 
-    -- 1. Все открытые вклады / выходящие вклады
-    , CAST(
-        ISNULL(o.opened_total,0)
-        / NULLIF(ISNULL(e.exit_td_sum,0),0)
-      AS decimal(18,6)) AS retention_1_td_all
+    , ISNULL(op.opened_total_sum, 0) AS opened_total_sum
+    , ISNULL(op.opened_new_money_sum, 0) AS opened_new_money_sum
+    , ISNULL(op.opened_retention_sum, 0) AS opened_retention_sum
+    , ISNULL(op.opened_flat_145_sum, 0) AS opened_flat_145_sum
+    , ISNULL(op.opened_other_sum, 0) AS opened_other_sum
 
-    -- 2. Дельта НС + все открытые вклады / выходящие вклады
-    , CAST(
-        (
-            ISNULL(ns2.ns_end_sum,0) - ISNULL(ns1.ns_start_sum,0)
-            + ISNULL(o.opened_total,0)
-        )
-        / NULLIF(ISNULL(e.exit_td_sum,0),0)
-      AS decimal(18,6)) AS retention_2_td_all_plus_ns
+    , ISNULL(nb.ns_base_sum, 0) AS ns_base_sum
+    , ISNULL(ne.ns_end_sum, 0) AS ns_end_sum
+    , ISNULL(ne.ns_end_sum, 0) - ISNULL(nb.ns_base_sum, 0) AS ns_delta
 
-    -- 3. База + промо с 8 апреля / выходящие вклады
-    -- Теперь promo_2 = 0, поэтому показатель равен opened_base / exit_td_sum
-    , CAST(
-        (
-            ISNULL(o.opened_base,0)
-            + ISNULL(o.opened_promo_2,0)
-        )
-        / NULLIF(ISNULL(e.exit_td_sum,0),0)
-      AS decimal(18,6)) AS retention_3_td_base_plus_promo2
+    , CASE
+          WHEN ISNULL(ne.ns_end_sum, 0) < ISNULL(nb.ns_base_sum, 0) THEN 1
+          ELSE 0
+      END AS ns_decrease_flag
 
-    -- 4. Дельта НС + база + промо с 8 апреля / выходящие вклады
-    -- Теперь promo_2 = 0
-    , CAST(
-        (
-            ISNULL(ns2.ns_end_sum,0) - ISNULL(ns1.ns_start_sum,0)
-            + ISNULL(o.opened_base,0)
-            + ISNULL(o.opened_promo_2,0)
-        )
-        / NULLIF(ISNULL(e.exit_td_sum,0),0)
-      AS decimal(18,6)) AS retention_4_td_base_plus_promo2_plus_ns
-
-    -- 5. Только база / выходящие вклады
-    , CAST(
-        ISNULL(o.opened_base,0)
-        / NULLIF(ISNULL(e.exit_td_sum,0),0)
-      AS decimal(18,6)) AS retention_5_td_base
-
-    -- 6. Дельта НС + только база / выходящие вклады
-    , CAST(
-        (
-            ISNULL(ns2.ns_end_sum,0) - ISNULL(ns1.ns_start_sum,0)
-            + ISNULL(o.opened_base,0)
-        )
-        / NULLIF(ISNULL(e.exit_td_sum,0),0)
-      AS decimal(18,6)) AS retention_6_td_base_plus_ns
-
-INTO #client_mart
 FROM #client_scope c
-LEFT JOIN client_flags f
-    ON c.cli_id = f.cli_id
-LEFT JOIN exit_sum e
-    ON c.cli_id = e.cli_id
-LEFT JOIN ns_start ns1
-    ON c.cli_id = ns1.cli_id
-LEFT JOIN ns_end ns2
-    ON c.cli_id = ns2.cli_id
-LEFT JOIN opened_agg o
-    ON c.cli_id = o.cli_id;
-
-
-SELECT
-      cli_id
-    , segment_flag
-    , exit_amount_flag
-    , exit_td_sum
-    , ns_start_sum
-    , opened_base
-    , opened_promo_2_from_8_apr
-    , opened_promo_1_from_1_7_apr
-    , ns_end_sum
-    , ns_delta
-    , retention_1_td_all
-    , retention_2_td_all_plus_ns
-    , retention_3_td_base_plus_promo2
-    , retention_4_td_base_plus_promo2_plus_ns
-    , retention_5_td_base
-    , retention_6_td_base_plus_ns
-FROM #client_mart
+LEFT JOIN #exit_agg ex
+    ON ex.cli_id = c.cli_id
+LEFT JOIN #opened_agg op
+    ON op.cli_id = c.cli_id
+LEFT JOIN #ns_base nb
+    ON nb.cli_id = c.cli_id
+LEFT JOIN #ns_end ne
+    ON ne.cli_id = c.cli_id
+LEFT JOIN #sms_clients sms
+    ON sms.cli_id = c.cli_id
 ORDER BY
       segment_flag
-    , exit_amount_flag
-    , cli_id;
+    , sms_promo_flag DESC
+    , had_exit_dep_flag DESC
+    , had_opened_dep_flag DESC
+    , had_ns_delta_flag DESC
+    , opened_total_sum DESC
+    , exit_dep_sum DESC
+    , ns_delta ASC
+    , c.cli_id;
+```
+
+Теперь в витрину попадут ещё и клиенты вида:
+
+```text
+had_exit_dep_flag = 0
+had_opened_dep_flag = 0
+had_ns_delta_flag = 1
+```
+
+То есть те, у кого не было ни вкладов к выходу, ни открытых вкладов, но изменился остаток на НС.
