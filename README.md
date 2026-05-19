@@ -7,17 +7,10 @@ WITH calendar AS (
     FROM ALM.info.VW_calendar WITH (NOLOCK)
     WHERE [Date] BETWEEN @DT_FROM AND @DT_TO
 ),
-keyrate_fact AS (
-    SELECT
-        CAST([date] AS date) AS [date],
-        CAST([rate] AS float) / 100.0 AS keyrate
-    FROM ALM.info.VW_CBKEY_everyday WITH (NOLOCK)
-    WHERE [date] BETWEEN @DT_FROM AND @DT_TO
-),
 together AS (
     SELECT
         'НС' AS section_name,
-        dt_rep,
+        CAST(dt_rep AS date) AS dt_rep,
         data_scope,
         out_rub_total,
         rate_con
@@ -27,7 +20,7 @@ together AS (
 
     SELECT
         'ДВС' AS section_name,
-        dt_rep,
+        CAST(dt_rep AS date) AS dt_rep,
         data_scope,
         out_rub_total,
         CASE 
@@ -44,7 +37,7 @@ together AS (
 DVS_FL AS (
     SELECT
         t.section_name,
-        CAST(t.dt_rep AS date) AS dt_rep,
+        t.dt_rep,
         t.data_scope,
         t.out_rub_total,
         t.rate_con + 0.0048 AS rate_con,
@@ -90,17 +83,17 @@ v_fl_float AS (
 
         SUM(
             (
-                kr.[keyrate] 
-                + fl.[correction] / 100.0 
+                kr.[KEY_RATE]
+                + fl.[correction] / 100.0
                 + ssv.[rate]
             ) * ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])
         ) / NULLIF(SUM(ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])), 0) AS rate_con,
 
-        kr.[keyrate] AS KEY_RATE,
+        kr.[KEY_RATE] AS KEY_RATE,
 
         SUM(
             (
-                fl.[correction] / 100.0 
+                fl.[correction] / 100.0
                 + ssv.[rate]
             ) * ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])
         ) / NULLIF(SUM(ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])), 0) AS spread_keyrate
@@ -119,17 +112,19 @@ v_fl_float AS (
         ON dep.[CON_ID] = sald.[CON_ID]
        AND cal.[Date] BETWEEN sald.[DT_FROM] AND sald.[DT_TO]
 
-    JOIN keyrate_fact kr
-        ON cal.[Date] = kr.[date]
+    LEFT JOIN ALM_TEST.WORK.ForecastKey_Cache kr WITH (NOLOCK)
+        ON cal.[Date] = kr.dt_rep
+       AND kr.term = 1
 
     JOIN ALM.info.VW_SSVrates ssv WITH (NOLOCK)
         ON cal.[Date] BETWEEN ssv.[dt_from] AND ssv.[dt_to]
 
     WHERE LOWER(fl.[comment]) LIKE '%фл%'
+      AND kr.[KEY_RATE] IS NOT NULL
 
     GROUP BY 
         CAST(cal.[Date] AS date),
-        kr.[keyrate]
+        kr.[KEY_RATE]
 )
 
 SELECT
