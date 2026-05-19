@@ -1,253 +1,172 @@
-Да, тут лучше после финальной витрины сохранить результат в #client_mart, а потом сделать 3 отдельных SELECT по платежам через join к нужной группе клиентов.
+DECLARE @DT_FROM date = '2025-01-01';
+DECLARE @DT_TO   date = DATEADD(day, -2, CAST(GETDATE() AS date));
 
-Ниже блок, который нужно поставить вместо твоего финального SELECT. Он:
+WITH calendar AS (
+    SELECT 
+        CAST([Date] AS date) AS [Date]
+    FROM ALM.info.VW_calendar WITH (NOLOCK)
+    WHERE [Date] BETWEEN @DT_FROM AND @DT_TO
+),
+keyrate_fact AS (
+    SELECT
+        CAST([date] AS date) AS [date],
+        CAST([rate] AS float) / 100.0 AS keyrate
+    FROM ALM.info.VW_CBKEY_everyday WITH (NOLOCK)
+    WHERE [date] BETWEEN @DT_FROM AND @DT_TO
+),
+together AS (
+    SELECT
+        'НС' AS section_name,
+        dt_rep,
+        data_scope,
+        out_rub_total,
+        rate_con
+    FROM ALM_TEST.mail.balance_metrics_savings WITH (NOLOCK)
 
-1. сохраняет витрину в #client_mart;
-2. выводит итоговую витрину;
-3. делает 3 выгрузки платежей:
-    * все розничные клиенты с СМС;
-    * розничные клиенты с СМС и вкладами к выходу;
-    * розничные клиенты с СМС без вкладов к выходу.
+    UNION ALL
 
-IF OBJECT_ID('tempdb..#client_mart') IS NOT NULL DROP TABLE #client_mart;
--- 9. Финальная клиентская витрина
+    SELECT
+        'ДВС' AS section_name,
+        dt_rep,
+        data_scope,
+        out_rub_total,
+        CASE 
+            WHEN data_scope = 'новые'
+                THEN FIRST_VALUE(rate_con) OVER (
+                    PARTITION BY dt_rep
+                    ORDER BY CASE WHEN data_scope = 'портфель' THEN 0 ELSE 1 END
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                )
+            ELSE rate_con
+        END AS rate_con
+    FROM ALM_TEST.mail.balance_metrics_dvs WITH (NOLOCK)
+),
+DVS_FL AS (
+    SELECT
+        t.section_name,
+        CAST(t.dt_rep AS date) AS dt_rep,
+        t.data_scope,
+        t.out_rub_total,
+        t.rate_con + 0.0048 AS rate_con,
+        kr.KEY_RATE,
+        t.rate_con + 0.0048 - kr.KEY_RATE AS spread_keyrate
+    FROM together t
+    LEFT JOIN ALM_TEST.WORK.ForecastKey_Cache kr WITH (NOLOCK)
+        ON t.dt_rep = kr.dt_rep 
+       AND kr.term = 1
+    WHERE t.dt_rep >= @DT_FROM
+),
+v_fl_fix AS (
+    SELECT 
+        'вклады ФЛ с фикс ставкой' AS section_name,
+        CAST(t.[Date] AS date) AS dt_rep,
+        CASE 
+            WHEN t.[Тип отчета] = 'Новые день ко дню' THEN 'новые'
+            WHEN t.[Тип отчета] = 'Срез' THEN 'портфель'
+        END AS data_scope,
+        t.balance_rub AS out_rub_total,
+        t.[MonthlyCONV_RATE_SSV] AS rate_con,
+        t.[MonthlyCONV_ForecastKeyRate] AS KEY_RATE,
+        t.[Spread_KeyRate] AS spread_keyrate
+    FROM [ALM_TEST].[WORK].[vGroupDepositInterestsRate_For_FL] t WITH (NOLOCK)
+    WHERE t.[Date] >= @DT_FROM
+      AND t.[Date] <= @DT_TO
+      AND t.[Признак опциональности для ФЛ] = 'all option_type'
+      AND t.[Сегмент ФЛ] = 'all segment'
+      AND t.[Срочн. бакеты] = 'all termgroup'
+      AND t.[Тип маржи] = 'all margin'
+      AND t.[Сегмент бизнеса] = 'all segment'
+      AND t.[Тип клиента] = 'all client'
+      AND t.[Тип отчета] IN ('Срез', 'Новые день ко дню')
+      AND t.[Спред к КС бакеты] = 'all spread bucket'
+),
+v_fl_float AS (
+    SELECT
+        'вклады ФЛ с плав ставкой' AS section_name,
+        CAST(cal.[Date] AS date) AS dt_rep,
+        'портфель' AS data_scope,
+
+        SUM(ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])) AS out_rub_total,
+
+        SUM(
+            (
+                kr.[keyrate] 
+                + fl.[correction] / 100.0 
+                + ssv.[rate]
+            ) * ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])
+        ) / NULLIF(SUM(ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])), 0) AS rate_con,
+
+        kr.[keyrate] AS KEY_RATE,
+
+        SUM(
+            (
+                fl.[correction] / 100.0 
+                + ssv.[rate]
+            ) * ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])
+        ) / NULLIF(SUM(ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])), 0) AS spread_keyrate
+
+    FROM [LIQUIDITY].[liq].[VW_FloatContracts] fl WITH (NOLOCK)
+
+    JOIN [LIQUIDITY].[liq].[DepositContract_all] dep WITH (NOLOCK)
+        ON fl.[con_id] = dep.[CON_ID]
+
+    JOIN calendar cal
+        ON cal.[Date] BETWEEN fl.[dt_from] AND fl.[dt_to]
+       AND cal.[Date] >= dep.[DT_OPEN]
+       AND cal.[Date] <  dep.[DT_CLOSE]
+
+    LEFT JOIN [LIQUIDITY].[liq].[DepositContract_Saldo] sald WITH (NOLOCK)
+        ON dep.[CON_ID] = sald.[CON_ID]
+       AND cal.[Date] BETWEEN sald.[DT_FROM] AND sald.[DT_TO]
+
+    JOIN keyrate_fact kr
+        ON cal.[Date] = kr.[date]
+
+    JOIN ALM.info.VW_SSVrates ssv WITH (NOLOCK)
+        ON cal.[Date] BETWEEN ssv.[dt_from] AND ssv.[dt_to]
+
+    WHERE LOWER(fl.[comment]) LIKE '%фл%'
+
+    GROUP BY 
+        CAST(cal.[Date] AS date),
+        kr.[keyrate]
+)
+
 SELECT
-      c.cli_id
-    , CASE
-          WHEN EXISTS (
-              SELECT 1
-              FROM #bal_base b
-              WHERE b.cli_id = c.cli_id
-                AND b.TSEGMENTNAME = N'ДЧБО'
-          )
-          OR EXISTS (
-              SELECT 1
-              FROM #bal_end e
-              WHERE e.cli_id = c.cli_id
-                AND e.TSEGMENTNAME = N'ДЧБО'
-          )
-          THEN N'ДЧБО'
-          ELSE N'Розница'
-      END AS segment_flag
-    , CASE WHEN sms.cli_id IS NOT NULL THEN 1 ELSE 0 END AS sms_promo_flag
-    , CASE WHEN ISNULL(ex.exit_dep_sum, 0) > 0 THEN 1 ELSE 0 END AS had_exit_dep_flag
-    , CASE WHEN ISNULL(op.opened_total_sum, 0) > 0 THEN 1 ELSE 0 END AS had_opened_dep_flag
-    , CASE
-          WHEN ISNULL(ne.ns_end_sum, 0) <> ISNULL(nb.ns_base_sum, 0) THEN 1
-          ELSE 0
-      END AS had_ns_delta_flag
-    , CASE 
-          WHEN sms.cli_id IS NOT NULL
-           AND ISNULL(ex.exit_dep_sum, 0) = 0
-           AND ISNULL(op.opened_total_sum, 0) = 0
-           AND ISNULL(ne.ns_end_sum, 0) = ISNULL(nb.ns_base_sum, 0)
-          THEN 1
-          ELSE 0
-      END AS only_sms_client_flag
-    , ISNULL(ex.exit_dep_sum, 0) AS exit_dep_sum
-    , ISNULL(op.opened_total_sum, 0) AS opened_total_sum
-    , ISNULL(op.opened_new_money_sum, 0) AS opened_new_money_sum
-    , ISNULL(op.opened_retention_sum, 0) AS opened_retention_sum
-    , ISNULL(op.opened_flat_145_sum, 0) AS opened_flat_145_sum
-    , ISNULL(op.opened_other_sum, 0) AS opened_other_sum
-    , ISNULL(nb.ns_base_sum, 0) AS ns_base_sum
-    , ISNULL(ne.ns_end_sum, 0) AS ns_end_sum
-    , ISNULL(ne.ns_end_sum, 0) - ISNULL(nb.ns_base_sum, 0) AS ns_delta
-    , CASE
-          WHEN ISNULL(ne.ns_end_sum, 0) < ISNULL(nb.ns_base_sum, 0) THEN 1
-          ELSE 0
-      END AS ns_decrease_flag
-INTO #client_mart
-FROM #client_scope c
-LEFT JOIN #exit_agg ex
-    ON ex.cli_id = c.cli_id
-LEFT JOIN #opened_agg op
-    ON op.cli_id = c.cli_id
-LEFT JOIN #ns_base nb
-    ON nb.cli_id = c.cli_id
-LEFT JOIN #ns_end ne
-    ON ne.cli_id = c.cli_id
-LEFT JOIN #sms_clients sms
-    ON sms.cli_id = c.cli_id;
--- 10. Сама клиентская витрина
-SELECT
-      cli_id
-    , segment_flag
-    , sms_promo_flag
-    , had_exit_dep_flag
-    , had_opened_dep_flag
-    , had_ns_delta_flag
-    , only_sms_client_flag
-    , exit_dep_sum
-    , opened_total_sum
-    , opened_new_money_sum
-    , opened_retention_sum
-    , opened_flat_145_sum
-    , opened_other_sum
-    , ns_base_sum
-    , ns_end_sum
-    , ns_delta
-    , ns_decrease_flag
-FROM #client_mart
-ORDER BY
-      segment_flag
-    , sms_promo_flag DESC
-    , only_sms_client_flag DESC
-    , had_exit_dep_flag DESC
-    , had_opened_dep_flag DESC
-    , had_ns_delta_flag DESC
-    , opened_total_sum DESC
-    , exit_dep_sum DESC
-    , ns_delta ASC
-    , cli_id;
--- 11. Проверка разбиения СМС-клиентов розницы
-SELECT
-      CASE
-          WHEN had_exit_dep_flag = 1 THEN N'02. СМС + были вклады к выходу'
-          WHEN had_exit_dep_flag = 0 THEN N'03. СМС + не было вкладов к выходу'
-      END AS sms_client_group
-    , COUNT(DISTINCT cli_id) AS client_cnt
-    , SUM(exit_dep_sum) AS exit_dep_sum
-    , SUM(opened_total_sum) AS opened_total_sum
-    , SUM(opened_new_money_sum) AS opened_new_money_sum
-    , SUM(opened_retention_sum) AS opened_retention_sum
-    , SUM(opened_flat_145_sum) AS opened_flat_145_sum
-    , SUM(opened_other_sum) AS opened_other_sum
-    , SUM(ns_delta) AS ns_delta
-FROM #client_mart
-WHERE
-    segment_flag <> N'ДЧБО'
-    AND sms_promo_flag = 1
-GROUP BY
-    CASE
-        WHEN had_exit_dep_flag = 1 THEN N'02. СМС + были вклады к выходу'
-        WHEN had_exit_dep_flag = 0 THEN N'03. СМС + не было вкладов к выходу'
-    END
+    section_name,
+    dt_rep,
+    data_scope,
+    out_rub_total,
+    rate_con,
+    KEY_RATE,
+    spread_keyrate
+FROM DVS_FL
+
 UNION ALL
+
 SELECT
-      N'01. Все СМС-клиенты розницы' AS sms_client_group
-    , COUNT(DISTINCT cli_id) AS client_cnt
-    , SUM(exit_dep_sum) AS exit_dep_sum
-    , SUM(opened_total_sum) AS opened_total_sum
-    , SUM(opened_new_money_sum) AS opened_new_money_sum
-    , SUM(opened_retention_sum) AS opened_retention_sum
-    , SUM(opened_flat_145_sum) AS opened_flat_145_sum
-    , SUM(opened_other_sum) AS opened_other_sum
-    , SUM(ns_delta) AS ns_delta
-FROM #client_mart
-WHERE
-    segment_flag <> N'ДЧБО'
-    AND sms_promo_flag = 1
-ORDER BY
-    sms_client_group;
--- 12. Платежи: все розничные клиенты, получившие СМС
+    section_name,
+    dt_rep,
+    data_scope,
+    out_rub_total,
+    rate_con,
+    KEY_RATE,
+    spread_keyrate
+FROM v_fl_fix
+
+UNION ALL
+
 SELECT
-      N'01. Все СМС-клиенты розницы' AS client_group
-    , m.cli_id
-    , m.had_exit_dep_flag
-    , m.had_opened_dep_flag
-    , m.had_ns_delta_flag
-    , m.exit_dep_sum
-    , m.opened_total_sum
-    , m.opened_new_money_sum
-    , m.opened_retention_sum
-    , m.opened_flat_145_sum
-    , m.opened_other_sum
-    , m.ns_base_sum
-    , m.ns_end_sum
-    , m.ns_delta
-    , m.ns_decrease_flag
-    , tr.*
-FROM #client_mart m
-INNER JOIN [ALM].[ehd].[VW_transfers_FL_det] tr WITH (NOLOCK)
-    ON tr.cli_id = m.cli_id
-WHERE
-    m.segment_flag <> N'ДЧБО'
-    AND m.sms_promo_flag = 1
-    AND tr.dt_rep >= @OpenFrom
-    AND tr.dt_rep <= @OpenTo
-    AND tr.transaction_type <> N'Внутренние переводы'
-    AND tr.transit_max_id IS NULL
+    section_name,
+    dt_rep,
+    data_scope,
+    out_rub_total,
+    rate_con,
+    KEY_RATE,
+    spread_keyrate
+FROM v_fl_float
+
 ORDER BY
-      m.cli_id
-    , tr.dt_rep;
--- 13. Платежи: СМС-клиенты розницы, у кого были вклады к выходу
-SELECT
-      N'02. СМС + были вклады к выходу' AS client_group
-    , m.cli_id
-    , m.had_exit_dep_flag
-    , m.had_opened_dep_flag
-    , m.had_ns_delta_flag
-    , m.exit_dep_sum
-    , m.opened_total_sum
-    , m.opened_new_money_sum
-    , m.opened_retention_sum
-    , m.opened_flat_145_sum
-    , m.opened_other_sum
-    , m.ns_base_sum
-    , m.ns_end_sum
-    , m.ns_delta
-    , m.ns_decrease_flag
-    , tr.*
-FROM #client_mart m
-INNER JOIN [ALM].[ehd].[VW_transfers_FL_det] tr WITH (NOLOCK)
-    ON tr.cli_id = m.cli_id
-WHERE
-    m.segment_flag <> N'ДЧБО'
-    AND m.sms_promo_flag = 1
-    AND m.had_exit_dep_flag = 1
-    AND tr.dt_rep >= @OpenFrom
-    AND tr.dt_rep <= @OpenTo
-    AND tr.transaction_type <> N'Внутренние переводы'
-    AND tr.transit_max_id IS NULL
-ORDER BY
-      m.cli_id
-    , tr.dt_rep;
--- 14. Платежи: СМС-клиенты розницы, у кого НЕ было вкладов к выходу
-SELECT
-      N'03. СМС + не было вкладов к выходу' AS client_group
-    , m.cli_id
-    , m.had_exit_dep_flag
-    , m.had_opened_dep_flag
-    , m.had_ns_delta_flag
-    , m.exit_dep_sum
-    , m.opened_total_sum
-    , m.opened_new_money_sum
-    , m.opened_retention_sum
-    , m.opened_flat_145_sum
-    , m.opened_other_sum
-    , m.ns_base_sum
-    , m.ns_end_sum
-    , m.ns_delta
-    , m.ns_decrease_flag
-    , tr.*
-FROM #client_mart m
-INNER JOIN [ALM].[ehd].[VW_transfers_FL_det] tr WITH (NOLOCK)
-    ON tr.cli_id = m.cli_id
-WHERE
-    m.segment_flag <> N'ДЧБО'
-    AND m.sms_promo_flag = 1
-    AND m.had_exit_dep_flag = 0
-    AND tr.dt_rep >= @OpenFrom
-    AND tr.dt_rep <= @OpenTo
-    AND tr.transaction_type <> N'Внутренние переводы'
-    AND tr.transit_max_id IS NULL
-ORDER BY
-      m.cli_id
-    , tr.dt_rep;
-
-Смысл групп:
-
-01. Все СМС-клиенты розницы
-= segment_flag <> 'ДЧБО' AND sms_promo_flag = 1
-02. СМС + были вклады к выходу
-= segment_flag <> 'ДЧБО' AND sms_promo_flag = 1 AND had_exit_dep_flag = 1
-03. СМС + не было вкладов к выходу
-= segment_flag <> 'ДЧБО' AND sms_promo_flag = 1 AND had_exit_dep_flag = 0
-
-Для платежей я оставил период @OpenFrom–@OpenTo, то есть 2026-04-30–2026-05-17, и фильтры:
-
-transaction_type <> N'Внутренние переводы'
-AND transit_max_id IS NULL
-
-как в твоём примере.
+    dt_rep,
+    section_name,
+    data_scope;
