@@ -1,19 +1,14 @@
-Да. Нужно просто **создать `#ns_base/#ns_end` до `#client_scope`** и добавить в `#client_scope` третью ветку: клиенты, у которых `ns_delta <> 0`.
-
-Ниже полный рабочий скрипт с этой правкой.
-
-```sql
 USE [ALM];
 SET NOCOUNT ON;
 
 DECLARE @BaseDate date = '2026-04-29';
-DECLARE @EndDate  date = '2026-05-13';
+DECLARE @EndDate  date = '2026-05-17';
 
 DECLARE @ExitFrom date = '2026-04-30';
-DECLARE @ExitTo   date = '2026-05-13';
+DECLARE @ExitTo   date = '2026-05-17';
 
 DECLARE @OpenFrom date = '2026-04-30';
-DECLARE @OpenTo   date = '2026-05-13';
+DECLARE @OpenTo   date = '2026-05-17';
 
 DECLARE @FlatRateFrom date = '2026-05-13';
 DECLARE @eps decimal(18,6) = 0.000005;
@@ -108,10 +103,22 @@ GROUP BY
     e.cli_id;
 
 
--- 5. Клиенты:
+-- 5. СМС
+-- Важно: создаём до #client_scope, чтобы все клиенты из СМС попали в витрину
+SELECT DISTINCT
+    TRY_CAST(s.cli_id AS bigint) AS cli_id
+INTO #sms_clients
+FROM ALM_TEST.[TESTWORKSPACE].[sms_promo_messages] s WITH (NOLOCK)
+WHERE
+    s.msgbegindate_dt <= @EndDate
+    AND TRY_CAST(s.cli_id AS bigint) IS NOT NULL;
+
+
+-- 6. Клиенты:
 -- 1) были вклады к выходу
 -- 2) были открытые вклады
--- 3) была дельта НС, даже если не было ни выходов, ни открытий
+-- 3) была дельта НС
+-- 4) получили СМС
 SELECT DISTINCT cli_id
 INTO #client_scope
 FROM (
@@ -137,10 +144,15 @@ FROM (
         ON ne.cli_id = nb.cli_id
     WHERE
         ISNULL(ne.ns_end_sum, 0) <> ISNULL(nb.ns_base_sum, 0)
+
+    UNION
+
+    SELECT s.cli_id
+    FROM #sms_clients s
 ) x;
 
 
--- 6. Сумма вкладов к выходу
+-- 7. Сумма вкладов к выходу
 SELECT
       b.cli_id
     , SUM(b.out_rub) AS exit_dep_sum
@@ -151,16 +163,6 @@ WHERE
     AND b.dt_close_plan BETWEEN @ExitFrom AND @ExitTo
 GROUP BY
     b.cli_id;
-
-
--- 7. СМС
-SELECT DISTINCT
-    TRY_CAST(s.cli_id AS bigint) AS cli_id
-INTO #sms_clients
-FROM ALM_TEST.[TESTWORKSPACE].[sms_promo_messages] s WITH (NOLOCK)
-WHERE
-    s.msgbegindate_dt <= '2026-05-13'
-    AND TRY_CAST(s.cli_id AS bigint) IS NOT NULL;
 
 
 -- 8. Открытые вклады: раскладываем на 4 категории
@@ -287,6 +289,15 @@ SELECT
           ELSE 0
       END AS had_ns_delta_flag
 
+    , CASE 
+          WHEN sms.cli_id IS NOT NULL
+           AND ISNULL(ex.exit_dep_sum, 0) = 0
+           AND ISNULL(op.opened_total_sum, 0) = 0
+           AND ISNULL(ne.ns_end_sum, 0) = ISNULL(nb.ns_base_sum, 0)
+          THEN 1
+          ELSE 0
+      END AS only_sms_client_flag
+
     , ISNULL(ex.exit_dep_sum, 0) AS exit_dep_sum
 
     , ISNULL(op.opened_total_sum, 0) AS opened_total_sum
@@ -318,6 +329,7 @@ LEFT JOIN #sms_clients sms
 ORDER BY
       segment_flag
     , sms_promo_flag DESC
+    , only_sms_client_flag DESC
     , had_exit_dep_flag DESC
     , had_opened_dep_flag DESC
     , had_ns_delta_flag DESC
@@ -325,14 +337,3 @@ ORDER BY
     , exit_dep_sum DESC
     , ns_delta ASC
     , c.cli_id;
-```
-
-Теперь в витрину попадут ещё и клиенты вида:
-
-```text
-had_exit_dep_flag = 0
-had_opened_dep_flag = 0
-had_ns_delta_flag = 1
-```
-
-То есть те, у кого не было ни вкладов к выходу, ни открытых вкладов, но изменился остаток на НС.
