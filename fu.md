@@ -1,138 +1,67 @@
-Работаем с двумя источниками:
+USE [ALM];
+SET NOCOUNT ON;
 
-1. Сальдо по con_id — даёт объём на дату:
+DECLARE @dt_prev date = '2026-05-25';
+DECLARE @dt_curr date = '2026-05-26';
 
-dt_rep | con_id | out_rub
+DROP TABLE IF EXISTS #prod_list;
 
-2. Архив вкладов/НС — даёт атрибуты договора:
+CREATE TABLE #prod_list (
+    prod_name_res nvarchar(255) NOT NULL PRIMARY KEY
+);
 
-con_id | cli_id | product_type | dt_open | dt_close_plan | promo_flag | floating_flag | segment flags
+INSERT INTO #prod_list (prod_name_res)
+VALUES
+    (N'Надёжный прайм'),
+    (N'Надёжный VIP'),
+    (N'Надёжный премиум'),
+    (N'Надёжный промо'),
+    (N'Надёжный старт'),
+    (N'Надёжный Т2'),
+    (N'Надёжный Мегафон'),
+    (N'Надёжный процент'),
+    (N'Надёжный'),
+    (N'Могучий');
 
-⸻
 
-1. Собираем договорно-дневную таблицу
+DROP TABLE IF EXISTS #clients_without_prod_25;
 
-dt_rep
-cli_id
-con_id
-out_rub
-product_type      -- вклад / НС
-promo_flag        -- РК входит в promo
-floating_flag
-dt_open
-dt_close_plan
-client_segment
-salary_flag
-premium_flag
+SELECT
+    t.cli_id
+INTO #clients_without_prod_25
+FROM [ALM].[ALM].[VW_balance_rest_all] t WITH (NOLOCK)
+LEFT JOIN #prod_list p
+    ON p.prod_name_res = t.PROD_NAME_res
+WHERE
+    t.dt_rep = @dt_prev
+    AND t.section_name IN (N'Срочные', N'До востребования', N'Накопительный счёт')
+    AND t.block_name = N'Привлечение ФЛ'
+    AND t.od_flag = 1
+    -- AND t.cur = '810'
+    AND t.out_rub IS NOT NULL
+    AND t.out_rub >= 0
+GROUP BY
+    t.cli_id
+HAVING
+    COUNT(DISTINCT CASE WHEN p.prod_name_res IS NOT NULL THEN t.con_id END) = 0;
 
-⸻
 
-2. Из неё собираем клиентскую дневную витрину
+CREATE CLUSTERED INDEX IX_clients_without_prod_25
+ON #clients_without_prod_25 (cli_id);
 
-Одна строка:
 
-dt_rep + cli_id
-
-Поля:
-
-dep_amt_total
-ns_amt_total
-total_balance = dep_amt_total + ns_amt_total
-has_ns_flag
-has_ns_opened_curr_month_flag
-has_ns_opened_prev_month_flag
-dep_nonpromo_cnt_total
-dep_nonpromo_amt_total
-dep_promo_cnt_total
-dep_promo_amt_total
-dep_nonpromo_cnt_exit_1d
-dep_nonpromo_amt_exit_1d
-dep_promo_cnt_exit_1d
-dep_promo_amt_exit_1d
-dep_nonpromo_cnt_exit_2_7d
-dep_nonpromo_amt_exit_2_7d
-dep_promo_cnt_exit_2_7d
-dep_promo_amt_exit_2_7d
-
-⸻
-
-3. Событие выхода
-
-Если на дату T-1:
-
-money_exit = dep_nonpromo_amt_exit_1d + dep_promo_amt_exit_1d > 0
-
-создаём событие:
-
-cli_id
-dt_feature = T-1
-dt_exit = T
-money_exit
-
-Если у клиента в один день выходит несколько вкладов — это одно событие, суммы складываем.
-
-⸻
-
-4. Мерим удержание
-
-Берём:
-
-total_before = total_balance на T-1
-total_after_30d = total_balance на T+30
-
-Если клиента нет на T+30, считаем:
-
-total_after_30d = 0
-
-Формула:
-
-drop_30d = max(total_before - total_after_30d, 0)
-outflow_share_30d = min(drop_30d / money_exit, 1)
-stability_30d = 1 - outflow_share_30d
-
-stability_30d — доля выходящей суммы, которая осталась в банке во вкладах или на НС.
-
-⸻
-
-5. ML
-
-Обучающая строка:
-
-клиент + дата выхода
-
-Признаки:
-
-все поля клиентской витрины на T-1
-
-Цель:
-
-stability_30d
-
-или бинарно:
-
-target = 1, если stability_30d >= 0.8
-target = 0, если stability_30d < 0.8
-
-Модель отвечает:
-
-какая вероятность / доля, что выходящие деньги клиента останутся во вкладах или на НС
-
-⸻
-
-6. Типизация
-
-Типы лучше делать уже после расчёта stability:
-
-промо + нет НС
-промо + свежий НС
-непромо
-floating
-Private
-salary
-premium
-
-По каждому типу смотреть:
-
-средняя stability
-доля полного оттока
-сумма money_exit
+SELECT
+    t.*
+FROM [ALM].[ALM].[VW_balance_rest_all] t WITH (NOLOCK)
+INNER JOIN #clients_without_prod_25 c
+    ON c.cli_id = t.cli_id
+INNER JOIN #prod_list p
+    ON p.prod_name_res = t.PROD_NAME_res
+WHERE
+    t.dt_rep = @dt_curr
+    AND t.section_name = N'Срочные'
+    AND t.block_name = N'Привлечение ФЛ'
+    AND t.od_flag = 1
+    -- AND t.cur = '810'
+    AND t.out_rub IS NOT NULL
+    AND t.out_rub >= 0;
