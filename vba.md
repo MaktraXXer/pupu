@@ -1,23 +1,18 @@
 Option Explicit
 
-Sub sendEmail_PShape_ManualGraph()
+Sub sendEmail_TwoTables_ManualGraph()
 
     Dim inputSheet As Worksheet
     Dim reportSheet As Worksheet
     Dim shpGroup As Shape
     
     Dim RngTop As Range
-    Dim RngRight As Range
     Dim RngBottom As Range
     
     Dim OutApp As Object
     Dim OutMail As Object
     Dim wEditor As Object
     Dim wdSel As Object
-    
-    Dim layoutTable As Object
-    Dim graphCellRange As Object
-    Dim rightCellRange As Object
     
     Dim t As String
     Dim oldVisible As MsoTriState
@@ -26,11 +21,10 @@ Sub sendEmail_PShape_ManualGraph()
     
     Set inputSheet = ThisWorkbook.Worksheets("Input")
     Set reportSheet = ThisWorkbook.Worksheets("Email")
-    Set shpGroup = reportSheet.Shapes("Group 5")
     
     Set RngTop = reportSheet.Range("A2:P31")
-    Set RngRight = reportSheet.Range("K38:P41")
     Set RngBottom = reportSheet.Range("A59:P91")
+    Set shpGroup = reportSheet.Shapes("Group 5")
     
     t = Format(inputSheet.Range("B2").Value, "DD.MM.YYYY")
     
@@ -48,62 +42,36 @@ Sub sendEmail_PShape_ManualGraph()
     
     OutApp.ActiveWindow.Activate
     
+    ' Текст письма
     wdSel.TypeText "Коллеги, добрый день!"
     wdSel.TypeParagraph
     wdSel.TypeText "Присылаю отчёт о спредах фиксированных ЕТС к ключевой ставке."
     wdSel.TypeParagraph
     wdSel.TypeParagraph
     
-    ' Скрываем Group 5, чтобы случайно не попал в табличные вставки
+    ' Скрываем график, чтобы он не попал в копируемые таблицы
     oldVisible = shpGroup.Visible
     shpGroup.Visible = msoFalse
     
     DoEvents
     Application.Wait Now + TimeValue("0:00:01")
     
-    ' 1. Верхняя таблица
+    ' Верхняя таблица
     PasteRangeOldWay RngTop, wdSel
     
     wdSel.TypeParagraph
-    
-    ' 2. Создаем средний блок: левая ячейка под график, правая под K38:P41
-    Set layoutTable = wEditor.Tables.Add(wdSel.Range, 1, 2)
-    
-    ' Убираем видимые границы у контейнера
-    layoutTable.Borders.Enable = False
-    
-    ' Подбираем ширины. При необходимости поправишь руками.
-    layoutTable.Columns(1).PreferredWidth = 420
-    layoutTable.Columns(2).PreferredWidth = 210
-    
-    ' Левая ячейка — место под график
-    Set graphCellRange = layoutTable.Cell(1, 1).Range
-    graphCellRange.Text = ""
-    
-    ' Правая ячейка — таблица K38:P41
-    Set rightCellRange = layoutTable.Cell(1, 2).Range
-    rightCellRange.Select
-    Set wdSel = wEditor.Application.Selection
-    wdSel.Collapse Direction:=0
-    
-    PasteRangeOldWay RngRight, wdSel
-    
-    ' Переходим после контейнера
-    layoutTable.Range.Select
-    Set wdSel = wEditor.Application.Selection
-    wdSel.Collapse Direction:=0 ' start
-    wdSel.MoveDown Unit:=5, Count:=1 ' wdLine = 5
-    wdSel.EndKey Unit:=6 ' wdStory = 6
-    
     wdSel.TypeParagraph
     
-    ' 3. Нижняя таблица
+    ' Нижняя таблица
     PasteRangeOldWay RngBottom, wdSel
     
-    ' Возвращаем график
+    wdSel.TypeParagraph
+    wdSel.TypeParagraph
+    
+    ' Возвращаем график на листе
     shpGroup.Visible = oldVisible
     
-    ' Копируем график в буфер как при ручном Ctrl+C
+    ' Копируем график в буфер, чтобы осталось только вставить руками
     reportSheet.Activate
     shpGroup.Select
     Selection.Copy
@@ -111,19 +79,22 @@ Sub sendEmail_PShape_ManualGraph()
     DoEvents
     Application.Wait Now + TimeValue("0:00:01")
     
-    ' Ставим курсор в левую ячейку контейнера под график
+    ' Возвращаем фокус в письмо.
+    ' Курсор должен стоять после нижней таблицы.
     OutApp.ActiveWindow.Activate
-    graphCellRange.Select
-    Set wdSel = wEditor.Application.Selection
-    wdSel.Collapse Direction:=0
     
-    MsgBox "Таблицы вставлены." & vbCrLf & vbCrLf & _
-           "Курсор стоит в отдельной левой области под график." & vbCrLf & _
-           "Group 5 скопирован в буфер." & vbCrLf & vbCrLf & _
-           "Вставь график: Ctrl + Alt + V -> Picture / Enhanced Metafile." & vbCrLf & _
-           "Не двигай его после вставки.", vbInformation
+    MsgBox "Письмо сформировано: верхняя и нижняя таблицы вставлены." & vbCrLf & vbCrLf & _
+           "График Group 5 скопирован в буфер." & vbCrLf & _
+           "Вставь его внизу письма руками:" & vbCrLf & _
+           "Ctrl + Alt + V -> Picture / Enhanced Metafile." & vbCrLf & vbCrLf & _
+           "После вставки график не двигать внутрь таблиц.", vbInformation
     
     OutMail.Save
+    
+    ' Автоотправку пока не включаем, потому что график вставляется руками
+    ' If inputSheet.Range("G6").Value = True Then
+    '     OutMail.Send
+    ' End If
     
 CleanExit:
     On Error Resume Next
@@ -133,16 +104,12 @@ CleanExit:
     reportSheet.Activate
     reportSheet.Range("A1").Select
     
-    Set graphCellRange = Nothing
-    Set rightCellRange = Nothing
-    Set layoutTable = Nothing
     Set wdSel = Nothing
     Set wEditor = Nothing
     Set OutMail = Nothing
     Set OutApp = Nothing
     Set shpGroup = Nothing
     Set RngTop = Nothing
-    Set RngRight = Nothing
     Set RngBottom = Nothing
     Set reportSheet = Nothing
     Set inputSheet = Nothing
