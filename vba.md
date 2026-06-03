@@ -1,6 +1,6 @@
 Option Explicit
 
-Sub sendEmail_TableAndGraph_CID()
+Sub sendEmail_TableAndGraph_CID_v2()
 
     Dim inputSheet As Worksheet
     Dim reportSheet As Worksheet
@@ -18,6 +18,7 @@ Sub sendEmail_TableAndGraph_CID()
     Dim tmpPng As String
     Dim cid As String
     Dim att As Object
+    Dim html As String
     
     On Error GoTo ErrHandler
     
@@ -34,6 +35,7 @@ Sub sendEmail_TableAndGraph_CID()
     With OutMail
         .To = "ALM@domrf.ru; liquidity.treasury@domrf.ru"
         .Subject = "Спреды ЕТС в терминах КС+ на " & t
+        .BodyFormat = 2 ' olFormatHTML
         .Display
     End With
     
@@ -72,36 +74,58 @@ Sub sendEmail_TableAndGraph_CID()
     ' Возвращаем график на лист
     shpGroup.Visible = oldVisible
     
-    ' Экспортируем Group 5 в нормальный PNG
+    ' Экспортируем Group 5 в PNG
     tmpPng = ExportShapeToPngViaPowerPoint(reportSheet, "Group 5")
     
-    ' Встраиваем PNG в письмо через CID, а не через ссылку на файл
-    cid = "ets_graph_" & Format(Now, "yyyymmdd_hhnnss") & "@domrf"
+    ' Проверяем, что файл реально создан и не пустой
+    If Len(Dir(tmpPng)) = 0 Then
+        Err.Raise vbObjectError + 100, , "PNG-файл не был создан: " & tmpPng
+    End If
     
-    Set att = OutMail.Attachments.Add(tmpPng, 1, 0)
+    If FileLen(tmpPng) = 0 Then
+        Err.Raise vbObjectError + 101, , "PNG-файл создан, но он пустой: " & tmpPng
+    End If
     
-    ' PR_ATTACH_CONTENT_ID
+    cid = "ets_graph_" & Format(Now, "yyyymmdd_hhnnss")
+    
+    ' Сначала сохраняем письмо после вставки таблицы
+    OutMail.Save
+    
+    ' Добавляем PNG как обычное вложение
+    Set att = OutMail.Attachments.Add(tmpPng, 1)
+    
+    ' Content-ID
     att.PropertyAccessor.SetProperty _
         "http://schemas.microsoft.com/mapi/proptag/0x3712001F", cid
     
-    ' PR_ATTACHMENT_HIDDEN
+    ' MIME type
     att.PropertyAccessor.SetProperty _
-        "http://schemas.microsoft.com/mapi/proptag/0x7FFE000B", True
+        "http://schemas.microsoft.com/mapi/proptag/0x370E001F", "image/png"
     
-    ' Добавляем картинку в конец тела письма
-    OutMail.HTMLBody = OutMail.HTMLBody & _
-        "<br><br><img src=""cid:" & cid & """>"
+    ' Сохраняем после добавления attachment
+    OutMail.Save
+    
+    ' Вставляем картинку в HTML по CID
+    html = OutMail.HTMLBody
+    
+    If InStr(1, html, "</body>", vbTextCompare) > 0 Then
+        html = Replace(html, "</body>", "<br><br><img src=""cid:" & cid & """ style=""max-width:100%;""><br></body>", , , vbTextCompare)
+    Else
+        html = html & "<br><br><img src=""cid:" & cid & """ style=""max-width:100%;""><br>"
+    End If
+    
+    OutMail.HTMLBody = html
     
     OutMail.Save
     
     If inputSheet.Range("G6").Value = True Then
         OutMail.Send
+    Else
+        MsgBox "Письмо сформировано. PNG сохранён для проверки: " & tmpPng, vbInformation
     End If
     
 CleanExit:
     On Error Resume Next
-    
-    If Len(tmpPng) > 0 Then Kill tmpPng
     
     If Not shpGroup Is Nothing Then shpGroup.Visible = oldVisible
     
@@ -144,7 +168,6 @@ Private Function ExportShapeToPngViaPowerPoint(ByVal ws As Worksheet, ByVal shap
     
     tmpPng = Environ$("TEMP") & "\ets_graph_" & Format(Now, "yyyymmdd_hhnnss") & ".png"
     
-    ' Копируем именно как при ручном Ctrl+C, а не CopyPicture
     ws.Activate
     shp.Select
     Selection.Copy
@@ -156,17 +179,13 @@ Private Function ExportShapeToPngViaPowerPoint(ByVal ws As Worksheet, ByVal shap
     pptApp.Visible = True
     
     Set pptPres = pptApp.Presentations.Add
+    Set pptSlide = pptPres.Slides.Add(1, 12) ' ppLayoutBlank
     
-    ' 12 = ppLayoutBlank
-    Set pptSlide = pptPres.Slides.Add(1, 12)
-    
-    ' Сначала пробуем PNG.
     ' 6 = ppPastePNG
     On Error Resume Next
     Set pptShape = pptSlide.Shapes.PasteSpecial(6)(1)
     On Error GoTo ErrHandler
     
-    ' Если PNG недоступен, пробуем Enhanced Metafile.
     ' 2 = ppPasteEnhancedMetafile
     If pptShape Is Nothing Then
         Set pptShape = pptSlide.Shapes.PasteSpecial(2)(1)
