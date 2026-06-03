@@ -1,6 +1,6 @@
 Option Explicit
 
-Sub sendEmail_Table_And_GroupPicture_v2()
+Sub sendEmail_TableAndGraph_CID()
 
     Dim inputSheet As Worksheet
     Dim reportSheet As Worksheet
@@ -14,6 +14,12 @@ Sub sendEmail_Table_And_GroupPicture_v2()
     
     Dim t As String
     Dim oldVisible As MsoTriState
+    
+    Dim tmpPng As String
+    Dim cid As String
+    Dim att As Object
+    
+    On Error GoTo ErrHandler
     
     Set inputSheet = ThisWorkbook.Worksheets("Input")
     Set reportSheet = ThisWorkbook.Worksheets("Email")
@@ -36,13 +42,14 @@ Sub sendEmail_Table_And_GroupPicture_v2()
     
     OutApp.ActiveWindow.Activate
     
+    ' Текст письма
     wdSel.TypeText "Коллеги, добрый день!"
     wdSel.TypeParagraph
     wdSel.TypeText "Присылаю отчёт о спредах фиксированных ЕТС к ключевой ставке."
     wdSel.TypeParagraph
     wdSel.TypeParagraph
     
-    ' Скрываем график, чтобы таблица вставилась без него
+    ' Скрываем Group 5, чтобы таблица вставилась без графика
     oldVisible = shpGroup.Visible
     shpGroup.Visible = msoFalse
     
@@ -62,29 +69,28 @@ Sub sendEmail_Table_And_GroupPicture_v2()
     DoEvents
     Application.Wait Now + TimeValue("0:00:01")
     
-    ' Возвращаем график
+    ' Возвращаем график на лист
     shpGroup.Visible = oldVisible
     
-    wdSel.TypeParagraph
-    wdSel.TypeParagraph
+    ' Экспортируем Group 5 в нормальный PNG
+    tmpPng = ExportShapeToPngViaPowerPoint(reportSheet, "Group 5")
     
-    ' КЛЮЧЕВОЕ: обычный Copy, не CopyPicture
-    reportSheet.Activate
-    shpGroup.Select
-    Selection.Copy
+    ' Встраиваем PNG в письмо через CID, а не через ссылку на файл
+    cid = "ets_graph_" & Format(Now, "yyyymmdd_hhnnss") & "@domrf"
     
-    DoEvents
-    Application.Wait Now + TimeValue("0:00:01")
+    Set att = OutMail.Attachments.Add(tmpPng, 1, 0)
     
-    ' Вставляем как Picture / Enhanced Metafile без связи
-    wdSel.PasteSpecial _
-        Link:=False, _
-        DataType:=9, _
-        Placement:=0, _
-        DisplayAsIcon:=False
+    ' PR_ATTACH_CONTENT_ID
+    att.PropertyAccessor.SetProperty _
+        "http://schemas.microsoft.com/mapi/proptag/0x3712001F", cid
     
-    DoEvents
-    Application.Wait Now + TimeValue("0:00:01")
+    ' PR_ATTACHMENT_HIDDEN
+    att.PropertyAccessor.SetProperty _
+        "http://schemas.microsoft.com/mapi/proptag/0x7FFE000B", True
+    
+    ' Добавляем картинку в конец тела письма
+    OutMail.HTMLBody = OutMail.HTMLBody & _
+        "<br><br><img src=""cid:" & cid & """>"
     
     OutMail.Save
     
@@ -92,9 +98,17 @@ Sub sendEmail_Table_And_GroupPicture_v2()
         OutMail.Send
     End If
     
+CleanExit:
+    On Error Resume Next
+    
+    If Len(tmpPng) > 0 Then Kill tmpPng
+    
+    If Not shpGroup Is Nothing Then shpGroup.Visible = oldVisible
+    
     reportSheet.Activate
     reportSheet.Range("A1").Select
     
+    Set att = Nothing
     Set wdSel = Nothing
     Set wEditor = Nothing
     Set OutMail = Nothing
@@ -103,5 +117,77 @@ Sub sendEmail_Table_And_GroupPicture_v2()
     Set Rng = Nothing
     Set reportSheet = Nothing
     Set inputSheet = Nothing
+    
+    Exit Sub
+
+ErrHandler:
+    MsgBox "Ошибка: " & Err.Description, vbExclamation
+    Resume CleanExit
 
 End Sub
+
+
+Private Function ExportShapeToPngViaPowerPoint(ByVal ws As Worksheet, ByVal shapeName As String) As String
+
+    Dim shp As Shape
+    
+    Dim pptApp As Object
+    Dim pptPres As Object
+    Dim pptSlide As Object
+    Dim pptShape As Object
+    
+    Dim tmpPng As String
+    
+    On Error GoTo ErrHandler
+    
+    Set shp = ws.Shapes(shapeName)
+    
+    tmpPng = Environ$("TEMP") & "\ets_graph_" & Format(Now, "yyyymmdd_hhnnss") & ".png"
+    
+    ' Копируем именно как при ручном Ctrl+C, а не CopyPicture
+    ws.Activate
+    shp.Select
+    Selection.Copy
+    
+    DoEvents
+    Application.Wait Now + TimeValue("0:00:01")
+    
+    Set pptApp = CreateObject("PowerPoint.Application")
+    pptApp.Visible = True
+    
+    Set pptPres = pptApp.Presentations.Add
+    
+    ' 12 = ppLayoutBlank
+    Set pptSlide = pptPres.Slides.Add(1, 12)
+    
+    ' Сначала пробуем PNG.
+    ' 6 = ppPastePNG
+    On Error Resume Next
+    Set pptShape = pptSlide.Shapes.PasteSpecial(6)(1)
+    On Error GoTo ErrHandler
+    
+    ' Если PNG недоступен, пробуем Enhanced Metafile.
+    ' 2 = ppPasteEnhancedMetafile
+    If pptShape Is Nothing Then
+        Set pptShape = pptSlide.Shapes.PasteSpecial(2)(1)
+    End If
+    
+    ' 2 = ppShapeFormatPNG
+    pptShape.Export tmpPng, 2
+    
+    pptPres.Close
+    pptApp.Quit
+    
+    ExportShapeToPngViaPowerPoint = tmpPng
+    
+    Exit Function
+
+ErrHandler:
+    On Error Resume Next
+    
+    If Not pptPres Is Nothing Then pptPres.Close
+    If Not pptApp Is Nothing Then pptApp.Quit
+    
+    Err.Raise Err.Number, Err.Source, Err.Description
+
+End Function
