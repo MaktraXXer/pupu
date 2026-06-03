@@ -1,36 +1,36 @@
 Option Explicit
 
-Sub sendEmail_FullTable_WithGraphHole()
+Sub sendEmail_PShape_ManualGraph()
 
     Dim inputSheet As Worksheet
     Dim reportSheet As Worksheet
-    Dim Rng As Range
     Dim shpGroup As Shape
+    
+    Dim RngTop As Range
+    Dim RngRight As Range
+    Dim RngBottom As Range
     
     Dim OutApp As Object
     Dim OutMail As Object
     Dim wEditor As Object
     Dim wdSel As Object
-    Dim wdTable As Object
+    
+    Dim layoutTable As Object
+    Dim graphCellRange As Object
+    Dim rightCellRange As Object
     
     Dim t As String
     Dim oldVisible As MsoTriState
-    
-    ' Excel row 33 соответствует Word row 32,
-    ' потому что диапазон начинается с Excel row 2.
-    Dim graphWordRow As Long
-    Dim graphWordCol As Long
     
     On Error GoTo ErrHandler
     
     Set inputSheet = ThisWorkbook.Worksheets("Input")
     Set reportSheet = ThisWorkbook.Worksheets("Email")
-    
-    Set Rng = reportSheet.Range("A2:P91")
     Set shpGroup = reportSheet.Shapes("Group 5")
     
-    graphWordRow = 32   ' Excel row 33 -> Word table row 32
-    graphWordCol = 1    ' колонка A
+    Set RngTop = reportSheet.Range("A2:P31")
+    Set RngRight = reportSheet.Range("K38:P41")
+    Set RngBottom = reportSheet.Range("A59:P91")
     
     t = Format(inputSheet.Range("B2").Value, "DD.MM.YYYY")
     
@@ -48,45 +48,62 @@ Sub sendEmail_FullTable_WithGraphHole()
     
     OutApp.ActiveWindow.Activate
     
-    ' Текст письма без Temp
     wdSel.TypeText "Коллеги, добрый день!"
     wdSel.TypeParagraph
     wdSel.TypeText "Присылаю отчёт о спредах фиксированных ЕТС к ключевой ставке."
     wdSel.TypeParagraph
     wdSel.TypeParagraph
     
-    ' Скрываем график, чтобы в таблице осталась дырка
+    ' Скрываем Group 5, чтобы случайно не попал в табличные вставки
     oldVisible = shpGroup.Visible
     shpGroup.Visible = msoFalse
     
     DoEvents
     Application.Wait Now + TimeValue("0:00:01")
     
-    ' Вставляем весь табличный диапазон одним куском
-    reportSheet.Activate
-    Rng.Select
-    Rng.Copy
+    ' 1. Верхняя таблица
+    PasteRangeOldWay RngTop, wdSel
     
-    DoEvents
-    Application.Wait Now + TimeValue("0:00:01")
+    wdSel.TypeParagraph
     
-    wdSel.Paste
+    ' 2. Создаем средний блок: левая ячейка под график, правая под K38:P41
+    Set layoutTable = wEditor.Tables.Add(wdSel.Range, 1, 2)
     
-    DoEvents
-    Application.Wait Now + TimeValue("0:00:01")
+    ' Убираем видимые границы у контейнера
+    layoutTable.Borders.Enable = False
     
-    ' Возвращаем график на Excel-листе
+    ' Подбираем ширины. При необходимости поправишь руками.
+    layoutTable.Columns(1).PreferredWidth = 420
+    layoutTable.Columns(2).PreferredWidth = 210
+    
+    ' Левая ячейка — место под график
+    Set graphCellRange = layoutTable.Cell(1, 1).Range
+    graphCellRange.Text = ""
+    
+    ' Правая ячейка — таблица K38:P41
+    Set rightCellRange = layoutTable.Cell(1, 2).Range
+    rightCellRange.Select
+    Set wdSel = wEditor.Application.Selection
+    wdSel.Collapse Direction:=0
+    
+    PasteRangeOldWay RngRight, wdSel
+    
+    ' Переходим после контейнера
+    layoutTable.Range.Select
+    Set wdSel = wEditor.Application.Selection
+    wdSel.Collapse Direction:=0 ' start
+    wdSel.MoveDown Unit:=5, Count:=1 ' wdLine = 5
+    wdSel.EndKey Unit:=6 ' wdStory = 6
+    
+    wdSel.TypeParagraph
+    
+    ' 3. Нижняя таблица
+    PasteRangeOldWay RngBottom, wdSel
+    
+    ' Возвращаем график
     shpGroup.Visible = oldVisible
     
-    ' Берём последнюю вставленную таблицу в письме
-    Set wdTable = wEditor.Tables(wEditor.Tables.Count)
-    
-    ' Ставим курсор в ячейку, где начинается дырка под график
-    wdTable.Cell(graphWordRow, graphWordCol).Range.Select
-    Set wdSel = wEditor.Application.Selection
-    wdSel.Collapse Direction:=0 ' wdCollapseStart
-    
-    ' Копируем Group 5 в буфер как при ручном Ctrl+C
+    ' Копируем график в буфер как при ручном Ctrl+C
     reportSheet.Activate
     shpGroup.Select
     Selection.Copy
@@ -94,16 +111,17 @@ Sub sendEmail_FullTable_WithGraphHole()
     DoEvents
     Application.Wait Now + TimeValue("0:00:01")
     
-    ' Возвращаем фокус в Outlook и ставим курсор обратно в дырку
+    ' Ставим курсор в левую ячейку контейнера под график
     OutApp.ActiveWindow.Activate
-    wdTable.Cell(graphWordRow, graphWordCol).Range.Select
+    graphCellRange.Select
     Set wdSel = wEditor.Application.Selection
     wdSel.Collapse Direction:=0
     
-    MsgBox "Таблица вставлена целиком, график скрыт из диапазона и скопирован в буфер." & vbCrLf & vbCrLf & _
-           "Курсор стоит в пустой области под график." & vbCrLf & _
-           "Вставь график: Ctrl + Alt + V -> Picture / Enhanced Metafile." & vbCrLf & vbCrLf & _
-           "Главное: после вставки НЕ двигай график мышкой.", vbInformation
+    MsgBox "Таблицы вставлены." & vbCrLf & vbCrLf & _
+           "Курсор стоит в отдельной левой области под график." & vbCrLf & _
+           "Group 5 скопирован в буфер." & vbCrLf & vbCrLf & _
+           "Вставь график: Ctrl + Alt + V -> Picture / Enhanced Metafile." & vbCrLf & _
+           "Не двигай его после вставки.", vbInformation
     
     OutMail.Save
     
@@ -115,13 +133,17 @@ CleanExit:
     reportSheet.Activate
     reportSheet.Range("A1").Select
     
-    Set wdTable = Nothing
+    Set graphCellRange = Nothing
+    Set rightCellRange = Nothing
+    Set layoutTable = Nothing
     Set wdSel = Nothing
     Set wEditor = Nothing
     Set OutMail = Nothing
     Set OutApp = Nothing
     Set shpGroup = Nothing
-    Set Rng = Nothing
+    Set RngTop = Nothing
+    Set RngRight = Nothing
+    Set RngBottom = Nothing
     Set reportSheet = Nothing
     Set inputSheet = Nothing
     
@@ -130,5 +152,22 @@ CleanExit:
 ErrHandler:
     MsgBox "Ошибка: " & Err.Description, vbExclamation
     Resume CleanExit
+
+End Sub
+
+
+Private Sub PasteRangeOldWay(ByVal srcRange As Range, ByVal wdSel As Object)
+
+    srcRange.Worksheet.Activate
+    srcRange.Select
+    srcRange.Copy
+    
+    DoEvents
+    Application.Wait Now + TimeValue("0:00:01")
+    
+    wdSel.Paste
+    
+    DoEvents
+    Application.Wait Now + TimeValue("0:00:01")
 
 End Sub
