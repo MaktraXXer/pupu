@@ -1,6 +1,6 @@
 Option Explicit
 
-Sub sendEmail_TwoTables_ManualGraph()
+Sub sendEmail_TwoTables_ThenGraph()
 
     Dim inputSheet As Worksheet
     Dim reportSheet As Worksheet
@@ -15,7 +15,6 @@ Sub sendEmail_TwoTables_ManualGraph()
     Dim wdSel As Object
     
     Dim t As String
-    Dim oldVisible As MsoTriState
     
     On Error GoTo ErrHandler
     
@@ -49,13 +48,6 @@ Sub sendEmail_TwoTables_ManualGraph()
     wdSel.TypeParagraph
     wdSel.TypeParagraph
     
-    ' Скрываем график, чтобы он не попал в копируемые таблицы
-    oldVisible = shpGroup.Visible
-    shpGroup.Visible = msoFalse
-    
-    DoEvents
-    Application.Wait Now + TimeValue("0:00:01")
-    
     ' Верхняя таблица
     PasteRangeOldWay RngTop, wdSel
     
@@ -68,38 +60,19 @@ Sub sendEmail_TwoTables_ManualGraph()
     wdSel.TypeParagraph
     wdSel.TypeParagraph
     
-    ' Возвращаем график на листе
-    shpGroup.Visible = oldVisible
+    ' График ниже таблиц
+    PasteShapeAsBestPicture reportSheet, shpGroup, wdSel, OutApp
     
-    ' Копируем график в буфер, чтобы осталось только вставить руками
-    reportSheet.Activate
-    shpGroup.Select
-    Selection.Copy
-    
-    DoEvents
-    Application.Wait Now + TimeValue("0:00:01")
-    
-    ' Возвращаем фокус в письмо.
-    ' Курсор должен стоять после нижней таблицы.
-    OutApp.ActiveWindow.Activate
-    
-    MsgBox "Письмо сформировано: верхняя и нижняя таблицы вставлены." & vbCrLf & vbCrLf & _
-           "График Group 5 скопирован в буфер." & vbCrLf & _
-           "Вставь его внизу письма руками:" & vbCrLf & _
-           "Ctrl + Alt + V -> Picture / Enhanced Metafile." & vbCrLf & vbCrLf & _
-           "После вставки график не двигать внутрь таблиц.", vbInformation
+    wdSel.TypeParagraph
     
     OutMail.Save
     
-    ' Автоотправку пока не включаем, потому что график вставляется руками
-    ' If inputSheet.Range("G6").Value = True Then
-    '     OutMail.Send
-    ' End If
+    If inputSheet.Range("G6").Value = True Then
+        OutMail.Send
+    End If
     
 CleanExit:
     On Error Resume Next
-    
-    If Not shpGroup Is Nothing Then shpGroup.Visible = oldVisible
     
     reportSheet.Activate
     reportSheet.Range("A1").Select
@@ -137,4 +110,56 @@ Private Sub PasteRangeOldWay(ByVal srcRange As Range, ByVal wdSel As Object)
     DoEvents
     Application.Wait Now + TimeValue("0:00:01")
 
+End Sub
+
+
+Private Sub PasteShapeAsBestPicture( _
+    ByVal ws As Worksheet, _
+    ByVal shp As Shape, _
+    ByVal wdSel As Object, _
+    ByVal OutApp As Object _
+)
+
+    Dim ok As Boolean
+    
+    ws.Activate
+    shp.Select
+    
+    ' Как при ручном Ctrl+C по Group 5
+    Selection.Copy
+    
+    DoEvents
+    Application.Wait Now + TimeValue("0:00:01")
+    
+    OutApp.ActiveWindow.Activate
+    
+    ' 1) Лучший вариант: Enhanced Metafile
+    On Error Resume Next
+    wdSel.PasteSpecial Link:=False, DataType:=9, Placement:=0, DisplayAsIcon:=False
+    ok = (Err.Number = 0)
+    Err.Clear
+    On Error GoTo 0
+    
+    If ok Then Exit Sub
+    
+    ' 2) Запасной вариант: обычный Metafile Picture
+    On Error Resume Next
+    wdSel.PasteSpecial Link:=False, DataType:=3, Placement:=0, DisplayAsIcon:=False
+    ok = (Err.Number = 0)
+    Err.Clear
+    On Error GoTo 0
+    
+    If ok Then Exit Sub
+    
+    ' 3) Последний запасной вариант: обычная вставка
+    ws.Activate
+    shp.Select
+    Selection.Copy
+    
+    DoEvents
+    Application.Wait Now + TimeValue("0:00:01")
+    
+    OutApp.ActiveWindow.Activate
+    wdSel.Paste
+    
 End Sub
