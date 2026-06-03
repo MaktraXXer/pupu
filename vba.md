@@ -1,6 +1,6 @@
 Option Explicit
 
-Sub sendEmail_TableAndGraph_CID_v2()
+Sub sendEmail_Table_ManualGraphPaste()
 
     Dim inputSheet As Worksheet
     Dim reportSheet As Worksheet
@@ -14,11 +14,6 @@ Sub sendEmail_TableAndGraph_CID_v2()
     
     Dim t As String
     Dim oldVisible As MsoTriState
-    
-    Dim tmpPng As String
-    Dim cid As String
-    Dim att As Object
-    Dim html As String
     
     On Error GoTo ErrHandler
     
@@ -35,7 +30,6 @@ Sub sendEmail_TableAndGraph_CID_v2()
     With OutMail
         .To = "ALM@domrf.ru; liquidity.treasury@domrf.ru"
         .Subject = "Спреды ЕТС в терминах КС+ на " & t
-        .BodyFormat = 2 ' olFormatHTML
         .Display
     End With
     
@@ -44,7 +38,7 @@ Sub sendEmail_TableAndGraph_CID_v2()
     
     OutApp.ActiveWindow.Activate
     
-    ' Текст письма
+    ' Текст письма напрямую, без Temp
     wdSel.TypeText "Коллеги, добрый день!"
     wdSel.TypeParagraph
     wdSel.TypeText "Присылаю отчёт о спредах фиксированных ЕТС к ключевой ставке."
@@ -71,68 +65,34 @@ Sub sendEmail_TableAndGraph_CID_v2()
     DoEvents
     Application.Wait Now + TimeValue("0:00:01")
     
-    ' Возвращаем график на лист
+    ' Возвращаем Group 5
     shpGroup.Visible = oldVisible
     
-    ' Экспортируем Group 5 в PNG
-    tmpPng = ExportShapeToPngViaPowerPoint(reportSheet, "Group 5")
+    ' Ставим курсор под таблицей
+    wdSel.TypeParagraph
+    wdSel.TypeParagraph
     
-    ' Проверяем, что файл реально создан и не пустой
-    If Len(Dir(tmpPng)) = 0 Then
-        Err.Raise vbObjectError + 100, , "PNG-файл не был создан: " & tmpPng
-    End If
+    ' Копируем Group 5 в буфер так же, как при ручном Ctrl+C
+    reportSheet.Activate
+    shpGroup.Select
+    Selection.Copy
     
-    If FileLen(tmpPng) = 0 Then
-        Err.Raise vbObjectError + 101, , "PNG-файл создан, но он пустой: " & tmpPng
-    End If
+    DoEvents
     
-    cid = "ets_graph_" & Format(Now, "yyyymmdd_hhnnss")
+    ' Возвращаем фокус в письмо
+    OutApp.ActiveWindow.Activate
     
-    ' Сначала сохраняем письмо после вставки таблицы
-    OutMail.Save
-    
-    ' Добавляем PNG как обычное вложение
-    Set att = OutMail.Attachments.Add(tmpPng, 1)
-    
-    ' Content-ID
-    att.PropertyAccessor.SetProperty _
-        "http://schemas.microsoft.com/mapi/proptag/0x3712001F", cid
-    
-    ' MIME type
-    att.PropertyAccessor.SetProperty _
-        "http://schemas.microsoft.com/mapi/proptag/0x370E001F", "image/png"
-    
-    ' Сохраняем после добавления attachment
-    OutMail.Save
-    
-    ' Вставляем картинку в HTML по CID
-    html = OutMail.HTMLBody
-    
-    If InStr(1, html, "</body>", vbTextCompare) > 0 Then
-        html = Replace(html, "</body>", "<br><br><img src=""cid:" & cid & """ style=""max-width:100%;""><br></body>", , , vbTextCompare)
-    Else
-        html = html & "<br><br><img src=""cid:" & cid & """ style=""max-width:100%;""><br>"
-    End If
-    
-    OutMail.HTMLBody = html
-    
-    OutMail.Save
-    
-    If inputSheet.Range("G6").Value = True Then
-        OutMail.Send
-    Else
-        MsgBox "Письмо сформировано. PNG сохранён для проверки: " & tmpPng, vbInformation
-    End If
-    
-CleanExit:
-    On Error Resume Next
-    
-    If Not shpGroup Is Nothing Then shpGroup.Visible = oldVisible
+    MsgBox "Письмо сформировано. Group 5 скопирован в буфер." & vbCrLf & vbCrLf & _
+           "Теперь в письме нажми Ctrl+Alt+V и выбери Picture / Изображение." & vbCrLf & _
+           "После этого можно отправить письмо вручную.", vbInformation
     
     reportSheet.Activate
     reportSheet.Range("A1").Select
     
-    Set att = Nothing
+CleanExit:
+    On Error Resume Next
+    If Not shpGroup Is Nothing Then shpGroup.Visible = oldVisible
+    
     Set wdSel = Nothing
     Set wEditor = Nothing
     Set OutMail = Nothing
@@ -149,64 +109,3 @@ ErrHandler:
     Resume CleanExit
 
 End Sub
-
-
-Private Function ExportShapeToPngViaPowerPoint(ByVal ws As Worksheet, ByVal shapeName As String) As String
-
-    Dim shp As Shape
-    
-    Dim pptApp As Object
-    Dim pptPres As Object
-    Dim pptSlide As Object
-    Dim pptShape As Object
-    
-    Dim tmpPng As String
-    
-    On Error GoTo ErrHandler
-    
-    Set shp = ws.Shapes(shapeName)
-    
-    tmpPng = Environ$("TEMP") & "\ets_graph_" & Format(Now, "yyyymmdd_hhnnss") & ".png"
-    
-    ws.Activate
-    shp.Select
-    Selection.Copy
-    
-    DoEvents
-    Application.Wait Now + TimeValue("0:00:01")
-    
-    Set pptApp = CreateObject("PowerPoint.Application")
-    pptApp.Visible = True
-    
-    Set pptPres = pptApp.Presentations.Add
-    Set pptSlide = pptPres.Slides.Add(1, 12) ' ppLayoutBlank
-    
-    ' 6 = ppPastePNG
-    On Error Resume Next
-    Set pptShape = pptSlide.Shapes.PasteSpecial(6)(1)
-    On Error GoTo ErrHandler
-    
-    ' 2 = ppPasteEnhancedMetafile
-    If pptShape Is Nothing Then
-        Set pptShape = pptSlide.Shapes.PasteSpecial(2)(1)
-    End If
-    
-    ' 2 = ppShapeFormatPNG
-    pptShape.Export tmpPng, 2
-    
-    pptPres.Close
-    pptApp.Quit
-    
-    ExportShapeToPngViaPowerPoint = tmpPng
-    
-    Exit Function
-
-ErrHandler:
-    On Error Resume Next
-    
-    If Not pptPres Is Nothing Then pptPres.Close
-    If Not pptApp Is Nothing Then pptApp.Quit
-    
-    Err.Raise Err.Number, Err.Source, Err.Description
-
-End Function
