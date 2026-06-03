@@ -2,25 +2,36 @@ Option Explicit
 
 Sub sendEmail()
 
+    'Declaration of variables
+    Dim i As Integer
+    Dim WBk As Workbook
+    Dim reportSheet As Worksheet
+    Dim Rng As Range
     Dim OutApp As Object
     Dim OutMail As Object
-    Dim insp As Object
     Dim wEditor As Object
-    Dim wdSel As Object
-    
-    Dim inputSheet As Worksheet
-    Dim reportSheet As Worksheet
-    Dim reportRange As Range
-    
     Dim t As String
-    Dim tmpPng As String
     
-    Set inputSheet = ThisWorkbook.Worksheets("Input")
-    Set reportSheet = ThisWorkbook.Worksheets("Email")
-    Set reportRange = reportSheet.Range("A2:P90")
+    Set WBk = ThisWorkbook
     
-    t = Format(inputSheet.Range("B2").Value, "DD.MM.YYYY")
+    'Analysis date
+    t = Format(Worksheets("Input").Range("B2").Value, "DD.MM.YYYY")
     
+    'Report tab from where an image/table will be generated
+    Set reportSheet = Worksheets("Email")
+    
+    'Range at which the report will be generated
+    Set Rng = reportSheet.Range("A2:P90")
+    
+    'A tab called "Temp" will be created to temporarily store the body text
+    Worksheets.Add After:=Sheets(Sheets.Count)
+    ActiveSheet.Name = "Temp"
+    
+    'Email Body Text
+    Cells(1, 1) = "Коллеги, добрый день!" & vbNewLine & _
+                  "Присылаю отчёт о спредах фиксированных ЕТС к ключевой ставке."
+    
+    'Create Outlook mail
     Set OutApp = CreateObject("Outlook.Application")
     Set OutMail = OutApp.CreateItem(0)
     
@@ -30,94 +41,73 @@ Sub sendEmail()
         .Display
     End With
     
-    Set insp = OutMail.GetInspector
-    Set wEditor = insp.WordEditor
-    Set wdSel = wEditor.Application.Selection
+    Set wEditor = OutApp.ActiveInspector.WordEditor
     
-    ' Текст письма
-    wdSel.TypeText "Коллеги, добрый день!"
-    wdSel.TypeParagraph
-    wdSel.TypeText "Присылаю отчёт о спредах фиксированных ЕТС к ключевой ставке."
-    wdSel.TypeParagraph
-    wdSel.TypeParagraph
+    OutApp.ActiveWindow.Activate
     
-    ' Вставляем диапазон как обычную таблицу без связи с Excel
-    reportRange.Copy
+    'Paste body text
+    For i = 1 To 2
+        Worksheets("Temp").Cells(i, 1).Copy
+        wEditor.Application.Selection.PasteSpecial xlPasteValues
+    Next i
     
-    ' Вариант 1: чаще лучше сохраняет формат Excel
-    wdSel.PasteExcelTable False, False, True
+    'Paste report exactly as before
+    reportSheet.Activate
+    Rng.Select
     
-    wdSel.TypeParagraph
-    wdSel.TypeParagraph
+    Selection.Copy
+    wEditor.Application.Selection.Paste
     
-    ' Экспортируем Group 5 в PNG и вставляем ниже как картинку без связи
-    tmpPng = ExportShapeToPng(reportSheet, "Group 5")
+    'КЛЮЧЕВОЕ ИЗМЕНЕНИЕ:
+    'После вставки принудительно встраиваем все связанные картинки в письмо
+    EmbedLinkedImagesInWordEditor wEditor
     
-    wdSel.InlineShapes.AddPicture _
-        Filename:=tmpPng, _
-        LinkToFile:=False, _
-        SaveWithDocument:=True
+    'Delete temp sheet
+    Application.DisplayAlerts = False
+    Worksheets("Temp").Delete
+    Application.DisplayAlerts = True
     
-    wdSel.TypeParagraph
-    
-    On Error Resume Next
-    Kill tmpPng
-    On Error GoTo 0
-    
-    ' Отправка письма, если стоит флаг
-    If inputSheet.Range("G6").Value = True Then
+    'Send email if flag is True
+    If Worksheets("Input").Range("G6").Value = True Then
         OutMail.Send
     End If
     
-    reportSheet.Activate
-    reportSheet.Range("A1").Select
+    Worksheets("Email").Range("A1").Select
     
-    Set wdSel = Nothing
-    Set wEditor = Nothing
-    Set insp = Nothing
-    Set OutMail = Nothing
-    Set OutApp = Nothing
-    Set reportRange = Nothing
+    'Disassociate variables
+    Set WBk = Nothing
     Set reportSheet = Nothing
-    Set inputSheet = Nothing
+    Set Rng = Nothing
+    Set OutApp = Nothing
+    Set OutMail = Nothing
+    Set wEditor = Nothing
 
 End Sub
 
 
-Private Function ExportShapeToPng(ByVal ws As Worksheet, ByVal shapeName As String) As String
+Private Sub EmbedLinkedImagesInWordEditor(ByVal wEditor As Object)
 
-    Dim shp As Shape
-    Dim tmpWs As Worksheet
-    Dim tmpChartObj As ChartObject
-    Dim tmpPng As String
+    Dim ils As Object
+    Dim shp As Object
     
-    Set shp = ws.Shapes(shapeName)
+    On Error Resume Next
     
-    tmpPng = Environ$("TEMP") & "\email_group_chart_" & Format(Now, "yyyymmdd_hhnnss") & ".png"
+    'Inline pictures
+    For Each ils In wEditor.InlineShapes
+        If Not ils.LinkFormat Is Nothing Then
+            ils.LinkFormat.SavePictureWithDocument = True
+            ils.LinkFormat.BreakLink
+        End If
+    Next ils
     
-    Application.DisplayAlerts = False
-    Set tmpWs = ThisWorkbook.Worksheets.Add
-    tmpWs.Name = "Temp_Email_Png"
-    Application.DisplayAlerts = True
+    'Floating pictures/shapes
+    For Each shp In wEditor.Shapes
+        If Not shp.LinkFormat Is Nothing Then
+            shp.LinkFormat.SavePictureWithDocument = True
+            shp.LinkFormat.BreakLink
+        End If
+    Next shp
     
-    shp.CopyPicture Appearance:=xlScreen, Format:=xlPicture
-    
-    Set tmpChartObj = tmpWs.ChartObjects.Add( _
-        Left:=10, _
-        Top:=10, _
-        Width:=shp.Width, _
-        Height:=shp.Height _
-    )
-    
-    tmpChartObj.Activate
-    tmpChartObj.Chart.Paste
-    
-    tmpChartObj.Chart.Export Filename:=tmpPng, FilterName:="PNG"
-    
-    Application.DisplayAlerts = False
-    tmpWs.Delete
-    Application.DisplayAlerts = True
-    
-    ExportShapeToPng = tmpPng
+    On Error GoTo 0
 
-End Function
+End Sub
