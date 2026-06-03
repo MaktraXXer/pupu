@@ -1,6 +1,6 @@
 Option Explicit
 
-Sub sendEmail_Table_And_GroupPicture()
+Sub sendEmail_Table_And_GroupPicture_v2()
 
     Dim inputSheet As Worksheet
     Dim reportSheet As Worksheet
@@ -36,14 +36,13 @@ Sub sendEmail_Table_And_GroupPicture()
     
     OutApp.ActiveWindow.Activate
     
-    ' Текст письма
     wdSel.TypeText "Коллеги, добрый день!"
     wdSel.TypeParagraph
     wdSel.TypeText "Присылаю отчёт о спредах фиксированных ЕТС к ключевой ставке."
     wdSel.TypeParagraph
     wdSel.TypeParagraph
     
-    ' Скрываем Group 5, чтобы она не попала в табличный диапазон
+    ' Скрываем график, чтобы таблица вставилась без него
     oldVisible = shpGroup.Visible
     shpGroup.Visible = msoFalse
     
@@ -63,25 +62,24 @@ Sub sendEmail_Table_And_GroupPicture()
     DoEvents
     Application.Wait Now + TimeValue("0:00:01")
     
-    ' Возвращаем группу
+    ' Возвращаем график
     shpGroup.Visible = oldVisible
     
     wdSel.TypeParagraph
     wdSel.TypeParagraph
     
-    ' Копируем Group 5 как картинку
+    ' КЛЮЧЕВОЕ: обычный Copy, не CopyPicture
     reportSheet.Activate
     shpGroup.Select
-    shpGroup.CopyPicture Appearance:=xlScreen, Format:=xlPicture
+    Selection.Copy
     
     DoEvents
     Application.Wait Now + TimeValue("0:00:01")
     
-    ' Вставляем как несвязанную картинку.
-    ' DataType:=3 = wdPasteMetafilePicture
+    ' Вставляем как Picture / Enhanced Metafile без связи
     wdSel.PasteSpecial _
         Link:=False, _
-        DataType:=3, _
+        DataType:=9, _
         Placement:=0, _
         DisplayAsIcon:=False
     
