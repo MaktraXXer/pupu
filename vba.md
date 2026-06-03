@@ -1,37 +1,36 @@
 Option Explicit
 
-Sub sendEmail_SplitLayout_ManualGraph()
+Sub sendEmail_FullTable_WithGraphHole()
 
     Dim inputSheet As Worksheet
     Dim reportSheet As Worksheet
+    Dim Rng As Range
     Dim shpGroup As Shape
-    
-    Dim RngTop As Range
-    Dim RngSide As Range
-    Dim RngBottom As Range
     
     Dim OutApp As Object
     Dim OutMail As Object
     Dim wEditor As Object
     Dim wdSel As Object
+    Dim wdTable As Object
     
     Dim t As String
     Dim oldVisible As MsoTriState
+    
+    ' Excel row 33 соответствует Word row 32,
+    ' потому что диапазон начинается с Excel row 2.
+    Dim graphWordRow As Long
+    Dim graphWordCol As Long
     
     On Error GoTo ErrHandler
     
     Set inputSheet = ThisWorkbook.Worksheets("Input")
     Set reportSheet = ThisWorkbook.Worksheets("Email")
+    
+    Set Rng = reportSheet.Range("A2:P91")
     Set shpGroup = reportSheet.Shapes("Group 5")
     
-    ' Верхняя таблица: строки 2-31
-    Set RngTop = reportSheet.Range("A2:P31")
-    
-    ' Табличка справа от графика: поправь колонки под фактическое расположение
-    Set RngSide = reportSheet.Range("N38:P41")
-    
-    ' Нижняя таблица: строки 59-91
-    Set RngBottom = reportSheet.Range("A59:P91")
+    graphWordRow = 32   ' Excel row 33 -> Word table row 32
+    graphWordCol = 1    ' колонка A
     
     t = Format(inputSheet.Range("B2").Value, "DD.MM.YYYY")
     
@@ -49,34 +48,45 @@ Sub sendEmail_SplitLayout_ManualGraph()
     
     OutApp.ActiveWindow.Activate
     
-    ' Текст письма
+    ' Текст письма без Temp
     wdSel.TypeText "Коллеги, добрый день!"
     wdSel.TypeParagraph
     wdSel.TypeText "Присылаю отчёт о спредах фиксированных ЕТС к ключевой ставке."
     wdSel.TypeParagraph
     wdSel.TypeParagraph
     
-    ' Скрываем график, чтобы он случайно не попал в копируемые диапазоны
+    ' Скрываем график, чтобы в таблице осталась дырка
     oldVisible = shpGroup.Visible
     shpGroup.Visible = msoFalse
     
     DoEvents
     Application.Wait Now + TimeValue("0:00:01")
     
-    ' 1. Верхняя таблица
-    PasteRangeOldWay RngTop, wdSel
-    wdSel.TypeParagraph
-    wdSel.TypeParagraph
+    ' Вставляем весь табличный диапазон одним куском
+    reportSheet.Activate
+    Rng.Select
+    Rng.Copy
     
-    ' 2. Мини-табличка справа от графика
-    PasteRangeOldWay RngSide, wdSel
-    wdSel.TypeParagraph
-    wdSel.TypeParagraph
+    DoEvents
+    Application.Wait Now + TimeValue("0:00:01")
     
-    ' Возвращаем график
+    wdSel.Paste
+    
+    DoEvents
+    Application.Wait Now + TimeValue("0:00:01")
+    
+    ' Возвращаем график на Excel-листе
     shpGroup.Visible = oldVisible
     
-    ' 3. Копируем график в буфер
+    ' Берём последнюю вставленную таблицу в письме
+    Set wdTable = wEditor.Tables(wEditor.Tables.Count)
+    
+    ' Ставим курсор в ячейку, где начинается дырка под график
+    wdTable.Cell(graphWordRow, graphWordCol).Range.Select
+    Set wdSel = wEditor.Application.Selection
+    wdSel.Collapse Direction:=0 ' wdCollapseStart
+    
+    ' Копируем Group 5 в буфер как при ручном Ctrl+C
     reportSheet.Activate
     shpGroup.Select
     Selection.Copy
@@ -84,26 +94,18 @@ Sub sendEmail_SplitLayout_ManualGraph()
     DoEvents
     Application.Wait Now + TimeValue("0:00:01")
     
+    ' Возвращаем фокус в Outlook и ставим курсор обратно в дырку
     OutApp.ActiveWindow.Activate
+    wdTable.Cell(graphWordRow, graphWordCol).Range.Select
+    Set wdSel = wEditor.Application.Selection
+    wdSel.Collapse Direction:=0
     
-    MsgBox "Group 5 скопирован в буфер." & vbCrLf & vbCrLf & _
-           "Вставь график в письмо руками:" & vbCrLf & _
-           "Ctrl + Alt + V -> Picture / Enhanced Metafile." & vbCrLf & vbCrLf & _
-           "Важно: не двигай график внутрь таблицы и не клади поверх ячеек." & vbCrLf & _
-           "После вставки нажми ОК — макрос добавит нижнюю таблицу.", vbInformation
-    
-    wdSel.TypeParagraph
-    wdSel.TypeParagraph
-    
-    ' 4. Нижняя таблица
-    PasteRangeOldWay RngBottom, wdSel
+    MsgBox "Таблица вставлена целиком, график скрыт из диапазона и скопирован в буфер." & vbCrLf & vbCrLf & _
+           "Курсор стоит в пустой области под график." & vbCrLf & _
+           "Вставь график: Ctrl + Alt + V -> Picture / Enhanced Metafile." & vbCrLf & vbCrLf & _
+           "Главное: после вставки НЕ двигай график мышкой.", vbInformation
     
     OutMail.Save
-    
-    ' Автоотправку пока лучше не включать, потому что есть ручной шаг
-    ' If inputSheet.Range("G6").Value = True Then
-    '     OutMail.Send
-    ' End If
     
 CleanExit:
     On Error Resume Next
@@ -113,14 +115,13 @@ CleanExit:
     reportSheet.Activate
     reportSheet.Range("A1").Select
     
+    Set wdTable = Nothing
     Set wdSel = Nothing
     Set wEditor = Nothing
     Set OutMail = Nothing
     Set OutApp = Nothing
     Set shpGroup = Nothing
-    Set RngTop = Nothing
-    Set RngSide = Nothing
-    Set RngBottom = Nothing
+    Set Rng = Nothing
     Set reportSheet = Nothing
     Set inputSheet = Nothing
     
@@ -129,22 +130,5 @@ CleanExit:
 ErrHandler:
     MsgBox "Ошибка: " & Err.Description, vbExclamation
     Resume CleanExit
-
-End Sub
-
-
-Private Sub PasteRangeOldWay(ByVal srcRange As Range, ByVal wdSel As Object)
-
-    srcRange.Worksheet.Activate
-    srcRange.Select
-    srcRange.Copy
-    
-    DoEvents
-    Application.Wait Now + TimeValue("0:00:01")
-    
-    wdSel.Paste
-    
-    DoEvents
-    Application.Wait Now + TimeValue("0:00:01")
 
 End Sub
