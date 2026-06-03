@@ -1,6 +1,6 @@
 Option Explicit
 
-Sub sendEmail_TwoTables_ThenGraph()
+Sub sendEmail_TopGraphBottom()
 
     Dim inputSheet As Worksheet
     Dim reportSheet As Worksheet
@@ -48,20 +48,20 @@ Sub sendEmail_TwoTables_ThenGraph()
     wdSel.TypeParagraph
     wdSel.TypeParagraph
     
-    ' Верхняя таблица
+    ' 1. Верхняя таблица
     PasteRangeOldWay RngTop, wdSel
     
     wdSel.TypeParagraph
     wdSel.TypeParagraph
     
-    ' Нижняя таблица
-    PasteRangeOldWay RngBottom, wdSel
-    
-    wdSel.TypeParagraph
-    wdSel.TypeParagraph
-    
-    ' График ниже таблиц
+    ' 2. График
     PasteShapeAsBestPicture reportSheet, shpGroup, wdSel, OutApp
+    
+    wdSel.TypeParagraph
+    wdSel.TypeParagraph
+    
+    ' 3. Нижняя таблица
+    PasteRangeOldWay RngBottom, wdSel
     
     wdSel.TypeParagraph
     
@@ -125,7 +125,7 @@ Private Sub PasteShapeAsBestPicture( _
     ws.Activate
     shp.Select
     
-    ' Как при ручном Ctrl+C по Group 5
+    ' Как ручной Ctrl+C по Group 5
     Selection.Copy
     
     DoEvents
@@ -133,7 +133,7 @@ Private Sub PasteShapeAsBestPicture( _
     
     OutApp.ActiveWindow.Activate
     
-    ' 1) Лучший вариант: Enhanced Metafile
+    ' 1. Enhanced Metafile
     On Error Resume Next
     wdSel.PasteSpecial Link:=False, DataType:=9, Placement:=0, DisplayAsIcon:=False
     ok = (Err.Number = 0)
@@ -142,7 +142,7 @@ Private Sub PasteShapeAsBestPicture( _
     
     If ok Then Exit Sub
     
-    ' 2) Запасной вариант: обычный Metafile Picture
+    ' 2. Metafile Picture
     On Error Resume Next
     wdSel.PasteSpecial Link:=False, DataType:=3, Placement:=0, DisplayAsIcon:=False
     ok = (Err.Number = 0)
@@ -151,7 +151,7 @@ Private Sub PasteShapeAsBestPicture( _
     
     If ok Then Exit Sub
     
-    ' 3) Последний запасной вариант: обычная вставка
+    ' 3. Обычная вставка
     ws.Activate
     shp.Select
     Selection.Copy
@@ -161,5 +161,5 @@ Private Sub PasteShapeAsBestPicture( _
     
     OutApp.ActiveWindow.Activate
     wdSel.Paste
-    
+
 End Sub
