@@ -82,9 +82,18 @@ WHERE
 -- 3. Клиенты для анализа:
 -- был НС на первую дату
 -- и НЕ было срочных вкладов к выходу в периоде
+-- плюс сразу считаем флаг НС, открытого в апреле 2026
 SELECT
       ns.cli_id
     , SUM(ns.out_rub) AS ns_start_sum
+    , MAX(
+          CASE
+              WHEN ns.dt_open >= '2026-04-01'
+               AND ns.dt_open <  '2026-05-01'
+              THEN 1
+              ELSE 0
+          END
+      ) AS ns_opened_apr2026_flag
 INTO #client_scope
 FROM #bal_base ns
 WHERE
@@ -216,7 +225,7 @@ WITH client_flags AS (
 ),
 
 -- контрольная сумма вкладов к выходу
--- по логике отбора должна быть 0, но оставляем поле для проверки
+-- по логике отбора должна быть 0
 exit_sum AS (
     SELECT
           b.cli_id
@@ -255,6 +264,9 @@ SELECT
           WHEN ISNULL(c.ns_start_sum, 0) < 5000000 THEN N'02. НС 1.5-5 млн'
           ELSE N'03. НС >= 5 млн'
       END AS ns_amount_flag
+
+    -- флаг: был хотя бы один НС на первую дату, открытый в апреле 2026
+    , ISNULL(c.ns_opened_apr2026_flag, 0) AS ns_opened_apr2026_flag
 
     -- контроль: вкладов к выходу быть не должно
     , ISNULL(e.exit_td_sum, 0) AS exit_td_sum
@@ -340,6 +352,7 @@ SELECT
       cli_id
     , segment_flag
     , ns_amount_flag
+    , ns_opened_apr2026_flag
 
     , exit_td_sum
 
@@ -363,6 +376,7 @@ FROM #client_mart
 ORDER BY
       segment_flag
     , ns_amount_flag
+    , ns_opened_apr2026_flag DESC
     , ns_decrease_flag DESC
     , opened_total DESC
     , ns_delta ASC
