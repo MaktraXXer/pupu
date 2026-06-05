@@ -1,247 +1,344 @@
 USE [ALM];
 SET NOCOUNT ON;
 
-DECLARE @DateFrom date = '2025-06-01';
-DECLARE @DateTo   date = '2026-04-30';
+DECLARE @BaseDate date = '2026-05-30'; -- дата баланса было
+DECLARE @EndDate  date = '2026-06-02'; -- дата баланса стало
 
-IF OBJECT_ID('tempdb..#months') IS NOT NULL DROP TABLE #months;
-IF OBJECT_ID('tempdb..#base') IS NOT NULL DROP TABLE #base;
+DECLARE @ExitFrom date = '2026-05-30'; -- выходы с
+DECLARE @ExitTo   date = '2026-06-02'; -- выходы по включительно
 
-IF OBJECT_ID('tempdb..#portfolio_client') IS NOT NULL DROP TABLE #portfolio_client;
-IF OBJECT_ID('tempdb..#portfolio_client_4m') IS NOT NULL DROP TABLE #portfolio_client_4m;
-IF OBJECT_ID('tempdb..#opened_client') IS NOT NULL DROP TABLE #opened_client;
-IF OBJECT_ID('tempdb..#opened_client_4m') IS NOT NULL DROP TABLE #opened_client_4m;
+DECLARE @OpenFrom date = '2026-05-30'; -- открытые с
+DECLARE @OpenTo   date = '2026-06-02'; -- открытые по включительно
 
-IF OBJECT_ID('tempdb..#portfolio_agg') IS NOT NULL DROP TABLE #portfolio_agg;
-IF OBJECT_ID('tempdb..#portfolio_4m_agg') IS NOT NULL DROP TABLE #portfolio_4m_agg;
-IF OBJECT_ID('tempdb..#opened_agg') IS NOT NULL DROP TABLE #opened_agg;
-IF OBJECT_ID('tempdb..#opened_4m_agg') IS NOT NULL DROP TABLE #opened_4m_agg;
+DECLARE @eps decimal(18,6) = 0.000005;
 
-------------------------------------------------------------
--- 1. Календарь концов месяцев
-------------------------------------------------------------
+IF OBJECT_ID('tempdb..#bal_base') IS NOT NULL DROP TABLE #bal_base;
+IF OBJECT_ID('tempdb..#bal_end') IS NOT NULL DROP TABLE #bal_end;
+IF OBJECT_ID('tempdb..#client_scope') IS NOT NULL DROP TABLE #client_scope;
+IF OBJECT_ID('tempdb..#client_mart') IS NOT NULL DROP TABLE #client_mart;
 
-;WITH m AS (
-    SELECT DATEFROMPARTS(YEAR(@DateFrom), MONTH(@DateFrom), 1) AS month_start
-
-    UNION ALL
-
-    SELECT DATEADD(month, 1, month_start)
-    FROM m
-    WHERE DATEADD(month, 1, month_start) <= DATEFROMPARTS(YEAR(@DateTo), MONTH(@DateTo), 1)
-)
-SELECT
-      EOMONTH(month_start) AS dt_rep
-    , month_start
-    , EOMONTH(month_start) AS month_end
-INTO #months
-FROM m
-OPTION (MAXRECURSION 100);
-
-
-------------------------------------------------------------
--- 2. База по нужным вкладам на конец каждого месяца
-------------------------------------------------------------
 
 SELECT
-      CAST(t.dt_rep AS date)  AS dt_rep
-    , t.cli_id
-    , t.con_id
+      CAST(t.dt_rep AS date) AS dt_rep
+    , CAST(t.cli_id AS bigint) AS cli_id
+    , CAST(t.con_id AS bigint) AS con_id
     , CAST(t.dt_open AS date) AS dt_open
-    , t.out_rub
-INTO #base
-FROM [ALM].[ALM].[VW_balance_rest_all] t WITH (NOLOCK)
-JOIN #months m
-    ON CAST(t.dt_rep AS date) = m.dt_rep
+    , CAST(t.dt_close_plan AS date) AS dt_close_plan
+    , t.section_name
+    , CAST(t.out_rub AS decimal(38,6)) AS out_rub
+    , CAST(t.rate_con AS decimal(18,6)) AS rate_con
+    , CASE
+          WHEN NULLIF(LTRIM(RTRIM(COALESCE(t.conv, ''))), '') IS NULL THEN 'AT_THE_END'
+          ELSE UPPER(LTRIM(RTRIM(t.conv)))
+      END AS conv_norm
+    , t.termdays
+    , t.TSEGMENTNAME
+INTO #bal_base
+FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
 WHERE
-        t.section_name = N'Срочные'
-    AND t.block_name   = N'Привлечение ФЛ'
-    AND t.od_flag      = 1
-    AND t.cur          = '810'
+    t.dt_rep = @BaseDate
+    AND t.section_name IN (N'Срочные', N'Накопительный счёт')
+    AND t.block_name = N'Привлечение ФЛ'
+    AND t.acc_role   = N'LIAB'
+    AND t.od_flag    = 1
+    AND t.cur        = '810'
     AND t.out_rub IS NOT NULL
-    AND t.out_rub >= 0
-    AND t.PROD_NAME_res IN (N'Надёжный', N'Надёжный VIP');
+    AND t.out_rub >= 0;
 
-
-------------------------------------------------------------
--- 3. Портфель на конец месяца: поклиентное полотно
-------------------------------------------------------------
 
 SELECT
-      b.dt_rep
-    , b.cli_id
-    , COUNT(DISTINCT b.con_id) AS con_cnt
-    , SUM(b.out_rub)           AS out_rub
-INTO #portfolio_client
-FROM #base b
-GROUP BY
-      b.dt_rep
-    , b.cli_id;
-
-
-------------------------------------------------------------
--- 4. Портфель на конец месяца: клиенты с объемом >= 4 млн
-------------------------------------------------------------
-
-SELECT
-      pc.dt_rep
-    , pc.cli_id
-    , pc.con_cnt
-    , pc.out_rub
-INTO #portfolio_client_4m
-FROM #portfolio_client pc
-WHERE pc.out_rub >= 4000000;
-
-
-------------------------------------------------------------
--- 5. Открытые в этом месяце вклады: поклиентное полотно
-------------------------------------------------------------
-
-SELECT
-      b.dt_rep
-    , b.cli_id
-    , COUNT(DISTINCT b.con_id) AS con_cnt
-    , SUM(b.out_rub)           AS out_rub
-INTO #opened_client
-FROM #base b
-JOIN #months m
-    ON b.dt_rep = m.dt_rep
+      CAST(t.dt_rep AS date) AS dt_rep
+    , CAST(t.cli_id AS bigint) AS cli_id
+    , CAST(t.con_id AS bigint) AS con_id
+    , CAST(t.dt_open AS date) AS dt_open
+    , CAST(t.dt_close_plan AS date) AS dt_close_plan
+    , t.section_name
+    , CAST(t.out_rub AS decimal(38,6)) AS out_rub
+    , CAST(t.rate_con AS decimal(18,6)) AS rate_con
+    , CASE
+          WHEN NULLIF(LTRIM(RTRIM(COALESCE(t.conv, ''))), '') IS NULL THEN 'AT_THE_END'
+          ELSE UPPER(LTRIM(RTRIM(t.conv)))
+      END AS conv_norm
+    , t.termdays
+    , t.TSEGMENTNAME
+INTO #bal_end
+FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
 WHERE
-        b.dt_open >= m.month_start
-    AND b.dt_open <= m.month_end
-GROUP BY
-      b.dt_rep
-    , b.cli_id;
+    t.dt_rep = @EndDate
+    AND t.section_name IN (N'Срочные', N'Накопительный счёт')
+    AND t.block_name = N'Привлечение ФЛ'
+    AND t.acc_role   = N'LIAB'
+    AND t.od_flag    = 1
+    AND t.cur        = '810'
+    AND t.out_rub IS NOT NULL
+    AND t.out_rub >= 0;
 
 
-------------------------------------------------------------
--- 6. Открытые в этом месяце: клиенты с объемом >= 4 млн
-------------------------------------------------------------
+SELECT DISTINCT
+    cli_id
+INTO #client_scope
+FROM #bal_base
+WHERE
+    section_name = N'Срочные'
+    AND dt_close_plan >= @ExitFrom
+    AND dt_close_plan <= @ExitTo;
+
+
+WITH client_flags AS (
+    SELECT
+          c.cli_id
+        , CASE
+              WHEN EXISTS (
+                  SELECT 1
+                  FROM #bal_base b
+                  WHERE b.cli_id = c.cli_id
+                    AND b.section_name IN (N'Срочные', N'Накопительный счёт')
+                    AND b.TSEGMENTNAME = N'ДЧБО'
+              )
+              THEN N'ДЧБО'
+              ELSE N'Розница'
+          END AS client_segment
+    FROM #client_scope c
+),
+
+exit_sum AS (
+    SELECT
+          cli_id
+        , SUM(out_rub) AS exit_td_sum
+    FROM #bal_base
+    WHERE
+        section_name = N'Срочные'
+        AND dt_close_plan >= @ExitFrom
+        AND dt_close_plan <= @ExitTo
+    GROUP BY
+        cli_id
+),
+
+ns_start AS (
+    SELECT
+          cli_id
+        , SUM(out_rub) AS ns_start_sum
+    FROM #bal_base
+    WHERE
+        section_name = N'Накопительный счёт'
+    GROUP BY
+        cli_id
+),
+
+ns_end AS (
+    SELECT
+          cli_id
+        , SUM(out_rub) AS ns_end_sum
+    FROM #bal_end
+    WHERE
+        section_name = N'Накопительный счёт'
+    GROUP BY
+        cli_id
+),
+
+opened_by_con AS (
+    SELECT
+          b.cli_id
+        , b.con_id
+        , SUM(b.out_rub) AS out_rub
+        , MIN(b.rate_con) AS rate_con
+        , MIN(b.termdays) AS termdays
+        , CASE
+              WHEN MIN(NULLIF(LTRIM(RTRIM(COALESCE(b.conv_norm, ''))), '')) IS NULL THEN 'AT_THE_END'
+              ELSE MIN(b.conv_norm)
+          END AS conv_norm
+    FROM #bal_end b
+    INNER JOIN #client_scope c
+        ON b.cli_id = c.cli_id
+    WHERE
+        b.section_name = N'Срочные'
+        AND b.dt_open >= @OpenFrom
+        AND b.dt_open <= @OpenTo
+    GROUP BY
+          b.cli_id
+        , b.con_id
+),
+
+opened_classified AS (
+    SELECT
+          o.cli_id
+        , o.con_id
+        , o.out_rub
+        , CASE
+            /* 45-79 дней */
+            WHEN o.termdays BETWEEN 45 AND 79
+             AND o.conv_norm = 'AT_THE_END'
+             AND o.out_rub >= 1500000
+             AND ABS(o.rate_con - 0.1450) <= @eps
+            THEN N'2m'
+
+            WHEN o.termdays BETWEEN 45 AND 79
+             AND o.conv_norm = 'AT_THE_END'
+             AND o.out_rub < 1500000
+             AND ABS(o.rate_con - 0.1430) <= @eps
+            THEN N'2m'
+
+            WHEN o.termdays BETWEEN 45 AND 79
+             AND o.conv_norm <> 'AT_THE_END'
+             AND o.out_rub < 1500000
+             AND ABS(o.rate_con - 0.1410) <= @eps
+            THEN N'2m'
+
+            WHEN o.termdays BETWEEN 45 AND 79
+             AND o.conv_norm <> 'AT_THE_END'
+             AND o.out_rub >= 1500000
+             AND ABS(o.rate_con - 0.1430) <= @eps
+            THEN N'2m'
+
+
+            /* 120-150 дней */
+            WHEN o.termdays BETWEEN 120 AND 150
+             AND o.conv_norm = 'AT_THE_END'
+             AND o.out_rub >= 1500000
+             AND ABS(o.rate_con - 0.1400) <= @eps
+            THEN N'4m'
+
+            WHEN o.termdays BETWEEN 120 AND 150
+             AND o.conv_norm = 'AT_THE_END'
+             AND o.out_rub < 1500000
+             AND ABS(o.rate_con - 0.1390) <= @eps
+            THEN N'4m'
+
+            WHEN o.termdays BETWEEN 120 AND 150
+             AND o.conv_norm <> 'AT_THE_END'
+             AND o.out_rub < 1500000
+             AND ABS(o.rate_con - 0.1370) <= @eps
+            THEN N'4m'
+
+            WHEN o.termdays BETWEEN 120 AND 150
+             AND o.conv_norm <> 'AT_THE_END'
+             AND o.out_rub >= 1500000
+             AND ABS(o.rate_con - 0.1380) <= @eps
+            THEN N'4m'
+
+            ELSE N'other'
+          END AS open_category
+    FROM opened_by_con o
+),
+
+opened_agg AS (
+    SELECT
+          cli_id
+        , SUM(CASE WHEN open_category = N'2m'    THEN out_rub ELSE 0 END) AS opened_2m
+        , SUM(CASE WHEN open_category = N'4m'    THEN out_rub ELSE 0 END) AS opened_4m
+        , SUM(CASE WHEN open_category = N'other' THEN out_rub ELSE 0 END) AS opened_other
+        , SUM(out_rub) AS opened_total
+    FROM opened_classified
+    GROUP BY
+        cli_id
+)
 
 SELECT
-      oc.dt_rep
-    , oc.cli_id
-    , oc.con_cnt
-    , oc.out_rub
-INTO #opened_client_4m
-FROM #opened_client oc
-WHERE oc.out_rub >= 4000000;
+      c.cli_id
+    , f.client_segment AS segment_flag
 
+    , CASE
+          WHEN ISNULL(e.exit_td_sum, 0) < 1500000 THEN N'01. Выход < 1.5 млн'
+          WHEN ISNULL(e.exit_td_sum, 0) < 5000000 THEN N'02. Выход 1.5-5 млн'
+          ELSE N'03. Выход >= 5 млн'
+      END AS exit_amount_flag
 
-------------------------------------------------------------
--- 7. Агрегация каждой категории до одной строки на месяц
-------------------------------------------------------------
+    , ISNULL(e.exit_td_sum, 0) AS exit_td_sum
+
+    , ISNULL(ns1.ns_start_sum, 0) AS ns_start_sum
+
+    -- открытые вклады, разбитые на 3 категории
+    , ISNULL(o.opened_2m, 0) AS opened_2m
+    , ISNULL(o.opened_4m, 0) AS opened_4m
+    , ISNULL(o.opened_other, 0) AS opened_other
+    , ISNULL(o.opened_total, 0) AS opened_total
+
+    , ISNULL(ns2.ns_end_sum, 0) AS ns_end_sum
+    , ISNULL(ns2.ns_end_sum, 0) - ISNULL(ns1.ns_start_sum, 0) AS ns_delta
+
+    -- 1. Все открытые вклады / выходящие вклады
+    , CAST(
+        ISNULL(o.opened_total, 0)
+        / NULLIF(ISNULL(e.exit_td_sum, 0), 0)
+      AS decimal(18,6)) AS retention_1_td_all
+
+    -- 2. Дельта НС + все открытые вклады / выходящие вклады
+    , CAST(
+        (
+            ISNULL(ns2.ns_end_sum, 0) - ISNULL(ns1.ns_start_sum, 0)
+            + ISNULL(o.opened_total, 0)
+        )
+        / NULLIF(ISNULL(e.exit_td_sum, 0), 0)
+      AS decimal(18,6)) AS retention_2_td_all_plus_ns
+
+    -- 3. Только 2m / выходящие вклады
+    , CAST(
+        ISNULL(o.opened_2m, 0)
+        / NULLIF(ISNULL(e.exit_td_sum, 0), 0)
+      AS decimal(18,6)) AS retention_3_td_2m
+
+    -- 4. Дельта НС + 2m / выходящие вклады
+    , CAST(
+        (
+            ISNULL(ns2.ns_end_sum, 0) - ISNULL(ns1.ns_start_sum, 0)
+            + ISNULL(o.opened_2m, 0)
+        )
+        / NULLIF(ISNULL(e.exit_td_sum, 0), 0)
+      AS decimal(18,6)) AS retention_4_td_2m_plus_ns
+
+    -- 5. 2m + 4m / выходящие вклады
+    , CAST(
+        (
+            ISNULL(o.opened_2m, 0)
+            + ISNULL(o.opened_4m, 0)
+        )
+        / NULLIF(ISNULL(e.exit_td_sum, 0), 0)
+      AS decimal(18,6)) AS retention_5_td_2m_plus_4m
+
+    -- 6. Дельта НС + 2m + 4m / выходящие вклады
+    , CAST(
+        (
+            ISNULL(ns2.ns_end_sum, 0) - ISNULL(ns1.ns_start_sum, 0)
+            + ISNULL(o.opened_2m, 0)
+            + ISNULL(o.opened_4m, 0)
+        )
+        / NULLIF(ISNULL(e.exit_td_sum, 0), 0)
+      AS decimal(18,6)) AS retention_6_td_2m_plus_4m_plus_ns
+
+INTO #client_mart
+FROM #client_scope c
+LEFT JOIN client_flags f
+    ON c.cli_id = f.cli_id
+LEFT JOIN exit_sum e
+    ON c.cli_id = e.cli_id
+LEFT JOIN ns_start ns1
+    ON c.cli_id = ns1.cli_id
+LEFT JOIN ns_end ns2
+    ON c.cli_id = ns2.cli_id
+LEFT JOIN opened_agg o
+    ON c.cli_id = o.cli_id;
+
 
 SELECT
-      dt_rep
-    , COUNT(DISTINCT cli_id) AS client_cnt
-    , SUM(con_cnt)           AS con_cnt
-    , SUM(out_rub)           AS out_rub
-    , CAST(SUM(con_cnt) * 1.0 / NULLIF(COUNT(DISTINCT cli_id), 0) AS decimal(18,4))
-        AS avg_con_cnt_per_client
-    , CAST(SUM(out_rub) * 1.0 / NULLIF(COUNT(DISTINCT cli_id), 0) AS decimal(18,2))
-        AS avg_out_rub_per_client
-INTO #portfolio_agg
-FROM #portfolio_client
-GROUP BY dt_rep;
-
-
-SELECT
-      dt_rep
-    , COUNT(DISTINCT cli_id) AS client_cnt
-    , SUM(con_cnt)           AS con_cnt
-    , SUM(out_rub)           AS out_rub
-    , CAST(SUM(con_cnt) * 1.0 / NULLIF(COUNT(DISTINCT cli_id), 0) AS decimal(18,4))
-        AS avg_con_cnt_per_client
-    , CAST(SUM(out_rub) * 1.0 / NULLIF(COUNT(DISTINCT cli_id), 0) AS decimal(18,2))
-        AS avg_out_rub_per_client
-INTO #portfolio_4m_agg
-FROM #portfolio_client_4m
-GROUP BY dt_rep;
-
-
-SELECT
-      dt_rep
-    , COUNT(DISTINCT cli_id) AS client_cnt
-    , SUM(con_cnt)           AS con_cnt
-    , SUM(out_rub)           AS out_rub
-    , CAST(SUM(con_cnt) * 1.0 / NULLIF(COUNT(DISTINCT cli_id), 0) AS decimal(18,4))
-        AS avg_con_cnt_per_client
-    , CAST(SUM(out_rub) * 1.0 / NULLIF(COUNT(DISTINCT cli_id), 0) AS decimal(18,2))
-        AS avg_out_rub_per_client
-INTO #opened_agg
-FROM #opened_client
-GROUP BY dt_rep;
-
-
-SELECT
-      dt_rep
-    , COUNT(DISTINCT cli_id) AS client_cnt
-    , SUM(con_cnt)           AS con_cnt
-    , SUM(out_rub)           AS out_rub
-    , CAST(SUM(con_cnt) * 1.0 / NULLIF(COUNT(DISTINCT cli_id), 0) AS decimal(18,4))
-        AS avg_con_cnt_per_client
-    , CAST(SUM(out_rub) * 1.0 / NULLIF(COUNT(DISTINCT cli_id), 0) AS decimal(18,2))
-        AS avg_out_rub_per_client
-INTO #opened_4m_agg
-FROM #opened_client_4m
-GROUP BY dt_rep;
-
-
-------------------------------------------------------------
--- 8. Финальный отчет: одна строка на месяц
-------------------------------------------------------------
-
-SELECT
-      m.dt_rep
-
-    --------------------------------------------------------
-    -- Портфель на конец месяца
-    --------------------------------------------------------
-    , ISNULL(pa.client_cnt, 0) AS portfolio_client_cnt
-    , ISNULL(pa.con_cnt, 0)    AS portfolio_con_cnt
-    , ISNULL(pa.out_rub, 0)    AS portfolio_out_rub
-    , pa.avg_con_cnt_per_client AS portfolio_avg_con_cnt_per_client
-    , pa.avg_out_rub_per_client AS portfolio_avg_out_rub_per_client
-
-
-    --------------------------------------------------------
-    -- Портфель на конец месяца, клиенты с объемом >= 4 млн
-    --------------------------------------------------------
-    , ISNULL(p4.client_cnt, 0) AS portfolio_4m_client_cnt
-    , ISNULL(p4.con_cnt, 0)    AS portfolio_4m_con_cnt
-    , ISNULL(p4.out_rub, 0)    AS portfolio_4m_out_rub
-    , p4.avg_con_cnt_per_client AS portfolio_4m_avg_con_cnt_per_client
-    , p4.avg_out_rub_per_client AS portfolio_4m_avg_out_rub_per_client
-
-
-    --------------------------------------------------------
-    -- Открытые в этом месяце
-    --------------------------------------------------------
-    , ISNULL(oa.client_cnt, 0) AS opened_client_cnt
-    , ISNULL(oa.con_cnt, 0)    AS opened_con_cnt
-    , ISNULL(oa.out_rub, 0)    AS opened_out_rub
-    , oa.avg_con_cnt_per_client AS opened_avg_con_cnt_per_client
-    , oa.avg_out_rub_per_client AS opened_avg_out_rub_per_client
-
-
-    --------------------------------------------------------
-    -- Открытые в этом месяце, клиенты с объемом >= 4 млн
-    --------------------------------------------------------
-    , ISNULL(o4.client_cnt, 0) AS opened_4m_client_cnt
-    , ISNULL(o4.con_cnt, 0)    AS opened_4m_con_cnt
-    , ISNULL(o4.out_rub, 0)    AS opened_4m_out_rub
-    , o4.avg_con_cnt_per_client AS opened_4m_avg_con_cnt_per_client
-    , o4.avg_out_rub_per_client AS opened_4m_avg_out_rub_per_client
-
-FROM #months m
-LEFT JOIN #portfolio_agg pa
-    ON m.dt_rep = pa.dt_rep
-LEFT JOIN #portfolio_4m_agg p4
-    ON m.dt_rep = p4.dt_rep
-LEFT JOIN #opened_agg oa
-    ON m.dt_rep = oa.dt_rep
-LEFT JOIN #opened_4m_agg o4
-    ON m.dt_rep = o4.dt_rep
+      cli_id
+    , segment_flag
+    , exit_amount_flag
+    , exit_td_sum
+    , ns_start_sum
+    , opened_2m
+    , opened_4m
+    , opened_other
+    , opened_total
+    , ns_end_sum
+    , ns_delta
+    , retention_1_td_all
+    , retention_2_td_all_plus_ns
+    , retention_3_td_2m
+    , retention_4_td_2m_plus_ns
+    , retention_5_td_2m_plus_4m
+    , retention_6_td_2m_plus_4m_plus_ns
+FROM #client_mart
 ORDER BY
-    m.dt_rep;
+      segment_flag
+    , exit_amount_flag
+    , cli_id;
