@@ -18,6 +18,7 @@ IF OBJECT_ID('tempdb..#client_scope') IS NOT NULL DROP TABLE #client_scope;
 IF OBJECT_ID('tempdb..#client_mart') IS NOT NULL DROP TABLE #client_mart;
 
 
+-- 1. Баланс на базовую дату
 SELECT
       CAST(t.dt_rep AS date) AS dt_rep
     , CAST(t.cli_id AS bigint) AS cli_id
@@ -46,6 +47,7 @@ WHERE
     AND t.out_rub >= 0;
 
 
+-- 2. Баланс на конечную дату
 SELECT
       CAST(t.dt_rep AS date) AS dt_rep
     , CAST(t.cli_id AS bigint) AS cli_id
@@ -74,14 +76,16 @@ WHERE
     AND t.out_rub >= 0;
 
 
-SELECT DISTINCT
-    cli_id
+-- 3. Отбираем ТОЛЬКО клиентов, у которых был НС на первую дату
+SELECT
+      b.cli_id
+    , SUM(b.out_rub) AS ns_start_sum
 INTO #client_scope
-FROM #bal_base
+FROM #bal_base b
 WHERE
-    section_name = N'Срочные'
-    AND dt_close_plan >= @ExitFrom
-    AND dt_close_plan <= @ExitTo;
+    b.section_name = N'Накопительный счёт'
+GROUP BY
+    b.cli_id;
 
 
 WITH client_flags AS (
@@ -101,41 +105,65 @@ WITH client_flags AS (
     FROM #client_scope c
 ),
 
+-- 4. Сумма вкладов к выходу у этих клиентов
 exit_sum AS (
     SELECT
-          cli_id
-        , SUM(out_rub) AS exit_td_sum
-    FROM #bal_base
+          b.cli_id
+        , SUM(b.out_rub) AS exit_td_sum
+    FROM #bal_base b
+    INNER JOIN #client_scope c
+        ON c.cli_id = b.cli_id
     WHERE
-        section_name = N'Срочные'
-        AND dt_close_plan >= @ExitFrom
-        AND dt_close_plan <= @ExitTo
+        b.section_name = N'Срочные'
+        AND b.dt_close_plan >= @ExitFrom
+        AND b.dt_close_plan <= @ExitTo
     GROUP BY
-        cli_id
+        b.cli_id
 ),
 
-ns_start AS (
-    SELECT
-          cli_id
-        , SUM(out_rub) AS ns_start_sum
-    FROM #bal_base
-    WHERE
-        section_name = N'Накопительный счёт'
-    GROUP BY
-        cli_id
-),
-
+-- 5. НС на конечную дату
 ns_end AS (
     SELECT
-          cli_id
-        , SUM(out_rub) AS ns_end_sum
-    FROM #bal_end
+          e.cli_id
+        , SUM(e.out_rub) AS ns_end_sum
+    FROM #bal_end e
+    INNER JOIN #client_scope c
+        ON c.cli_id = e.cli_id
     WHERE
-        section_name = N'Накопительный счёт'
+        e.section_name = N'Накопительный счёт'
     GROUP BY
-        cli_id
+        e.cli_id
 ),
 
+-- 6. Вклады на базовую дату
+td_start AS (
+    SELECT
+          b.cli_id
+        , SUM(b.out_rub) AS td_start_sum
+    FROM #bal_base b
+    INNER JOIN #client_scope c
+        ON c.cli_id = b.cli_id
+    WHERE
+        b.section_name = N'Срочные'
+    GROUP BY
+        b.cli_id
+),
+
+-- 7. Вклады на конечную дату
+td_end AS (
+    SELECT
+          e.cli_id
+        , SUM(e.out_rub) AS td_end_sum
+    FROM #bal_end e
+    INNER JOIN #client_scope c
+        ON c.cli_id = e.cli_id
+    WHERE
+        e.section_name = N'Срочные'
+    GROUP BY
+        e.cli_id
+),
+
+-- 8. Открытые вклады за период
 opened_by_con AS (
     SELECT
           b.cli_id
@@ -159,6 +187,7 @@ opened_by_con AS (
         , b.con_id
 ),
 
+-- 9. Классификация открытых вкладов: 2m / 4m / other
 opened_classified AS (
     SELECT
           o.cli_id
@@ -189,7 +218,6 @@ opened_classified AS (
              AND o.out_rub >= 1500000
              AND ABS(o.rate_con - 0.1430) <= @eps
             THEN N'2m'
-
 
             /* 120-150 дней */
             WHEN o.termdays BETWEEN 120 AND 150
@@ -243,9 +271,29 @@ SELECT
           ELSE N'03. Выход >= 5 млн'
       END AS exit_amount_flag
 
-    , ISNULL(e.exit_td_sum, 0) AS exit_td_sum
+    -- НС
+    , ISNULL(c.ns_start_sum, 0) AS ns_start_sum
+    , ISNULL(ns2.ns_end_sum, 0) AS ns_end_sum
+    , ISNULL(ns2.ns_end_sum, 0) - ISNULL(c.ns_start_sum, 0) AS ns_delta
 
-    , ISNULL(ns1.ns_start_sum, 0) AS ns_start_sum
+    , CASE
+          WHEN ISNULL(ns2.ns_end_sum, 0) < ISNULL(c.ns_start_sum, 0) THEN 1
+          ELSE 0
+      END AS ns_decrease_flag
+
+    , CASE
+          WHEN ISNULL(ns2.ns_end_sum, 0) > ISNULL(c.ns_start_sum, 0) THEN 1
+          ELSE 0
+      END AS ns_increase_flag
+
+    -- срочные вклады на двух датах
+    , ISNULL(td1.td_start_sum, 0) AS td_start_sum
+    , ISNULL(td2.td_end_sum, 0) AS td_end_sum
+    , ISNULL(td2.td_end_sum, 0) - ISNULL(td1.td_start_sum, 0) AS td_delta
+
+    -- вклады к выходу
+    , ISNULL(e.exit_td_sum, 0) AS exit_td_sum
+    , CASE WHEN ISNULL(e.exit_td_sum, 0) > 0 THEN 1 ELSE 0 END AS had_exit_td_flag
 
     -- открытые вклады, разбитые на 3 категории
     , ISNULL(o.opened_2m, 0) AS opened_2m
@@ -253,57 +301,37 @@ SELECT
     , ISNULL(o.opened_other, 0) AS opened_other
     , ISNULL(o.opened_total, 0) AS opened_total
 
-    , ISNULL(ns2.ns_end_sum, 0) AS ns_end_sum
-    , ISNULL(ns2.ns_end_sum, 0) - ISNULL(ns1.ns_start_sum, 0) AS ns_delta
+    , CASE WHEN ISNULL(o.opened_total, 0) > 0 THEN 1 ELSE 0 END AS had_opened_td_flag
 
-    -- 1. Все открытые вклады / выходящие вклады
+    -- условная оценка перекладки НС во вклады:
+    -- если НС снизился, а вклады открылись, берем минимум между снижением НС и открытиями
+    , CASE
+          WHEN ISNULL(ns2.ns_end_sum, 0) < ISNULL(c.ns_start_sum, 0)
+           AND ISNULL(o.opened_total, 0) > 0
+          THEN
+              CASE
+                  WHEN ABS(ISNULL(ns2.ns_end_sum, 0) - ISNULL(c.ns_start_sum, 0)) <= ISNULL(o.opened_total, 0)
+                  THEN ABS(ISNULL(ns2.ns_end_sum, 0) - ISNULL(c.ns_start_sum, 0))
+                  ELSE ISNULL(o.opened_total, 0)
+              END
+          ELSE 0
+      END AS estimated_ns_to_td_sum
+
+    -- retention-метрики относительно начального НС
     , CAST(
         ISNULL(o.opened_total, 0)
-        / NULLIF(ISNULL(e.exit_td_sum, 0), 0)
-      AS decimal(18,6)) AS retention_1_td_all
+        / NULLIF(ISNULL(c.ns_start_sum, 0), 0)
+      AS decimal(18,6)) AS ns_to_opened_total_ratio
 
-    -- 2. Дельта НС + все открытые вклады / выходящие вклады
-    , CAST(
-        (
-            ISNULL(ns2.ns_end_sum, 0) - ISNULL(ns1.ns_start_sum, 0)
-            + ISNULL(o.opened_total, 0)
-        )
-        / NULLIF(ISNULL(e.exit_td_sum, 0), 0)
-      AS decimal(18,6)) AS retention_2_td_all_plus_ns
-
-    -- 3. Только 2m / выходящие вклады
     , CAST(
         ISNULL(o.opened_2m, 0)
-        / NULLIF(ISNULL(e.exit_td_sum, 0), 0)
-      AS decimal(18,6)) AS retention_3_td_2m
+        / NULLIF(ISNULL(c.ns_start_sum, 0), 0)
+      AS decimal(18,6)) AS ns_to_opened_2m_ratio
 
-    -- 4. Дельта НС + 2m / выходящие вклады
     , CAST(
-        (
-            ISNULL(ns2.ns_end_sum, 0) - ISNULL(ns1.ns_start_sum, 0)
-            + ISNULL(o.opened_2m, 0)
-        )
-        / NULLIF(ISNULL(e.exit_td_sum, 0), 0)
-      AS decimal(18,6)) AS retention_4_td_2m_plus_ns
-
-    -- 5. 2m + 4m / выходящие вклады
-    , CAST(
-        (
-            ISNULL(o.opened_2m, 0)
-            + ISNULL(o.opened_4m, 0)
-        )
-        / NULLIF(ISNULL(e.exit_td_sum, 0), 0)
-      AS decimal(18,6)) AS retention_5_td_2m_plus_4m
-
-    -- 6. Дельта НС + 2m + 4m / выходящие вклады
-    , CAST(
-        (
-            ISNULL(ns2.ns_end_sum, 0) - ISNULL(ns1.ns_start_sum, 0)
-            + ISNULL(o.opened_2m, 0)
-            + ISNULL(o.opened_4m, 0)
-        )
-        / NULLIF(ISNULL(e.exit_td_sum, 0), 0)
-      AS decimal(18,6)) AS retention_6_td_2m_plus_4m_plus_ns
+        ISNULL(o.opened_4m, 0)
+        / NULLIF(ISNULL(c.ns_start_sum, 0), 0)
+      AS decimal(18,6)) AS ns_to_opened_4m_ratio
 
 INTO #client_mart
 FROM #client_scope c
@@ -311,10 +339,12 @@ LEFT JOIN client_flags f
     ON c.cli_id = f.cli_id
 LEFT JOIN exit_sum e
     ON c.cli_id = e.cli_id
-LEFT JOIN ns_start ns1
-    ON c.cli_id = ns1.cli_id
 LEFT JOIN ns_end ns2
     ON c.cli_id = ns2.cli_id
+LEFT JOIN td_start td1
+    ON c.cli_id = td1.cli_id
+LEFT JOIN td_end td2
+    ON c.cli_id = td2.cli_id
 LEFT JOIN opened_agg o
     ON c.cli_id = o.cli_id;
 
@@ -323,22 +353,34 @@ SELECT
       cli_id
     , segment_flag
     , exit_amount_flag
-    , exit_td_sum
+
     , ns_start_sum
+    , ns_end_sum
+    , ns_delta
+    , ns_decrease_flag
+    , ns_increase_flag
+
+    , td_start_sum
+    , td_end_sum
+    , td_delta
+
+    , exit_td_sum
+    , had_exit_td_flag
+
     , opened_2m
     , opened_4m
     , opened_other
     , opened_total
-    , ns_end_sum
-    , ns_delta
-    , retention_1_td_all
-    , retention_2_td_all_plus_ns
-    , retention_3_td_2m
-    , retention_4_td_2m_plus_ns
-    , retention_5_td_2m_plus_4m
-    , retention_6_td_2m_plus_4m_plus_ns
+    , had_opened_td_flag
+
+    , estimated_ns_to_td_sum
+    , ns_to_opened_total_ratio
+    , ns_to_opened_2m_ratio
+    , ns_to_opened_4m_ratio
 FROM #client_mart
 ORDER BY
       segment_flag
-    , exit_amount_flag
+    , ns_decrease_flag DESC
+    , opened_total DESC
+    , ns_delta ASC
     , cli_id;
