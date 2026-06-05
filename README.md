@@ -15,6 +15,9 @@ DECLARE @eps decimal(18,6) = 0.000005;
 IF OBJECT_ID('tempdb..#bal_base') IS NOT NULL DROP TABLE #bal_base;
 IF OBJECT_ID('tempdb..#bal_end') IS NOT NULL DROP TABLE #bal_end;
 IF OBJECT_ID('tempdb..#client_scope') IS NOT NULL DROP TABLE #client_scope;
+IF OBJECT_ID('tempdb..#opened_by_con') IS NOT NULL DROP TABLE #opened_by_con;
+IF OBJECT_ID('tempdb..#opened_classified') IS NOT NULL DROP TABLE #opened_classified;
+IF OBJECT_ID('tempdb..#opened_agg') IS NOT NULL DROP TABLE #opened_agg;
 IF OBJECT_ID('tempdb..#client_mart') IS NOT NULL DROP TABLE #client_mart;
 
 
@@ -74,8 +77,7 @@ WHERE
     AND t.out_rub >= 0;
 
 
--- Клиенты, у которых на первую дату был НС,
--- но НЕ было срочных вкладов к выходу в заданном окне
+-- Клиенты: был НС на первую дату и НЕ было вкладов к выходу в окне
 SELECT DISTINCT
     ns.cli_id
 INTO #client_scope
@@ -91,6 +93,102 @@ WHERE
             AND td.dt_close_plan >= @ExitFrom
             AND td.dt_close_plan <= @ExitTo
     );
+
+
+-- Открытые вклады по договорам
+SELECT
+      b.cli_id
+    , b.con_id
+    , SUM(b.out_rub) AS out_rub
+    , MIN(b.rate_con) AS rate_con
+    , MIN(b.termdays) AS termdays
+    , MIN(b.conv_norm) AS conv_norm
+INTO #opened_by_con
+FROM #bal_end b
+INNER JOIN #client_scope c
+    ON b.cli_id = c.cli_id
+WHERE
+    b.section_name = N'Срочные'
+    AND b.dt_open >= @OpenFrom
+    AND b.dt_open <= @OpenTo
+GROUP BY
+      b.cli_id
+    , b.con_id;
+
+
+-- Классификация открытых вкладов
+SELECT
+      o.cli_id
+    , o.con_id
+    , o.out_rub
+    , CASE
+        /* 45-79 дней */
+        WHEN o.termdays BETWEEN 45 AND 79
+         AND o.conv_norm = 'AT_THE_END'
+         AND o.out_rub >= 1500000
+         AND ABS(o.rate_con - 0.1450) <= @eps
+        THEN N'2m'
+
+        WHEN o.termdays BETWEEN 45 AND 79
+         AND o.conv_norm = 'AT_THE_END'
+         AND o.out_rub < 1500000
+         AND ABS(o.rate_con - 0.1430) <= @eps
+        THEN N'2m'
+
+        WHEN o.termdays BETWEEN 45 AND 79
+         AND o.conv_norm <> 'AT_THE_END'
+         AND o.out_rub < 1500000
+         AND ABS(o.rate_con - 0.1410) <= @eps
+        THEN N'2m'
+
+        WHEN o.termdays BETWEEN 45 AND 79
+         AND o.conv_norm <> 'AT_THE_END'
+         AND o.out_rub >= 1500000
+         AND ABS(o.rate_con - 0.1430) <= @eps
+        THEN N'2m'
+
+        /* 120-150 дней */
+        WHEN o.termdays BETWEEN 120 AND 150
+         AND o.conv_norm = 'AT_THE_END'
+         AND o.out_rub >= 1500000
+         AND ABS(o.rate_con - 0.1400) <= @eps
+        THEN N'4m'
+
+        WHEN o.termdays BETWEEN 120 AND 150
+         AND o.conv_norm = 'AT_THE_END'
+         AND o.out_rub < 1500000
+         AND ABS(o.rate_con - 0.1390) <= @eps
+        THEN N'4m'
+
+        WHEN o.termdays BETWEEN 120 AND 150
+         AND o.conv_norm <> 'AT_THE_END'
+         AND o.out_rub < 1500000
+         AND ABS(o.rate_con - 0.1370) <= @eps
+        THEN N'4m'
+
+        WHEN o.termdays BETWEEN 120 AND 150
+         AND o.conv_norm <> 'AT_THE_END'
+         AND o.out_rub >= 1500000
+         AND ABS(o.rate_con - 0.1380) <= @eps
+        THEN N'4m'
+
+        ELSE N'other'
+      END AS open_category
+INTO #opened_classified
+FROM #opened_by_con o;
+
+
+-- Агрегация открытых вкладов по клиенту
+SELECT
+      cli_id
+    , SUM(CASE WHEN open_category = N'2m'    THEN out_rub ELSE 0 END) AS opened_2m
+    , SUM(CASE WHEN open_category = N'4m'    THEN out_rub ELSE 0 END) AS opened_4m
+    , SUM(CASE WHEN open_category = N'other' THEN out_rub ELSE 0 END) AS opened_other
+    , SUM(out_rub) AS opened_total
+INTO #opened_agg
+FROM #opened_classified
+GROUP BY
+    cli_id;
 
 
 WITH client_flags AS (
@@ -143,102 +241,6 @@ ns_end AS (
         section_name = N'Накопительный счёт'
     GROUP BY
         cli_id
-),
-
-opened_by_con AS (
-    SELECT
-          b.cli_id
-        , b.con_id
-        , SUM(b.out_rub) AS out_rub
-        , MIN(b.rate_con) AS rate_con
-        , MIN(b.termdays) AS termdays
-        , CASE
-              WHEN MIN(NULLIF(LTRIM(RTRIM(COALESCE(b.conv_norm, ''))), '')) IS NULL THEN 'AT_THE_END'
-              ELSE MIN(b.conv_norm)
-          END AS conv_norm
-    FROM #bal_end b
-    INNER JOIN #client_scope c
-        ON b.cli_id = c.cli_id
-    WHERE
-        b.section_name = N'Срочные'
-        AND b.dt_open >= @OpenFrom
-        AND b.dt_open <= @OpenTo
-    GROUP BY
-          b.cli_id
-        , b.con_id
-),
-
-opened_classified AS (
-    SELECT
-          o.cli_id
-        , o.con_id
-        , o.out_rub
-        , CASE
-            /* 45-79 дней */
-            WHEN o.termdays BETWEEN 45 AND 79
-             AND o.conv_norm = 'AT_THE_END'
-             AND o.out_rub >= 1500000
-             AND ABS(o.rate_con - 0.1450) <= @eps
-            THEN N'2m'
-
-            WHEN o.termdays BETWEEN 45 AND 79
-             AND o.conv_norm = 'AT_THE_END'
-             AND o.out_rub < 1500000
-             AND ABS(o.rate_con - 0.1430) <= @eps
-            THEN N'2m'
-
-            WHEN o.termdays BETWEEN 45 AND 79
-             AND o.conv_norm <> 'AT_THE_END'
-             AND o.out_rub < 1500000
-             AND ABS(o.rate_con - 0.1410) <= @eps
-            THEN N'2m'
-
-            WHEN o.termdays BETWEEN 45 AND 79
-             AND o.conv_norm <> 'AT_THE_END'
-             AND o.out_rub >= 1500000
-             AND ABS(o.rate_con - 0.1430) <= @eps
-            THEN N'2m'
-
-            /* 120-150 дней */
-            WHEN o.termdays BETWEEN 120 AND 150
-             AND o.conv_norm = 'AT_THE_END'
-             AND o.out_rub >= 1500000
-             AND ABS(o.rate_con - 0.1400) <= @eps
-            THEN N'4m'
-
-            WHEN o.termdays BETWEEN 120 AND 150
-             AND o.conv_norm = 'AT_THE_END'
-             AND o.out_rub < 1500000
-             AND ABS(o.rate_con - 0.1390) <= @eps
-            THEN N'4m'
-
-            WHEN o.termdays BETWEEN 120 AND 150
-             AND o.conv_norm <> 'AT_THE_END'
-             AND o.out_rub < 1500000
-             AND ABS(o.rate_con - 0.1370) <= @eps
-            THEN N'4m'
-
-            WHEN o.termdays BETWEEN 120 AND 150
-             AND o.conv_norm <> 'AT_THE_END'
-             AND o.out_rub >= 1500000
-             AND ABS(o.rate_con - 0.1380) <= @eps
-            THEN N'4m'
-
-            ELSE N'other'
-          END AS open_category
-    FROM opened_by_con o
-),
-
-opened_agg AS (
-    SELECT
-          cli_id
-        , SUM(CASE WHEN open_category = N'2m'    THEN out_rub ELSE 0 END) AS opened_2m
-        , SUM(CASE WHEN open_category = N'4m'    THEN out_rub ELSE 0 END) AS opened_4m
-        , SUM(CASE WHEN open_category = N'other' THEN out_rub ELSE 0 END) AS opened_other
-        , SUM(out_rub) AS opened_total
-    FROM opened_classified
-    GROUP BY
-        cli_id
 )
 
 SELECT
@@ -255,7 +257,6 @@ SELECT
 
     , ISNULL(ns1.ns_start_sum,0) AS ns_start_sum
 
-    -- открытые вклады, разбитые на 3 категории
     , ISNULL(o.opened_2m,0) AS opened_2m
     , ISNULL(o.opened_4m,0) AS opened_4m
     , ISNULL(o.opened_other,0) AS opened_other
@@ -328,7 +329,7 @@ LEFT JOIN ns_start ns1
     ON c.cli_id = ns1.cli_id
 LEFT JOIN ns_end ns2
     ON c.cli_id = ns2.cli_id
-LEFT JOIN opened_agg o
+LEFT JOIN #opened_agg o
     ON c.cli_id = o.cli_id;
 
 
