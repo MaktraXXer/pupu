@@ -7,16 +7,13 @@ WITH calendar AS (
     FROM ALM.info.VW_calendar WITH (NOLOCK)
     WHERE [Date] BETWEEN @DT_FROM AND @DT_TO
 ),
-
 together AS (
     SELECT
         'НС' AS section_name,
         CAST(dt_rep AS date) AS dt_rep,
         data_scope,
         out_rub_total,
-        rate_con,
-        CAST(0 AS int) AS has_matur,
-        CAST(NULL AS decimal(18, 6)) AS matur
+        rate_con
     FROM ALM_TEST.mail.balance_metrics_savings WITH (NOLOCK)
 
     UNION ALL
@@ -34,12 +31,9 @@ together AS (
                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                 )
             ELSE rate_con
-        END AS rate_con,
-        CAST(0 AS int) AS has_matur,
-        CAST(NULL AS decimal(18, 6)) AS matur
+        END AS rate_con
     FROM ALM_TEST.mail.balance_metrics_dvs WITH (NOLOCK)
 ),
-
 DVS_FL AS (
     SELECT
         t.section_name,
@@ -48,30 +42,25 @@ DVS_FL AS (
         t.out_rub_total,
         t.rate_con + 0.0048 AS rate_con,
         kr.KEY_RATE,
-        t.rate_con + 0.0048 - kr.KEY_RATE AS spread_keyrate,
-        t.has_matur,
-        t.matur
+        t.rate_con + 0.0048 - kr.KEY_RATE AS spread_keyrate
     FROM together t
     LEFT JOIN ALM_TEST.WORK.ForecastKey_Cache kr WITH (NOLOCK)
         ON t.dt_rep = kr.dt_rep
        AND kr.term = 1
     WHERE t.dt_rep >= @DT_FROM
 ),
-
 v_fl_fix AS (
-    /* портфель фиксированных вкладов ФЛ:
-       оставляем старую готовую строку all termgroup,
-       matur не выводим */
     SELECT
         'вклады ФЛ с фикс ставкой' AS section_name,
         CAST(t.[Date] AS date) AS dt_rep,
-        'портфель' AS data_scope,
+        CASE
+            WHEN t.[Тип отчета] = 'Новые день ко дню' THEN 'новые'
+            WHEN t.[Тип отчета] = 'Срез' THEN 'портфель'
+        END AS data_scope,
         t.balance_rub AS out_rub_total,
         t.[MonthlyCONV_RATE_SSV] AS rate_con,
         t.[MonthlyCONV_ForecastKeyRate] AS KEY_RATE,
-        t.[Spread_KeyRate] AS spread_keyrate,
-        CAST(1 AS int) AS has_matur,
-        CAST(NULL AS decimal(18, 6)) AS matur
+        t.[Spread_KeyRate] AS spread_keyrate
     FROM [ALM_TEST].[WORK].[vGroupDepositInterestsRate_For_FL] t WITH (NOLOCK)
     WHERE t.[Date] >= @DT_FROM
       AND t.[Date] <= @DT_TO
@@ -81,59 +70,11 @@ v_fl_fix AS (
       AND t.[Тип маржи] = 'all margin'
       AND t.[Сегмент бизнеса] = 'all segment'
       AND t.[Тип клиента] = 'all client'
-      AND t.[Тип отчета] = 'Срез'
+      AND t.[Тип отчета] IN ('Срез', 'Новые день ко дню')
       AND t.[Спред к КС бакеты] = 'all spread bucket'
-
-    UNION ALL
-
-    /* новые фиксированные вклады ФЛ:
-       берем строки по срочным бакетам,
-       rate_con / KEY_RATE / spread_keyrate считаем с весом balance_rub * MATUR,
-       matur считаем с весом balance_rub */
-    SELECT
-        'вклады ФЛ с фикс ставкой' AS section_name,
-        CAST(t.[Date] AS date) AS dt_rep,
-        'новые' AS data_scope,
-
-        SUM(t.balance_rub) AS out_rub_total,
-
-        SUM(t.[MonthlyCONV_RATE_SSV] * t.balance_rub * t.[MATUR])
-            / NULLIF(SUM(t.balance_rub * t.[MATUR]), 0) AS rate_con,
-
-        SUM(t.[MonthlyCONV_ForecastKeyRate] * t.balance_rub * t.[MATUR])
-            / NULLIF(SUM(t.balance_rub * t.[MATUR]), 0) AS KEY_RATE,
-
-        SUM(t.[Spread_KeyRate] * t.balance_rub * t.[MATUR])
-            / NULLIF(SUM(t.balance_rub * t.[MATUR]), 0) AS spread_keyrate,
-
-        CAST(1 AS int) AS has_matur,
-
-        SUM(t.[MATUR] * t.balance_rub)
-            / NULLIF(SUM(t.balance_rub), 0) AS matur
-
-    FROM [ALM_TEST].[WORK].[vGroupDepositInterestsRate_For_FL] t WITH (NOLOCK)
-    WHERE t.[Date] >= @DT_FROM
-      AND t.[Date] <= @DT_TO
-      AND t.[Признак опциональности для ФЛ] = 'all option_type'
-      AND t.[Сегмент ФЛ] = 'all segment'
-      AND t.[Срочн. бакеты] <> 'all termgroup'
-      AND t.[Тип маржи] = 'all margin'
-      AND t.[Сегмент бизнеса] = 'all segment'
-      AND t.[Тип клиента] = 'all client'
-      AND t.[Тип отчета] = 'Новые день ко дню'
-      AND t.[Спред к КС бакеты] = 'all spread bucket'
-      AND t.balance_rub IS NOT NULL
-      AND t.balance_rub <> 0
-      AND t.[MATUR] IS NOT NULL
-      AND t.[MATUR] <> 0
-    GROUP BY
-        CAST(t.[Date] AS date)
 ),
-
 v_fl_float AS (
-    /* портфель плавающих вкладов ФЛ:
-       оставляем как было,
-       matur не выводим */
+    -- портфель плавающих вкладов ФЛ
     SELECT
         'вклады ФЛ с плав ставкой' AS section_name,
         CAST(cal.[Date] AS date) AS dt_rep,
@@ -156,10 +97,7 @@ v_fl_float AS (
                 fl.[correction] / 100.0
                 + ssv.[rate]
             ) * ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])
-        ) / NULLIF(SUM(ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])), 0) AS spread_keyrate,
-
-        CAST(1 AS int) AS has_matur,
-        CAST(NULL AS decimal(18, 6)) AS matur
+        ) / NULLIF(SUM(ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])), 0) AS spread_keyrate
 
     FROM [LIQUIDITY].[liq].[VW_FloatContracts] fl WITH (NOLOCK)
 
@@ -193,11 +131,7 @@ v_fl_float AS (
     UNION ALL
 
 
-    /* новые плавающие вклады ФЛ:
-       дата = дата открытия,
-       matur = DATEDIFF(day, dep.DT_OPEN, dep.DT_CLOSE_PLAN),
-       rate_con / KEY_RATE / spread_keyrate считаем с весом balance * matur,
-       matur считаем с весом balance */
+    -- новые плавающие вклады ФЛ
     SELECT
         'вклады ФЛ с плав ставкой' AS section_name,
         CAST(cal.[Date] AS date) AS dt_rep,
@@ -210,54 +144,17 @@ v_fl_float AS (
                 kr.[KEY_RATE]
                 + fl.[correction] / 100.0
                 + ssv.[rate]
-            )
-            * ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])
-            * DATEDIFF(day, dep.[DT_OPEN], dep.[DT_CLOSE_PLAN])
-        )
-        / NULLIF(
-            SUM(
-                ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])
-                * DATEDIFF(day, dep.[DT_OPEN], dep.[DT_CLOSE_PLAN])
-            ),
-            0
-        ) AS rate_con,
+            ) * ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])
+        ) / NULLIF(SUM(ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])), 0) AS rate_con,
 
-        SUM(
-            kr.[KEY_RATE]
-            * ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])
-            * DATEDIFF(day, dep.[DT_OPEN], dep.[DT_CLOSE_PLAN])
-        )
-        / NULLIF(
-            SUM(
-                ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])
-                * DATEDIFF(day, dep.[DT_OPEN], dep.[DT_CLOSE_PLAN])
-            ),
-            0
-        ) AS KEY_RATE,
+        kr.[KEY_RATE] AS KEY_RATE,
 
         SUM(
             (
                 fl.[correction] / 100.0
                 + ssv.[rate]
-            )
-            * ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])
-            * DATEDIFF(day, dep.[DT_OPEN], dep.[DT_CLOSE_PLAN])
-        )
-        / NULLIF(
-            SUM(
-                ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])
-                * DATEDIFF(day, dep.[DT_OPEN], dep.[DT_CLOSE_PLAN])
-            ),
-            0
-        ) AS spread_keyrate,
-
-        CAST(1 AS int) AS has_matur,
-
-        SUM(
-            DATEDIFF(day, dep.[DT_OPEN], dep.[DT_CLOSE_PLAN])
-            * ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])
-        )
-        / NULLIF(SUM(ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])), 0) AS matur
+            ) * ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])
+        ) / NULLIF(SUM(ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])), 0) AS spread_keyrate
 
     FROM [LIQUIDITY].[liq].[VW_FloatContracts] fl WITH (NOLOCK)
 
@@ -281,11 +178,10 @@ v_fl_float AS (
 
     WHERE LOWER(fl.[comment]) LIKE '%фл%'
       AND kr.[KEY_RATE] IS NOT NULL
-      AND dep.[DT_CLOSE_PLAN] IS NOT NULL
-      AND DATEDIFF(day, dep.[DT_OPEN], dep.[DT_CLOSE_PLAN]) <> 0
 
     GROUP BY
-        CAST(cal.[Date] AS date)
+        CAST(cal.[Date] AS date),
+        kr.[KEY_RATE]
 )
 
 SELECT
@@ -295,9 +191,7 @@ SELECT
     out_rub_total,
     rate_con,
     KEY_RATE,
-    spread_keyrate,
-    has_matur,
-    matur
+    spread_keyrate
 FROM DVS_FL
 
 UNION ALL
@@ -309,9 +203,7 @@ SELECT
     out_rub_total,
     rate_con,
     KEY_RATE,
-    spread_keyrate,
-    has_matur,
-    matur
+    spread_keyrate
 FROM v_fl_fix
 
 UNION ALL
@@ -323,9 +215,7 @@ SELECT
     out_rub_total,
     rate_con,
     KEY_RATE,
-    spread_keyrate,
-    has_matur,
-    matur
+    spread_keyrate
 FROM v_fl_float
 
 ORDER BY
