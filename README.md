@@ -167,9 +167,6 @@ order by
     end,
     b.bucket_num;
 
-
-
-
     merge into s_curve_params_gos t
 using (
     select 0 as period, 0.08402 as b0, 0.00000 as b1, -2.00237 as b2, 2.19674 as b3, 0.04009 as b4, 1.98494 as b5, 0.33410 as b6 from dual union all
