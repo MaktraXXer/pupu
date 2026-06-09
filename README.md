@@ -166,3 +166,29 @@ order by
         else 1
     end,
     b.bucket_num;
+
+
+
+
+    merge into s_curve_params_gos t
+using (
+    select 0 as period, 0.08402 as b0, 0.00000 as b1, -2.00237 as b2, 2.19674 as b3, 0.04009 as b4, 1.98494 as b5, 0.33410 as b6 from dual union all
+    select 1, 0.08326, 0.00000, -2.00055, 2.19876, 0.04037, 1.98747, 0.31523 from dual union all
+    select 2, 0.07412, 0.00000, -2.00105, 2.19859, 0.03930, 1.99837, 0.20856 from dual union all
+    select 3, 0.18951, 0.07962, -2.02408, 2.16378, 0.02453, 2.07600, 0.20028 from dual union all
+    select 4, 0.18700, 0.07796, -2.02406, 2.16305, 0.02459, 2.06755, 0.19974 from dual union all
+    select 5, 0.18382, 0.07592, -2.02406, 2.16301, 0.02460, 2.06708, 0.19951 from dual union all
+    select 6, 0.18131, 0.07427, -2.02406, 2.16300, 0.02465, 2.06698, 0.19956 from dual union all
+    select 7, 0.17855, 0.07245, -2.02500, 2.16218, 0.02472, 2.06276, 0.19931 from dual union all
+    select 8, 0.16114, 0.06627, -2.02510, 2.16252, 0.01978, 2.06579, 0.17735 from dual union all
+    select 9, 0.15854, 0.06457, -2.02508, 2.16223, 0.01983, 2.06163, 0.17708 from dual
+) s
+on (t.period = s.period)
+when matched then update set
+    t.b0 = s.b0,
+    t.b1 = s.b1,
+    t.b2 = s.b2,
+    t.b3 = s.b3,
+    t.b4 = s.b4,
+    t.b5 = s.b5,
+    t.b6 = s.b6;
