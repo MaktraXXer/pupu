@@ -1,405 +1,168 @@
-USE [ALM];
-SET NOCOUNT ON;
+/* ============================================================
+   CPR_fact и CPR_model по ВСЕМ гос программам вместе
+   в разрезе бакетов ставки + строка "ВСЕ БАКЕТЫ СТАВКИ"
 
-DECLARE @BaseDate date = '2026-05-30'; -- дата баланса было
-DECLARE @EndDate  date = '2026-06-03'; -- дата баланса стало
+   "ВСЕ БАКЕТЫ СТАВКИ" = агрегат по всем bucket_num внутри payment_period.
+   ============================================================ */
 
-DECLARE @ExitFrom date = '2026-05-30'; -- выходы с
-DECLARE @ExitTo   date = '2026-06-03'; -- выходы по включительно
+with
+enriched as (
+    select
+        cpr.payment_period,
+        cpr.od_after_plan,
+        cpr.od,
+        cpr.premat_payment,
+        cpr.con_rate,
+        cpr.refin_rate,
+        cpr.stimul,
+        cpr.age_group_id,
+        greatest(cpr.con_rate * 100, 0) as pct,
 
-DECLARE @OpenFrom date = '2026-05-30'; -- открытые с
-DECLARE @OpenTo   date = '2026-06-03'; -- открытые по включительно
+        case
+            -- 0.0% ... 8.5% с шагом 0.5 п.п.
+            when greatest(cpr.con_rate * 100, 0) < 8.75 then
+                floor((greatest(cpr.con_rate * 100, 0) + 0.25) / 0.5) + 1
 
-DECLARE @eps decimal(18,6) = 0.000005;
+            -- дополнительные бакеты вокруг 9-12%
+            when greatest(cpr.con_rate * 100, 0) < 9.25  then 19   -- 9.0%
+            when greatest(cpr.con_rate * 100, 0) < 9.75  then 20   -- 9.5%
+            when greatest(cpr.con_rate * 100, 0) < 10.25 then 21   -- 10.0%
+            when greatest(cpr.con_rate * 100, 0) < 10.75 then 22   -- 10.5%
+            when greatest(cpr.con_rate * 100, 0) < 11.25 then 23   -- 11.0%
+            when greatest(cpr.con_rate * 100, 0) < 11.75 then 24   -- 11.5%
+            when greatest(cpr.con_rate * 100, 0) < 12.25 then 25   -- 12.0%
 
-IF OBJECT_ID('tempdb..#bal_base') IS NOT NULL DROP TABLE #bal_base;
-IF OBJECT_ID('tempdb..#bal_end') IS NOT NULL DROP TABLE #bal_end;
-IF OBJECT_ID('tempdb..#client_scope') IS NOT NULL DROP TABLE #client_scope;
-IF OBJECT_ID('tempdb..#opened_by_con') IS NOT NULL DROP TABLE #opened_by_con;
-IF OBJECT_ID('tempdb..#opened_classified') IS NOT NULL DROP TABLE #opened_classified;
-IF OBJECT_ID('tempdb..#opened_agg') IS NOT NULL DROP TABLE #opened_agg;
-IF OBJECT_ID('tempdb..#client_mart') IS NOT NULL DROP TABLE #client_mart;
+            -- дальше укрупнённые бакеты
+            when greatest(cpr.con_rate * 100, 0) < 15 then 26
+            when greatest(cpr.con_rate * 100, 0) < 20 then 27
+            else 28
+        end as bucket_num
 
-
--- 1. Баланс на базовую дату
-SELECT
-      CAST(t.dt_rep AS date) AS dt_rep
-    , CAST(t.cli_id AS bigint) AS cli_id
-    , CAST(t.con_id AS bigint) AS con_id
-    , CAST(t.dt_open AS date) AS dt_open
-    , CAST(t.dt_close_plan AS date) AS dt_close_plan
-    , t.section_name
-    , CAST(t.out_rub AS decimal(38,6)) AS out_rub
-    , CAST(t.rate_con AS decimal(18,6)) AS rate_con
-    , CASE
-          WHEN NULLIF(LTRIM(RTRIM(COALESCE(t.conv, ''))), '') IS NULL THEN 'AT_THE_END'
-          ELSE UPPER(LTRIM(RTRIM(t.conv)))
-      END AS conv_norm
-    , t.termdays
-    , t.TSEGMENTNAME
-INTO #bal_base
-FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
-WHERE
-    t.dt_rep = @BaseDate
-    AND t.section_name IN (N'Срочные', N'Накопительный счёт')
-    AND t.block_name = N'Привлечение ФЛ'
-    AND t.acc_role   = N'LIAB'
-    AND t.od_flag    = 1
-    AND t.cur        = '810'
-    AND t.out_rub IS NOT NULL
-    AND t.out_rub >= 0;
-
-
--- 2. Баланс на конечную дату
-SELECT
-      CAST(t.dt_rep AS date) AS dt_rep
-    , CAST(t.cli_id AS bigint) AS cli_id
-    , CAST(t.con_id AS bigint) AS con_id
-    , CAST(t.dt_open AS date) AS dt_open
-    , CAST(t.dt_close_plan AS date) AS dt_close_plan
-    , t.section_name
-    , CAST(t.out_rub AS decimal(38,6)) AS out_rub
-    , CAST(t.rate_con AS decimal(18,6)) AS rate_con
-    , CASE
-          WHEN NULLIF(LTRIM(RTRIM(COALESCE(t.conv, ''))), '') IS NULL THEN 'AT_THE_END'
-          ELSE UPPER(LTRIM(RTRIM(t.conv)))
-      END AS conv_norm
-    , t.termdays
-    , t.TSEGMENTNAME
-INTO #bal_end
-FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
-WHERE
-    t.dt_rep = @EndDate
-    AND t.section_name IN (N'Срочные', N'Накопительный счёт')
-    AND t.block_name = N'Привлечение ФЛ'
-    AND t.acc_role   = N'LIAB'
-    AND t.od_flag    = 1
-    AND t.cur        = '810'
-    AND t.out_rub IS NOT NULL
-    AND t.out_rub >= 0;
-
-
--- 3. Клиенты для анализа:
--- был НС на первую дату
--- и НЕ было срочных вкладов к выходу в периоде
-SELECT
-      ns.cli_id
-    , SUM(ns.out_rub) AS ns_start_sum
-INTO #client_scope
-FROM #bal_base ns
-WHERE
-    ns.section_name = N'Накопительный счёт'
-    AND NOT EXISTS (
-        SELECT 1
-        FROM #bal_base td
-        WHERE
-            td.cli_id = ns.cli_id
-            AND td.section_name = N'Срочные'
-            AND td.dt_close_plan >= @ExitFrom
-            AND td.dt_close_plan <= @ExitTo
-    )
-GROUP BY
-    ns.cli_id;
-
-
--- 4. Открытые срочные вклады по договорам
-SELECT
-      b.cli_id
-    , b.con_id
-    , SUM(b.out_rub) AS out_rub
-    , MIN(b.rate_con) AS rate_con
-    , MIN(b.termdays) AS termdays
-    , MIN(b.conv_norm) AS conv_norm
-INTO #opened_by_con
-FROM #bal_end b
-INNER JOIN #client_scope c
-    ON b.cli_id = c.cli_id
-WHERE
-    b.section_name = N'Срочные'
-    AND b.dt_open >= @OpenFrom
-    AND b.dt_open <= @OpenTo
-GROUP BY
-      b.cli_id
-    , b.con_id;
-
-
--- 5. Классификация открытых вкладов: 2m / 4m / other
-SELECT
-      o.cli_id
-    , o.con_id
-    , o.out_rub
-    , CASE
-        /* 45-79 дней */
-        WHEN o.termdays BETWEEN 45 AND 79
-         AND o.conv_norm = 'AT_THE_END'
-         AND o.out_rub >= 1500000
-         AND ABS(o.rate_con - 0.1450) <= @eps
-        THEN N'2m'
-
-        WHEN o.termdays BETWEEN 45 AND 79
-         AND o.conv_norm = 'AT_THE_END'
-         AND o.out_rub < 1500000
-         AND ABS(o.rate_con - 0.1430) <= @eps
-        THEN N'2m'
-
-        WHEN o.termdays BETWEEN 45 AND 79
-         AND o.conv_norm <> 'AT_THE_END'
-         AND o.out_rub < 1500000
-         AND ABS(o.rate_con - 0.1410) <= @eps
-        THEN N'2m'
-
-        WHEN o.termdays BETWEEN 45 AND 79
-         AND o.conv_norm <> 'AT_THE_END'
-         AND o.out_rub >= 1500000
-         AND ABS(o.rate_con - 0.1430) <= @eps
-        THEN N'2m'
-
-        /* 120-150 дней */
-        WHEN o.termdays BETWEEN 120 AND 150
-         AND o.conv_norm = 'AT_THE_END'
-         AND o.out_rub >= 1500000
-         AND ABS(o.rate_con - 0.1400) <= @eps
-        THEN N'4m'
-
-        WHEN o.termdays BETWEEN 120 AND 150
-         AND o.conv_norm = 'AT_THE_END'
-         AND o.out_rub < 1500000
-         AND ABS(o.rate_con - 0.1390) <= @eps
-        THEN N'4m'
-
-        WHEN o.termdays BETWEEN 120 AND 150
-         AND o.conv_norm <> 'AT_THE_END'
-         AND o.out_rub < 1500000
-         AND ABS(o.rate_con - 0.1370) <= @eps
-        THEN N'4m'
-
-        WHEN o.termdays BETWEEN 120 AND 150
-         AND o.conv_norm <> 'AT_THE_END'
-         AND o.out_rub >= 1500000
-         AND ABS(o.rate_con - 0.1380) <= @eps
-        THEN N'4m'
-
-        ELSE N'other'
-      END AS open_category
-INTO #opened_classified
-FROM #opened_by_con o;
-
-
--- 6. Агрегация открытых вкладов по клиенту
-SELECT
-      cli_id
-    , SUM(CASE WHEN open_category = N'2m'    THEN out_rub ELSE 0 END) AS opened_2m
-    , SUM(CASE WHEN open_category = N'4m'    THEN out_rub ELSE 0 END) AS opened_4m
-    , SUM(CASE WHEN open_category = N'other' THEN out_rub ELSE 0 END) AS opened_other
-    , SUM(out_rub) AS opened_total
-INTO #opened_agg
-FROM #opened_classified
-GROUP BY
-    cli_id;
-
-
-WITH client_flags AS (
-    SELECT
-          c.cli_id
-        , CASE
-              WHEN EXISTS (
-                  SELECT 1
-                  FROM #bal_base b
-                  WHERE b.cli_id = c.cli_id
-                    AND b.section_name IN (N'Срочные', N'Накопительный счёт')
-                    AND b.TSEGMENTNAME = N'ДЧБО'
-              )
-              THEN N'ДЧБО'
-              ELSE N'Розница'
-          END AS client_segment
-    FROM #client_scope c
+    from cpr_report_new cpr
+    where 1 = 1
+      and cpr.payment_period between date'2024-01-01' and date'2026-05-31'
+      and cpr.agg_prod_name in (
+            'Семейная ипотека',
+            'ИТ ипотека',
+            'Дальневосточная ипотека',
+            'Льготная ипотека'
+      )
+      and cpr.stimul is not null
+      and cpr.refin_rate > 0
+      and cpr.con_rate > 0
 ),
 
--- контрольная сумма вкладов к выходу
--- по логике отбора должна быть 0, но оставляем поле для проверки
-exit_sum AS (
-    SELECT
-          b.cli_id
-        , SUM(b.out_rub) AS exit_td_sum
-    FROM #bal_base b
-    INNER JOIN #client_scope c
-        ON c.cli_id = b.cli_id
-    WHERE
-        b.section_name = N'Срочные'
-        AND b.dt_close_plan >= @ExitFrom
-        AND b.dt_close_plan <= @ExitTo
-    GROUP BY
-        b.cli_id
+bucket_names as (
+    select 1 as bucket_num,  'A. 0% (0.0-0.25%)'      as bucket_name from dual union all
+    select 2,  'B. 0.5% (0.25-0.75%)'  from dual union all
+    select 3,  'C. 1.0% (0.75-1.25%)'  from dual union all
+    select 4,  'D. 1.5% (1.25-1.75%)'  from dual union all
+    select 5,  'E. 2.0% (1.75-2.25%)'  from dual union all
+    select 6,  'F. 2.5% (2.25-2.75%)'  from dual union all
+    select 7,  'G. 3.0% (2.75-3.25%)'  from dual union all
+    select 8,  'H. 3.5% (3.25-3.75%)'  from dual union all
+    select 9,  'I. 4.0% (3.75-4.25%)'  from dual union all
+    select 10, 'J. 4.5% (4.25-4.75%)'  from dual union all
+    select 11, 'K. 5.0% (4.75-5.25%)'  from dual union all
+    select 12, 'L. 5.5% (5.25-5.75%)'  from dual union all
+    select 13, 'M. 6.0% (5.75-6.25%)'  from dual union all
+    select 14, 'N. 6.5% (6.25-6.75%)'  from dual union all
+    select 15, 'O. 7.0% (6.75-7.25%)'  from dual union all
+    select 16, 'P. 7.5% (7.25-7.75%)'  from dual union all
+    select 17, 'Q. 8.0% (7.75-8.25%)'  from dual union all
+    select 18, 'R. 8.5% (8.25-8.75%)'  from dual union all
+
+    select 19, 'S. 9.0% (8.75-9.25%)'   from dual union all
+    select 20, 'T. 9.5% (9.25-9.75%)'   from dual union all
+    select 21, 'U. 10.0% (9.75-10.25%)' from dual union all
+    select 22, 'V. 10.5% (10.25-10.75%)' from dual union all
+    select 23, 'W. 11.0% (10.75-11.25%)' from dual union all
+    select 24, 'X. 11.5% (11.25-11.75%)' from dual union all
+    select 25, 'Y. 12.0% (11.75-12.25%)' from dual union all
+
+    select 26, 'Z. 12.25-15.0%' from dual union all
+    select 27, 'AA. 15.0-20.0%' from dual union all
+    select 28, 'AB. 20.0%+' from dual
 ),
 
--- новый флаг: есть ли у клиента другие рублевые срочные вклады на дату начала,
--- которые НЕ являются вкладами к выходу в заданном диапазоне
-other_td_flag AS (
-    SELECT
-          c.cli_id
-        , CASE
-              WHEN EXISTS (
-                  SELECT 1
-                  FROM #bal_base b
-                  WHERE b.cli_id = c.cli_id
-                    AND b.section_name = N'Срочные'
-                    AND NOT (
-                            b.dt_close_plan >= @ExitFrom
-                        AND b.dt_close_plan <= @ExitTo
-                    )
-              )
-              THEN 1
-              ELSE 0
-          END AS has_other_rub_td_flag
-    FROM #client_scope c
-),
-
-ns_end AS (
-    SELECT
-          e.cli_id
-        , SUM(e.out_rub) AS ns_end_sum
-    FROM #bal_end e
-    INNER JOIN #client_scope c
-        ON c.cli_id = e.cli_id
-    WHERE
-        e.section_name = N'Накопительный счёт'
-    GROUP BY
-        e.cli_id
+base_with_model as (
+    select
+        e.payment_period,
+        e.bucket_num,
+        e.od_after_plan,
+        e.od,
+        e.premat_payment,
+        round(
+            e.od_after_plan
+            * (
+                1 - power(
+                    1 - (
+                        s.b0
+                        + s.b1 * atan(s.b2 + s.b3 * e.stimul)
+                        + s.b4 * atan(s.b5 + s.b6 * e.stimul)
+                    ),
+                    1 / 12
+                )
+            ),
+            2
+        ) as premat_model
+    from enriched e
+    left join s_curve_params_gos s
+           on e.age_group_id = s.period
 )
 
-SELECT
-      c.cli_id
-    , f.client_segment AS segment_flag
+select
+    b.payment_period as dt_rep,
 
-    -- категория по объёму НС на первую дату
-    , CASE
-          WHEN ISNULL(c.ns_start_sum, 0) < 1500000 THEN N'01. НС < 1.5 млн'
-          WHEN ISNULL(c.ns_start_sum, 0) < 5000000 THEN N'02. НС 1.5-5 млн'
-          ELSE N'03. НС >= 5 млн'
-      END AS ns_amount_flag
+    case
+        when grouping(b.bucket_num) = 1 then 'ВСЕ БАКЕТЫ СТАВКИ'
+        else bn.bucket_name
+    end as bucket_name,
 
-    -- контроль: вкладов к выходу быть не должно
-    , ISNULL(e.exit_td_sum, 0) AS exit_td_sum
+    sum(b.od_after_plan) as od_after_plan,
+    sum(b.od) as od,
+    sum(b.premat_payment) as premat_fact,
+    sum(b.premat_model) as premat_model,
 
-    -- 0 = нет других рублевых срочных вкладов на @BaseDate
-    -- 1 = есть хотя бы один срочный рублевый вклад на @BaseDate,
-    --     который НЕ попал в диапазон выходов @ExitFrom-@ExitTo
-    , ISNULL(ot.has_other_rub_td_flag, 0) AS has_other_rub_td_flag
-
-    -- НС
-    , ISNULL(c.ns_start_sum, 0) AS ns_start_sum
-    , ISNULL(ns2.ns_end_sum, 0) AS ns_end_sum
-    , ISNULL(ns2.ns_end_sum, 0) - ISNULL(c.ns_start_sum, 0) AS ns_delta
-
-    , CASE
-          WHEN ISNULL(ns2.ns_end_sum, 0) < ISNULL(c.ns_start_sum, 0) THEN 1
-          ELSE 0
-      END AS ns_decrease_flag
-
-    -- открытые вклады, разбитые на 3 категории
-    , ISNULL(o.opened_2m, 0) AS opened_2m
-    , ISNULL(o.opened_4m, 0) AS opened_4m
-    , ISNULL(o.opened_other, 0) AS opened_other
-    , ISNULL(o.opened_total, 0) AS opened_total
-
-    -- 1. Все открытые вклады / НС на первую дату
-    , CAST(
-        ISNULL(o.opened_total, 0)
-        / NULLIF(ISNULL(c.ns_start_sum, 0), 0)
-      AS decimal(18,6)) AS retention_1_ns_all
-
-    -- 2. Дельта НС + все открытые вклады / НС на первую дату
-    , CAST(
-        (
-            ISNULL(ns2.ns_end_sum, 0) - ISNULL(c.ns_start_sum, 0)
-            + ISNULL(o.opened_total, 0)
+    case
+        when sum(b.od_after_plan) <= 0 then 0
+        else round(
+            100 * (
+                1 - power(
+                    1 - sum(b.premat_payment) / sum(b.od_after_plan),
+                    12
+                )
+            ),
+            2
         )
-        / NULLIF(ISNULL(c.ns_start_sum, 0), 0)
-      AS decimal(18,6)) AS retention_2_ns_all_plus_ns
+    end as cpr_fact,
 
-    -- 3. Только 2m / НС на первую дату
-    , CAST(
-        ISNULL(o.opened_2m, 0)
-        / NULLIF(ISNULL(c.ns_start_sum, 0), 0)
-      AS decimal(18,6)) AS retention_3_ns_2m
-
-    -- 4. Дельта НС + 2m / НС на первую дату
-    , CAST(
-        (
-            ISNULL(ns2.ns_end_sum, 0) - ISNULL(c.ns_start_sum, 0)
-            + ISNULL(o.opened_2m, 0)
+    case
+        when sum(b.od_after_plan) <= 0 then 0
+        else round(
+            100 * (
+                1 - power(
+                    1 - sum(b.premat_model) / sum(b.od_after_plan),
+                    12
+                )
+            ),
+            2
         )
-        / NULLIF(ISNULL(c.ns_start_sum, 0), 0)
-      AS decimal(18,6)) AS retention_4_ns_2m_plus_ns
+    end as cpr_model
 
-    -- 5. 2m + 4m / НС на первую дату
-    , CAST(
-        (
-            ISNULL(o.opened_2m, 0)
-            + ISNULL(o.opened_4m, 0)
-        )
-        / NULLIF(ISNULL(c.ns_start_sum, 0), 0)
-      AS decimal(18,6)) AS retention_5_ns_2m_plus_4m
+from base_with_model b
+left join bucket_names bn
+       on b.bucket_num = bn.bucket_num
 
-    -- 6. Дельта НС + 2m + 4m / НС на первую дату
-    , CAST(
-        (
-            ISNULL(ns2.ns_end_sum, 0) - ISNULL(c.ns_start_sum, 0)
-            + ISNULL(o.opened_2m, 0)
-            + ISNULL(o.opened_4m, 0)
-        )
-        / NULLIF(ISNULL(c.ns_start_sum, 0), 0)
-      AS decimal(18,6)) AS retention_6_ns_2m_plus_4m_plus_ns
+group by grouping sets (
+    (b.payment_period, b.bucket_num, bn.bucket_name),
+    (b.payment_period)
+)
 
-INTO #client_mart
-FROM #client_scope c
-LEFT JOIN client_flags f
-    ON c.cli_id = f.cli_id
-LEFT JOIN exit_sum e
-    ON c.cli_id = e.cli_id
-LEFT JOIN other_td_flag ot
-    ON c.cli_id = ot.cli_id
-LEFT JOIN ns_end ns2
-    ON c.cli_id = ns2.cli_id
-LEFT JOIN #opened_agg o
-    ON c.cli_id = o.cli_id;
-
-
-SELECT
-      cli_id
-    , segment_flag
-    , ns_amount_flag
-    , exit_td_sum
-    , has_other_rub_td_flag
-
-    , ns_start_sum
-    , ns_end_sum
-    , ns_delta
-    , ns_decrease_flag
-
-    , opened_2m
-    , opened_4m
-    , opened_other
-    , opened_total
-
-    , retention_1_ns_all
-    , retention_2_ns_all_plus_ns
-    , retention_3_ns_2m
-    , retention_4_ns_2m_plus_ns
-    , retention_5_ns_2m_plus_4m
-    , retention_6_ns_2m_plus_4m_plus_ns
-FROM #client_mart
-ORDER BY
-      segment_flag
-    , ns_amount_flag
-    , has_other_rub_td_flag DESC
-    , ns_decrease_flag DESC
-    , opened_total DESC
-    , ns_delta ASC
-    , cli_id;
-
-
--- Проверка: таких строк быть не должно, иначе где-то нарушена логика отбора
-SELECT *
-FROM #client_mart
-WHERE exit_td_sum <> 0;
+order by
+    b.payment_period,
+    case
+        when bucket_name = 'ВСЕ БАКЕТЫ СТАВКИ' then 0
+        else 1
+    end,
+    b.bucket_num;
