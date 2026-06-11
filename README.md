@@ -1,175 +1,112 @@
-Попробуй эту версию. Она сама включает Solver Add-in, подключает Solver.xlam и вызывает Solver через Application.Run, чтобы не надо было руками ставить ссылку в VBA References.
-
 Option Explicit
-Sub Optimize_Monotone_CPR_With_Solver()
+
+Sub Optimize_Monotone_CPR_NoSolver()
+
     Dim ws As Worksheet
-    Dim i As Long
-    Dim solverPath As String
-    Dim addinWasInstalled As Boolean
-    Dim result As Variant
-    
     Set ws = ActiveSheet
     
-    Application.ScreenUpdating = False
-    Application.DisplayAlerts = False
-    Application.Calculation = xlCalculationAutomatic
+    Dim firstRow As Long, lastRow As Long
+    firstRow = 34
+    lastRow = 58
     
-    On Error GoTo SolverError
+    Dim n As Long
+    n = lastRow - firstRow + 1
     
-    ' 1. Пытаемся включить Solver Add-in
-    On Error Resume Next
-    addinWasInstalled = AddIns("Solver Add-in").Installed
-    AddIns("Solver Add-in").Installed = True
-    On Error GoTo SolverError
+    Dim y() As Double          ' исходный CPR до сглаживания, L
+    Dim w() As Double          ' веса, например sqrt(OD)
+    Dim fit() As Double        ' результат, M
     
-    ' 2. Подключаем Solver.xlam напрямую
-    solverPath = Application.LibraryPath & "\SOLVER\SOLVER.XLAM"
+    ReDim y(1 To n)
+    ReDim w(1 To n)
+    ReDim fit(1 To n)
     
-    If Dir(solverPath) <> "" Then
-        Workbooks.Open Filename:=solverPath
-    Else
-        MsgBox "Не найден Solver.xlam по пути:" & vbCrLf & solverPath, vbCritical
-        GoTo CleanExit
-    End If
-    
-    ' 3. Пересчет листа
-    ws.Calculate
-    
-    ' 4. Сброс Solver
-    Application.Run "Solver.xlam!SolverReset"
-    
-    ' 5. Целевая функция: N34 -> минимум
-    '    Изменяемые ячейки: M34:M58
-    Application.Run "Solver.xlam!SolverOk", _
-        ws.Range("N34"), _
-        2, _
-        0, _
-        ws.Range("M34:M58")
-    
-    ' 6. Ограничения монотонности:
-    '    M34 >= M35 >= ... >= M58
-    For i = 34 To 57
-        Application.Run "Solver.xlam!SolverAdd", _
-            ws.Range("M" & i), _
-            3, _
-            ws.Range("M" & i + 1)
-    Next i
-    
-    ' 7. CPR >= 0
-    Application.Run "Solver.xlam!SolverAdd", _
-        ws.Range("M34:M58"), _
-        3, _
-        "0"
-    
-    ' 8. CPR <= 100%
-    Application.Run "Solver.xlam!SolverAdd", _
-        ws.Range("M34:M58"), _
-        1, _
-        "1"
-    
-    ' 9. Настройки Solver
-    Application.Run "Solver.xlam!SolverOptions", _
-        30, _
-        1000, _
-        0.000001, _
-        False, _
-        False, _
-        1, _
-        1, _
-        1, _
-        5, _
-        True, _
-        0.000001
-    
-    ' 10. Запуск Solver без окна
-    result = Application.Run("Solver.xlam!SolverSolve", True)
-    
-    ws.Calculate
-    
-    MsgBox "Оптимизация CPR завершена. Код Solver: " & result, vbInformation
-CleanExit:
-    Application.DisplayAlerts = True
-    Application.ScreenUpdating = True
-    Exit Sub
-SolverError:
-    Application.DisplayAlerts = True
-    Application.ScreenUpdating = True
-    
-    MsgBox _
-        "Solver не запустился." & vbCrLf & vbCrLf & _
-        "Проверь, что файл Solver.xlam существует по пути:" & vbCrLf & _
-        Application.LibraryPath & "\SOLVER\SOLVER.XLAM" & vbCrLf & vbCrLf & _
-        "Ошибка VBA: " & Err.Description, _
-        vbCritical
-End Sub
-
-Если снова ругнётся именно на строку с SolverOptions, используй упрощённую версию без неё:
-
-Option Explicit
-Sub Optimize_Monotone_CPR_With_Solver_Simple()
-    Dim ws As Worksheet
     Dim i As Long
-    Dim solverPath As String
-    Dim result As Variant
-    
-    Set ws = ActiveSheet
     
     Application.ScreenUpdating = False
-    Application.DisplayAlerts = False
-    Application.Calculation = xlCalculationAutomatic
+    Application.Calculation = xlCalculationManual
     
-    On Error GoTo SolverError
-    
-    On Error Resume Next
-    AddIns("Solver Add-in").Installed = True
-    On Error GoTo SolverError
-    
-    solverPath = Application.LibraryPath & "\SOLVER\SOLVER.XLAM"
-    
-    If Dir(solverPath) <> "" Then
-        Workbooks.Open Filename:=solverPath
-    Else
-        MsgBox "Не найден Solver.xlam по пути:" & vbCrLf & solverPath, vbCritical
-        GoTo CleanExit
-    End If
-    
-    ws.Calculate
-    
-    Application.Run "Solver.xlam!SolverReset"
-    
-    Application.Run "Solver.xlam!SolverOk", _
-        ws.Range("N34"), _
-        2, _
-        0, _
-        ws.Range("M34:M58")
-    
-    For i = 34 To 57
-        Application.Run "Solver.xlam!SolverAdd", _
-            ws.Range("M" & i), _
-            3, _
-            ws.Range("M" & i + 1)
+    ' Забираем данные:
+    ' A = OD
+    ' L = CPR_raw
+    ' M = сюда пишем оптимизированный CPR
+    For i = 1 To n
+        y(i) = CDbl(ws.Range("L" & firstRow + i - 1).Value)
+        
+        If ws.Range("A" & firstRow + i - 1).Value > 0 Then
+            w(i) = Sqr(CDbl(ws.Range("A" & firstRow + i - 1).Value))
+        Else
+            w(i) = 1
+        End If
     Next i
     
-    Application.Run "Solver.xlam!SolverAdd", ws.Range("M34:M58"), 3, "0"
-    Application.Run "Solver.xlam!SolverAdd", ws.Range("M34:M58"), 1, "1"
+    ' Запускаем монотонную регрессию:
+    ' Нужно M34 >= M35 >= ... >= M58
+    ' Алгоритм удобнее делает возрастающую регрессию,
+    ' поэтому используем -y, потом возвращаем знак обратно.
+    Call PAVA_Decreasing(y, w, fit, n)
     
-    result = Application.Run("Solver.xlam!SolverSolve", True)
+    ' Записываем результат в M34:M58
+    For i = 1 To n
+        ws.Range("M" & firstRow + i - 1).Value = fit(i)
+    Next i
     
+    Application.Calculation = xlCalculationAutomatic
     ws.Calculate
-    
-    MsgBox "Оптимизация CPR завершена. Код Solver: " & result, vbInformation
-CleanExit:
-    Application.DisplayAlerts = True
-    Application.ScreenUpdating = True
-    Exit Sub
-SolverError:
-    Application.DisplayAlerts = True
     Application.ScreenUpdating = True
     
-    MsgBox _
-        "Solver не запустился." & vbCrLf & _
-        "Ошибка VBA: " & Err.Description, _
-        vbCritical
+    MsgBox "Монотонная оптимизация CPR завершена без Solver", vbInformation
+
 End Sub
 
-Я бы сначала запускал Optimize_Monotone_CPR_With_Solver_Simple. Она менее капризная.
+
+Private Sub PAVA_Decreasing(ByRef y() As Double, ByRef w() As Double, ByRef fit() As Double, ByVal n As Long)
+
+    Dim level() As Double
+    Dim weight() As Double
+    Dim startIdx() As Long
+    Dim endIdx() As Long
+    
+    ReDim level(1 To n)
+    ReDim weight(1 To n)
+    ReDim startIdx(1 To n)
+    ReDim endIdx(1 To n)
+    
+    Dim blocks As Long
+    Dim i As Long, j As Long
+    
+    blocks = 0
+    
+    For i = 1 To n
+        
+        blocks = blocks + 1
+        level(blocks) = y(i)
+        weight(blocks) = w(i)
+        startIdx(blocks) = i
+        endIdx(blocks) = i
+        
+        ' Для убывающей последовательности нужно:
+        ' level(k-1) >= level(k)
+        ' Если нарушено, объединяем блоки
+        Do While blocks > 1 And level(blocks - 1) < level(blocks)
+            
+            level(blocks - 1) = _
+                (level(blocks - 1) * weight(blocks - 1) + level(blocks) * weight(blocks)) _
+                / (weight(blocks - 1) + weight(blocks))
+            
+            weight(blocks - 1) = weight(blocks - 1) + weight(blocks)
+            endIdx(blocks - 1) = endIdx(blocks)
+            
+            blocks = blocks - 1
+            
+        Loop
+        
+    Next i
+    
+    ' Раскладываем уровни блоков обратно по строкам
+    For i = 1 To blocks
+        For j = startIdx(i) To endIdx(i)
+            fit(j) = level(i)
+        Next j
+    Next i
+
+End Sub
