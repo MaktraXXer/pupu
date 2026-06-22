@@ -21,7 +21,9 @@ Sub fill_new_building_matrix_running_to_upfront_fast()
     If lastRow < 2 Then Exit Sub
     
     n = lastRow - 1
-    ReDim arrOut(1 To n, 1 To 4)
+    
+    ' E:J = 6 выходных столбцов
+    ReDim arrOut(1 To n, 1 To 6)
     
     With Application
         .ScreenUpdating = False
@@ -49,16 +51,22 @@ Sub fill_new_building_matrix_running_to_upfront_fast()
             
             targetRunning = CDbl(runningTarget)
             
+            ' входные параметры
             wsCalc.Range("C2").Value = rateVal
             wsCalc.Range("D2").Value = cprVal
             wsCalc.Range("D3").Value = termVal
             
-            ' стартовое приближение
-            wsCalc.Range("E5").Value = 0
+            ' стартовое приближение для upfront
+            ' если предыдущий upfront найден, стартуем с него
+            If idx > 1 And IsNumeric(arrOut(idx - 1, 3)) Then
+                wsCalc.Range("E5").Value = arrOut(idx - 1, 3)
+            Else
+                wsCalc.Range("E5").Value = 0
+            End If
             
             wsCalc.Calculate
             
-            ' подбираем E5 так, чтобы I5 = targetRunning
+            ' подбираем E5 так, чтобы I5 = runningTarget
             ok = wsCalc.Range("I5").GoalSeek( _
                     Goal:=targetRunning, _
                     ChangingCell:=wsCalc.Range("E5") _
@@ -68,14 +76,17 @@ Sub fill_new_building_matrix_running_to_upfront_fast()
             
             factRunning = CDbl(wsCalc.Range("I5").Value)
             
-            arrOut(idx, 1) = wsCalc.Range("E5").Value
-            arrOut(idx, 2) = factRunning
-            arrOut(idx, 3) = factRunning - targetRunning
+            ' результаты
+            arrOut(idx, 1) = wsCalc.Range("F2").Value                 ' E: ТС as is
+            arrOut(idx, 2) = wsCalc.Range("J5").Value                 ' F: ТС to be
+            arrOut(idx, 3) = wsCalc.Range("E5").Value                 ' G: подобранный upfront
+            arrOut(idx, 4) = factRunning                              ' H: running факт
+            arrOut(idx, 5) = factRunning - targetRunning              ' I: ошибка
             
             If ok Then
-                arrOut(idx, 4) = "OK"
+                arrOut(idx, 6) = "OK"
             Else
-                arrOut(idx, 4) = "NOT FOUND"
+                arrOut(idx, 6) = "NOT FOUND"
             End If
             
         End If
@@ -86,12 +97,8 @@ Sub fill_new_building_matrix_running_to_upfront_fast()
         
     Next i
     
-    ' E:H:
-    ' E = найденный upfront
-    ' F = running факт
-    ' G = ошибка
-    ' H = статус GoalSeek
-    wsSrc.Range("E2:H" & lastRow).Value = arrOut
+    ' выгружаем результаты в E:J одним блоком
+    wsSrc.Range("E2:J" & lastRow).Value = arrOut
 
 CLEANUP:
 
