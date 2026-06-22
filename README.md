@@ -1,270 +1,479 @@
-Option Explicit
+USE [ALM];
+SET NOCOUNT ON;
 
-Sub fill_new_building_matrix_running_to_upfront_precise()
+DECLARE @BaseDate date = '2026-05-30'; -- дата баланса было
+DECLARE @EndDate  date = '2026-06-06'; -- дата баланса стало
 
-    Const TOL_RUNNING As Double = 0.0000001
-    Const MAX_ITER As Long = 80
+DECLARE @ExitFrom date = DATEADD(day, 1, @BaseDate);
+DECLARE @ExitTo   date = @EndDate;
 
-    Dim wb As Workbook
-    Dim wsSrc As Worksheet, wsCalc As Worksheet
-    
-    Set wb = ActiveWorkbook
-    
-    If Not SheetExists(wb, "Matrix") Then
-        MsgBox "Не найден лист Matrix в активной книге: " & wb.Name, vbExclamation
-        Exit Sub
-    End If
-    
-    If Not SheetExists(wb, "Новостройка") Then
-        MsgBox "Не найден лист Новостройка в активной книге: " & wb.Name, vbExclamation
-        Exit Sub
-    End If
-    
-    Set wsSrc = wb.Worksheets("Matrix")
-    Set wsCalc = wb.Worksheets("Новостройка")
-    
-    Dim lastRow As Long, i As Long, idx As Long, n As Long
-    Dim calcMode As XlCalculation, eventsState As Boolean
-    Dim statusBarState As Variant
-    
-    Dim rateVal As Variant, cprVal As Variant, runningTarget As Variant, termVal As Variant
-    Dim arrOut() As Variant
-    
-    Dim targetRunning As Double
-    Dim factRunning As Double
-    Dim errRunning As Double
-    Dim foundUpfront As Double
-    Dim prevUpfront As Double
-    Dim ok As Boolean
-    
-    lastRow = wsSrc.Cells(wsSrc.Rows.Count, "A").End(xlUp).Row
-    If lastRow < 2 Then Exit Sub
-    
-    n = lastRow - 1
-    
-    ' E:J = 6 выходных столбцов
-    ReDim arrOut(1 To n, 1 To 6)
-    
-    With Application
-        .ScreenUpdating = False
-        eventsState = .EnableEvents
-        .EnableEvents = False
-        statusBarState = .StatusBar
-        .StatusBar = "Matrix: подготовка..."
-        calcMode = .Calculation
-        .Calculation = xlCalculationManual
-        .CalculateBeforeSave = False
-    End With
-    
-    On Error GoTo CLEANUP
-    
-    prevUpfront = 0
-    
-    For i = 2 To lastRow
-        
-        idx = i - 1
-        
-        rateVal = wsSrc.Cells(i, "A").Value
-        cprVal = wsSrc.Cells(i, "B").Value
-        runningTarget = wsSrc.Cells(i, "C").Value
-        termVal = wsSrc.Cells(i, "D").Value
-        
-        If Len(rateVal) > 0 And Len(runningTarget) > 0 Then
-            
-            targetRunning = CDbl(runningTarget)
-            
-            ' входные параметры
-            wsCalc.Range("C2").Value = rateVal
-            wsCalc.Range("D2").Value = cprVal
-            wsCalc.Range("D3").Value = termVal
-            
-            ' точный подбор upfront
-            ok = FindUpfrontPrecise( _
-                    wsCalc:=wsCalc, _
-                    targetRunning:=targetRunning, _
-                    startUpfront:=prevUpfront, _
-                    tol:=TOL_RUNNING, _
-                    maxIter:=MAX_ITER, _
-                    foundUpfront:=foundUpfront, _
-                    factRunning:=factRunning, _
-                    errRunning:=errRunning _
-                 )
-            
-            prevUpfront = foundUpfront
-            
-            ' результаты
-            arrOut(idx, 1) = wsCalc.Range("F2").Value                 ' E: ТС as is
-            arrOut(idx, 2) = wsCalc.Range("J5").Value                 ' F: ТС to be
-            arrOut(idx, 3) = foundUpfront                             ' G: подобранный upfront
-            arrOut(idx, 4) = factRunning                              ' H: running факт
-            arrOut(idx, 5) = errRunning                               ' I: ошибка
-            
-            If ok Then
-                arrOut(idx, 6) = "OK"
-            Else
-                arrOut(idx, 6) = "CHECK"
-            End If
-            
-        End If
-        
-        If (idx Mod 20) = 0 Or idx = n Then
-            Application.StatusBar = "Matrix: " & idx & " / " & n
-        End If
-        
-    Next i
-    
-    wsSrc.Range("E2:J" & lastRow).Value = arrOut
+DECLARE @OpenFrom date = DATEADD(day, 1, @BaseDate);
+DECLARE @OpenTo   date = @EndDate;
 
-CLEANUP:
+DECLARE @eps decimal(18,6) = 0.000005;
 
-    With Application
-        .Calculation = calcMode
-        .EnableEvents = eventsState
-        .StatusBar = statusBarState
-        .ScreenUpdating = True
-    End With
-    
-    If Err.Number <> 0 Then
-        MsgBox "Ошибка: " & Err.Description, vbExclamation
-    Else
-        MsgBox "Заполнение Matrix завершено", vbInformation
-    End If
-
-End Sub
+IF OBJECT_ID('tempdb..#bal_base') IS NOT NULL DROP TABLE #bal_base;
+IF OBJECT_ID('tempdb..#bal_end') IS NOT NULL DROP TABLE #bal_end;
+IF OBJECT_ID('tempdb..#client_scope') IS NOT NULL DROP TABLE #client_scope;
+IF OBJECT_ID('tempdb..#client_mart') IS NOT NULL DROP TABLE #client_mart;
 
 
-Private Function FindUpfrontPrecise( _
-    ByVal wsCalc As Worksheet, _
-    ByVal targetRunning As Double, _
-    ByVal startUpfront As Double, _
-    ByVal tol As Double, _
-    ByVal maxIter As Long, _
-    ByRef foundUpfront As Double, _
-    ByRef factRunning As Double, _
-    ByRef errRunning As Double _
-) As Boolean
-
-    Dim lo As Double, hi As Double, mid As Double
-    Dim fLo As Double, fHi As Double, fMid As Double
-    Dim stepVal As Double
-    Dim iter As Long
-    Dim okBracket As Boolean
-    
-    ' стартовая точка
-    foundUpfront = startUpfront
-    errRunning = RunningError(wsCalc, foundUpfront, targetRunning, factRunning)
-    
-    If Abs(errRunning) <= tol Then
-        FindUpfrontPrecise = True
-        Exit Function
-    End If
-    
-    ' ищем вилку вокруг стартового upfront
-    stepVal = 0.0001
-    
-    For iter = 1 To 60
-        
-        lo = startUpfront - stepVal
-        hi = startUpfront + stepVal
-        
-        fLo = RunningError(wsCalc, lo, targetRunning, factRunning)
-        fHi = RunningError(wsCalc, hi, targetRunning, factRunning)
-        
-        If Abs(fLo) <= tol Then
-            foundUpfront = lo
-            errRunning = fLo
-            factRunning = wsCalc.Range("I5").Value
-            FindUpfrontPrecise = True
-            Exit Function
-        End If
-        
-        If Abs(fHi) <= tol Then
-            foundUpfront = hi
-            errRunning = fHi
-            factRunning = wsCalc.Range("I5").Value
-            FindUpfrontPrecise = True
-            Exit Function
-        End If
-        
-        If fLo * fHi <= 0 Then
-            okBracket = True
-            Exit For
-        End If
-        
-        stepVal = stepVal * 2
-        
-    Next iter
-    
-    If Not okBracket Then
-        ' если вилку не нашли, оставляем ближайшую из двух границ
-        If Abs(fLo) < Abs(fHi) Then
-            foundUpfront = lo
-            errRunning = RunningError(wsCalc, foundUpfront, targetRunning, factRunning)
-        Else
-            foundUpfront = hi
-            errRunning = RunningError(wsCalc, foundUpfront, targetRunning, factRunning)
-        End If
-        
-        FindUpfrontPrecise = False
-        Exit Function
-    End If
-    
-    ' бисекция внутри найденной вилки
-    For iter = 1 To maxIter
-        
-        mid = (lo + hi) / 2
-        fMid = RunningError(wsCalc, mid, targetRunning, factRunning)
-        
-        If Abs(fMid) <= tol Then
-            foundUpfront = mid
-            errRunning = fMid
-            FindUpfrontPrecise = True
-            Exit Function
-        End If
-        
-        If fLo * fMid <= 0 Then
-            hi = mid
-            fHi = fMid
-        Else
-            lo = mid
-            fLo = fMid
-        End If
-        
-    Next iter
-    
-    ' если за maxIter не попали идеально, берем середину
-    foundUpfront = (lo + hi) / 2
-    errRunning = RunningError(wsCalc, foundUpfront, targetRunning, factRunning)
-    
-    FindUpfrontPrecise = (Abs(errRunning) <= tol)
-
-End Function
+/* ============================================================
+   1. Баланс на базовую дату
+   ============================================================ */
+SELECT
+      CAST(t.dt_rep AS date) AS dt_rep
+    , CAST(t.cli_id AS bigint) AS cli_id
+    , CAST(t.con_id AS bigint) AS con_id
+    , CAST(t.dt_open AS date) AS dt_open
+    , CAST(t.dt_close_plan AS date) AS dt_close_plan
+    , t.section_name
+    , CAST(t.out_rub AS decimal(38,6)) AS out_rub
+    , CAST(t.rate_con AS decimal(18,6)) AS rate_con
+    , CASE
+          WHEN NULLIF(LTRIM(RTRIM(COALESCE(t.conv, ''))), '') IS NULL THEN 'AT_THE_END'
+          ELSE UPPER(LTRIM(RTRIM(t.conv)))
+      END AS conv_norm
+    , CAST(t.termdays AS int) AS termdays
+    , t.TSEGMENTNAME
+INTO #bal_base
+FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
+WHERE
+    t.dt_rep = @BaseDate
+    AND t.section_name IN (N'Срочные', N'Накопительный счёт')
+    AND t.block_name = N'Привлечение ФЛ'
+    AND t.acc_role   = N'LIAB'
+    AND t.od_flag    = 1
+    AND t.cur        = '810'
+    AND t.out_rub IS NOT NULL
+    AND t.out_rub >= 0;
 
 
-Private Function RunningError( _
-    ByVal wsCalc As Worksheet, _
-    ByVal upfrontValue As Double, _
-    ByVal targetRunning As Double, _
-    ByRef factRunning As Double _
-) As Double
+/* ============================================================
+   2. Баланс на конечную дату
+   ============================================================ */
+SELECT
+      CAST(t.dt_rep AS date) AS dt_rep
+    , CAST(t.cli_id AS bigint) AS cli_id
+    , CAST(t.con_id AS bigint) AS con_id
+    , CAST(t.dt_open AS date) AS dt_open
+    , CAST(t.dt_close_plan AS date) AS dt_close_plan
+    , t.section_name
+    , CAST(t.out_rub AS decimal(38,6)) AS out_rub
+    , CAST(t.rate_con AS decimal(18,6)) AS rate_con
+    , CASE
+          WHEN NULLIF(LTRIM(RTRIM(COALESCE(t.conv, ''))), '') IS NULL THEN 'AT_THE_END'
+          ELSE UPPER(LTRIM(RTRIM(t.conv)))
+      END AS conv_norm
+    , CAST(t.termdays AS int) AS termdays
+    , t.TSEGMENTNAME
+INTO #bal_end
+FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
+WHERE
+    t.dt_rep = @EndDate
+    AND t.section_name IN (N'Срочные', N'Накопительный счёт')
+    AND t.block_name = N'Привлечение ФЛ'
+    AND t.acc_role   = N'LIAB'
+    AND t.od_flag    = 1
+    AND t.cur        = '810'
+    AND t.out_rub IS NOT NULL
+    AND t.out_rub >= 0;
 
-    wsCalc.Range("E5").Value = upfrontValue
-    wsCalc.Calculate
-    
-    factRunning = CDbl(wsCalc.Range("I5").Value)
-    RunningError = factRunning - targetRunning
 
-End Function
+/* ============================================================
+   3. Единая база клиентов для анализа
+
+   01. Вкладчики к выходу:
+       есть срочный вклад на @BaseDate с dt_close_plan в окне
+       @BaseDate + 1 ... @EndDate
+
+   02. НС без вкладов к выходу:
+       есть НС на @BaseDate
+       и нет срочного вклада к выходу в этом окне
+   ============================================================ */
+SELECT
+      x.cli_id
+    , x.client_base_type
+INTO #client_scope
+FROM (
+    /* 01. Клиенты со срочными вкладами к выходу */
+    SELECT DISTINCT
+          b.cli_id
+        , CAST(N'01. Вкладчики к выходу' AS nvarchar(100)) AS client_base_type
+    FROM #bal_base b
+    WHERE
+        b.section_name = N'Срочные'
+        AND b.dt_close_plan >= @ExitFrom
+        AND b.dt_close_plan <= @ExitTo
+
+    UNION ALL
+
+    /* 02. Клиенты с НС, но без срочных вкладов к выходу */
+    SELECT
+          ns.cli_id
+        , CAST(N'02. НС без вкладов к выходу' AS nvarchar(100)) AS client_base_type
+    FROM #bal_base ns
+    WHERE
+        ns.section_name = N'Накопительный счёт'
+        AND NOT EXISTS (
+            SELECT 1
+            FROM #bal_base td
+            WHERE
+                td.cli_id = ns.cli_id
+                AND td.section_name = N'Срочные'
+                AND td.dt_close_plan >= @ExitFrom
+                AND td.dt_close_plan <= @ExitTo
+        )
+    GROUP BY
+        ns.cli_id
+) x;
 
 
-Private Function SheetExists(ByVal wb As Workbook, ByVal sheetName As String) As Boolean
+/* ============================================================
+   4. Общие расчёты по клиентам
+   ============================================================ */
+WITH client_flags AS (
+    SELECT
+          c.cli_id
+        , CASE
+              WHEN EXISTS (
+                  SELECT 1
+                  FROM #bal_base b
+                  WHERE b.cli_id = c.cli_id
+                    AND b.section_name IN (N'Срочные', N'Накопительный счёт')
+                    AND b.TSEGMENTNAME = N'ДЧБО'
+              )
+              THEN N'ДЧБО'
+              ELSE N'Розница'
+          END AS client_segment
+    FROM #client_scope c
+),
 
-    Dim ws As Worksheet
-    
-    On Error Resume Next
-    Set ws = wb.Worksheets(sheetName)
-    On Error GoTo 0
-    
-    SheetExists = Not ws Is Nothing
+exit_sum AS (
+    SELECT
+          b.cli_id
+        , SUM(b.out_rub) AS exit_td_sum
+    FROM #bal_base b
+    INNER JOIN #client_scope c
+        ON c.cli_id = b.cli_id
+    WHERE
+        b.section_name = N'Срочные'
+        AND b.dt_close_plan >= @ExitFrom
+        AND b.dt_close_plan <= @ExitTo
+    GROUP BY
+        b.cli_id
+),
 
-End Function
+other_td_flag AS (
+    SELECT
+          c.cli_id
+        , CASE
+              WHEN EXISTS (
+                  SELECT 1
+                  FROM #bal_base b
+                  WHERE b.cli_id = c.cli_id
+                    AND b.section_name = N'Срочные'
+                    AND NOT (
+                            b.dt_close_plan >= @ExitFrom
+                        AND b.dt_close_plan <= @ExitTo
+                    )
+              )
+              THEN 1
+              ELSE 0
+          END AS has_other_rub_td_flag
+    FROM #client_scope c
+),
+
+ns_start AS (
+    SELECT
+          b.cli_id
+        , SUM(b.out_rub) AS ns_start_sum
+    FROM #bal_base b
+    INNER JOIN #client_scope c
+        ON c.cli_id = b.cli_id
+    WHERE
+        b.section_name = N'Накопительный счёт'
+    GROUP BY
+        b.cli_id
+),
+
+ns_end AS (
+    SELECT
+          e.cli_id
+        , SUM(e.out_rub) AS ns_end_sum
+    FROM #bal_end e
+    INNER JOIN #client_scope c
+        ON c.cli_id = e.cli_id
+    WHERE
+        e.section_name = N'Накопительный счёт'
+    GROUP BY
+        e.cli_id
+),
+
+opened_by_con AS (
+    SELECT
+          b.cli_id
+        , b.con_id
+        , MIN(b.dt_open) AS dt_open
+        , SUM(b.out_rub) AS out_rub
+        , MIN(b.rate_con) AS rate_con
+        , MIN(b.termdays) AS termdays
+        , CASE
+              WHEN MIN(NULLIF(LTRIM(RTRIM(COALESCE(b.conv_norm, ''))), '')) IS NULL THEN 'AT_THE_END'
+              ELSE MIN(b.conv_norm)
+          END AS conv_norm
+    FROM #bal_end b
+    INNER JOIN #client_scope c
+        ON b.cli_id = c.cli_id
+    WHERE
+        b.section_name = N'Срочные'
+        AND b.dt_open >= @OpenFrom
+        AND b.dt_open <= @OpenTo
+    GROUP BY
+          b.cli_id
+        , b.con_id
+),
+
+/* ============================================================
+   НОВАЯ ЛОГИКА:
+   промо определяется НЕ хардкодом по сроку/ставке,
+   а сверкой с [ALM_TEST].[WORK].[promo_new_money_rate_dict]
+
+   Условия:
+   - дата открытия попадает в период действия строки справочника
+   - срок попадает в term_min / term_max
+   - conv совпадает с conv_type
+   - сумма попадает в amount_from / amount_to
+   - ставка договора совпадает с promo_rate с учетом @eps
+   ============================================================ */
+opened_classified AS (
+    SELECT
+          o.cli_id
+        , o.con_id
+        , o.out_rub
+        , CASE
+              WHEN p.id IS NOT NULL THEN N'promo'
+              ELSE N'other'
+          END AS open_category
+    FROM opened_by_con o
+    OUTER APPLY (
+        SELECT TOP (1)
+              d.id
+        FROM [ALM_TEST].[WORK].[promo_new_money_rate_dict] d WITH (NOLOCK)
+        WHERE
+            d.is_active = 1
+            AND o.dt_open BETWEEN d.date_from AND d.date_to
+            AND o.termdays BETWEEN d.term_min AND d.term_max
+            AND o.conv_norm = d.conv_type
+            AND o.out_rub BETWEEN d.amount_from AND d.amount_to
+            AND ABS(o.rate_con - d.promo_rate) <= @eps
+        ORDER BY
+              d.date_from DESC
+            , d.id DESC
+    ) p
+),
+
+opened_agg AS (
+    SELECT
+          cli_id
+        , SUM(CASE WHEN open_category = N'promo' THEN out_rub ELSE 0 END) AS opened_promo
+        , SUM(CASE WHEN open_category = N'other' THEN out_rub ELSE 0 END) AS opened_other
+        , SUM(out_rub) AS opened_total
+    FROM opened_classified
+    GROUP BY
+        cli_id
+)
+
+SELECT
+      c.cli_id
+    , c.client_base_type
+    , f.client_segment AS segment_flag
+
+    /* Единая сумма, по которой строится бакет:
+       - для вкладчиков к выходу это сумма вкладов к выходу
+       - для НС-группы это стартовый остаток НС */
+    , CASE
+          WHEN c.client_base_type = N'01. Вкладчики к выходу'
+              THEN ISNULL(e.exit_td_sum, 0)
+          WHEN c.client_base_type = N'02. НС без вкладов к выходу'
+              THEN ISNULL(ns1.ns_start_sum, 0)
+          ELSE 0
+      END AS base_amount_for_bucket
+
+    /* Единый бакет, но с разной смысловой базой */
+    , CASE
+          WHEN c.client_base_type = N'01. Вкладчики к выходу'
+               AND ISNULL(e.exit_td_sum, 0) < 1500000
+              THEN N'01. Выход < 1.5 млн'
+
+          WHEN c.client_base_type = N'01. Вкладчики к выходу'
+               AND ISNULL(e.exit_td_sum, 0) < 5000000
+              THEN N'02. Выход 1.5-5 млн'
+
+          WHEN c.client_base_type = N'01. Вкладчики к выходу'
+              THEN N'03. Выход >= 5 млн'
+
+          WHEN c.client_base_type = N'02. НС без вкладов к выходу'
+               AND ISNULL(ns1.ns_start_sum, 0) < 1500000
+              THEN N'01. НС < 1.5 млн'
+
+          WHEN c.client_base_type = N'02. НС без вкладов к выходу'
+               AND ISNULL(ns1.ns_start_sum, 0) < 5000000
+              THEN N'02. НС 1.5-5 млн'
+
+          WHEN c.client_base_type = N'02. НС без вкладов к выходу'
+              THEN N'03. НС >= 5 млн'
+
+          ELSE N'Не определено'
+      END AS base_amount_flag
+
+    /* Вклады к выходу */
+    , ISNULL(e.exit_td_sum, 0) AS exit_td_sum
+
+    /* 0 = нет других рублёвых срочных вкладов на @BaseDate, кроме выходящих в окне
+       1 = есть другие рублёвые срочные вклады на @BaseDate */
+    , ISNULL(ot.has_other_rub_td_flag, 0) AS has_other_rub_td_flag
+
+    /* Накопительные счета */
+    , ISNULL(ns1.ns_start_sum, 0) AS ns_start_sum
+
+    , CASE
+          WHEN ISNULL(ns1.ns_start_sum, 0) > 1000 THEN 1
+          ELSE 0
+      END AS has_ns_gt_1000_flag
+
+    , ISNULL(ns2.ns_end_sum, 0) AS ns_end_sum
+    , ISNULL(ns2.ns_end_sum, 0) - ISNULL(ns1.ns_start_sum, 0) AS ns_delta
+
+    , CASE
+          WHEN ISNULL(ns2.ns_end_sum, 0) < ISNULL(ns1.ns_start_sum, 0) THEN 1
+          ELSE 0
+      END AS ns_decrease_flag
+
+    /* Открытые срочные вклады */
+    , ISNULL(o.opened_promo, 0) AS opened_promo
+    , ISNULL(o.opened_other, 0) AS opened_other
+    , ISNULL(o.opened_total, 0) AS opened_total
+
+INTO #client_mart
+FROM #client_scope c
+LEFT JOIN client_flags f
+    ON c.cli_id = f.cli_id
+LEFT JOIN exit_sum e
+    ON c.cli_id = e.cli_id
+LEFT JOIN other_td_flag ot
+    ON c.cli_id = ot.cli_id
+LEFT JOIN ns_start ns1
+    ON c.cli_id = ns1.cli_id
+LEFT JOIN ns_end ns2
+    ON c.cli_id = ns2.cli_id
+LEFT JOIN opened_agg o
+    ON c.cli_id = o.cli_id;
+
+
+/* ============================================================
+   5. Итоговая детализация
+   ============================================================ */
+SELECT
+      cli_id
+    , client_base_type
+    , segment_flag
+    , base_amount_for_bucket
+    , base_amount_flag
+    , exit_td_sum
+    , has_other_rub_td_flag
+    , ns_start_sum
+    , has_ns_gt_1000_flag
+    , ns_end_sum
+    , ns_delta
+    , ns_decrease_flag
+    , opened_promo
+    , opened_other
+    , opened_total
+FROM #client_mart
+ORDER BY
+      client_base_type
+    , segment_flag
+    , base_amount_flag
+    , has_other_rub_td_flag DESC
+    , ns_decrease_flag DESC
+    , opened_total DESC
+    , ns_delta ASC
+    , cli_id;
+
+
+/* ============================================================
+   6. Контроль: у группы "НС без вкладов к выходу"
+      exit_td_sum должен быть 0
+   ============================================================ */
+SELECT *
+FROM #client_mart
+WHERE client_base_type = N'02. НС без вкладов к выходу'
+  AND exit_td_sum <> 0;
+
+
+/* ============================================================
+   7. Контроль: клиенты не должны задваиваться между группами
+   ============================================================ */
+SELECT
+      cli_id
+    , COUNT(*) AS cnt_rows
+FROM #client_scope
+GROUP BY
+    cli_id
+HAVING COUNT(*) > 1;
+
+
+/* ============================================================
+   8. Контроль: какие новые открытия не попали в промо
+      Можно использовать для диагностики ставок/сроков/конвенции
+   ============================================================ */
+WITH opened_by_con_check AS (
+    SELECT
+          b.cli_id
+        , b.con_id
+        , MIN(b.dt_open) AS dt_open
+        , SUM(b.out_rub) AS out_rub
+        , MIN(b.rate_con) AS rate_con
+        , MIN(b.termdays) AS termdays
+        , CASE
+              WHEN MIN(NULLIF(LTRIM(RTRIM(COALESCE(b.conv_norm, ''))), '')) IS NULL THEN 'AT_THE_END'
+              ELSE MIN(b.conv_norm)
+          END AS conv_norm
+    FROM #bal_end b
+    INNER JOIN #client_scope c
+        ON b.cli_id = c.cli_id
+    WHERE
+        b.section_name = N'Срочные'
+        AND b.dt_open >= @OpenFrom
+        AND b.dt_open <= @OpenTo
+    GROUP BY
+          b.cli_id
+        , b.con_id
+)
+SELECT
+      o.cli_id
+    , o.con_id
+    , o.dt_open
+    , o.out_rub
+    , o.rate_con
+    , o.termdays
+    , o.conv_norm
+FROM opened_by_con_check o
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM [ALM_TEST].[WORK].[promo_new_money_rate_dict] d WITH (NOLOCK)
+    WHERE
+        d.is_active = 1
+        AND o.dt_open BETWEEN d.date_from AND d.date_to
+        AND o.termdays BETWEEN d.term_min AND d.term_max
+        AND o.conv_norm = d.conv_type
+        AND o.out_rub BETWEEN d.amount_from AND d.amount_to
+        AND ABS(o.rate_con - d.promo_rate) <= @eps
+)
+ORDER BY
+      o.dt_open
+    , o.termdays
+    , o.rate_con
+    , o.out_rub
+    , o.con_id;
