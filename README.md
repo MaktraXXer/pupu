@@ -1,29 +1,27 @@
 Option Explicit
 
-Sub fill_new_building_matrix_running_to_upfront()
+Sub fill_new_building_matrix_running_to_upfront_fast()
 
     Dim wsSrc As Worksheet, wsCalc As Worksheet
     Set wsSrc = Worksheets("Matrix")
     Set wsCalc = Worksheets("Новостройка")
     
-    Dim lastRow As Long, i As Long
+    Dim lastRow As Long, i As Long, idx As Long, n As Long
     Dim calcMode As XlCalculation, eventsState As Boolean
     Dim statusBarState As Variant
     
     Dim rateVal As Variant, cprVal As Variant, runningTarget As Variant, termVal As Variant
     Dim arrOut() As Variant
-    Dim n As Long, idx As Long
     
-    Dim solverResult As Variant
-    Dim factRunning As Double
+    Dim ok As Boolean
     Dim targetRunning As Double
+    Dim factRunning As Double
     
-    ' последняя строка по столбцу A
     lastRow = wsSrc.Cells(wsSrc.Rows.Count, "A").End(xlUp).Row
     If lastRow < 2 Then Exit Sub
     
     n = lastRow - 1
-    ReDim arrOut(1 To n, 1 To 3)
+    ReDim arrOut(1 To n, 1 To 4)
     
     With Application
         .ScreenUpdating = False
@@ -38,11 +36,6 @@ Sub fill_new_building_matrix_running_to_upfront()
     
     On Error GoTo CLEANUP
     
-    ' пробуем подключить Solver
-    On Error Resume Next
-    AddIns("Solver Add-in").Installed = True
-    On Error GoTo CLEANUP
-    
     For i = 2 To lastRow
         
         idx = i - 1
@@ -52,62 +45,38 @@ Sub fill_new_building_matrix_running_to_upfront()
         runningTarget = wsSrc.Cells(i, "C").Value
         termVal = wsSrc.Cells(i, "D").Value
         
-        ' если строка пустая - пропускаем
         If Len(rateVal) > 0 And Len(runningTarget) > 0 Then
             
             targetRunning = CDbl(runningTarget)
             
-            ' записываем входы на лист "Новостройка"
             wsCalc.Range("C2").Value = rateVal
             wsCalc.Range("D2").Value = cprVal
             wsCalc.Range("D3").Value = termVal
             
-            ' стартовое приближение для upfront
+            ' стартовое приближение
             wsCalc.Range("E5").Value = 0
             
-            Application.Calculate
+            wsCalc.Calculate
             
-            ' Solver:
-            ' подбираем E5 так, чтобы I5 = runningTarget
-            Application.Run "Solver.xlam!SolverReset"
+            ' подбираем E5 так, чтобы I5 = targetRunning
+            ok = wsCalc.Range("I5").GoalSeek( _
+                    Goal:=targetRunning, _
+                    ChangingCell:=wsCalc.Range("E5") _
+                 )
             
-            Application.Run "Solver.xlam!SolverOk", _
-                wsCalc.Range("I5"), _
-                3, _
-                targetRunning, _
-                wsCalc.Range("E5")
-            
-            ' Ограничение: upfront >= 0
-            Application.Run "Solver.xlam!SolverAdd", _
-                wsCalc.Range("E5"), _
-                3, _
-                0
-            
-            ' Настройки точности
-            Application.Run "Solver.xlam!SolverOptions", _
-                100, _
-                100, _
-                0.000001, _
-                0.000001, _
-                False, _
-                False, _
-                1, _
-                1, _
-                1, _
-                5, _
-                0.0001, _
-                False
-            
-            solverResult = Application.Run("Solver.xlam!SolverSolve", True)
-            
-            Application.Calculate
+            wsCalc.Calculate
             
             factRunning = CDbl(wsCalc.Range("I5").Value)
             
-            ' результаты
-            arrOut(idx, 1) = wsCalc.Range("E5").Value                 ' подобранный Upfront
-            arrOut(idx, 2) = factRunning                              ' Running факт
-            arrOut(idx, 3) = factRunning - targetRunning              ' ошибка
+            arrOut(idx, 1) = wsCalc.Range("E5").Value
+            arrOut(idx, 2) = factRunning
+            arrOut(idx, 3) = factRunning - targetRunning
+            
+            If ok Then
+                arrOut(idx, 4) = "OK"
+            Else
+                arrOut(idx, 4) = "NOT FOUND"
+            End If
             
         End If
         
@@ -117,8 +86,12 @@ Sub fill_new_building_matrix_running_to_upfront()
         
     Next i
     
-    ' выгружаем результаты в E:G одним блоком
-    wsSrc.Range("E2:G" & lastRow).Value = arrOut
+    ' E:H:
+    ' E = найденный upfront
+    ' F = running факт
+    ' G = ошибка
+    ' H = статус GoalSeek
+    wsSrc.Range("E2:H" & lastRow).Value = arrOut
 
 CLEANUP:
 
