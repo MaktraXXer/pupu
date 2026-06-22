@@ -2,9 +2,23 @@ Option Explicit
 
 Sub fill_new_building_matrix_running_to_upfront_fast()
 
+    Dim wb As Workbook
     Dim wsSrc As Worksheet, wsCalc As Worksheet
-    Set wsSrc = Worksheets("Matrix")
-    Set wsCalc = Worksheets("Новостройка")
+    
+    Set wb = ActiveWorkbook
+    
+    If Not SheetExists(wb, "Matrix") Then
+        MsgBox "Не найден лист Matrix в активной книге: " & wb.Name, vbExclamation
+        Exit Sub
+    End If
+    
+    If Not SheetExists(wb, "Новостройка") Then
+        MsgBox "Не найден лист Новостройка в активной книге: " & wb.Name, vbExclamation
+        Exit Sub
+    End If
+    
+    Set wsSrc = wb.Worksheets("Matrix")
+    Set wsCalc = wb.Worksheets("Новостройка")
     
     Dim lastRow As Long, i As Long, idx As Long, n As Long
     Dim calcMode As XlCalculation, eventsState As Boolean
@@ -16,6 +30,7 @@ Sub fill_new_building_matrix_running_to_upfront_fast()
     Dim ok As Boolean
     Dim targetRunning As Double
     Dim factRunning As Double
+    Dim prevUpfront As Variant
     
     lastRow = wsSrc.Cells(wsSrc.Rows.Count, "A").End(xlUp).Row
     If lastRow < 2 Then Exit Sub
@@ -38,6 +53,8 @@ Sub fill_new_building_matrix_running_to_upfront_fast()
     
     On Error GoTo CLEANUP
     
+    prevUpfront = 0
+    
     For i = 2 To lastRow
         
         idx = i - 1
@@ -57,9 +74,8 @@ Sub fill_new_building_matrix_running_to_upfront_fast()
             wsCalc.Range("D3").Value = termVal
             
             ' стартовое приближение для upfront
-            ' если предыдущий upfront найден, стартуем с него
-            If idx > 1 And IsNumeric(arrOut(idx - 1, 3)) Then
-                wsCalc.Range("E5").Value = arrOut(idx - 1, 3)
+            If IsNumeric(prevUpfront) Then
+                wsCalc.Range("E5").Value = prevUpfront
             Else
                 wsCalc.Range("E5").Value = 0
             End If
@@ -75,6 +91,7 @@ Sub fill_new_building_matrix_running_to_upfront_fast()
             wsCalc.Calculate
             
             factRunning = CDbl(wsCalc.Range("I5").Value)
+            prevUpfront = wsCalc.Range("E5").Value
             
             ' результаты
             arrOut(idx, 1) = wsCalc.Range("F2").Value                 ' E: ТС as is
@@ -97,7 +114,6 @@ Sub fill_new_building_matrix_running_to_upfront_fast()
         
     Next i
     
-    ' выгружаем результаты в E:J одним блоком
     wsSrc.Range("E2:J" & lastRow).Value = arrOut
 
 CLEANUP:
@@ -116,3 +132,16 @@ CLEANUP:
     End If
 
 End Sub
+
+
+Private Function SheetExists(ByVal wb As Workbook, ByVal sheetName As String) As Boolean
+
+    Dim ws As Worksheet
+    
+    On Error Resume Next
+    Set ws = wb.Worksheets(sheetName)
+    On Error GoTo 0
+    
+    SheetExists = Not ws Is Nothing
+
+End Function
