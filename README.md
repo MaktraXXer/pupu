@@ -1,6 +1,6 @@
 Option Explicit
 
-Sub calc_matrix_with_montecarlo_fast_persist_v4_minfix()
+Sub calc_matrix_with_montecarlo_fast_persist_v3_minfix()
 
     Dim wsG As Worksheet, wsUp As Worksheet, wsRun As Worksheet, wsCpr As Worksheet, wsIn As Worksheet
     Set wsG = Worksheets("График погашения")
@@ -62,23 +62,11 @@ Sub calc_matrix_with_montecarlo_fast_persist_v4_minfix()
 
     ' Предзагрузка сетки
     Dim arrDiscounts As Variant, arrTerms As Variant
-    arrDiscounts = wsIn.Range(wsIn.Cells(min_row, 2), wsIn.Cells(max_row, 2)).Value2
-    arrTerms = wsIn.Range(wsIn.Cells(2, min_col), wsIn.Cells(2, max_col)).Value2
 
-    ' ВАЖНО:
-    ' если диапазон из одной ячейки, Excel возвращает не массив, а scalar.
-    ' Оборачиваем только этот крайний случай.
-    If nRow = 1 Then
-        Dim tmpDiscounts(1 To 1, 1 To 1) As Variant
-        tmpDiscounts(1, 1) = arrDiscounts
-        arrDiscounts = tmpDiscounts
-    End If
-
-    If nCol = 1 Then
-        Dim tmpTerms(1 To 1, 1 To 1) As Variant
-        tmpTerms(1, 1) = arrTerms
-        arrTerms = tmpTerms
-    End If
+    ' ЕДИНСТВЕННОЕ ИЗМЕНЕНИЕ:
+    ' если диапазон из одной ячейки, To2DArray превратит его в массив 1x1
+    arrDiscounts = To2DArray(wsIn.Range(wsIn.Cells(min_row, 2), wsIn.Cells(max_row, 2)).Value2)
+    arrTerms = To2DArray(wsIn.Range(wsIn.Cells(2, min_col), wsIn.Cells(2, max_col)).Value2)
 
     Dim i As Long, k As Long, sc As Long
     Dim rr As Long, cc As Long
@@ -197,3 +185,17 @@ CLEANUP:
     End If
 
 End Sub
+
+
+Private Function To2DArray(ByVal v As Variant) As Variant
+
+    Dim arr(1 To 1, 1 To 1) As Variant
+
+    If IsArray(v) Then
+        To2DArray = v
+    Else
+        arr(1, 1) = v
+        To2DArray = arr
+    End If
+
+End Function
