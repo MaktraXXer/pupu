@@ -1,20 +1,14 @@
-## Функциональная форма модели CPR
-
-Модель рассчитывает CPR как функцию стимула $x$, выдержки кредита $t$ и ставки кредита $r$:
-
 $$
-CPR(x,t,r)
+CPR
 =
 L
 +
-\left(M(t,r)-L\right)
-\frac{1}{1+\exp\left[-k_1(t,r)(x-I_1(t,r))\right]}
+(M-L)\cdot \frac{1}{1+\exp\left[-k_1(x-I_1)\right]}
 +
-\left(U(t,r)-M(t,r)\right)
-\frac{1}{1+\exp\left[-k_2(t,r)(x-I_2(t,r))\right]}.
+(U-M)\cdot \frac{1}{1+\exp\left[-k_2(x-I_2)\right]}.
 $$
 
-Компоненты $M$, $U$, $k_1$, $k_2$ зависят от выдержки и ставки следующим образом:
+Для $M$, $U$, $k_1$, $k_2$:
 
 $$
 j(t,r)
@@ -22,12 +16,14 @@ j(t,r)
 \gamma_j
 \left(1+\rho_j e^{-\lambda_j t}\right)
 \left(
-1+
-\frac{\delta_j}{1+\exp[-\alpha_j(r-r_0)]}
-\right).
+1+\delta_j\cdot
+\frac{1}{1+\exp\left[-\alpha_j(r-r_0)\right]}
+\right),
 $$
 
-Для порогов $I_1$ и $I_2$ используется логарифмическая зависимость от выдержки:
+где $j\in\{M,U,k_1,k_2\}$.
+
+Для $I_1$, $I_2$:
 
 $$
 I_j(t,r)
@@ -35,16 +31,10 @@ I_j(t,r)
 \gamma_j
 \left(1+\rho_j\ln(1+\lambda_j t)\right)
 \left(
-1+
-\frac{\delta_j}{1+\exp[-\alpha_j(r-r_0)]}
+1+\delta_j\cdot
+\frac{1}{1+\exp\left[-\alpha_j(r-r_0)\right]}
 \right)
-+c_j.
++c_j,
 $$
 
-Таким образом, зависимость CPR от стимула представляет собой два последовательных логистических перехода: от уровня $L$ к $M$ и далее от $M$ к $U$.
-
-Результат модели возвращается в долях единицы:
-
-$$
-CPR_{\%}=100\cdot CPR.
-$$
+где $j\in\{1,2\}$.
