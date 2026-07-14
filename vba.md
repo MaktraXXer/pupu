@@ -1,985 +1,533 @@
-ты дебил 
+Да, так делать можно как упрощённое модельное допущение, если вы считаете:
 
- я про сравнение этих методик
+KS_t = RUONIA_t + 0{,}20\%
 
-МЕТОДИКА 3
+то есть basis между ключевой ставкой и RUONIA:
+
+* постоянный;
+* детерминированный;
+* одинаковый на всём горизонте.
+
+Тогда ваши траектории X остаются траекториями RUONIA, а непосредственно перед расчётом payoff переводятся в траектории ключевой ставки прибавлением 0.002.
+
+Предыдущая логика:
+
+current_ks - model_rate_0
+
+была менее прозрачной: она подбирала basis из стартовых значений модели. Теперь basis задаётся явно как экономическое предположение.
+
+Следствие относительно оценки опциона непосредственно на RUONIA:
+
+* cap на КС станет дороже, потому что ставка для payoff выше на 0,2 п.п.;
+* floor на КС станет дешевле, потому что вероятность ухода ниже страйка уменьшается.
+
+1. Исправленный общий блок
+
 import numpy as np
 import pandas as pd
-
-from scipy.optimize import minimize
-from scipy.special import expit, logit
-from scipy.stats import ncx2
-
 # =============================================================================
-# CIR: совместная MLE-калибровка a, theta, sigma
-#
-# ВАЖНО:
-# 1. Используются соседние строки ежедневной RUONIA.
-# 2. Каждый переход по-прежнему считается переходом длиной dt = 1/12.
-# 3. Частота данных и старое значение dt намеренно не меняются.
-# 4. На выходе создаётся opt_ats в прежнем формате.
+# ПАРАМЕТРЫ ОПЦИОНОВ
 # =============================================================================
-
-time_field = 'dt'
-rate_field = 'ruonia'
-
-dt = 1.0 / 12.0
-eps = 1e-10
-
-# -----------------------------------------------------------------------------
-# 1. Подготовка истории — ровно в старой логике
-# -----------------------------------------------------------------------------
-
-rates = (
-    rate_hist[[time_field, rate_field]]
-    .dropna()
-    .sort_values(time_field)
-    .copy()
-)
-
-rs = rates[rate_field].astype(float).reset_index(drop=True)
-
-# Соседние наблюдения:
-# x_prev = r_{t-1}
-# x_next = r_t
-x_prev = rs.iloc[:-1].to_numpy(dtype=float)
-x_next = rs.iloc[1:].to_numpy(dtype=float)
-
-mask = (
-    np.isfinite(x_prev)
-    & np.isfinite(x_next)
-    & (x_prev > 0.0)
-    & (x_next > 0.0)
-)
-
-x_prev = x_prev[mask]
-x_next = x_next[mask]
-
-N = len(x_next)
-
-if N < 10:
-    raise ValueError(
-        f'Недостаточно наблюдений для калибровки CIR: N={N}'
-    )
-
-# -----------------------------------------------------------------------------
-# 2. Параметризация
+# Текущая ключевая ставка.
+# Нужна для контроля, но не используется для автоматической подгонки basis.
+current_ks = 0.1425
+# Предположение:
+# RUONIA в среднем ниже ключевой ставки на 0.20 п.п.
 #
-# a > 0
-# theta > 0
-# 0 < sigma < sqrt(2*a*theta)
-#
-# Последнее условие автоматически обеспечивает условие Феллера:
-# 2*a*theta > sigma^2
-# -----------------------------------------------------------------------------
-
-def unpack_cir_params(raw_params):
+# 0.20 процентного пункта = 0.002 в десятичном формате.
+ks_minus_ruonia_basis = 0.0020
+maturities_years = [
+    0.5,
+    1,
+    2,
+    3,
+    4,
+    5
+]
+cap_strikes = np.arange(
+    0.135,
+    0.180 + 1e-12,
+    0.005
+)
+floor_strikes = np.arange(
+    0.115,
+    0.145 + 1e-12,
+    0.005
+)
+notional_rub = 500_000_000.0
+# Ежемесячная доля года:
+# payoff = max(...) * 1/12
+accrual = 1.0 / 12.0
+# Настройки Monte Carlo
+n_sim_options = 20_000
+option_seed = 42
+# =============================================================================
+# ДИСКОНТИРОВАНИЕ ЧЕРЕЗ ZCYC
+# =============================================================================
+def discount_factors_from_zcyc(months):
     """
-    raw_params = [log(a), log(theta), q_sigma]
-
-    q_sigma преобразуется через sigmoid.
+    Возвращает детерминированные OIS discount factors:
+        DF(1M), DF(2M), ..., DF(months)
+    ZCYC(t) возвращает непрерывную zero-rate,
+    где t выражен в годах:
+        DF(0,t) = exp(-ZCYC(t) * t)
     """
-
-    log_a, log_theta, q_sigma = raw_params
-
-    a = np.exp(log_a)
-    theta = np.exp(log_theta)
-
-    sigma_share = expit(q_sigma)
-
-    # Небольшой отступ от границы Феллера
-    sigma = (
-        0.999
-        * np.sqrt(2.0 * a * theta)
-        * sigma_share
+    times = (
+        np.arange(
+            1,
+            months + 1,
+            dtype=float
+        )
+        / 12.0
     )
-
-    return float(a), float(theta), float(sigma)
-
-def pack_cir_params(a, theta, sigma):
+    zero_rates = np.asarray(
+        ZCYC(times),
+        dtype=float
+    )
+    discount_factors = np.exp(
+        -zero_rates * times
+    )
+    return discount_factors
+# =============================================================================
+# ПЕРЕХОД ОТ МОДЕЛЬНОЙ RUONIA К КЛЮЧЕВОЙ СТАВКЕ
+# =============================================================================
+def ruonia_paths_to_key_rate(
+    ruonia_paths,
+    basis=ks_minus_ruonia_basis
+):
     """
-    Обратное преобразование параметров в пространство оптимизации.
+    Переводит модельные траектории RUONIA
+    в приближённые траектории ключевой ставки.
+    Предположение:
+        KS_t = RUONIA_t + basis
+    По умолчанию:
+        basis = 0.002 = 0.20 п.п.
+    Важно:
+    basis здесь постоянный на всём горизонте.
     """
-
-    a = max(float(a), eps)
-    theta = max(float(theta), eps)
-
-    sigma_limit = 0.999 * np.sqrt(2.0 * a * theta)
-
-    sigma_share = sigma / max(sigma_limit, eps)
-    sigma_share = np.clip(sigma_share, 1e-6, 1.0 - 1e-6)
-
-    return np.array(
-        [
-            np.log(a),
-            np.log(theta),
-            logit(sigma_share)
+    ruonia_paths = np.asarray(
+        ruonia_paths,
+        dtype=float
+    )
+    key_rate_paths = (
+        ruonia_paths
+        + float(basis)
+    )
+    return key_rate_paths
+# =============================================================================
+# РАСЧЁТ МАТРИЦЫ CAP ИЛИ FLOOR
+# =============================================================================
+def option_matrix_from_paths(
+    ruonia_paths,
+    strikes,
+    maturities,
+    option_type,
+    basis=ks_minus_ruonia_basis
+):
+    """
+    Рассчитывает upfront-премию
+    в процентах от номинала.
+    Исходные paths являются траекториями RUONIA.
+    Для payoff используются траектории ключевой ставки:
+        KS_t = RUONIA_t + basis
+    Ежемесячный payoff:
+        Cap:
+            max(KS_t - strike, 0) / 12
+        Floor:
+            max(strike - KS_t, 0) / 12
+    Дисконтирование:
+        по текущей OIS zero curve через ZCYC.
+    Результат:
+        upfront-премия в процентах от номинала.
+    """
+    key_rate_paths = ruonia_paths_to_key_rate(
+        ruonia_paths=ruonia_paths,
+        basis=basis
+    )
+    result = pd.DataFrame(
+        index=[
+            f'{strike * 100:.1f}%'
+            for strike in strikes
+        ],
+        columns=[
+            f'{maturity:g}Y'
+            for maturity in maturities
         ],
         dtype=float
     )
-
-# -----------------------------------------------------------------------------
-# 3. Точная условная плотность CIR
-#
-# x_{t+dt} = c * Y
-# Y ~ noncentral chi-square(df, nc)
-# -----------------------------------------------------------------------------
-
-def cir_exact_negative_log_likelihood(raw_params):
-    a, theta, sigma = unpack_cir_params(raw_params)
-
-    sigma2 = sigma ** 2
-
-    exp_a_dt = np.exp(-a * dt)
-    one_minus_exp = 1.0 - exp_a_dt
-
-    if (
-        not np.isfinite(a)
-        or not np.isfinite(theta)
-        or not np.isfinite(sigma)
-        or a <= 0.0
-        or theta <= 0.0
-        or sigma <= 0.0
-        or one_minus_exp <= 0.0
+    option_type = option_type.lower()
+    if option_type not in (
+        'cap',
+        'floor'
     ):
-        return 1e100
-
-    # Масштаб переходного распределения
-    c = (
-        sigma2
-        * one_minus_exp
-        / (4.0 * a)
-    )
-
-    # Число степеней свободы
-    degrees_freedom = (
-        4.0
-        * a
-        * theta
-        / sigma2
-    )
-
-    # Параметр нецентральности для каждого наблюдения
-    noncentrality = (
-        4.0
-        * a
-        * exp_a_dt
-        * x_prev
-        / (
-            sigma2
-            * one_minus_exp
+        raise ValueError(
+            "option_type должен быть 'cap' или 'floor'"
         )
-    )
-
-    scaled_next = x_next / c
-
-    if (
-        c <= 0.0
-        or degrees_freedom <= 0.0
-        or np.any(noncentrality < 0.0)
-        or np.any(scaled_next <= 0.0)
-    ):
-        return 1e100
-
-    log_density = (
-        ncx2.logpdf(
-            scaled_next,
-            df=degrees_freedom,
-            nc=noncentrality
-        )
-        - np.log(c)
-    )
-
-    if np.any(~np.isfinite(log_density)):
-        return 1e100
-
-    return float(-np.sum(log_density))
-
-# -----------------------------------------------------------------------------
-# 4. Стартовые приближения
-# -----------------------------------------------------------------------------
-
-def build_cir_mle_starts(M=60, seed=42):
-    rng = np.random.default_rng(seed)
-
-    theta_base = max(float(np.mean(rs)), 1e-4)
-
-    # Приближённая оценка a через AR(1):
-    # rho ≈ exp(-a*dt)
-    rho = np.corrcoef(x_prev, x_next)[0, 1]
-
-    if np.isfinite(rho):
-        rho = np.clip(rho, 1e-5, 0.99999)
-        a_base = -np.log(rho) / dt
-    else:
-        a_base = 1.0
-
-    a_base = float(np.clip(a_base, 0.01, 20.0))
-
-    # Грубая Euler-оценка sigma только для стартовой точки
-    residual_base = (
-        x_next
-        - x_prev
-        - a_base * (theta_base - x_prev) * dt
-    )
-
-    sigma_base = np.std(
-        residual_base
-        / np.sqrt(np.maximum(x_prev * dt, eps)),
-        ddof=1
-    )
-
-    sigma_base = max(float(sigma_base), 1e-4)
-
-    starts = []
-
-    a_multipliers = [0.2, 0.5, 1.0, 2.0, 5.0]
-    theta_multipliers = [0.6, 0.8, 1.0, 1.2, 1.5]
-    sigma_multipliers = [0.5, 0.8, 1.0, 1.2]
-
-    for a_mult in a_multipliers:
-        for theta_mult in theta_multipliers:
-            for sigma_mult in sigma_multipliers:
-
-                a0 = max(a_base * a_mult, 1e-4)
-                theta0 = max(theta_base * theta_mult, 1e-4)
-
-                sigma_limit = (
-                    0.95
-                    * np.sqrt(2.0 * a0 * theta0)
-                )
-
-                sigma0 = min(
-                    sigma_base * sigma_mult,
-                    sigma_limit
-                )
-
-                sigma0 = max(sigma0, 1e-6)
-
-                starts.append(
-                    pack_cir_params(
-                        a=a0,
-                        theta=theta0,
-                        sigma=sigma0
-                    )
-                )
-
-    # Случайные старты при необходимости
-    while len(starts) < M:
-        a0 = np.exp(
-            rng.uniform(
-                np.log(0.01),
-                np.log(20.0)
+    for maturity in maturities:
+        months = int(
+            round(
+                maturity * 12
             )
         )
-
-        theta0 = theta_base * rng.uniform(0.4, 2.0)
-        theta0 = max(theta0, 1e-4)
-
-        sigma_limit = np.sqrt(2.0 * a0 * theta0)
-        sigma0 = rng.uniform(0.1, 0.9) * sigma_limit
-
-        starts.append(
-            pack_cir_params(
-                a=a0,
-                theta=theta0,
-                sigma=sigma0
+        if key_rate_paths.shape[0] < months + 1:
+            raise ValueError(
+                f'Для срока {maturity:g}Y необходимо '
+                f'не менее {months + 1} строк в paths.'
             )
-        )
-
-    return starts[:M]
-
-# -----------------------------------------------------------------------------
-# 5. Multi-start MLE
-# -----------------------------------------------------------------------------
-
-def calibrate_cir_joint_mle(
-    M=60,
-    seed=42,
-    verbose=True
+        # Ставки, соответствующие выплатам
+        # в месяцы 1...months.
+        rates = key_rate_paths[
+            1:months + 1,
+            :
+        ]
+        # Дисконт-факторы:
+        # DF(1M)...DF(months)
+        dfs = discount_factors_from_zcyc(
+            months
+        )[:, None]
+        for strike in strikes:
+            if option_type == 'cap':
+                intrinsic = np.maximum(
+                    rates - strike,
+                    0.0
+                )
+            else:
+                intrinsic = np.maximum(
+                    strike - rates,
+                    0.0
+                )
+            # Дисконтированный PV по каждому сценарию.
+            # Получаем долю от номинала.
+            scenario_pv_fraction = np.sum(
+                intrinsic
+                * accrual
+                * dfs,
+                axis=0
+            )
+            # Monte Carlo expectation
+            premium_fraction = np.mean(
+                scenario_pv_fraction
+            )
+            # Перевод доли номинала
+            # в проценты от номинала.
+            premium_percent = (
+                premium_fraction
+                * 100.0
+            )
+            result.loc[
+                f'{strike * 100:.1f}%',
+                f'{maturity:g}Y'
+            ] = premium_percent
+    return result
+def show_option_matrices(
+    cap_matrix,
+    floor_matrix
 ):
-    starts = build_cir_mle_starts(
-        M=M,
-        seed=seed
+    print(
+        '\nCAP на ключевую ставку, '
+        'upfront % от номинала'
+    )
+    display(
+        cap_matrix.round(4)
+    )
+    print(
+        '\nFLOOR на ключевую ставку, '
+        'upfront % от номинала'
+    )
+    display(
+        floor_matrix.round(4)
     )
 
-    results = []
+2. Метод 1: одна симуляция RUONIA на 360 месяцев
 
-    for run_number, start in enumerate(starts, start=1):
-
-        opt = minimize(
-            fun=cir_exact_negative_log_likelihood,
-            x0=start,
-            method='L-BFGS-B',
-            bounds=[
-                (np.log(1e-4), np.log(100.0)),   # a
-                (np.log(1e-4), np.log(2.0)),     # theta
-                (-15.0, 15.0)                    # sigma share
-            ],
-            options={
-                'maxiter': 20000,
-                'ftol': 1e-12,
-                'gtol': 1e-8,
-                'maxls': 100
-            }
-        )
-
-        a_hat, theta_hat, sigma_hat = unpack_cir_params(opt.x)
-
-        feller_margin = (
-            2.0 * a_hat * theta_hat
-            - sigma_hat ** 2
-        )
-
-        result = {
-            'success': bool(opt.success),
-            'message': str(opt.message),
-            'a': float(a_hat),
-            'theta': float(theta_hat),
-            's': float(sigma_hat),
-            'nll': float(opt.fun),
-            'nit': int(getattr(opt, 'nit', -1)),
-            'feller_margin': float(feller_margin)
-        }
-
-        results.append(result)
-
-        if verbose and (
-            run_number % 10 == 0
-            or run_number == len(starts)
-        ):
-            finite_results = [
-                item
-                for item in results
-                if np.isfinite(item['nll'])
-            ]
-
-            best_nll = min(
-                item['nll']
-                for item in finite_results
-            )
-
-            print(
-                f'[CIR joint MLE] '
-                f'{run_number}/{len(starts)}; '
-                f'best NLL={best_nll:.8f}'
-            )
-
-    valid_results = [
-        item
-        for item in results
-        if np.isfinite(item['nll'])
-        and item['feller_margin'] > 0.0
-    ]
-
-    if not valid_results:
-        raise RuntimeError(
-            'Не найдено допустимое решение совместной MLE-калибровки CIR.'
-        )
-
-    valid_results.sort(
-        key=lambda item: item['nll']
-    )
-
-    best = valid_results[0]
-
-    if verbose:
-        print('\nTop-5 joint CIR MLE:')
-
-        for rank, item in enumerate(
-            valid_results[:5],
-            start=1
-        ):
-            half_life_years = (
-                np.log(2.0) / item['a']
-            )
-
-            print(
-                f"{rank}) "
-                f"a={item['a']:.10f}; "
-                f"theta={item['theta']:.10f}; "
-                f"s={item['s']:.10f}; "
-                f"NLL={item['nll']:.6f}; "
-                f"half-life={half_life_years:.6f} years; "
-                f"Feller={item['feller_margin']:.10f}; "
-                f"success={item['success']}"
-            )
-
-        print('\nChosen joint MLE parameters:')
-        print(
-            f"a={best['a']:.10f}, "
-            f"theta={best['theta']:.10f}, "
-            f"s={best['s']:.10f}, "
-            f"NLL={best['nll']:.6f}"
-        )
-
-    return best, results
-
-# -----------------------------------------------------------------------------
-# 6. Запуск
-# -----------------------------------------------------------------------------
-
-best_mle, all_mle_runs = calibrate_cir_joint_mle(
-    M=60,
-    seed=42,
-    verbose=True
+# =============================================================================
+# МЕТОД 1
+# ОДНА СИМУЛЯЦИЯ RUONIA НА 360 МЕСЯЦЕВ
+# =============================================================================
+np.random.seed(
+    option_seed
+)
+X_360_ruonia = MC_simulations(
+    T=360,
+    n_sim=n_sim_options,
+    a=opt_ats['a'],
+    theta=opt_ats['theta'],
+    s=opt_ats['s'],
+    debug=False
+)
+cap_matrix_method_1 = option_matrix_from_paths(
+    ruonia_paths=X_360_ruonia,
+    strikes=cap_strikes,
+    maturities=maturities_years,
+    option_type='cap',
+    basis=ks_minus_ruonia_basis
+)
+floor_matrix_method_1 = option_matrix_from_paths(
+    ruonia_paths=X_360_ruonia,
+    strikes=floor_strikes,
+    maturities=maturities_years,
+    option_type='floor',
+    basis=ks_minus_ruonia_basis
+)
+show_option_matrices(
+    cap_matrix_method_1,
+    floor_matrix_method_1
 )
 
-# Формат полностью совместим с вашим MC_simulations()
-opt_ats = {
-    'a': best_mle['a'],
-    'theta': best_mle['theta'],
-    's': best_mle['s']
-}
+Пример перевода в рубли:
 
-print('\nFinal opt_ats:')
-print(opt_ats)
+premium_percent = (
+    cap_matrix_method_1.loc[
+        '15.0%',
+        '2Y'
+    ]
+)
+premium_rub = (
+    premium_percent
+    / 100.0
+    * notional_rub
+)
+print(
+    f'Cap на КС 15.0%, 2Y: '
+    f'{premium_percent:.4f}% '
+    f'= {premium_rub:,.0f} руб.'
+)
 
-методика 2
-import numpy as np
-import pandas as pd
+3. Метод 2: отдельная симуляция RUONIA до каждого срока
 
-from scipy.optimize import minimize
-from scipy.stats import ncx2
-
-# ------------------------------------------------------------
-# Exact MLE calibration for CIR
-# ------------------------------------------------------------
-
-time_field = 'dt'
-rate_field = 'ruonia'
-
-eps = 1e-10
-
-def prepare_cir_history(rate_hist):
-    rates = (
-        rate_hist[[time_field, rate_field]]
-        .dropna()
-        .sort_values(time_field)
-        .copy()
+# =============================================================================
+# МЕТОД 2
+# ОТДЕЛЬНАЯ СИМУЛЯЦИЯ RUONIA ДО СРОКА КАЖДОГО ОПЦИОНА
+# =============================================================================
+def option_matrices_separate_horizons(
+    n_sim,
+    seed,
+    basis=ks_minus_ruonia_basis
+):
+    cap_result = pd.DataFrame(
+        index=[
+            f'{strike * 100:.1f}%'
+            for strike in cap_strikes
+        ],
+        columns=[
+            f'{maturity:g}Y'
+            for maturity in maturities_years
+        ],
+        dtype=float
     )
-
-    rates[time_field] = pd.to_datetime(rates[time_field])
-
-    x_prev = rates[rate_field].iloc[:-1].to_numpy(dtype=float)
-    x_next = rates[rate_field].iloc[1:].to_numpy(dtype=float)
-
-    dates_prev = rates[time_field].iloc[:-1].to_numpy()
-    dates_next = rates[time_field].iloc[1:].to_numpy()
-
-    # Фактическое время между наблюдениями в годах
-    delta_days = (
-        dates_next.astype('datetime64[D]')
-        - dates_prev.astype('datetime64[D]')
-    ).astype(int)
-
-    delta_t = delta_days / 365.0
-
-    mask = (
-        np.isfinite(x_prev)
-        & np.isfinite(x_next)
-        & np.isfinite(delta_t)
-        & (x_prev > 0)
-        & (x_next > 0)
-        & (delta_t > 0)
+    floor_result = pd.DataFrame(
+        index=[
+            f'{strike * 100:.1f}%'
+            for strike in floor_strikes
+        ],
+        columns=[
+            f'{maturity:g}Y'
+            for maturity in maturities_years
+        ],
+        dtype=float
     )
-
+    for maturity in maturities_years:
+        months = int(
+            round(
+                maturity * 12
+            )
+        )
+        # Возвращаем генератор к тому же seed,
+        # чтобы начальные случайные числа совпадали
+        # с общей 360-месячной симуляцией.
+        np.random.seed(
+            seed
+        )
+        ruonia_paths = MC_simulations(
+            T=months,
+            n_sim=n_sim,
+            a=opt_ats['a'],
+            theta=opt_ats['theta'],
+            s=opt_ats['s'],
+            debug=False
+        )
+        cap_one = option_matrix_from_paths(
+            ruonia_paths=ruonia_paths,
+            strikes=cap_strikes,
+            maturities=[maturity],
+            option_type='cap',
+            basis=basis
+        )
+        floor_one = option_matrix_from_paths(
+            ruonia_paths=ruonia_paths,
+            strikes=floor_strikes,
+            maturities=[maturity],
+            option_type='floor',
+            basis=basis
+        )
+        column = (
+            f'{maturity:g}Y'
+        )
+        cap_result[column] = (
+            cap_one[column]
+        )
+        floor_result[column] = (
+            floor_one[column]
+        )
     return (
-        x_prev[mask],
-        x_next[mask],
-        delta_t[mask]
+        cap_result,
+        floor_result
     )
-
-x_prev, x_next, delta_t = prepare_cir_history(rate_hist)
-
-def unpack_params(raw_params):
-    """
-    Оптимизируем логарифмы параметров, чтобы автоматически обеспечить:
-    a > 0, theta > 0, sigma > 0
-    """
-    log_a, log_theta, log_sigma = raw_params
-
-    a = np.exp(log_a)
-    theta = np.exp(log_theta)
-    sigma = np.exp(log_sigma)
-
-    return a, theta, sigma
-
-def cir_negative_log_likelihood(
-    raw_params,
-    x_prev,
-    x_next,
-    delta_t,
-    enforce_feller=True
-):
-    a, theta, sigma = unpack_params(raw_params)
-
-    sigma2 = sigma ** 2
-
-    if (
-        not np.isfinite(a)
-        or not np.isfinite(theta)
-        or not np.isfinite(sigma)
-    ):
-        return 1e100
-
-    # Жёсткая проверка Феллера при необходимости
-    if enforce_feller and 2.0 * a * theta <= sigma2:
-        return 1e100
-
-    exp_term = np.exp(-a * delta_t)
-    one_minus_exp = 1.0 - exp_term
-
-    if np.any(one_minus_exp <= 0):
-        return 1e100
-
-    c = sigma2 * one_minus_exp / (4.0 * a)
-
-    degrees_freedom = 4.0 * a * theta / sigma2
-
-    noncentrality = (
-        4.0
-        * a
-        * exp_term
-        * x_prev
-        / (sigma2 * one_minus_exp)
+cap_matrix_method_2, floor_matrix_method_2 = (
+    option_matrices_separate_horizons(
+        n_sim=n_sim_options,
+        seed=option_seed,
+        basis=ks_minus_ruonia_basis
     )
-
-    scaled_next = x_next / c
-
-    if (
-        np.any(c <= 0)
-        or degrees_freedom <= 0
-        or np.any(noncentrality < 0)
-        or np.any(scaled_next <= 0)
-    ):
-        return 1e100
-
-    log_pdf = (
-        ncx2.logpdf(
-            scaled_next,
-            df=degrees_freedom,
-            nc=noncentrality
-        )
-        - np.log(c)
-    )
-
-    if np.any(~np.isfinite(log_pdf)):
-        return 1e100
-
-    return -np.sum(log_pdf)
-
-def build_mle_start_points(M=60, seed=42):
-    rng = np.random.default_rng(seed)
-
-    theta_base = float(np.mean(x_prev))
-    theta_base = max(theta_base, 1e-4)
-
-    # Грубая оценка mean reversion
-    rho = np.corrcoef(x_prev, x_next)[0, 1]
-
-    if np.isfinite(rho):
-        rho = np.clip(rho, 1e-4, 0.9999)
-
-        mean_dt = float(np.mean(delta_t))
-        a_base = -np.log(rho) / mean_dt
-    else:
-        a_base = 1.0
-
-    a_base = float(np.clip(a_base, 0.01, 20.0))
-
-    dx = x_next - x_prev
-
-    sigma_base = np.std(
-        dx / np.sqrt(np.maximum(x_prev * delta_t, eps)),
-        ddof=1
-    )
-
-    sigma_base = float(np.clip(sigma_base, 1e-4, 5.0))
-
-    starts = []
-
-    a_multipliers = [0.25, 0.5, 1.0, 2.0, 4.0]
-    theta_multipliers = [0.7, 1.0, 1.3]
-    sigma_multipliers = [0.5, 1.0, 1.5]
-
-    for am in a_multipliers:
-        for tm in theta_multipliers:
-            for sm in sigma_multipliers:
-                a0 = max(a_base * am, 1e-6)
-                theta0 = max(theta_base * tm, 1e-6)
-                sigma0 = max(sigma_base * sm, 1e-6)
-
-                # Подрезаем sigma, чтобы старт проходил Феллера
-                sigma_max = 0.95 * np.sqrt(2.0 * a0 * theta0)
-
-                if sigma0 >= sigma_max:
-                    sigma0 = max(sigma_max, 1e-6)
-
-                starts.append(
-                    np.log([a0, theta0, sigma0])
-                )
-
-    while len(starts) < M:
-        a0 = np.exp(
-            rng.uniform(
-                np.log(0.01),
-                np.log(20.0)
-            )
-        )
-
-        theta0 = np.exp(
-            rng.uniform(
-                np.log(max(theta_base * 0.4, 1e-4)),
-                np.log(theta_base * 2.0)
-            )
-        )
-
-        sigma_max = np.sqrt(2.0 * a0 * theta0)
-
-        sigma0 = rng.uniform(0.1, 0.9) * sigma_max
-        sigma0 = max(sigma0, 1e-6)
-
-        starts.append(
-            np.log([a0, theta0, sigma0])
-        )
-
-    return starts[:M]
-
-def calibrate_cir_exact_mle(
-    x_prev,
-    x_next,
-    delta_t,
-    M=60,
-    seed=42,
-    enforce_feller=True,
-    verbose=True
-):
-    starts = build_mle_start_points(M=M, seed=seed)
-
-    results = []
-
-    for i, start in enumerate(starts, start=1):
-        opt = minimize(
-            fun=cir_negative_log_likelihood,
-            x0=start,
-            args=(
-                x_prev,
-                x_next,
-                delta_t,
-                enforce_feller
-            ),
-            method='L-BFGS-B',
-            options={
-                'maxiter': 10000,
-                'ftol': 1e-12,
-                'gtol': 1e-8
-            }
-        )
-
-        a, theta, sigma = unpack_params(opt.x)
-
-        result = {
-            'success': bool(opt.success),
-            'message': str(opt.message),
-            'a': float(a),
-            'theta': float(theta),
-            's': float(sigma),
-            'nll': float(opt.fun),
-            'nit': int(getattr(opt, 'nit', -1)),
-            'feller_margin': float(
-                2.0 * a * theta - sigma ** 2
-            )
-        }
-
-        results.append(result)
-
-        if verbose and (i % 10 == 0 or i == len(starts)):
-            valid_nll = [
-                r['nll']
-                for r in results
-                if r['success'] and np.isfinite(r['nll'])
-            ]
-
-            best_nll = (
-                min(valid_nll)
-                if valid_nll
-                else np.inf
-            )
-
-            print(
-                f'[MLE] {i}/{len(starts)}, '
-                f'best NLL={best_nll:.6f}'
-            )
-
-    valid_results = [
-        r
-        for r in results
-        if r['success']
-        and np.isfinite(r['nll'])
-        and (
-            not enforce_feller
-            or r['feller_margin'] > 0
-        )
-    ]
-
-    if not valid_results:
-        raise RuntimeError(
-            'Не удалось получить допустимую MLE-калибровку CIR.'
-        )
-
-    valid_results.sort(key=lambda r: r['nll'])
-    best = valid_results[0]
-
-    if verbose:
-        print('\nTop-5 CIR MLE results:')
-
-        for rank, res in enumerate(valid_results[:5], start=1):
-            half_life = np.log(2.0) / res['a']
-
-            print(
-                f"{rank}) "
-                f"a={res['a']:.8f}, "
-                f"theta={res['theta']:.8f}, "
-                f"s={res['s']:.8f}, "
-                f"NLL={res['nll']:.4f}, "
-                f"half-life={half_life:.4f} years, "
-                f"Feller margin={res['feller_margin']:.8g}"
-            )
-
-    return best, results
-
-best_mle, all_mle_runs = calibrate_cir_exact_mle(
-    x_prev=x_prev,
-    x_next=x_next,
-    delta_t=delta_t,
-    M=60,
-    seed=42,
-    enforce_feller=True,
-    verbose=True
+)
+show_option_matrices(
+    cap_matrix_method_2,
+    floor_matrix_method_2
 )
 
-opt_ats = {
-    'a': best_mle['a'],
-    'theta': best_mle['theta'],
-    's': best_mle['s']
+4. Полезно сразу сравнить с оценкой без basis
+
+Так вы увидите чистый эффект предположения, что КС выше RUONIA на 0,2 п.п.
+
+cap_matrix_ruonia_only = option_matrix_from_paths(
+    ruonia_paths=X_360_ruonia,
+    strikes=cap_strikes,
+    maturities=maturities_years,
+    option_type='cap',
+    basis=0.0
+)
+floor_matrix_ruonia_only = option_matrix_from_paths(
+    ruonia_paths=X_360_ruonia,
+    strikes=floor_strikes,
+    maturities=maturities_years,
+    option_type='floor',
+    basis=0.0
+)
+cap_basis_effect = (
+    cap_matrix_method_1
+    - cap_matrix_ruonia_only
+)
+floor_basis_effect = (
+    floor_matrix_method_1
+    - floor_matrix_ruonia_only
+)
+print(
+    '\nВлияние basis +0.20 п.п. на CAP, '
+    'п.п. upfront'
+)
+display(
+    cap_basis_effect.round(4)
+)
+print(
+    '\nВлияние basis +0.20 п.п. на FLOOR, '
+    'п.п. upfront'
+)
+display(
+    floor_basis_effect.round(4)
+)
+
+Ожидаемо:
+
+cap_basis_effect >= 0
+
+и:
+
+floor_basis_effect <= 0
+
+с точностью до численных погрешностей.
+
+Насколько это справедливо
+
+Для первого приближения — справедливо. Вы делаете явное предположение:
+
+KS_t-RUONIA_t=0{,}20\%
+
+на всех будущих датах и во всех сценариях.
+
+Но есть три ограничения.
+
+1. Разница не обязательно постоянна
+
+Фактический спред может зависеть от:
+
+* режима денежно-кредитной политики;
+* состояния ликвидности;
+* периода усреднения резервов;
+* ожиданий изменения КС;
+* технических факторов денежного рынка.
+
+Поэтому более реалистично было бы иметь:
+
+KS_t=RUONIA_t+b_t,
+
+где b_t может меняться.
+
+2. Текущий basis может отличаться от исторического среднего
+
+При текущей КС 14,25% предположение даёт текущую RUONIA:
+
+14{,}25\%-0{,}20\%=14{,}05\%.
+
+Стоит проверить, близко ли это к:
+
+X_360_ruonia[0, 0]
+
+Если модель стартует, например, с 13,70%, то после прибавления 0,20% стартовая модельная КС будет 13,90%, а не 14,25%.
+
+Проверка:
+
+model_ruonia_0 = float(
+    X_360_ruonia[0, 0]
+)
+model_key_rate_0 = (
+    model_ruonia_0
+    + ks_minus_ruonia_basis
+)
+print(
+    'Model RUONIA 0:',
+    model_ruonia_0
+)
+print(
+    'Model KS 0:',
+    model_key_rate_0
+)
+print(
+    'Actual KS:',
+    current_ks
+)
+print(
+    'Start mismatch:',
+    model_key_rate_0 - current_ks
+)
+
+Если расхождение существенное, надо решить, что важнее:
+
+* фиксированный исторический basis 0.002;
+* либо точное совпадение стартовой КС.
+
+3. Дисконтирование по RUONIA OIS остаётся нормальным
+
+Даже если payoff зависит от КС, дисконтировать его по OIS RUONIA-кривой логично:
+
+DF(0,t)=e^{-ZCYC(t)t}.
+
+То есть:
+
+* индекс payoff — ключевая ставка;
+* discount curve — OIS RUONIA.
+
+Это нормальное разделение.
+
+Итоговая схема:
+
+\boxed{
+X_t^{RUONIA}
+\rightarrow
+X_t^{KS}=X_t^{RUONIA}+0{,}20\%
+\rightarrow
+\text{cap/floor payoff}
+\rightarrow
+\text{OIS-дисконтирование}
 }
 
-print('\nFinal exact MLE parameters:')
-print(opt_ats)
-
-Методика 1 
-
-import numpy as np
-import pandas as pd
-from scipy.optimize import minimize
-
-# --- CIR parameters calibration (multi-start, Variant 2) ----------------------
-# Требования:
-# - сделать калибровку устойчивой к стартовой точке
-# - выбрать лучший запуск по "финальному" качеству после шага B 
-
-# Настройки
-time_field = 'dt'
-rate_field = 'ruonia'
-constr_mul = 2.0  # Феллер: 2*a*theta - s^2 >= eps
-method = 'SLSQP'
-bounds = ((0, None), (0, None), (0, None))
-
-# 1) Подготовка рядов r_t и r_{t-1}
-rates = rate_hist.copy()
-rates = rates[[time_field, rate_field]].dropna()
-rates = rates.sort_values(time_field).set_index(time_field)
-rs = pd.Series(rates[rate_field], dtype=float)
-
-series_shift = 1
-r1 = rs.shift(series_shift).iloc[series_shift:].to_numpy(dtype=float)  # r_{t-1}
-r = rs.iloc[series_shift:].to_numpy(dtype=float)                      # r_t
-N = len(r)
-
-# Защита от нулей/отрицательных значений в sqrt (для нормировки)
-r1_safe = np.maximum(r1, eps)
-r1s = np.sqrt(r1_safe)
-
-# 2) Функции ошибки и статистики (как в исходной логике)
-def dw_term(ats):
-    a, theta, s = ats
-    # (r_t - r_{t-1}) - a(theta - r_{t-1})dt
-    return (r - r1) - (a * theta - a * r1) * dt
-
-def error_A(ats):
-    # Error на шаге A: sum( (dw/sqrt(r_{t-1}))^2 )
-    return np.sum((dw_term(ats) / r1s) ** 2)
-
-def mean_u(ats):
-    # среднее нормированного остатка
-    u = dw_term(ats) / r1s
-    return float(np.mean(u))
-
-def std_u_sample(ats):
-    # выборочное std нормированного остатка u_t = dw/sqrt(r_{t-1})
-    u = dw_term(ats) / r1s
-    # ddof=1 как у выборочной дисперсии
-    return float(np.std(u, ddof=1))
-
-def s_from_history(a, theta):
-    # Шаг B: s ≈ Std(u)/sqrt(dt)
-    # где u = dw/sqrt(r_{t-1}), а Std(u) ≈ s*sqrt(dt)
-    # Также гарантируем s>=0
-    # Здесь dw считаем с s=0 (не влияет на dw), поэтому используем ats=(a,theta,0)
-    u_std = std_u_sample((a, theta, 0.0))
-    return max(u_std / np.sqrt(dt), 0.0)
-
-def feller_ok(a, theta, s):
-    return (constr_mul * a * theta - s * s) >= eps
-
-# 3) Оптимизация шага A для одного старта
-def run_step_A(ats0):
-    constr = ({'type': 'ineq',
-               'fun': lambda x: constr_mul * x[0] * x[1] - x[2] * x[2] - eps},)
-
-    opt = minimize(
-        fun=error_A,
-        x0=np.array(ats0, dtype=float),
-        method=method,
-        bounds=bounds,
-        constraints=constr,
-        options={'maxiter': 10**6}
-    )
-
-    a_hat, theta_hat, s_hat = opt.x
-    return {
-        'success': bool(opt.success),
-        'message': str(opt.message),
-        'a': float(a_hat),
-        'theta': float(theta_hat),
-        's_A': float(s_hat),            # s из шага A
-        'error_A': float(opt.fun),
-        'nit': int(getattr(opt, 'nit', -1))
-    }
-
-# 4) Multi-start: как генерируем стартовые точки
-def build_start_points(M=60, seed=42):
-    rng = np.random.default_rng(seed)
-
-    # базовые оценки из данных
-    theta_base = float(np.mean(rs))
-    theta_base = max(theta_base, 1e-4)
-
-    # грубая оценка a по лаг-1 корреляции (если адекватно считается)
-    rs_shift = rs.shift(1).dropna()
-    rs_now = rs.iloc[1:]
-    if len(rs_shift) > 10:
-        rho1 = float(np.corrcoef(rs_now.to_numpy(), rs_shift.to_numpy())[0, 1])
-        rho1 = np.clip(rho1, 1e-6, 0.999999)  # чтобы log не взорвался
-        a_base = float(-np.log(rho1) / dt)
-        a_base = np.clip(a_base, 0.05, 5.0)
-    else:
-        a_base = 1.0
-
-    # грубая оценка s из дисперсии приращений
-    dr = rs.diff().dropna().to_numpy(dtype=float)
-    sigma_dr = float(np.std(dr, ddof=1)) if len(dr) > 10 else 0.01
-    s_base = sigma_dr / (np.sqrt(theta_base) * np.sqrt(dt))
-    s_base = float(np.clip(s_base, 1e-4, 2.0))
-
-    # детерминированная сетка (устойчива и воспроизводима)
-    a_grid = np.array([0.1, 0.3, 0.7, 1.5, 3.0, a_base])
-    theta_grid = theta_base * np.array([0.5, 0.8, 1.0, 1.2, 1.5])
-    s_mult = np.array([0.6, 0.8, 1.0, 1.2, 1.5])
-
-    starts = []
-    for a0 in a_grid:
-        for th0 in theta_grid:
-            # выбираем несколько s0, которые стараются быть допустимыми по Феллеру
-            for m in s_mult:
-                s0 = s_base * m
-                # если не проходит Феллер — “подрежем” s0 до 0.8*sqrt(2*a*theta)
-                s_max = 0.8 * np.sqrt(max(constr_mul * a0 * th0, 0.0))
-                if s0 > s_max:
-                    s0 = max(s_max, 1e-6)
-                starts.append((float(a0), float(th0), float(s0)))
-
-    # добавим случайные старты до M (если нужно)
-    while len(starts) < M:
-        a0 = float(np.exp(rng.uniform(np.log(0.05), np.log(5.0))))
-        th0 = float(theta_base * rng.uniform(0.5, 1.5))
-        # ставим s0 как долю от sqrt(2*a*theta), чтобы почти наверняка пройти Феллер
-        s0 = float(rng.uniform(0.3, 0.9) * np.sqrt(max(constr_mul * a0 * th0, 0.0)))
-        s0 = max(s0, 1e-6)
-        starts.append((a0, th0, s0))
-
-    # если стартов слишком много — обрежем
-    if len(starts) > M:
-        starts = starts[:M]
-
-    return starts
-
-# 5) Вариант 2: для каждого старта делаем A -> B, считаем финальную ошибку, выбираем лучший
-def multi_start_calibrate(M=60, seed=42, verbose=True):
-    starts = build_start_points(M=M, seed=seed)
-
-    results = []
-    for j, ats0 in enumerate(starts, start=1):
-        resA = run_step_A(ats0)
-
-        # Если оптимизация не сошлась — всё равно можно сохранить для анализа, но как кандидата не брать
-        if not resA['success']:
-            resA['s_final'] = np.nan
-            resA['error_final'] = np.inf
-            results.append(resA)
-            continue
-
-        a_hat = resA['a']
-        theta_hat = resA['theta']
-
-        # Шаг B: уточняем s по истории
-        s_final = s_from_history(a_hat, theta_hat)
-
-        # проверка Феллера после шага B (важно!)
-        if not feller_ok(a_hat, theta_hat, s_final):
-            # если нарушили — считаем этот запуск плохим
-            resA['s_final'] = float(s_final)
-            resA['error_final'] = np.inf
-            results.append(resA)
-            continue
-
-        # финальная ошибка уже на (a,theta,s_final)
-        err_final = error_A((a_hat, theta_hat, s_final))
-
-        resA['s_final'] = float(s_final)
-        resA['error_final'] = float(err_final)
-        results.append(resA)
-
-        if verbose and (j % 10 == 0 or j == len(starts)):
-            print(f"[multi-start] {j}/{len(starts)} done. best_error_final={min(r['error_final'] for r in results):.6g}")
-
-    # выбираем лучший по минимальному error_final (это и есть вариант 2)
-    best = min(results, key=lambda d: d['error_final'])
-
-    # доп. табличка топ-5 для sanity
-    results_sorted = sorted(results, key=lambda d: d['error_final'])
-    top5 = results_sorted[:5]
-
-    if verbose:
-        print("\nTop-5 by final error (after step B):")
-        for i, r_ in enumerate(top5, 1):
-            print(f"{i}) a={r_['a']:.6g}, theta={r_['theta']:.6g}, s_final={r_['s_final']:.6g}, "
-                  f"error_final={r_['error_final']:.6g}, error_A={r_['error_A']:.6g}, success={r_['success']}")
-
-        print("\nChosen best (variant 2):")
-        print(f"a={best['a']:.6g}, theta={best['theta']:.6g}, s={best['s_final']:.6g}, error_final={best['error_final']:.6g}")
-
-    return best, results
-
-# --- Запуск калибровки
-best, all_runs = multi_start_calibrate(M=60, seed=42, verbose=True)
-
-# --- Итоговый словарь, который ожидают дальнейшие блоки (оставляем имя opt_ats)
-opt_ats = {
-    'a': best['a'],
-    'theta': best['theta'],
-    's': best['s_final'],
-}
-
-print("\nFinal opt_ats:", opt_ats)
+Она методологически понятнее предыдущей автоматической подгонки basis через current_ks - model_rate_0.
