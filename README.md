@@ -1,108 +1,215 @@
-Option Explicit
+## Функциональная форма модели CPR
 
-' Загружает историю ТС ДВС из листа "история ТС" (A:C) в таблицу ALM_TEST.alm_report.trf_dvs_history
-' 1) очищает таблицу (TRUNCATE)
-' 2) вставляет все строки (dt_rep, rate_trf_fix, rate_trf_float)
-'
-' Ожидаемый формат на листе "история ТС":
-'   A: Дата (Date)
-'   B: ТС фикс (может быть 17.95% или 0.1795)
-'   C: ТС флоат (может быть 17.32% или 0.1732)
+Модель рассчитывает годовой CPR как функцию:
 
-Public Sub Upload_TRF_DVS_History()
-    Dim wb As Workbook, sht As Worksheet
-    Dim lastRow As Long, r As Long
+- стимула к рефинансированию $x$;
+- выдержки кредита $t$ в месяцах;
+- ставки кредита $r$;
+- набора откалиброванных параметров.
 
-    Dim dtRep As Date
-    Dim rateFix As Double, rateFloat As Double
+Итоговая функция имеет вид:
 
-    Dim sql As String
-    Dim cnt As Long
+$$
+CPR(x,t,r)
+=
+L
++
+\left(M(t,r)-L\right)\sigma_1(x,t,r)
++
+\left(U(t,r)-M(t,r)\right)\sigma_2(x,t,r),
+$$
 
-    Set wb = ActiveWorkbook
-    Set sht = wb.Sheets("история ТС")
+где:
 
-    lastRow = sht.Cells(sht.Rows.Count, "A").End(xlUp).Row
-    If lastRow < 2 Then
-        MsgBox "На листе 'история ТС' нет данных (ожидаю строки начиная со 2).", vbExclamation
-        Exit Sub
-    End If
+$$
+\sigma_1(x,t,r)
+=
+\frac{1}
+{1+\exp\left[-k_1(t,r)\left(x-I_1(t,r)\right)\right]},
+$$
 
-    ' 1) Очистка таблицы
-    sql = "TRUNCATE TABLE [ALM_TEST].[alm_report].[trf_dvs_history];"
-    Call sql_exec(GetConStr_ALM_TEST(), sql)
+$$
+\sigma_2(x,t,r)
+=
+\frac{1}
+{1+\exp\left[-k_2(t,r)\left(x-I_2(t,r)\right)\right]}.
+$$
 
-    ' 2) Вставка данных (одним батчем)
-    sql = "INSERT INTO [ALM_TEST].[alm_report].[trf_dvs_history] ([dt_rep],[rate_trf_fix],[rate_trf_float]) VALUES " & vbCrLf
+Здесь:
 
-    cnt = 0
-    For r = 2 To lastRow
-        If Trim(CStr(sht.Cells(r, "A").Value)) <> "" Then
-            dtRep = CDate(sht.Cells(r, "A").Value)
+- $L$ — нижний асимптотический уровень CPR;
+- $M(t,r)$ — промежуточный уровень CPR;
+- $U(t,r)$ — верхний уровень CPR;
+- $k_1(t,r)$ и $k_2(t,r)$ — крутизна первого и второго логистических переходов;
+- $I_1(t,r)$ и $I_2(t,r)$ — положения точек логистического перехода по стимулу.
 
-            rateFix = ParsePercentToDecimal(sht.Cells(r, "B").Value)
-            rateFloat = ParsePercentToDecimal(sht.Cells(r, "C").Value)
+Таким образом, зависимость CPR от стимула представляет собой сумму двух логистических переходов:
 
-            If cnt > 0 Then sql = sql & "," & vbCrLf
-            sql = sql & "('" & Format(dtRep, "yyyy-mm-dd") & "', " & DblToSql(rateFix) & ", " & DblToSql(rateFloat) & ")"
+1. от уровня $L$ к уровню $M$;
+2. от уровня $M$ к уровню $U$.
 
-            cnt = cnt + 1
-        End If
-    Next r
+---
 
-    sql = sql & ";"
+## Зависимость компонентов от ставки кредита
 
-    If cnt > 0 Then
-        Call sql_exec(GetConStr_ALM_TEST(), sql)
-        MsgBox "Готово. Загружено строк: " & cnt, vbInformation
-    Else
-        MsgBox "Нет строк для загрузки (пустой столбец A).", vbExclamation
-    End If
+Для каждого компонента
 
-    Set sht = Nothing
-    Set wb = Nothing
-End Sub
+$$
+j \in \{M,U,k_1,k_2,I_1,I_2\}
+$$
 
-' --- Helpers ---
+сначала рассчитывается отклонение ставки кредита от базовой ставки:
 
-' Подключение (как у тебя, Integrated Security).
-' Если у тебя в GetConStr() нет Initial Catalog, можно явно указать ALM_TEST.
-Public Function GetConStr_ALM_TEST() As String
-    GetConStr_ALM_TEST = "Provider=SQLOLEDB.1;Data Source=trading-db.ahml1.ru;Integrated Security=SSPI;Initial Catalog=ALM_TEST;"
-End Function
+$$
+R=r-r_0,
+$$
 
-' Выполнение non-select SQL (TRUNCATE/INSERT/UPDATE/DELETE)
-Public Sub sql_exec(ByVal ConStr As String, ByVal strSQL As String)
-    Dim cn As Object
-    Set cn = CreateObject("ADODB.Connection")
-    cn.ConnectionString = ConStr
-    cn.Open
-    cn.Execute strSQL
-    cn.Close
-    Set cn = Nothing
-End Sub
+где $r_0$ — базовый уровень ставки.
 
-' Приведение процента из Excel к доле:
-'  - если пришло 17.95% (0.1795) -> вернет 0.1795
-'  - если пришло 17.95 (без %) -> вернет 0.1795 (эвристика: >1 => /100)
-'  - если пришло 0.1795 -> вернет 0.1795
-Private Function ParsePercentToDecimal(ByVal v As Variant) As Double
-    Dim x As Double
+Ставочный множитель компонента имеет вид:
 
-    If IsEmpty(v) Or Trim(CStr(v)) = "" Then
-        ParsePercentToDecimal = 0#
-        Exit Function
-    End If
+$$
+F_j^{rate}(r)
+=
+1+\delta_j
+\operatorname{sigmoid}\left(\alpha_j R\right),
+$$
 
-    x = CDbl(v)
+или в явной форме:
 
-    ' В Excel процент может быть уже долей (0.1795) или числом 17.95 (если формат общий/числовой)
-    If x > 1# Then x = x / 100#
+$$
+F_j^{rate}(r)
+=
+1+
+\frac{\delta_j}
+{1+\exp\left[-\alpha_j(r-r_0)\right]}.
+$$
 
-    ParsePercentToDecimal = x
-End Function
+Параметр:
 
-' Double -> SQL (точка как разделитель)
-Private Function DblToSql(ByVal x As Double) As String
-    DblToSql = Replace(Format$(x, "0.##############"), ",", ".")
-End Function
+- $\delta_j$ определяет масштаб влияния ставки;
+- $\alpha_j$ определяет направление и скорость изменения компонента при изменении ставки.
+
+---
+
+## Зависимость компонентов от выдержки кредита
+
+Для компонентов
+
+$$
+j \in \{M,U,k_1,k_2\}
+$$
+
+используется экспоненциальная зависимость от выдержки:
+
+$$
+F_j^{age}(t)
+=
+1+\rho_j\exp(-\lambda_j t).
+$$
+
+При увеличении выдержки экспоненциальная часть стремится к нулю:
+
+$$
+\lim_{t\to\infty}F_j^{age}(t)=1.
+$$
+
+Для компонентов
+
+$$
+j \in \{I_1,I_2\}
+$$
+
+используется логарифмическая зависимость:
+
+$$
+F_j^{age}(t)
+=
+1+\rho_j\ln(1+\lambda_j t).
+$$
+
+---
+
+## Общая формула компонентов модели
+
+Для компонентов
+
+$$
+j \in \{M,U,k_1,k_2\}
+$$
+
+значение рассчитывается как:
+
+$$
+j(t,r)
+=
+\gamma_j
+\left(1+\rho_j\exp(-\lambda_j t)\right)
+\left(
+1+
+\frac{\delta_j}
+{1+\exp[-\alpha_j(r-r_0)]}
+\right).
+$$
+
+Для пороговых компонентов $I_1$ и $I_2$ используется дополнительная константа $c_j$:
+
+$$
+I_j(t,r)
+=
+\gamma_{I_j}
+\left(
+1+\rho_{I_j}\ln(1+\lambda_{I_j}t)
+\right)
+\left(
+1+
+\frac{\delta_{I_j}}
+{1+\exp[-\alpha_{I_j}(r-r_0)]}
+\right)
++c_{I_j},
+$$
+
+где $j\in\{1,2\}$.
+
+---
+
+## Полная запись модели
+
+С учетом всех зависимостей итоговый CPR равен:
+
+$$
+\begin{aligned}
+CPR(x,t,r)
+={}&L\\
+&+
+\left(M(t,r)-L\right)
+\frac{1}
+{1+\exp\left[-k_1(t,r)(x-I_1(t,r))\right]}\\
+&+
+\left(U(t,r)-M(t,r)\right)
+\frac{1}
+{1+\exp\left[-k_2(t,r)(x-I_2(t,r))\right]}.
+\end{aligned}
+$$
+
+Модельный результат возвращается в долях единицы. Для перевода в проценты годовых используется:
+
+$$
+CPR_{\%}=100\cdot CPR.
+$$
+
+Для входных значений:
+
+$$
+x=-1,
+\qquad
+t=12,
+\qquad
+r=17.3\%,
+$$
+
+модель дает:
+
+$$
+CPR_{\%}\approx 26.633\%.
+$$
