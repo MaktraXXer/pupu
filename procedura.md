@@ -1,6 +1,3 @@
-ФУ → Нов/НДП/НДМ → Пк2 при dt_open >= 30.04.2026 → МПЛ → остальные
-
-
 USE [ALM];
 SET NOCOUNT ON;
 
@@ -13,7 +10,8 @@ DECLARE @ExitTo   date = @EndDate;
 DECLARE @OpenFrom date = DATEADD(day, 1, @BaseDate);
 DECLARE @OpenTo   date = @EndDate;
 
-/* Пк2 учитывается только для вкладов, открытых с этой даты включительно */
+/* Пк2 учитывается только для вкладов,
+   открытых с 30.04.2026 включительно */
 DECLARE @Pk2DateFrom date = '2026-04-30';
 
 IF OBJECT_ID('tempdb..#bal_base') IS NOT NULL DROP TABLE #bal_base;
@@ -47,7 +45,10 @@ INTO #bal_base
 FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
 WHERE
     t.dt_rep = @BaseDate
-    AND t.section_name IN (N'Срочные', N'Накопительный счёт')
+    AND t.section_name IN (
+          N'Срочные'
+        , N'Накопительный счёт'
+    )
     AND t.block_name = N'Привлечение ФЛ'
     AND t.acc_role   = N'LIAB'
     AND t.od_flag    = 1
@@ -80,7 +81,10 @@ INTO #bal_end
 FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
 WHERE
     t.dt_rep = @EndDate
-    AND t.section_name IN (N'Срочные', N'Накопительный счёт')
+    AND t.section_name IN (
+          N'Срочные'
+        , N'Накопительный счёт'
+    )
     AND t.block_name = N'Привлечение ФЛ'
     AND t.acc_role   = N'LIAB'
     AND t.od_flag    = 1
@@ -92,14 +96,17 @@ WHERE
 /* ============================================================
    3. Последние актуальные признаки договора
 
-   По каждому con_id берётся последняя запись:
+   Таблица attr_DepoFLConditions читается один раз.
+
+   По каждому con_id берём последнюю запись:
    1) по DT_UPDATE;
    2) затем по loaddate.
 
-   Признаки:
-   - Мпл;
+   Отдельные признаки:
+   - Нов;
+   - НДП или НДМ;
    - Пк2;
-   - Нов / НДП / НДМ.
+   - Мпл.
    ============================================================ */
 WITH relevant_con_id AS (
     SELECT con_id
@@ -118,10 +125,17 @@ attr_ranked AS (
           CAST(a.CON_ID AS bigint) AS con_id
 
         , CASE
-              WHEN ISNULL(TRY_CAST(a.[Мпл] AS int), 0) = 1
+              WHEN ISNULL(TRY_CAST(a.[Нов] AS int), 0) = 1
                   THEN 1
               ELSE 0
-          END AS is_mpl_flag
+          END AS is_nov_flag
+
+        , CASE
+              WHEN ISNULL(TRY_CAST(a.[НДП] AS int), 0) = 1
+                OR ISNULL(TRY_CAST(a.[НДМ] AS int), 0) = 1
+                  THEN 1
+              ELSE 0
+          END AS is_ndp_ndm_flag
 
         , CASE
               WHEN ISNULL(TRY_CAST(a.[Пк2] AS int), 0) = 1
@@ -130,12 +144,10 @@ attr_ranked AS (
           END AS is_pk2_flag
 
         , CASE
-              WHEN ISNULL(TRY_CAST(a.[Нов] AS int), 0) = 1
-                OR ISNULL(TRY_CAST(a.[НДП] AS int), 0) = 1
-                OR ISNULL(TRY_CAST(a.[НДМ] AS int), 0) = 1
+              WHEN ISNULL(TRY_CAST(a.[Мпл] AS int), 0) = 1
                   THEN 1
               ELSE 0
-          END AS is_new_money_flag
+          END AS is_mpl_flag
 
         , ROW_NUMBER() OVER (
               PARTITION BY a.CON_ID
@@ -143,6 +155,7 @@ attr_ranked AS (
                     a.DT_UPDATE DESC
                   , a.loaddate DESC
           ) AS rn
+
     FROM alm.ehd.attr_DepoFLConditions a WITH (NOLOCK)
     INNER JOIN relevant_con_id r
         ON r.con_id = CAST(a.CON_ID AS bigint)
@@ -150,9 +163,10 @@ attr_ranked AS (
 
 SELECT
       con_id
-    , is_mpl_flag
+    , is_nov_flag
+    , is_ndp_ndm_flag
     , is_pk2_flag
-    , is_new_money_flag
+    , is_mpl_flag
 INTO #attr_flags
 FROM attr_ranked
 WHERE rn = 1;
@@ -174,10 +188,13 @@ SELECT
     , x.client_base_type
 INTO #client_scope
 FROM (
+    /* 01. Вкладчики к выходу */
     SELECT DISTINCT
           b.cli_id
-        , CAST(N'01. Вкладчики к выходу' AS nvarchar(100))
-            AS client_base_type
+        , CAST(
+              N'01. Вкладчики к выходу'
+              AS nvarchar(100)
+          ) AS client_base_type
     FROM #bal_base b
     WHERE
         b.section_name = N'Срочные'
@@ -186,10 +203,13 @@ FROM (
 
     UNION ALL
 
+    /* 02. Клиенты с НС без вкладов к выходу */
     SELECT
           ns.cli_id
-        , CAST(N'02. НС без вкладов к выходу' AS nvarchar(100))
-            AS client_base_type
+        , CAST(
+              N'02. НС без вкладов к выходу'
+              AS nvarchar(100)
+          ) AS client_base_type
     FROM #bal_base ns
     WHERE
         ns.section_name = N'Накопительный счёт'
@@ -233,7 +253,7 @@ WITH client_flags AS (
 
 
 /* ============================================================
-   Вклады к выходу на уровне договора
+   Вклады к выходу на уровне con_id
    ============================================================ */
 exit_by_con AS (
     SELECT
@@ -262,7 +282,8 @@ exit_by_con AS (
               END
           ) AS is_fu_flag
 
-        , MAX(ISNULL(a.is_new_money_flag, 0)) AS is_new_money_flag
+        , MAX(ISNULL(a.is_nov_flag, 0)) AS is_nov_flag
+        , MAX(ISNULL(a.is_ndp_ndm_flag, 0)) AS is_ndp_ndm_flag
         , MAX(ISNULL(a.is_pk2_flag, 0)) AS is_pk2_flag
         , MAX(ISNULL(a.is_mpl_flag, 0)) AS is_mpl_flag
 
@@ -285,10 +306,11 @@ exit_by_con AS (
    Приоритет вкладов к выходу:
 
    1. ФУ;
-   2. Нов / НДП / НДМ;
-   3. Пк2, только если dt_open >= 30.04.2026;
-   4. МПЛ;
-   5. остальные.
+   2. Нов;
+   3. НДП / НДМ;
+   4. Пк2, только если dt_open >= 30.04.2026;
+   5. МПЛ;
+   6. остальные.
    ============================================================ */
 exit_classified AS (
     SELECT
@@ -299,8 +321,11 @@ exit_classified AS (
               WHEN e.is_fu_flag = 1
                   THEN N'fu'
 
-              WHEN e.is_new_money_flag = 1
-                  THEN N'new_money'
+              WHEN e.is_nov_flag = 1
+                  THEN N'nov'
+
+              WHEN e.is_ndp_ndm_flag = 1
+                  THEN N'ndp_ndm'
 
               WHEN e.is_pk2_flag = 1
                    AND e.dt_open >= @Pk2DateFrom
@@ -329,11 +354,19 @@ exit_sum AS (
 
         , SUM(
               CASE
-                  WHEN exit_category = N'new_money'
+                  WHEN exit_category = N'nov'
                       THEN out_rub
                   ELSE 0
               END
-          ) AS exit_new_money_td_sum
+          ) AS exit_nov_td_sum
+
+        , SUM(
+              CASE
+                  WHEN exit_category = N'ndp_ndm'
+                      THEN out_rub
+                  ELSE 0
+              END
+          ) AS exit_ndp_ndm_td_sum
 
         , SUM(
               CASE
@@ -373,7 +406,7 @@ exit_sum AS (
 ),
 
 
-/* Есть ли другие срочные вклады,
+/* Есть ли у клиента другие срочные вклады,
    не попадающие в период выхода */
 other_td_flag AS (
     SELECT
@@ -442,7 +475,7 @@ sms_clients AS (
 
 
 /* ============================================================
-   Открытые вклады на уровне договора
+   Открытые вклады на уровне con_id
    ============================================================ */
 opened_by_con AS (
     SELECT
@@ -471,7 +504,8 @@ opened_by_con AS (
               END
           ) AS is_fu_flag
 
-        , MAX(ISNULL(a.is_new_money_flag, 0)) AS is_new_money_flag
+        , MAX(ISNULL(a.is_nov_flag, 0)) AS is_nov_flag
+        , MAX(ISNULL(a.is_ndp_ndm_flag, 0)) AS is_ndp_ndm_flag
         , MAX(ISNULL(a.is_pk2_flag, 0)) AS is_pk2_flag
         , MAX(ISNULL(a.is_mpl_flag, 0)) AS is_mpl_flag
 
@@ -494,10 +528,11 @@ opened_by_con AS (
    Приоритет открытых вкладов:
 
    1. ФУ;
-   2. Нов / НДП / НДМ;
-   3. Пк2, только если dt_open >= 30.04.2026;
-   4. МПЛ;
-   5. остальные.
+   2. Нов;
+   3. НДП / НДМ;
+   4. Пк2, только если dt_open >= 30.04.2026;
+   5. МПЛ;
+   6. остальные.
    ============================================================ */
 opened_classified AS (
     SELECT
@@ -508,8 +543,11 @@ opened_classified AS (
               WHEN o.is_fu_flag = 1
                   THEN N'fu'
 
-              WHEN o.is_new_money_flag = 1
-                  THEN N'new_money'
+              WHEN o.is_nov_flag = 1
+                  THEN N'nov'
+
+              WHEN o.is_ndp_ndm_flag = 1
+                  THEN N'ndp_ndm'
 
               WHEN o.is_pk2_flag = 1
                    AND o.dt_open >= @Pk2DateFrom
@@ -537,11 +575,19 @@ opened_agg AS (
 
         , SUM(
               CASE
-                  WHEN open_category = N'new_money'
+                  WHEN open_category = N'nov'
                       THEN out_rub
                   ELSE 0
               END
-          ) AS opened_new_money
+          ) AS opened_nov
+
+        , SUM(
+              CASE
+                  WHEN open_category = N'ndp_ndm'
+                      THEN out_rub
+                  ELSE 0
+              END
+          ) AS opened_ndp_ndm
 
         , SUM(
               CASE
@@ -617,7 +663,8 @@ SELECT
     /* Вклады к выходу */
     , ISNULL(e.exit_td_sum, 0) AS exit_td_sum
     , ISNULL(e.exit_fu_td_sum, 0) AS exit_fu_td_sum
-    , ISNULL(e.exit_new_money_td_sum, 0) AS exit_new_money_td_sum
+    , ISNULL(e.exit_nov_td_sum, 0) AS exit_nov_td_sum
+    , ISNULL(e.exit_ndp_ndm_td_sum, 0) AS exit_ndp_ndm_td_sum
     , ISNULL(e.exit_pk2_td_sum, 0) AS exit_pk2_td_sum
     , ISNULL(e.exit_mpl_td_sum, 0) AS exit_mpl_td_sum
     , ISNULL(e.exit_other_td_sum, 0) AS exit_other_td_sum
@@ -648,7 +695,8 @@ SELECT
 
     /* Открытые вклады */
     , ISNULL(o.opened_fu, 0) AS opened_fu
-    , ISNULL(o.opened_new_money, 0) AS opened_new_money
+    , ISNULL(o.opened_nov, 0) AS opened_nov
+    , ISNULL(o.opened_ndp_ndm, 0) AS opened_ndp_ndm
     , ISNULL(o.opened_pk2, 0) AS opened_pk2
     , ISNULL(o.opened_mpl, 0) AS opened_mpl
     , ISNULL(o.opened_other, 0) AS opened_other
@@ -684,7 +732,8 @@ SELECT
 
     , exit_td_sum
     , exit_fu_td_sum
-    , exit_new_money_td_sum
+    , exit_nov_td_sum
+    , exit_ndp_ndm_td_sum
     , exit_pk2_td_sum
     , exit_mpl_td_sum
     , exit_other_td_sum
@@ -699,7 +748,8 @@ SELECT
     , ns_decrease_flag
 
     , opened_fu
-    , opened_new_money
+    , opened_nov
+    , opened_ndp_ndm
     , opened_pk2
     , opened_mpl
     , opened_other
