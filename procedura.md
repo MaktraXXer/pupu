@@ -1,3 +1,6 @@
+ФУ → Нов/НДП/НДМ → Пк2 при dt_open >= 30.04.2026 → МПЛ → остальные
+
+
 USE [ALM];
 SET NOCOUNT ON;
 
@@ -9,6 +12,9 @@ DECLARE @ExitTo   date = @EndDate;
 
 DECLARE @OpenFrom date = DATEADD(day, 1, @BaseDate);
 DECLARE @OpenTo   date = @EndDate;
+
+/* Пк2 учитывается только для вкладов, открытых с этой даты включительно */
+DECLARE @Pk2DateFrom date = '2026-04-30';
 
 IF OBJECT_ID('tempdb..#bal_base') IS NOT NULL DROP TABLE #bal_base;
 IF OBJECT_ID('tempdb..#bal_end') IS NOT NULL DROP TABLE #bal_end;
@@ -86,18 +92,14 @@ WHERE
 /* ============================================================
    3. Последние актуальные признаки договора
 
-   Таблица attr_DepoFLConditions читается один раз.
-
-   По каждому con_id берём последнюю запись:
+   По каждому con_id берётся последняя запись:
    1) по DT_UPDATE;
    2) затем по loaddate.
 
-   Используемые признаки:
+   Признаки:
    - Мпл;
    - Пк2;
-   - Нов;
-   - НДП;
-   - НДМ.
+   - Нов / НДП / НДМ.
    ============================================================ */
 WITH relevant_con_id AS (
     SELECT con_id
@@ -116,12 +118,14 @@ attr_ranked AS (
           CAST(a.CON_ID AS bigint) AS con_id
 
         , CASE
-              WHEN ISNULL(TRY_CAST(a.[Мпл] AS int), 0) = 1 THEN 1
+              WHEN ISNULL(TRY_CAST(a.[Мпл] AS int), 0) = 1
+                  THEN 1
               ELSE 0
           END AS is_mpl_flag
 
         , CASE
-              WHEN ISNULL(TRY_CAST(a.[Пк2] AS int), 0) = 1 THEN 1
+              WHEN ISNULL(TRY_CAST(a.[Пк2] AS int), 0) = 1
+                  THEN 1
               ELSE 0
           END AS is_pk2_flag
 
@@ -129,7 +133,7 @@ attr_ranked AS (
               WHEN ISNULL(TRY_CAST(a.[Нов] AS int), 0) = 1
                 OR ISNULL(TRY_CAST(a.[НДП] AS int), 0) = 1
                 OR ISNULL(TRY_CAST(a.[НДМ] AS int), 0) = 1
-              THEN 1
+                  THEN 1
               ELSE 0
           END AS is_new_money_flag
 
@@ -155,25 +159,25 @@ WHERE rn = 1;
 
 
 /* ============================================================
-   4. Интересуют две категории клиентов
+   4. Две категории клиентов
 
-   A. Вкладчики к выходу:
-      есть срочный вклад на @BaseDate с dt_close_plan в окне
-      @BaseDate + 1 ... @EndDate.
+   01. Вкладчики к выходу:
+       есть срочный вклад на @BaseDate с плановым закрытием
+       в периоде @BaseDate + 1 ... @EndDate.
 
-   B. Клиенты с НС без вкладов к выходу:
-      есть НС на @BaseDate
-      и нет срочного вклада к выходу в этом окне.
+   02. НС без вкладов к выходу:
+       есть НС на @BaseDate, но нет срочного вклада
+       к выходу в анализируемом периоде.
    ============================================================ */
 SELECT
       x.cli_id
     , x.client_base_type
 INTO #client_scope
 FROM (
-    /* A. Клиенты со срочными вкладами к выходу */
     SELECT DISTINCT
           b.cli_id
-        , CAST(N'01. Вкладчики к выходу' AS nvarchar(100)) AS client_base_type
+        , CAST(N'01. Вкладчики к выходу' AS nvarchar(100))
+            AS client_base_type
     FROM #bal_base b
     WHERE
         b.section_name = N'Срочные'
@@ -182,10 +186,10 @@ FROM (
 
     UNION ALL
 
-    /* B. Клиенты с НС, но без срочных вкладов к выходу */
     SELECT
           ns.cli_id
-        , CAST(N'02. НС без вкладов к выходу' AS nvarchar(100)) AS client_base_type
+        , CAST(N'02. НС без вкладов к выходу' AS nvarchar(100))
+            AS client_base_type
     FROM #bal_base ns
     WHERE
         ns.section_name = N'Накопительный счёт'
@@ -204,11 +208,9 @@ FROM (
 
 
 /* ============================================================
-   5. Общие расчёты и маркировки по клиентам
+   5. Общие расчёты и маркировки
    ============================================================ */
 WITH client_flags AS (
-    /* Если хотя бы один вклад или НС клиента имеет сегмент ДЧБО,
-       клиент целиком считается клиентом ДЧБО */
     SELECT
           c.cli_id
         , CASE
@@ -223,7 +225,7 @@ WITH client_flags AS (
                       )
                       AND b.TSEGMENTNAME = N'ДЧБО'
               )
-              THEN N'ДЧБО'
+                  THEN N'ДЧБО'
               ELSE N'Розница'
           END AS client_segment
     FROM #client_scope c
@@ -232,20 +234,12 @@ WITH client_flags AS (
 
 /* ============================================================
    Вклады к выходу на уровне договора
-
-   Каждый con_id сначала схлопывается до одной строки.
-
-   Приоритет классификации:
-   1. ФУ;
-   2. МПЛ;
-   3. Пк2;
-   4. Нов / НДП / НДМ;
-   5. остальные.
    ============================================================ */
 exit_by_con AS (
     SELECT
           b.cli_id
         , b.con_id
+        , MIN(b.dt_open) AS dt_open
         , SUM(b.out_rub) AS out_rub
 
         , MAX(
@@ -263,14 +257,14 @@ exit_by_con AS (
                       , N'Могучий'
                       , N'Надёжный'
                   )
-                  THEN 1
+                      THEN 1
                   ELSE 0
               END
           ) AS is_fu_flag
 
-        , MAX(ISNULL(a.is_mpl_flag, 0)) AS is_mpl_flag
-        , MAX(ISNULL(a.is_pk2_flag, 0)) AS is_pk2_flag
         , MAX(ISNULL(a.is_new_money_flag, 0)) AS is_new_money_flag
+        , MAX(ISNULL(a.is_pk2_flag, 0)) AS is_pk2_flag
+        , MAX(ISNULL(a.is_mpl_flag, 0)) AS is_mpl_flag
 
     FROM #bal_base b
     INNER JOIN #client_scope c
@@ -286,6 +280,16 @@ exit_by_con AS (
         , b.con_id
 ),
 
+
+/* ============================================================
+   Приоритет вкладов к выходу:
+
+   1. ФУ;
+   2. Нов / НДП / НДМ;
+   3. Пк2, только если dt_open >= 30.04.2026;
+   4. МПЛ;
+   5. остальные.
+   ============================================================ */
 exit_classified AS (
     SELECT
           e.cli_id
@@ -295,14 +299,15 @@ exit_classified AS (
               WHEN e.is_fu_flag = 1
                   THEN N'fu'
 
-              WHEN e.is_mpl_flag = 1
-                  THEN N'mpl'
-
-              WHEN e.is_pk2_flag = 1
-                  THEN N'pk2'
-
               WHEN e.is_new_money_flag = 1
                   THEN N'new_money'
+
+              WHEN e.is_pk2_flag = 1
+                   AND e.dt_open >= @Pk2DateFrom
+                  THEN N'pk2'
+
+              WHEN e.is_mpl_flag = 1
+                  THEN N'mpl'
 
               ELSE N'other'
           END AS exit_category
@@ -312,7 +317,6 @@ exit_classified AS (
 exit_sum AS (
     SELECT
           cli_id
-
         , SUM(out_rub) AS exit_td_sum
 
         , SUM(
@@ -325,11 +329,11 @@ exit_sum AS (
 
         , SUM(
               CASE
-                  WHEN exit_category = N'mpl'
+                  WHEN exit_category = N'new_money'
                       THEN out_rub
                   ELSE 0
               END
-          ) AS exit_mpl_td_sum
+          ) AS exit_new_money_td_sum
 
         , SUM(
               CASE
@@ -341,11 +345,11 @@ exit_sum AS (
 
         , SUM(
               CASE
-                  WHEN exit_category = N'new_money'
+                  WHEN exit_category = N'mpl'
                       THEN out_rub
                   ELSE 0
               END
-          ) AS exit_new_money_td_sum
+          ) AS exit_mpl_td_sum
 
         , SUM(
               CASE
@@ -369,8 +373,8 @@ exit_sum AS (
 ),
 
 
-/* Есть ли у клиента другие срочные вклады,
-   не попадающие в анализируемый период выхода */
+/* Есть ли другие срочные вклады,
+   не попадающие в период выхода */
 other_td_flag AS (
     SELECT
           c.cli_id
@@ -386,14 +390,14 @@ other_td_flag AS (
                           AND b.dt_close_plan <= @ExitTo
                       )
               )
-              THEN 1
+                  THEN 1
               ELSE 0
           END AS has_other_rub_td_flag
     FROM #client_scope c
 ),
 
 
-/* Остаток на НС на начало */
+/* Остаток НС на начало */
 ns_start AS (
     SELECT
           b.cli_id
@@ -408,7 +412,7 @@ ns_start AS (
 ),
 
 
-/* Остаток на НС на конец */
+/* Остаток НС на конец */
 ns_end AS (
     SELECT
           e.cli_id
@@ -423,8 +427,7 @@ ns_end AS (
 ),
 
 
-/* Клиенты, которые получали SMS за анализируемый период.
-   Флаг клиента сохраняется независимо от классификации вкладов. */
+/* Клиентский флаг получения SMS сохраняется */
 sms_clients AS (
     SELECT DISTINCT
           CAST(m.cli_id AS bigint) AS cli_id
@@ -439,16 +442,7 @@ sms_clients AS (
 
 
 /* ============================================================
-   Новые открытия на уровне договора
-
-   Каждый con_id сначала схлопывается до одной строки.
-
-   Приоритет классификации:
-   1. ФУ;
-   2. МПЛ;
-   3. Пк2;
-   4. Нов / НДП / НДМ;
-   5. остальные.
+   Открытые вклады на уровне договора
    ============================================================ */
 opened_by_con AS (
     SELECT
@@ -456,18 +450,6 @@ opened_by_con AS (
         , b.con_id
         , MIN(b.dt_open) AS dt_open
         , SUM(b.out_rub) AS out_rub
-        , MIN(b.rate_con) AS rate_con
-        , MIN(b.termdays) AS termdays
-        , CASE
-              WHEN MIN(
-                       NULLIF(
-                           LTRIM(RTRIM(COALESCE(b.conv_norm, '')))
-                         , ''
-                       )
-                   ) IS NULL
-                  THEN 'AT_THE_END'
-              ELSE MIN(b.conv_norm)
-          END AS conv_norm
 
         , MAX(
               CASE
@@ -484,14 +466,14 @@ opened_by_con AS (
                       , N'Могучий'
                       , N'Надёжный'
                   )
-                  THEN 1
+                      THEN 1
                   ELSE 0
               END
           ) AS is_fu_flag
 
-        , MAX(ISNULL(a.is_mpl_flag, 0)) AS is_mpl_flag
-        , MAX(ISNULL(a.is_pk2_flag, 0)) AS is_pk2_flag
         , MAX(ISNULL(a.is_new_money_flag, 0)) AS is_new_money_flag
+        , MAX(ISNULL(a.is_pk2_flag, 0)) AS is_pk2_flag
+        , MAX(ISNULL(a.is_mpl_flag, 0)) AS is_mpl_flag
 
     FROM #bal_end b
     INNER JOIN #client_scope c
@@ -507,6 +489,16 @@ opened_by_con AS (
         , b.con_id
 ),
 
+
+/* ============================================================
+   Приоритет открытых вкладов:
+
+   1. ФУ;
+   2. Нов / НДП / НДМ;
+   3. Пк2, только если dt_open >= 30.04.2026;
+   4. МПЛ;
+   5. остальные.
+   ============================================================ */
 opened_classified AS (
     SELECT
           o.cli_id
@@ -516,14 +508,15 @@ opened_classified AS (
               WHEN o.is_fu_flag = 1
                   THEN N'fu'
 
-              WHEN o.is_mpl_flag = 1
-                  THEN N'mpl'
-
-              WHEN o.is_pk2_flag = 1
-                  THEN N'pk2'
-
               WHEN o.is_new_money_flag = 1
                   THEN N'new_money'
+
+              WHEN o.is_pk2_flag = 1
+                   AND o.dt_open >= @Pk2DateFrom
+                  THEN N'pk2'
+
+              WHEN o.is_mpl_flag = 1
+                  THEN N'mpl'
 
               ELSE N'other'
           END AS open_category
@@ -544,11 +537,11 @@ opened_agg AS (
 
         , SUM(
               CASE
-                  WHEN open_category = N'mpl'
+                  WHEN open_category = N'new_money'
                       THEN out_rub
                   ELSE 0
               END
-          ) AS opened_mpl
+          ) AS opened_new_money
 
         , SUM(
               CASE
@@ -560,11 +553,11 @@ opened_agg AS (
 
         , SUM(
               CASE
-                  WHEN open_category = N'new_money'
+                  WHEN open_category = N'mpl'
                       THEN out_rub
                   ELSE 0
               END
-          ) AS opened_new_money
+          ) AS opened_mpl
 
         , SUM(
               CASE
@@ -590,15 +583,11 @@ SELECT
     , c.client_base_type
     , f.client_segment AS segment_flag
 
-    /* Клиент получал SMS в анализируемый период */
     , CASE
           WHEN sms.cli_id IS NOT NULL THEN 1
           ELSE 0
       END AS is_sms_sent
 
-    /* Единый бакет с разной базой:
-       - вкладчики: объём вкладов к выходу;
-       - НС-группа: стартовый остаток НС */
     , CASE
           WHEN c.client_base_type = N'01. Вкладчики к выходу'
                AND ISNULL(e.exit_td_sum, 0) < 1500000
@@ -609,7 +598,6 @@ SELECT
               THEN N'2. Выход|НС 1.5-5 млн'
 
           WHEN c.client_base_type = N'01. Вкладчики к выходу'
-               AND ISNULL(e.exit_td_sum, 0) >= 5000000
               THEN N'3. Выход|НС >= 5 млн'
 
           WHEN c.client_base_type = N'02. НС без вкладов к выходу'
@@ -621,7 +609,6 @@ SELECT
               THEN N'2. Выход|НС 1.5-5 млн'
 
           WHEN c.client_base_type = N'02. НС без вкладов к выходу'
-               AND ISNULL(ns1.ns_start_sum, 0) >= 5000000
               THEN N'3. Выход|НС >= 5 млн'
 
           ELSE N'Не определено'
@@ -629,25 +616,21 @@ SELECT
 
     /* Вклады к выходу */
     , ISNULL(e.exit_td_sum, 0) AS exit_td_sum
-
     , ISNULL(e.exit_fu_td_sum, 0) AS exit_fu_td_sum
-    , ISNULL(e.exit_mpl_td_sum, 0) AS exit_mpl_td_sum
-    , ISNULL(e.exit_pk2_td_sum, 0) AS exit_pk2_td_sum
     , ISNULL(e.exit_new_money_td_sum, 0) AS exit_new_money_td_sum
+    , ISNULL(e.exit_pk2_td_sum, 0) AS exit_pk2_td_sum
+    , ISNULL(e.exit_mpl_td_sum, 0) AS exit_mpl_td_sum
     , ISNULL(e.exit_other_td_sum, 0) AS exit_other_td_sum
 
-    /* 1 = у клиента есть вклад ФУ к выходу */
     , ISNULL(e.has_fu_exit_td_flag, 0) AS has_fu_exit_td_flag
-
-    /* 1 = у клиента есть другие срочные вклады,
-       не попадающие в период выхода */
     , ISNULL(ot.has_other_rub_td_flag, 0) AS has_other_rub_td_flag
 
     /* Накопительные счета */
     , ISNULL(ns1.ns_start_sum, 0) AS ns_start_sum
 
     , CASE
-          WHEN ISNULL(ns1.ns_start_sum, 0) > 1000 THEN 1
+          WHEN ISNULL(ns1.ns_start_sum, 0) > 1000
+              THEN 1
           ELSE 0
       END AS has_ns_gt_1000_flag
 
@@ -663,11 +646,11 @@ SELECT
           ELSE 0
       END AS ns_decrease_flag
 
-    /* Открытые срочные вклады */
+    /* Открытые вклады */
     , ISNULL(o.opened_fu, 0) AS opened_fu
-    , ISNULL(o.opened_mpl, 0) AS opened_mpl
-    , ISNULL(o.opened_pk2, 0) AS opened_pk2
     , ISNULL(o.opened_new_money, 0) AS opened_new_money
+    , ISNULL(o.opened_pk2, 0) AS opened_pk2
+    , ISNULL(o.opened_mpl, 0) AS opened_mpl
     , ISNULL(o.opened_other, 0) AS opened_other
     , ISNULL(o.opened_total, 0) AS opened_total
 
@@ -701,9 +684,9 @@ SELECT
 
     , exit_td_sum
     , exit_fu_td_sum
-    , exit_mpl_td_sum
-    , exit_pk2_td_sum
     , exit_new_money_td_sum
+    , exit_pk2_td_sum
+    , exit_mpl_td_sum
     , exit_other_td_sum
 
     , has_fu_exit_td_flag
@@ -716,9 +699,9 @@ SELECT
     , ns_decrease_flag
 
     , opened_fu
-    , opened_mpl
-    , opened_pk2
     , opened_new_money
+    , opened_pk2
+    , opened_mpl
     , opened_other
     , opened_total
 FROM #client_mart
