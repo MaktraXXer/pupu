@@ -1,137 +1,311 @@
-На дату расчёта загружается история ставок RUONIA и актуальная рыночная OIS-кривая. Из OIS-котировок строится функция непрерывной безрисковой кривой доходности ZCYC(t), которая по любому сроку возвращает соответствующую zero-coupon ставку. Эта кривая далее используется всеми моделями CIR++ для задания начальной временной структуры процентных ставок и расчёта дисконтирования.
+Да, дисконтировать по текущей OIS-кривой можно, и для вашей текущей практической оценки это может быть даже более устойчивым подходом.
 
+Два варианта
 
-Отличие методик
+1. Pathwise-дисконтирование
 
-Вариант 1: соседние дневные значения RUONIA считаются переходами длиной 1/12 года.
-Плюс — сохраняет старую логику и сопоставимость. Минус — временная шкала искусственная, параметры нельзя нормально трактовать как годовые.
-
-Вариант 2: используется фактический интервал между датами:
-
-\Delta t_i=\frac{\text{дни}}{365}.
-
-Плюс — параметры получают корректный календарный смысл. Минус — результаты сильно отличаются от старой модели.
-
-Интерпретация параметров
-
-Вариант 1:
-
-a = 0.0147
-theta = 0.1870
-sigma = 0.0211
-
-Вариант 2:
-
-a = 0.3298
-theta = 0.1834
-sigma = 0.1010
-
-Что это значит:
-
-* theta почти одинаковая: долгосрочный средний уровень около 18,5%;
-* a во втором варианте намного выше: возврат к среднему быстрее;
-* sigma во втором варианте почти в 5 раз выше: траектории заметно шире, опционы обычно дороже.
-
-В варианте 1 модель считает, что небольшое дневное изменение происходило целый месяц, поэтому искусственно занижает и скорость возврата, и годовую волатильность.
-
-Дальнейшее моделирование
-
-После калибровки CIR++ моделируется с месячным шагом:
-
-dt=\frac1{12}.
-
-Это нормально для обоих вариантов, потому что прогноз нужен помесячный. Но методологически корректнее:
-
-* калибровать на фактических дневных интервалах;
-* моделировать дальше месячными шагами.
-
-Итого: вариант 1 — старая условная шкала, вариант 2 — нормальная календарная модель.
-
-
-
-Как считается IRS MID
-
-По каждой траектории CIR++ берётся модельная ставка и по этой же траектории рассчитываются дисконт-факторы. Затем находится такая фиксированная годовая ставка $K$, при которой ожидаемый PV фиксированной ноги равен ожидаемому PV плавающей:
+В каждом сценарии используется своя будущая короткая ставка:
 
 $$
-K=
-\frac{
-\mathbb{E}\left[
-\sum_t DF_t \cdot Rate_t \cdot \frac{1}{12}
-\right]
-}{
-\mathbb{E}\left[
-\sum_t DF_t \cdot \frac{1}{12}
-\right]
-}.
+DF_{i,j}
+
+\exp\left(
+-\sum_{k=0}^{i-1}RUONIA_{k,j}\Delta t
+\right).
 $$
 
-IRS MID — это модельная справедливая фиксированная ставка свопа.
+Плюсы:
 
-Как считается cap
+* внутренне согласовано с short-rate моделью CIR++;
+* учитывает связь между ставкой, payoff и дисконтированием;
+* теоретически правильно при корректной калибровке в риск-нейтральной мере.
 
-В каждом месяце и сценарии выплата равна:
+Минусы:
 
-$$
-\max(Rate_t-Strike,0)\cdot\frac{1}{12}.
-$$
+* чувствительно к ошибкам реализации CIR++, $\varphi(t)$ и параметров;
+* средние дисконт-факторы могут не совпасть с наблюдаемой OIS-кривой;
+* исторически откалиброванные параметры не обязательно являются параметрами меры $Q$.
 
-Каждая выплата дисконтируется по своей траектории, затем выплаты суммируются и усредняются по всем сценариям. Результат — upfront-премия в процентах от номинала.
+2. Дисконтирование по текущей OIS-кривой
 
-Как считается floor
-
-Выплата возникает, когда ставка ниже страйка:
-
-$$
-\max(Strike-Rate_t,0)\cdot\frac{1}{12}.
-$$
-
-Далее выплаты также дисконтируются, суммируются по сроку и усредняются по всем сценариям.
-
-Роль спреда между КС и RUONIA
-
-Модель генерирует RUONIA/OIS short rate. Для оценки инструментов на ключевую ставку используется приближение:
+Для каждой даты используется один рыночный дисконт-фактор:
 
 $$
-KS_t^{proxy}=RUONIA_t+0{,}20\text{ п.п.}
+DF_i
+
+\exp\left(
+-ZCYC(t_i)t_i
+\right).
 $$
 
-Спред нужен только для перехода от модельной RUONIA к proxy КС.
+Плюсы:
 
-Положительный спред:
+* строго воспроизводит текущую рыночную OIS-кривую;
+* проще и устойчивее;
+* результат не искажается ошибками pathwise-дисконтирования.
 
-* повышает IRS MID;
-* повышает стоимость cap;
-* снижает стоимость floor.
+Минусы:
 
-Для дисконтирования спред не используется: дисконт-факторы считаются по исходным RUONIA-траекториям.
+* не учитывает корреляцию между будущей ставкой и дисконт-фактором;
+* менее строго соответствует полноценной short-rate модели;
+* все сценарии дисконтируются одинаково.
 
-Влияние параметров CIR
+Что разумнее сейчас
 
-$a$ — скорость возврата к среднему
+Для текущей версии, где:
 
-Чем выше $a$:
+* параметры получены из истории RUONIA;
+* модель ещё проверяется;
+* payoff относится к proxy КС;
+* OIS-кривая наблюдается непосредственно на рынке,
 
-* быстрее траектории возвращаются к $\theta$;
-* меньше устойчивость долгих отклонений;
-* сильнее меняется поведение длинных сроков.
+я бы основной расчёт делал с детерминированным OIS-дисконтированием, а pathwise оставил как альтернативную проверку.
 
-$\theta$ — долгосрочный уровень
+⸻
 
-Чем выше $\theta$:
+Исправленный cap/floor
 
-* выше центральный уровень долгосрочных траекторий;
-* обычно выше IRS MID;
-* cap дороже;
-* floor дешевле.
+Замените функцию option_matrix_from_ruonia_paths_pathwise на:
 
-Часть влияния $\theta$ компенсируется сдвигом $\varphi(t)$, который подгоняет модель к текущей OIS-кривой.
+def option_matrix_from_ruonia_paths_ois(
+    ruonia_paths,
+    strikes,
+    maturities,
+    option_type,
+    basis=ks_minus_ruonia_basis
+):
+    """
+    Рассчитывает upfront-премию в процентах от номинала.
+    Payoff:
+        KS_proxy_t = RUONIA_t + basis
+    Дисконтирование:
+        по текущей рыночной OIS-кривой ZCYC:
+        DF(0,t) = exp(-ZCYC(t) * t)
+    Все сценарии используют одинаковые рыночные DF.
+    """
+    ruonia_paths = np.asarray(
+        ruonia_paths,
+        dtype=float
+    )
+    key_rate_proxy_paths = (
+        ruonia_paths_to_key_rate_proxy(
+            ruonia_paths=ruonia_paths,
+            basis=basis
+        )
+    )
+    option_type = option_type.lower()
+    if option_type not in (
+        'cap',
+        'floor'
+    ):
+        raise ValueError(
+            "option_type должен быть 'cap' или 'floor'"
+        )
+    result = pd.DataFrame(
+        index=[
+            f'{strike * 100:.1f}%'
+            for strike in strikes
+        ],
+        columns=[
+            f'{maturity:g}Y'
+            for maturity in maturities
+        ],
+        dtype=float
+    )
+    for maturity in maturities:
+        months = int(
+            round(
+                maturity * 12
+            )
+        )
+        if ruonia_paths.shape[0] < months + 1:
+            raise ValueError(
+                f'Для срока {maturity:g}Y необходимо '
+                f'не менее {months + 1} строк.'
+            )
+        # Proxy КС в даты выплат
+        rates = key_rate_proxy_paths[
+            1:months + 1,
+            :
+        ]
+        # Рыночные OIS DF:
+        # DF(1M)...DF(months)
+        dfs = discount_factors_from_zcyc(
+            months
+        )[:, None]
+        for strike in strikes:
+            if option_type == 'cap':
+                payoff_rate = np.maximum(
+                    rates - strike,
+                    0.0
+                )
+            else:
+                payoff_rate = np.maximum(
+                    strike - rates,
+                    0.0
+                )
+            scenario_pv_fraction = np.sum(
+                payoff_rate
+                * accrual
+                * dfs,
+                axis=0
+            )
+            premium_fraction = float(
+                np.mean(
+                    scenario_pv_fraction
+                )
+            )
+            result.loc[
+                f'{strike * 100:.1f}%',
+                f'{maturity:g}Y'
+            ] = (
+                premium_fraction
+                * 100.0
+            )
+    return result
 
-$\sigma$ — волатильность
+⸻
 
-Чем выше $\sigma$:
+Исправленный IRS MID
 
-* шире разброс траекторий;
-* выше вероятность сильных движений;
-* обычно дорожают и cap, и floor;
-* на IRS MID влияет значительно слабее, чем на опционы.
+def irs_mid_from_ruonia_paths_ois(
+    ruonia_paths,
+    tenors_months=irs_tenors_months,
+    basis=ks_minus_ruonia_basis
+):
+    """
+    Рассчитывает fair IRS MID.
+    Плавающая ставка:
+        KS_proxy_t = RUONIA_t + basis
+    Дисконтирование:
+        по текущей рыночной OIS-кривой ZCYC.
+    Fair IRS:
+        K =
+            E[PV floating]
+            /
+            PV01 fixed
+    """
+    ruonia_paths = np.asarray(
+        ruonia_paths,
+        dtype=float
+    )
+    key_rate_proxy_paths = (
+        ruonia_paths_to_key_rate_proxy(
+            ruonia_paths=ruonia_paths,
+            basis=basis
+        )
+    )
+    rows = []
+    for tenor, months in tenors_months.items():
+        if ruonia_paths.shape[0] < months + 1:
+            raise ValueError(
+                f'Для IRS {tenor} необходимо '
+                f'не менее {months + 1} строк.'
+            )
+        monthly_rates = key_rate_proxy_paths[
+            1:months + 1,
+            :
+        ]
+        dfs = discount_factors_from_zcyc(
+            months
+        )
+        # Средняя модельная proxy КС по каждому месяцу
+        expected_monthly_rates = np.mean(
+            monthly_rates,
+            axis=1
+        )
+        expected_floating_leg_pv = float(
+            np.sum(
+                expected_monthly_rates
+                * accrual
+                * dfs
+            )
+        )
+        fixed_leg_annuity = float(
+            np.sum(
+                accrual
+                * dfs
+            )
+        )
+        fair_irs_rate = (
+            expected_floating_leg_pv
+            / fixed_leg_annuity
+        )
+        rows.append({
+            'tenor': tenor,
+            'months': months,
+            'model_mid': fair_irs_rate
+        })
+    return (
+        pd.DataFrame(rows)
+        .set_index('tenor')
+    )
+
+⸻
+
+Запуск
+
+Блок расчёта DF_360_pathwise больше не нужен.
+
+np.random.seed(
+    option_seed
+)
+X_360_ruonia = MC_simulations(
+    T=360,
+    n_sim=n_sim_options,
+    a=opt_ats['a'],
+    theta=opt_ats['theta'],
+    s=opt_ats['s'],
+    debug=False
+)
+
+Cap/floor:
+
+cap_matrix_ois = (
+    option_matrix_from_ruonia_paths_ois(
+        ruonia_paths=X_360_ruonia,
+        strikes=cap_strikes,
+        maturities=maturities_years,
+        option_type='cap',
+        basis=ks_minus_ruonia_basis
+    )
+)
+floor_matrix_ois = (
+    option_matrix_from_ruonia_paths_ois(
+        ruonia_paths=X_360_ruonia,
+        strikes=floor_strikes,
+        maturities=maturities_years,
+        option_type='floor',
+        basis=ks_minus_ruonia_basis
+    )
+)
+show_option_matrices(
+    cap_matrix_ois,
+    floor_matrix_ois
+)
+
+IRS:
+
+model_irs_ois = (
+    irs_mid_from_ruonia_paths_ois(
+        ruonia_paths=X_360_ruonia,
+        tenors_months=irs_tenors_months,
+        basis=ks_minus_ruonia_basis
+    )
+)
+model_irs_ois_display = pd.DataFrame(
+    index=model_irs_ois.index
+)
+model_irs_ois_display[
+    'Model IRS MID OIS, %'
+] = (
+    model_irs_ois['model_mid']
+    * 100.0
+)
+display(
+    model_irs_ois_display.round(4)
+)
+
+Смысл нового подхода:
+
+будущие выплаты определяются Monte Carlo-траекториями, но приводятся к текущей стоимости по наблюдаемой сегодня рыночной OIS-кривой.
