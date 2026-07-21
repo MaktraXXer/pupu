@@ -1,311 +1,916 @@
-Да, дисконтировать по текущей OIS-кривой можно, и для вашей текущей практической оценки это может быть даже более устойчивым подходом.
+# =============================================================================
+# ПОЛНАЯ ДИАГНОСТИКА CIR-КАЛИБРОВКИ
+#
+# Запускать после определения:
+#   - cir_negative_log_likelihood
+#   - unpack_params
+#   - x_prev
+#   - x_next
+#   - delta_t
+# =============================================================================
 
-Два варианта
+import numpy as np
+import pandas as pd
 
-1. Pathwise-дисконтирование
+from scipy.optimize import minimize
+from IPython.display import display
 
-В каждом сценарии используется своя будущая короткая ставка:
 
-$$
-DF_{i,j}
+# -----------------------------------------------------------------------------
+# 1. Универсальные стартовые точки для конкретного набора данных
+# -----------------------------------------------------------------------------
 
-\exp\left(
--\sum_{k=0}^{i-1}RUONIA_{k,j}\Delta t
-\right).
-$$
-
-Плюсы:
-
-* внутренне согласовано с short-rate моделью CIR++;
-* учитывает связь между ставкой, payoff и дисконтированием;
-* теоретически правильно при корректной калибровке в риск-нейтральной мере.
-
-Минусы:
-
-* чувствительно к ошибкам реализации CIR++, $\varphi(t)$ и параметров;
-* средние дисконт-факторы могут не совпасть с наблюдаемой OIS-кривой;
-* исторически откалиброванные параметры не обязательно являются параметрами меры $Q$.
-
-2. Дисконтирование по текущей OIS-кривой
-
-Для каждой даты используется один рыночный дисконт-фактор:
-
-$$
-DF_i
-
-\exp\left(
--ZCYC(t_i)t_i
-\right).
-$$
-
-Плюсы:
-
-* строго воспроизводит текущую рыночную OIS-кривую;
-* проще и устойчивее;
-* результат не искажается ошибками pathwise-дисконтирования.
-
-Минусы:
-
-* не учитывает корреляцию между будущей ставкой и дисконт-фактором;
-* менее строго соответствует полноценной short-rate модели;
-* все сценарии дисконтируются одинаково.
-
-Что разумнее сейчас
-
-Для текущей версии, где:
-
-* параметры получены из истории RUONIA;
-* модель ещё проверяется;
-* payoff относится к proxy КС;
-* OIS-кривая наблюдается непосредственно на рынке,
-
-я бы основной расчёт делал с детерминированным OIS-дисконтированием, а pathwise оставил как альтернативную проверку.
-
-⸻
-
-Исправленный cap/floor
-
-Замените функцию option_matrix_from_ruonia_paths_pathwise на:
-
-def option_matrix_from_ruonia_paths_ois(
-    ruonia_paths,
-    strikes,
-    maturities,
-    option_type,
-    basis=ks_minus_ruonia_basis
+def build_diagnostic_starts(
+    x_prev_local,
+    x_next_local,
+    delta_t_local,
+    M=40,
+    seed=42
 ):
-    """
-    Рассчитывает upfront-премию в процентах от номинала.
-    Payoff:
-        KS_proxy_t = RUONIA_t + basis
-    Дисконтирование:
-        по текущей рыночной OIS-кривой ZCYC:
-        DF(0,t) = exp(-ZCYC(t) * t)
-    Все сценарии используют одинаковые рыночные DF.
-    """
-    ruonia_paths = np.asarray(
-        ruonia_paths,
-        dtype=float
+    rng = np.random.default_rng(seed)
+
+    theta_base = max(
+        float(np.mean(x_prev_local)),
+        1e-6
     )
-    key_rate_proxy_paths = (
-        ruonia_paths_to_key_rate_proxy(
-            ruonia_paths=ruonia_paths,
-            basis=basis
+
+    rho = np.corrcoef(
+        x_prev_local,
+        x_next_local
+    )[0, 1]
+
+    mean_dt = float(
+        np.mean(delta_t_local)
+    )
+
+    if np.isfinite(rho):
+        rho = np.clip(
+            rho,
+            1e-5,
+            0.99999
+        )
+
+        a_base = (
+            -np.log(rho)
+            / mean_dt
+        )
+    else:
+        a_base = 1.0
+
+    a_base = float(
+        np.clip(
+            a_base,
+            1e-3,
+            50.0
         )
     )
-    option_type = option_type.lower()
-    if option_type not in (
-        'cap',
-        'floor'
+
+    dx = (
+        x_next_local
+        - x_prev_local
+    )
+
+    sigma_base = np.std(
+        dx
+        / np.sqrt(
+            np.maximum(
+                x_prev_local
+                * delta_t_local,
+                1e-12
+            )
+        ),
+        ddof=1
+    )
+
+    sigma_base = float(
+        np.clip(
+            sigma_base,
+            1e-5,
+            5.0
+        )
+    )
+
+    starts = []
+
+    a_multipliers = [
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.0,
+        5.0
+    ]
+
+    theta_multipliers = [
+        0.5,
+        0.75,
+        1.0,
+        1.25,
+        1.5
+    ]
+
+    sigma_multipliers = [
+        0.25,
+        0.5,
+        1.0,
+        1.5
+    ]
+
+    for am in a_multipliers:
+        for tm in theta_multipliers:
+            for sm in sigma_multipliers:
+
+                a0 = max(
+                    a_base * am,
+                    1e-6
+                )
+
+                theta0 = max(
+                    theta_base * tm,
+                    1e-6
+                )
+
+                sigma0 = max(
+                    sigma_base * sm,
+                    1e-6
+                )
+
+                # Не заставляем все старты проходить Феллера:
+                # часть заведомо плохих стартов полезна для диагностики.
+                starts.append(
+                    np.log(
+                        [
+                            a0,
+                            theta0,
+                            sigma0
+                        ]
+                    )
+                )
+
+    while len(starts) < M:
+
+        a0 = np.exp(
+            rng.uniform(
+                np.log(1e-3),
+                np.log(50.0)
+            )
+        )
+
+        theta0 = np.exp(
+            rng.uniform(
+                np.log(
+                    max(
+                        theta_base * 0.25,
+                        1e-4
+                    )
+                ),
+                np.log(
+                    max(
+                        theta_base * 3.0,
+                        2e-4
+                    )
+                )
+            )
+        )
+
+        sigma0 = np.exp(
+            rng.uniform(
+                np.log(1e-4),
+                np.log(1.0)
+            )
+        )
+
+        starts.append(
+            np.log(
+                [
+                    a0,
+                    theta0,
+                    sigma0
+                ]
+            )
+        )
+
+    return starts[:M]
+
+
+# -----------------------------------------------------------------------------
+# 2. Универсальная калибровка одного сценария
+# -----------------------------------------------------------------------------
+
+def calibrate_diagnostic_scenario(
+    scenario_name,
+    x_prev_local,
+    x_next_local,
+    delta_t_local,
+    enforce_feller=True,
+    M=40,
+    seed=42
+):
+    starts = build_diagnostic_starts(
+        x_prev_local=x_prev_local,
+        x_next_local=x_next_local,
+        delta_t_local=delta_t_local,
+        M=M,
+        seed=seed
+    )
+
+    runs = []
+
+    for run_number, start in enumerate(
+        starts,
+        start=1
     ):
-        raise ValueError(
-            "option_type должен быть 'cap' или 'floor'"
-        )
-    result = pd.DataFrame(
-        index=[
-            f'{strike * 100:.1f}%'
-            for strike in strikes
-        ],
-        columns=[
-            f'{maturity:g}Y'
-            for maturity in maturities
-        ],
-        dtype=float
-    )
-    for maturity in maturities:
-        months = int(
-            round(
-                maturity * 12
-            )
-        )
-        if ruonia_paths.shape[0] < months + 1:
-            raise ValueError(
-                f'Для срока {maturity:g}Y необходимо '
-                f'не менее {months + 1} строк.'
-            )
-        # Proxy КС в даты выплат
-        rates = key_rate_proxy_paths[
-            1:months + 1,
-            :
-        ]
-        # Рыночные OIS DF:
-        # DF(1M)...DF(months)
-        dfs = discount_factors_from_zcyc(
-            months
-        )[:, None]
-        for strike in strikes:
-            if option_type == 'cap':
-                payoff_rate = np.maximum(
-                    rates - strike,
-                    0.0
-                )
-            else:
-                payoff_rate = np.maximum(
-                    strike - rates,
-                    0.0
-                )
-            scenario_pv_fraction = np.sum(
-                payoff_rate
-                * accrual
-                * dfs,
-                axis=0
-            )
-            premium_fraction = float(
-                np.mean(
-                    scenario_pv_fraction
-                )
-            )
-            result.loc[
-                f'{strike * 100:.1f}%',
-                f'{maturity:g}Y'
-            ] = (
-                premium_fraction
-                * 100.0
-            )
-    return result
 
-⸻
+        start_a, start_theta, start_sigma = (
+            unpack_params(start)
+        )
 
-Исправленный IRS MID
+        start_nll = (
+            cir_negative_log_likelihood(
+                raw_params=start,
+                x_prev=x_prev_local,
+                x_next=x_next_local,
+                delta_t=delta_t_local,
+                enforce_feller=enforce_feller
+            )
+        )
 
-def irs_mid_from_ruonia_paths_ois(
-    ruonia_paths,
-    tenors_months=irs_tenors_months,
-    basis=ks_minus_ruonia_basis
-):
-    """
-    Рассчитывает fair IRS MID.
-    Плавающая ставка:
-        KS_proxy_t = RUONIA_t + basis
-    Дисконтирование:
-        по текущей рыночной OIS-кривой ZCYC.
-    Fair IRS:
-        K =
-            E[PV floating]
-            /
-            PV01 fixed
-    """
-    ruonia_paths = np.asarray(
-        ruonia_paths,
-        dtype=float
-    )
-    key_rate_proxy_paths = (
-        ruonia_paths_to_key_rate_proxy(
-            ruonia_paths=ruonia_paths,
-            basis=basis
+        opt = minimize(
+            fun=cir_negative_log_likelihood,
+            x0=start,
+            args=(
+                x_prev_local,
+                x_next_local,
+                delta_t_local,
+                enforce_feller
+            ),
+            method='L-BFGS-B',
+            bounds=[
+                (
+                    np.log(1e-5),
+                    np.log(100.0)
+                ),
+                (
+                    np.log(1e-5),
+                    np.log(2.0)
+                ),
+                (
+                    np.log(1e-5),
+                    np.log(5.0)
+                )
+            ],
+            options={
+                'maxiter': 10000,
+                'ftol': 1e-12,
+                'gtol': 1e-8,
+                'maxls': 100
+            }
         )
-    )
-    rows = []
-    for tenor, months in tenors_months.items():
-        if ruonia_paths.shape[0] < months + 1:
-            raise ValueError(
-                f'Для IRS {tenor} необходимо '
-                f'не менее {months + 1} строк.'
+
+        a, theta, sigma = (
+            unpack_params(opt.x)
+        )
+
+        final_nll = float(
+            opt.fun
+        )
+
+        feller_margin = (
+            2.0 * a * theta
+            - sigma ** 2
+        )
+
+        runs.append({
+            'scenario': scenario_name,
+            'run': run_number,
+
+            'success': bool(opt.success),
+            'message': str(opt.message),
+            'iterations': int(
+                getattr(
+                    opt,
+                    'nit',
+                    -1
+                )
+            ),
+
+            'start_a': start_a,
+            'start_theta': start_theta,
+            'start_sigma': start_sigma,
+            'start_nll': start_nll,
+
+            'a': a,
+            'theta': theta,
+            'sigma': sigma,
+            'final_nll': final_nll,
+
+            'nll_improvement': (
+                start_nll
+                - final_nll
+            ),
+
+            'feller_margin': (
+                feller_margin
+            ),
+
+            'half_life_years': (
+                np.log(2.0) / a
+            ),
+
+            'n_obs': len(
+                x_next_local
+            ),
+
+            'nll_per_obs': (
+                final_nll
+                / len(x_next_local)
             )
-        monthly_rates = key_rate_proxy_paths[
-            1:months + 1,
-            :
-        ]
-        dfs = discount_factors_from_zcyc(
-            months
-        )
-        # Средняя модельная proxy КС по каждому месяцу
-        expected_monthly_rates = np.mean(
-            monthly_rates,
-            axis=1
-        )
-        expected_floating_leg_pv = float(
-            np.sum(
-                expected_monthly_rates
-                * accrual
-                * dfs
-            )
-        )
-        fixed_leg_annuity = float(
-            np.sum(
-                accrual
-                * dfs
-            )
-        )
-        fair_irs_rate = (
-            expected_floating_leg_pv
-            / fixed_leg_annuity
-        )
-        rows.append({
-            'tenor': tenor,
-            'months': months,
-            'model_mid': fair_irs_rate
         })
-    return (
-        pd.DataFrame(rows)
-        .set_index('tenor')
+
+    runs_df = pd.DataFrame(
+        runs
     )
 
-⸻
+    valid = runs_df[
+        np.isfinite(
+            runs_df['final_nll']
+        )
+    ].copy()
 
-Запуск
+    if enforce_feller:
+        valid = valid[
+            valid['feller_margin'] > 0.0
+        ]
 
-Блок расчёта DF_360_pathwise больше не нужен.
+    if valid.empty:
+        return None, runs_df
 
-np.random.seed(
-    option_seed
+    valid = valid.sort_values(
+        'final_nll'
+    )
+
+    best = valid.iloc[0].copy()
+
+    return best, runs_df
+
+
+# -----------------------------------------------------------------------------
+# 3. Основные и намеренно ошибочные сценарии
+# -----------------------------------------------------------------------------
+
+rng = np.random.default_rng(
+    42
 )
-X_360_ruonia = MC_simulations(
-    T=360,
-    n_sim=n_sim_options,
-    a=opt_ats['a'],
-    theta=opt_ats['theta'],
-    s=opt_ats['s'],
-    debug=False
+
+scenario_inputs = {}
+
+
+# Правильный сценарий:
+# фактическое число дней между наблюдениями.
+scenario_inputs[
+    'actual_dt_feller'
+] = {
+    'x_prev': x_prev,
+    'x_next': x_next,
+    'delta_t': delta_t,
+    'enforce_feller': True
+}
+
+
+# Тот же сценарий, но без условия Феллера.
+scenario_inputs[
+    'actual_dt_no_feller'
+] = {
+    'x_prev': x_prev,
+    'x_next': x_next,
+    'delta_t': delta_t,
+    'enforce_feller': False
+}
+
+
+# Упрощённый дневной сценарий:
+# все интервалы считаются ровно одним днём.
+scenario_inputs[
+    'constant_1_day'
+] = {
+    'x_prev': x_prev,
+    'x_next': x_next,
+    'delta_t': np.full_like(
+        delta_t,
+        1.0 / 365.0
+    ),
+    'enforce_feller': True
+}
+
+
+# Старый, методологически неверный сценарий:
+# каждый соседний день считается месяцем.
+scenario_inputs[
+    'wrong_constant_1_month'
+] = {
+    'x_prev': x_prev,
+    'x_next': x_next,
+    'delta_t': np.full_like(
+        delta_t,
+        1.0 / 12.0
+    ),
+    'enforce_feller': True
+}
+
+
+# Намеренно неверный сценарий:
+# будущие значения случайно перемешиваются,
+# временная зависимость уничтожается.
+shuffled_next = x_next.copy()
+
+rng.shuffle(
+    shuffled_next
 )
 
-Cap/floor:
+scenario_inputs[
+    'wrong_shuffled_transitions'
+] = {
+    'x_prev': x_prev,
+    'x_next': shuffled_next,
+    'delta_t': delta_t,
+    'enforce_feller': True
+}
 
-cap_matrix_ois = (
-    option_matrix_from_ruonia_paths_ois(
-        ruonia_paths=X_360_ruonia,
-        strikes=cap_strikes,
-        maturities=maturities_years,
-        option_type='cap',
-        basis=ks_minus_ruonia_basis
+
+# Намеренно неверный сценарий:
+# переходы рассматриваются в обратном направлении.
+scenario_inputs[
+    'wrong_reversed_direction'
+] = {
+    'x_prev': x_next,
+    'x_next': x_prev,
+    'delta_t': delta_t,
+    'enforce_feller': True
+}
+
+
+# -----------------------------------------------------------------------------
+# 4. Запуск всех сценариев
+# -----------------------------------------------------------------------------
+
+scenario_best_rows = []
+scenario_all_runs = {}
+
+for scenario_name, scenario_data in (
+    scenario_inputs.items()
+):
+
+    print(
+        f'Калибровка сценария: '
+        f'{scenario_name}'
+    )
+
+    best_scenario, runs_scenario = (
+        calibrate_diagnostic_scenario(
+            scenario_name=scenario_name,
+            x_prev_local=(
+                scenario_data['x_prev']
+            ),
+            x_next_local=(
+                scenario_data['x_next']
+            ),
+            delta_t_local=(
+                scenario_data['delta_t']
+            ),
+            enforce_feller=(
+                scenario_data[
+                    'enforce_feller'
+                ]
+            ),
+            M=40,
+            seed=42
+        )
+    )
+
+    scenario_all_runs[
+        scenario_name
+    ] = runs_scenario
+
+    if best_scenario is not None:
+        scenario_best_rows.append(
+            best_scenario
+        )
+
+
+scenario_summary = pd.DataFrame(
+    scenario_best_rows
+)
+
+
+scenario_summary = (
+    scenario_summary[
+        [
+            'scenario',
+            'a',
+            'theta',
+            'sigma',
+            'half_life_years',
+            'feller_margin',
+            'final_nll',
+            'nll_per_obs',
+            'nll_improvement',
+            'iterations',
+            'success'
+        ]
+    ]
+    .sort_values(
+        'final_nll'
     )
 )
-floor_matrix_ois = (
-    option_matrix_from_ruonia_paths_ois(
-        ruonia_paths=X_360_ruonia,
-        strikes=floor_strikes,
-        maturities=maturities_years,
-        option_type='floor',
-        basis=ks_minus_ruonia_basis
-    )
-)
-show_option_matrices(
-    cap_matrix_ois,
-    floor_matrix_ois
+
+
+print(
+    '\nСравнение сценариев калибровки'
 )
 
-IRS:
-
-model_irs_ois = (
-    irs_mid_from_ruonia_paths_ois(
-        ruonia_paths=X_360_ruonia,
-        tenors_months=irs_tenors_months,
-        basis=ks_minus_ruonia_basis
-    )
-)
-model_irs_ois_display = pd.DataFrame(
-    index=model_irs_ois.index
-)
-model_irs_ois_display[
-    'Model IRS MID OIS, %'
-] = (
-    model_irs_ois['model_mid']
-    * 100.0
-)
 display(
-    model_irs_ois_display.round(4)
+    scenario_summary.round(8)
 )
 
-Смысл нового подхода:
 
-будущие выплаты определяются Monte Carlo-траекториями, но приводятся к текущей стоимости по наблюдаемой сегодня рыночной OIS-кривой.
+# -----------------------------------------------------------------------------
+# 5. Насколько разные старты сходятся к одному результату
+# -----------------------------------------------------------------------------
+
+actual_runs = (
+    scenario_all_runs[
+        'actual_dt_feller'
+    ]
+    .copy()
+)
+
+
+actual_valid = actual_runs[
+    np.isfinite(
+        actual_runs['final_nll']
+    )
+    &
+    (
+        actual_runs[
+            'feller_margin'
+        ] > 0.0
+    )
+].copy()
+
+
+actual_valid = actual_valid.sort_values(
+    'final_nll'
+)
+
+
+print(
+    '\nЛучшие 15 запусков '
+    'правильной калибровки'
+)
+
+display(
+    actual_valid[
+        [
+            'run',
+            'start_a',
+            'start_theta',
+            'start_sigma',
+            'a',
+            'theta',
+            'sigma',
+            'start_nll',
+            'final_nll',
+            'nll_improvement',
+            'iterations',
+            'success'
+        ]
+    ]
+    .head(15)
+    .round(8)
+)
+
+
+# Разброс параметров среди решений,
+# которые почти не уступают лучшему NLL.
+best_actual_nll = float(
+    actual_valid[
+        'final_nll'
+    ].min()
+)
+
+near_optimal = actual_valid[
+    actual_valid['final_nll']
+    <= best_actual_nll + 1.0
+].copy()
+
+
+near_optimal_stats = pd.DataFrame({
+    'metric': [
+        'Количество решений',
+        'Минимум a',
+        'Максимум a',
+        'Минимум theta',
+        'Максимум theta',
+        'Минимум sigma',
+        'Максимум sigma',
+        'Минимум NLL',
+        'Максимум NLL'
+    ],
+    'value': [
+        len(near_optimal),
+        near_optimal['a'].min(),
+        near_optimal['a'].max(),
+        near_optimal['theta'].min(),
+        near_optimal['theta'].max(),
+        near_optimal['sigma'].min(),
+        near_optimal['sigma'].max(),
+        near_optimal['final_nll'].min(),
+        near_optimal['final_nll'].max()
+    ]
+})
+
+
+print(
+    '\nРазброс почти оптимальных решений: '
+    'NLL не хуже лучшего более чем на 1'
+)
+
+display(
+    near_optimal_stats.round(10)
+)
+
+
+# -----------------------------------------------------------------------------
+# 6. Локальная чувствительность NLL к каждому параметру
+# -----------------------------------------------------------------------------
+
+best_actual = (
+    actual_valid.iloc[0]
+)
+
+best_a = float(
+    best_actual['a']
+)
+
+best_theta = float(
+    best_actual['theta']
+)
+
+best_sigma = float(
+    best_actual['sigma']
+)
+
+best_nll = float(
+    best_actual['final_nll']
+)
+
+
+parameter_multipliers = [
+    0.50,
+    0.75,
+    0.90,
+    0.95,
+    1.00,
+    1.05,
+    1.10,
+    1.25,
+    1.50,
+    2.00
+]
+
+
+sensitivity_rows = []
+
+for parameter_name in [
+    'a',
+    'theta',
+    'sigma'
+]:
+
+    for multiplier in parameter_multipliers:
+
+        test_a = best_a
+        test_theta = best_theta
+        test_sigma = best_sigma
+
+        if parameter_name == 'a':
+            test_a = (
+                best_a
+                * multiplier
+            )
+
+        elif parameter_name == 'theta':
+            test_theta = (
+                best_theta
+                * multiplier
+            )
+
+        else:
+            test_sigma = (
+                best_sigma
+                * multiplier
+            )
+
+        raw_test = np.log(
+            [
+                test_a,
+                test_theta,
+                test_sigma
+            ]
+        )
+
+        test_nll = (
+            cir_negative_log_likelihood(
+                raw_params=raw_test,
+                x_prev=x_prev,
+                x_next=x_next,
+                delta_t=delta_t,
+                enforce_feller=True
+            )
+        )
+
+        sensitivity_rows.append({
+            'parameter': parameter_name,
+            'multiplier': multiplier,
+            'tested_a': test_a,
+            'tested_theta': test_theta,
+            'tested_sigma': test_sigma,
+            'nll': test_nll,
+            'delta_nll': (
+                test_nll
+                - best_nll
+            )
+        })
+
+
+sensitivity_df = pd.DataFrame(
+    sensitivity_rows
+)
+
+
+print(
+    '\nЛокальная чувствительность NLL '
+    'к изменению параметров'
+)
+
+display(
+    sensitivity_df[
+        [
+            'parameter',
+            'multiplier',
+            'nll',
+            'delta_nll'
+        ]
+    ].round(8)
+)
+
+
+# -----------------------------------------------------------------------------
+# 7. Проверка стабильности на временных подвыборках
+# -----------------------------------------------------------------------------
+
+n_total = len(
+    x_next
+)
+
+split_points = {
+    'first_half': (
+        0,
+        n_total // 2
+    ),
+
+    'second_half': (
+        n_total // 2,
+        n_total
+    ),
+
+    'first_75pct': (
+        0,
+        int(
+            n_total * 0.75
+        )
+    ),
+
+    'last_75pct': (
+        int(
+            n_total * 0.25
+        ),
+        n_total
+    )
+}
+
+
+subsample_rows = []
+
+for sample_name, (
+    left_index,
+    right_index
+) in split_points.items():
+
+    best_sample, runs_sample = (
+        calibrate_diagnostic_scenario(
+            scenario_name=sample_name,
+            x_prev_local=x_prev[
+                left_index:right_index
+            ],
+            x_next_local=x_next[
+                left_index:right_index
+            ],
+            delta_t_local=delta_t[
+                left_index:right_index
+            ],
+            enforce_feller=True,
+            M=30,
+            seed=42
+        )
+    )
+
+    if best_sample is not None:
+        subsample_rows.append(
+            best_sample
+        )
+
+
+subsample_summary = pd.DataFrame(
+    subsample_rows
+)
+
+
+print(
+    '\nСтабильность параметров '
+    'на разных частях истории'
+)
+
+display(
+    subsample_summary[
+        [
+            'scenario',
+            'n_obs',
+            'a',
+            'theta',
+            'sigma',
+            'half_life_years',
+            'final_nll',
+            'nll_per_obs'
+        ]
+    ].round(8)
+)
+
+
+# -----------------------------------------------------------------------------
+# 8. Корреляция параметров среди почти оптимальных решений
+# -----------------------------------------------------------------------------
+
+if len(near_optimal) >= 3:
+
+    parameter_correlations = (
+        near_optimal[
+            [
+                'a',
+                'theta',
+                'sigma'
+            ]
+        ]
+        .corr()
+    )
+
+    print(
+        '\nКорреляция параметров '
+        'среди почти оптимальных решений'
+    )
+
+    display(
+        parameter_correlations.round(6)
+    )
+
+
+# -----------------------------------------------------------------------------
+# 9. Итоговые параметры правильной калибровки
+# -----------------------------------------------------------------------------
+
+diagnostic_best_mle = {
+    'a': best_a,
+    'theta': best_theta,
+    's': best_sigma
+}
+
+
+print(
+    '\nЛучшие параметры '
+    'по фактическим интервалам времени:'
+)
+
+print(
+    diagnostic_best_mle
+)
+
+
+print(
+    '\nПериод полураспада отклонения:'
+)
+
+print(
+    np.log(2.0)
+    / diagnostic_best_mle['a'],
+    'лет'
+)
