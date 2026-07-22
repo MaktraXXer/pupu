@@ -1,522 +1,288 @@
-USE [ALM_TEST]
+USE [ALM_TEST];
 GO
-
-SET ANSI_NULLS ON
-GO
-
-SET QUOTED_IDENTIFIER ON
-GO
-
-CREATE TABLE [alm_history].[liquidity_rates_v_trading]
+CREATE OR ALTER FUNCTION morgach.fn_predict_cpr_scalar
 (
-    [id]                [int] IDENTITY(1,1) NOT NULL,
-    [dt_from]           [date] NOT NULL,
-    [dt_to]             [date] NOT NULL,
-    [term]              [int] NOT NULL,
-    [cur]               [char](3) NOT NULL,
-    [IS_PDR]            [int] NOT NULL,
-    [IS_FINANCE_LCR]    [int] NOT NULL,
-    [value]             [float] NOT NULL,
-    [load_dt]           [datetime] NOT NULL,
+    @incentive float(53),  -- -0.002 = стимул -0.2 п.п.
+    @age       float(53),  -- выдержка в месяцах
+    @rate      float(53)   -- 0.10 = ставка 10% годовых
+)
+RETURNS float(53)
+WITH SCHEMABINDING
+AS
+BEGIN
 
-    CONSTRAINT [PK_liquidity_rates_v_trading]
-        PRIMARY KEY CLUSTERED
+    DECLARE @cpr float(53);
+
+    SELECT
+        @cpr =
+              p.[L]
+            + (cv.M_val - p.[L]) * fs.sig1
+            + (cv.U_val - cv.M_val) * fs.sig2
+    FROM morgach.cpr_model_params AS p
+
+    /* Перевод входных величин в формат как в питоне
+       0.10->10.0%
+    -0.002->-0.2 п.п.
+    */
+    CROSS APPLY
     (
-        [id] ASC
-    )
-    WITH
-    (
-        PAD_INDEX = OFF,
-        STATISTICS_NORECOMPUTE = OFF,
-        IGNORE_DUP_KEY = OFF,
-        ALLOW_ROW_LOCKS = ON,
-        ALLOW_PAGE_LOCKS = ON,
-        OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF
-    ) ON [PRIMARY]
-) ON [PRIMARY]
-GO
-
-ALTER TABLE [alm_history].[liquidity_rates_v_trading]
-ADD CONSTRAINT [DF_liquidity_rates_v_trading_dt_to]
-DEFAULT ('4444-01-01') FOR [dt_to]
-GO
-
-ALTER TABLE [alm_history].[liquidity_rates_v_trading]
-ADD CONSTRAINT [DF_liquidity_rates_v_trading_load_dt]
-DEFAULT (GETDATE()) FOR [load_dt]
-GO
-
-
-
-Option Explicit
-
-'====================================================
-' Импорт ставок в alm_history.liquidity_rates_v_trading
-'
-' Лист: "ликв cny"
-'
-' Формат:
-'   B1 = валюта (810/156/840/978)
-'   B2 = дата начала действия ставок
-'
-'   Строка 5:
-'       A5 = описание
-'       B5 = IS_PDR
-'       C5 = IS_FINANCE_LCR
-'       D5.. = term
-'
-'   Строки 6..N:
-'       A = текстовое описание
-'       B = IS_PDR (0/1)
-'       C = IS_FINANCE_LCR (0/1)
-'       D.. = value (%)
-'====================================================
-
-Sub ImportLiquidityRatesTrading()
-
-    Const SHEET_NAME As String = "ликв cny"
-
-    Const CUR_CELL As String = "B1"
-    Const DATE_CELL As String = "B2"
-
-    Const HEADER_ROW As Long = 5
-    Const FIRST_DATA_ROW As Long = 6
-
-    Const COL_DESC As Long = 1              'A
-    Const COL_ISPDR As Long = 2             'B
-    Const COL_IS_FIN_LCR As Long = 3        'C
-    Const FIRST_TERM_COL As Long = 4        'D
-
-    Dim ws As Worksheet
-    Dim conn As Object
-
-    Dim lastCol As Long
-    Dim lastRow As Long
-    Dim row As Long
-    Dim col As Long
-
-    Dim termDay As Long
-    Dim curCode As String
-    Dim isPdr As Long
-    Dim isFinanceLcr As Long
-    Dim dtFrom As String
-    Dim rateValue As Double
-    Dim cellText As String
-
-    On Error GoTo ErrorHandler
-
-    Application.ScreenUpdating = False
-
-    Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
-
-    '========================
-    ' Валидация шапки
-    '========================
-
-    curCode = NormalizeCurCode(ws.Range(CUR_CELL).Value)
-
-    If Not IsAllowedCur(curCode) Then
-        MsgBox _
-            "Некорректная валюта в " & CUR_CELL & _
-            ". Ожидаю 810/156/840/978.", _
-            vbExclamation
-
-        GoTo Cleanup
-    End If
-
-    If Not IsDate(ws.Range(DATE_CELL).Value) Then
-        MsgBox _
-            "Некорректная дата начала в " & DATE_CELL & ".", _
-            vbExclamation
-
-        GoTo Cleanup
-    End If
-
-    dtFrom = Format(CDate(ws.Range(DATE_CELL).Value), "yyyy-mm-dd")
-
-    lastCol = ws.Cells(HEADER_ROW, ws.Columns.Count).End(xlToLeft).Column
-
-    If lastCol < FIRST_TERM_COL Then
-        MsgBox _
-            "Не найдены сроки в строке " & HEADER_ROW & ".", _
-            vbExclamation
-
-        GoTo Cleanup
-    End If
-
-    lastRow = ws.Cells(ws.Rows.Count, COL_DESC).End(xlUp).row
-
-    If lastRow < FIRST_DATA_ROW Then
-        MsgBox "Не найдены строки со ставками.", vbExclamation
-        GoTo Cleanup
-    End If
-
-    '========================
-    ' Подключение к БД
-    '========================
-
-    Set conn = CreateObject("ADODB.Connection")
-
-    conn.ConnectionString = _
-        "Provider=SQLOLEDB;" & _
-        "Data Source=trading-db.ahml1.ru;" & _
-        "Initial Catalog=ALM_TEST;" & _
-        "Integrated Security=SSPI;"
-
-    conn.Open
-    conn.BeginTrans
-
-    '========================
-    ' Основной цикл
-    '========================
-
-    For row = FIRST_DATA_ROW To lastRow
-
-        ' Пропускаем полностью пустые строки
-        If Trim(CStr(ws.Cells(row, COL_DESC).Value)) = "" _
-           And Trim(CStr(ws.Cells(row, COL_ISPDR).Value)) = "" _
-           And Trim(CStr(ws.Cells(row, COL_IS_FIN_LCR).Value)) = "" Then
-
-            GoTo NextRow
-        End If
-
-        ' IS_PDR
-        If Not IsNumeric(ws.Cells(row, COL_ISPDR).Value) Then
-            Err.Raise _
-                vbObjectError + 1001, _
-                , _
-                "Некорректный IS_PDR в строке " & row
-        End If
-
-        isPdr = CLng(ws.Cells(row, COL_ISPDR).Value)
-
-        If Not (isPdr = 0 Or isPdr = 1) Then
-            Err.Raise _
-                vbObjectError + 1002, _
-                , _
-                "IS_PDR должен быть 0 или 1 в строке " & row
-        End If
-
-        ' IS_FINANCE_LCR
-        If Not IsNumeric(ws.Cells(row, COL_IS_FIN_LCR).Value) Then
-            Err.Raise _
-                vbObjectError + 1003, _
-                , _
-                "Некорректный IS_FINANCE_LCR в строке " & row
-        End If
-
-        isFinanceLcr = CLng(ws.Cells(row, COL_IS_FIN_LCR).Value)
-
-        If Not (isFinanceLcr = 0 Or isFinanceLcr = 1) Then
-            Err.Raise _
-                vbObjectError + 1004, _
-                , _
-                "IS_FINANCE_LCR должен быть 0 или 1 в строке " & row
-        End If
-
-        ' Цикл по срокам
-        For col = FIRST_TERM_COL To lastCol
-
-            termDay = 0
-
-            If IsNumeric(ws.Cells(HEADER_ROW, col).Value) Then
-                termDay = CLng(ws.Cells(HEADER_ROW, col).Value)
-            End If
-
-            If termDay <= 0 Then GoTo NextCol
-
-            cellText = Trim(CStr(ws.Cells(row, col).Text))
-
-            If cellText <> "" Then
-                rateValue = ParseRateValue(cellText)
-
-                ReplaceOrInsertLiquidityRateTrading _
-                    conn, _
-                    dtFrom, _
-                    termDay, _
-                    curCode, _
-                    isPdr, _
-                    isFinanceLcr, _
-                    rateValue
-            End If
-
-NextCol:
-        Next col
-
-NextRow:
-    Next row
-
-    conn.CommitTrans
-    conn.Close
-
-    MsgBox _
-        "Ставки успешно импортированы в " & _
-        "alm_history.liquidity_rates_v_trading.", _
-        vbInformation
-
-Cleanup:
-    Application.ScreenUpdating = True
-
-    Set conn = Nothing
-    Set ws = Nothing
-
-    Exit Sub
-
-ErrorHandler:
-    On Error Resume Next
-
-    If Not conn Is Nothing Then
-        If conn.State = 1 Then conn.RollbackTrans
-        If conn.State = 1 Then conn.Close
-    End If
-
-    Application.ScreenUpdating = True
-
-    MsgBox _
-        "Ошибка №" & Err.Number & ": " & Err.Description, _
-        vbCritical
-End Sub
-
-
-'===============================================================
-' UPSERT в alm_history.liquidity_rates_v_trading:
-'
-' 1. Если запись на ту же дату и комбинацию уже существует,
-'    обновляется value и load_dt.
-'
-' 2. Если записи нет:
-'    - закрывается предыдущий открытый интервал;
-'    - добавляется новая запись.
-'===============================================================
-
-Private Sub ReplaceOrInsertLiquidityRateTrading( _
-    ByVal conn As Object, _
-    ByVal newDtFrom As String, _
-    ByVal termDay As Long, _
-    ByVal curCode As String, _
-    ByVal isPdr As Long, _
-    ByVal isFinanceLcr As Long, _
-    ByVal rateValue As Double)
-
-    Dim rs As Object
-    Dim sql As String
-    Dim idExisting As Long
-
-    sql = _
-        "SELECT TOP 1 id " & _
-        "FROM alm_history.liquidity_rates_v_trading " & _
-        "WHERE dt_from='" & newDtFrom & "' " & _
-        "  AND term=" & termDay & _
-        "  AND cur='" & EscapeSql(curCode) & "' " & _
-        "  AND IS_PDR=" & isPdr & _
-        "  AND IS_FINANCE_LCR=" & isFinanceLcr & ";"
-
-    Set rs = CreateObject("ADODB.Recordset")
-    rs.Open sql, conn, 1, 3
-
-    If Not rs.EOF Then
-
-        idExisting = CLng(rs.Fields("id").Value)
-
-        sql = _
-            "UPDATE alm_history.liquidity_rates_v_trading " & _
-            "SET value=" & SqlNum(rateValue) & ", " & _
-            "    load_dt=GETDATE() " & _
-            "WHERE id=" & idExisting & ";"
-
-        conn.Execute sql
-
-    Else
-
-        ClosePrevOpenIntervalLiquidityTrading _
-            conn, _
-            newDtFrom, _
-            termDay, _
-            curCode, _
-            isPdr, _
-            isFinanceLcr
-
-        sql = _
-            "INSERT INTO alm_history.liquidity_rates_v_trading " & _
-            "(dt_from, dt_to, term, cur, IS_PDR, " & _
-            "IS_FINANCE_LCR, value, load_dt) " & _
-            "VALUES (" & _
-            "'" & newDtFrom & "', " & _
-            "'4444-01-01', " & _
-            termDay & ", " & _
-            "'" & EscapeSql(curCode) & "', " & _
-            isPdr & ", " & _
-            isFinanceLcr & ", " & _
-            SqlNum(rateValue) & ", " & _
-            "GETDATE());"
-
-        conn.Execute sql
-
-    End If
-
-    rs.Close
-    Set rs = Nothing
-End Sub
-
-
-'===============================================================
-' Закрывает предыдущий открытый интервал по той же комбинации:
-'
-' cur
-' term
-' IS_PDR
-' IS_FINANCE_LCR
-'
-' Для предыдущей записи:
-' dt_to = новая dt_from - 1 день.
-'===============================================================
-
-Private Sub ClosePrevOpenIntervalLiquidityTrading( _
-    ByVal conn As Object, _
-    ByVal newDtFrom As String, _
-    ByVal termDay As Long, _
-    ByVal curCode As String, _
-    ByVal isPdr As Long, _
-    ByVal isFinanceLcr As Long)
-
-    Dim rs As Object
-    Dim sqlSel As String
-    Dim sqlUpd As String
-    Dim prevId As Long
-    Dim dtToClose As String
-
-    sqlSel = _
-        "SELECT TOP 1 id " & _
-        "FROM alm_history.liquidity_rates_v_trading " & _
-        "WHERE cur='" & EscapeSql(curCode) & "' " & _
-        "  AND term=" & termDay & _
-        "  AND IS_PDR=" & isPdr & _
-        "  AND IS_FINANCE_LCR=" & isFinanceLcr & _
-        "  AND dt_to='4444-01-01' " & _
-        "  AND dt_from < '" & newDtFrom & "' " & _
-        "ORDER BY dt_from DESC;"
-
-    Set rs = CreateObject("ADODB.Recordset")
-    rs.Open sqlSel, conn, 1, 3
-
-    If Not rs.EOF Then
-
-        prevId = CLng(rs.Fields("id").Value)
-
-        dtToClose = Format( _
-            DateAdd("d", -1, CDate(newDtFrom)), _
-            "yyyy-mm-dd" _
+        VALUES
+        (
+            @rate * 100.0,
+            @incentive * 100.0
         )
+    ) AS mi
+    (
+        rate_pct,
+        incentive_pp
+    )
 
-        sqlUpd = _
-            "UPDATE alm_history.liquidity_rates_v_trading " & _
-            "SET dt_to='" & dtToClose & "' " & _
-            "WHERE id=" & prevId & ";"
+    /* R = rate - r0 */
+    CROSS APPLY
+    (
+        VALUES
+        (
+            mi.rate_pct - p.r0
+        )
+    ) AS rd(R)
 
-        conn.Execute sqlUpd
+    /* Аргументы rate-sigmoid */
+    CROSS APPLY
+    (
+        VALUES
+        (
+            p.M_alpha  * rd.R,
+            p.U_alpha  * rd.R,
+            p.k1_alpha * rd.R,
+            p.k2_alpha * rd.R,
+            p.I1_alpha * rd.R,
+            p.I2_alpha * rd.R
+        )
+    ) AS ra
+    (
+        M_x,
+        U_x,
+        k1_x,
+        k2_x,
+        I1_x,
+        I2_x
+    )
 
-    End If
+    /*rate_factor = 1 + delta * expit(alpha * R)
+       EXP(-ABS(x)) для устойчивого expit функции
+       https://stackoverflow.com/questions/51976461/optimal-way-of-defining-a-numerically-stable-sigmoid-function-for-a-list-in-pyth
+       */
+    CROSS APPLY
+    (
+        VALUES
+        (
+            EXP(-ABS(ra.M_x)),
+            EXP(-ABS(ra.U_x)),
+            EXP(-ABS(ra.k1_x)),
+            EXP(-ABS(ra.k2_x)),
+            EXP(-ABS(ra.I1_x)),
+            EXP(-ABS(ra.I2_x))
+        )
+    ) AS re
+    (
+        M_e,
+        U_e,
+        k1_e,
+        k2_e,
+        I1_e,
+        I2_e
+    )
 
-    rs.Close
-    Set rs = Nothing
-End Sub
+    CROSS APPLY
+    (
+        VALUES
+        (
+            1.0 + p.M_delta *
+                CASE
+                    WHEN ra.M_x >= 0.0
+                        THEN 1.0 / (1.0 + re.M_e)
+                    ELSE re.M_e / (1.0 + re.M_e)
+                END,
 
+            1.0 + p.U_delta *
+                CASE
+                    WHEN ra.U_x >= 0.0
+                        THEN 1.0 / (1.0 + re.U_e)
+                    ELSE re.U_e / (1.0 + re.U_e)
+                END,
 
-'===============================================================
-' Парсинг ставки:
-'
-' "-0.05%" -> -0.0005
-' "0.10%"  ->  0.001
-' "-0,4"   -> -0.004
-'===============================================================
+            1.0 + p.k1_delta *
+                CASE
+                    WHEN ra.k1_x >= 0.0
+                        THEN 1.0 / (1.0 + re.k1_e)
+                    ELSE re.k1_e / (1.0 + re.k1_e)
+                END,
 
-Private Function ParseRateValue(ByVal s As String) As Double
+            1.0 + p.k2_delta *
+                CASE
+                    WHEN ra.k2_x >= 0.0
+                        THEN 1.0 / (1.0 + re.k2_e)
+                    ELSE re.k2_e / (1.0 + re.k2_e)
+                END,
 
-    Dim t As String
-    Dim v As Double
+            1.0 + p.I1_delta *
+                CASE
+                    WHEN ra.I1_x >= 0.0
+                        THEN 1.0 / (1.0 + re.I1_e)
+                    ELSE re.I1_e / (1.0 + re.I1_e)
+                END,
 
-    t = Trim(CStr(s))
-    t = Replace(t, " ", "")
-    t = Replace(t, ",", ".")
+            1.0 + p.I2_delta *
+                CASE
+                    WHEN ra.I2_x >= 0.0
+                        THEN 1.0 / (1.0 + re.I2_e)
+                    ELSE re.I2_e / (1.0 + re.I2_e)
+                END
+        )
+    ) AS rf
+    (
+        M_rate_factor,
+        U_rate_factor,
+        k1_rate_factor,
+        k2_rate_factor,
+        I1_rate_factor,
+        I2_rate_factor
+    )
 
-    If InStr(1, t, "%", vbTextCompare) > 0 Then
+    /*Возрастные множители*/
+    CROSS APPLY
+    (
+        VALUES
+        (
+            1.0 + p.M_rho
+                * EXP(-p.M_lam * @age),
 
-        t = Replace(t, "%", "")
-        v = Val(t) / 100#
+            1.0 + p.U_rho
+                * EXP(-p.U_lam * @age),
 
-    Else
+            1.0 + p.k1_rho
+                * EXP(-p.k1_lam * @age),
 
-        v = Val(t)
+            1.0 + p.k2_rho
+                * EXP(-p.k2_lam * @age),
 
-        If Abs(v) > 1# Then
-            v = v / 100#
-        End If
+            1.0 + p.I1_rho
+                * LOG(1.0 + p.I1_lam * @age),
 
-    End If
+            1.0 + p.I2_rho
+                * LOG(1.0 + p.I2_lam * @age)
+        )
+    ) AS af
+    (
+        M_age_factor,
+        U_age_factor,
+        k1_age_factor,
+        k2_age_factor,
+        I1_age_factor,
+        I2_age_factor
+    )
 
-    ParseRateValue = v
-End Function
+    /* Компоненты M, U, k1, k2, I1, I2 */
+    CROSS APPLY
+    (
+        VALUES
+        (
+            p.M_gamma
+                * af.M_age_factor
+                * rf.M_rate_factor,
 
+            p.U_gamma
+                * af.U_age_factor
+                * rf.U_rate_factor,
 
-'===============================================================
-' Нормализация кода валюты
-'===============================================================
+            p.k1_gamma
+                * af.k1_age_factor
+                * rf.k1_rate_factor,
 
-Private Function NormalizeCurCode(ByVal v As Variant) As String
+            p.k2_gamma
+                * af.k2_age_factor
+                * rf.k2_rate_factor,
 
-    Dim s As String
+            p.I1_gamma
+                * af.I1_age_factor
+                * rf.I1_rate_factor
+                + p.I1_c,
 
-    s = Trim(CStr(v))
-    s = Replace(s, " ", "")
+            p.I2_gamma
+                * af.I2_age_factor
+                * rf.I2_rate_factor
+                + p.I2_c
+        )
+    ) AS cv
+    (
+        M_val,
+        U_val,
+        k1_val,
+        k2_val,
+        I1_val,
+        I2_val
+    )
 
-    If s = "" Then
+    /* Аргументы двух итоговых sigmoid */
+    CROSS APPLY
+    (
+        VALUES
+        (
+            cv.k1_val * (mi.incentive_pp - cv.I1_val),
+            cv.k2_val * (mi.incentive_pp - cv.I2_val)
+        )
+    ) AS fa
+    (
+        sig1_x,
+        sig2_x
+    )
 
-        NormalizeCurCode = ""
+    CROSS APPLY
+    (
+        VALUES
+        (
+            EXP(-ABS(fa.sig1_x)),
+            EXP(-ABS(fa.sig2_x))
+        )
+    ) AS fe
+    (
+        sig1_e,
+        sig2_e
+    )
 
-    ElseIf IsNumeric(s) Then
+    CROSS APPLY
+    (
+        VALUES
+        (
+            CASE
+                WHEN fa.sig1_x >= 0.0
+                    THEN 1.0 / (1.0 + fe.sig1_e)
+                ELSE fe.sig1_e / (1.0 + fe.sig1_e)
+            END,
 
-        NormalizeCurCode = Right$("000" & CStr(CLng(s)), 3)
+            CASE
+                WHEN fa.sig2_x >= 0.0
+                    THEN 1.0 / (1.0 + fe.sig2_e)
+                ELSE fe.sig2_e / (1.0 + fe.sig2_e)
+            END
+        )
+    ) AS fs
+    (
+        sig1,
+        sig2
+    )
 
-    Else
+    /* WHERE обязательно после всех CROSS APPLY */
+    WHERE
+        p.is_active = 1
+        AND p.model_id =
+        (
+            SELECT MAX(pm.model_id)
+            FROM morgach.cpr_model_params AS pm
+            WHERE pm.is_active = 1
+        );
 
-        NormalizeCurCode = s
+    RETURN @cpr;
 
-    End If
-End Function
-
-
-'===============================================================
-' Допустимые коды валют
-'===============================================================
-
-Private Function IsAllowedCur(ByVal curCode As String) As Boolean
-
-    IsAllowedCur = _
-        curCode = "810" _
-        Or curCode = "156" _
-        Or curCode = "840" _
-        Or curCode = "978"
-
-End Function
-
-
-'===============================================================
-' Экранирование строк для SQL
-'===============================================================
-
-Private Function EscapeSql(ByVal s As String) As String
-
-    EscapeSql = Replace(CStr(s), "'", "''")
-
-End Function
-
-
-'===============================================================
-' Преобразование числа в SQL-формат с точкой
-'===============================================================
-
-Private Function SqlNum(ByVal v As Double) As String
-
-    SqlNum = Replace(Format(v, "0.000000"), ",", ".")
-
-End Function
+END;
+GO
