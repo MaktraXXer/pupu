@@ -48,36 +48,53 @@ WITH src AS (
         CASE WHEN [Пк5] = 1 THEN 1 ELSE 0 END +
         CASE WHEN [Пк6] = 1 THEN 1 ELSE 0 END AS flags_count
 
-    FROM ehd.attr_DepoFLConditions t WITH (NOLOCK)
+    FROM ehd.attr_DepoFLConditions AS t WITH (NOLOCK)
 ),
 ranked AS (
     SELECT
         src.*,
 
         COUNT(*) OVER (
-            PARTITION BY
-                PROMO_GROUP,
-                flags_mask
+            PARTITION BY PROMO_GROUP, flags_mask
         ) AS combination_frequency,
 
         MIN(DT_OPEN_FACT) OVER (
-            PARTITION BY
-                PROMO_GROUP,
-                flags_mask
+            PARTITION BY PROMO_GROUP, flags_mask
         ) AS first_dt_open_fact,
 
         MAX(DT_OPEN_FACT) OVER (
-            PARTITION BY
-                PROMO_GROUP,
-                flags_mask
+            PARTITION BY PROMO_GROUP, flags_mask
         ) AS last_dt_open_fact,
 
+        SUM(COALESCE(START_DEPOSIT, 0)) OVER (
+            PARTITION BY PROMO_GROUP, flags_mask
+        ) AS total_start_deposit,
+
+        SUM(
+            CASE
+                WHEN DT_OPEN_FACT >= DATEFROMPARTS(2026, 1, 1)
+                THEN 1
+                ELSE 0
+            END
+        ) OVER (
+            PARTITION BY PROMO_GROUP, flags_mask
+        ) AS deposits_count_from_2026,
+
+        SUM(
+            CASE
+                WHEN DT_OPEN_FACT >= DATEFROMPARTS(2026, 1, 1)
+                THEN COALESCE(START_DEPOSIT, 0)
+                ELSE 0
+            END
+        ) OVER (
+            PARTITION BY PROMO_GROUP, flags_mask
+        ) AS start_deposit_from_2026,
+
         ROW_NUMBER() OVER (
-            PARTITION BY
-                PROMO_GROUP,
-                flags_mask
+            PARTITION BY PROMO_GROUP, flags_mask
             ORDER BY
                 DT_OPEN_FACT DESC,
+                START_DEPOSIT DESC,
                 DT_UPDATE DESC,
                 CON_ID DESC
         ) AS rn
@@ -90,9 +107,15 @@ SELECT
     flags_mask,
     flags_count,
     combination_frequency,
+
     first_dt_open_fact,
     last_dt_open_fact,
 
+    total_start_deposit,
+    deposits_count_from_2026,
+    start_deposit_from_2026,
+
+    -- Пример самого свежего и наиболее крупного вклада
     CON_ID,
     CLI_ID,
     DT_OPEN_FACT,
