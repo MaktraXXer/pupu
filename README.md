@@ -1,159 +1,110 @@
-WITH src AS (
-    SELECT
-        t.*,
+USE [ALM];
+SET NOCOUNT ON;
 
-        CONCAT(
-            CASE WHEN [Зрп] = 1 THEN '1' ELSE '0' END,
-            CASE WHEN [Пнс] = 1 THEN '1' ELSE '0' END,
-            CASE WHEN [Нов] = 1 THEN '1' ELSE '0' END,
-            CASE WHEN [НДП] = 1 THEN '1' ELSE '0' END,
-            CASE WHEN [НДМ] = 1 THEN '1' ELSE '0' END,
-            CASE WHEN [Мпл] = 1 THEN '1' ELSE '0' END,
-            CASE WHEN [Прл] = 1 THEN '1' ELSE '0' END,
-            CASE WHEN [Пр2] = 1 THEN '1' ELSE '0' END,
-            CASE WHEN [Пр3] = 1 THEN '1' ELSE '0' END,
-            CASE WHEN [Пк2] = 1 THEN '1' ELSE '0' END,
-            CASE WHEN [От1] = 1 THEN '1' ELSE '0' END,
-            CASE WHEN [От2] = 1 THEN '1' ELSE '0' END,
-            CASE WHEN [От3] = 1 THEN '1' ELSE '0' END,
-            CASE WHEN [Пк3] = 1 THEN '1' ELSE '0' END,
-            CASE WHEN [ДБО] = 1 THEN '1' ELSE '0' END,
-            CASE WHEN [Лмт] = 1 THEN '1' ELSE '0' END,
-            CASE WHEN [Прм] = 1 THEN '1' ELSE '0' END,
-            CASE WHEN [Пк1] = 1 THEN '1' ELSE '0' END,
-            CASE WHEN [Пк4] = 1 THEN '1' ELSE '0' END,
-            CASE WHEN [Пк5] = 1 THEN '1' ELSE '0' END,
-            CASE WHEN [Пк6] = 1 THEN '1' ELSE '0' END
-        ) AS flags_mask,
+DECLARE @DtRep date = '2026-06-30';
 
-        CASE WHEN [Зрп] = 1 THEN 1 ELSE 0 END +
-        CASE WHEN [Пнс] = 1 THEN 1 ELSE 0 END +
-        CASE WHEN [Нов] = 1 THEN 1 ELSE 0 END +
-        CASE WHEN [НДП] = 1 THEN 1 ELSE 0 END +
-        CASE WHEN [НДМ] = 1 THEN 1 ELSE 0 END +
-        CASE WHEN [Мпл] = 1 THEN 1 ELSE 0 END +
-        CASE WHEN [Прл] = 1 THEN 1 ELSE 0 END +
-        CASE WHEN [Пр2] = 1 THEN 1 ELSE 0 END +
-        CASE WHEN [Пр3] = 1 THEN 1 ELSE 0 END +
-        CASE WHEN [Пк2] = 1 THEN 1 ELSE 0 END +
-        CASE WHEN [От1] = 1 THEN 1 ELSE 0 END +
-        CASE WHEN [От2] = 1 THEN 1 ELSE 0 END +
-        CASE WHEN [От3] = 1 THEN 1 ELSE 0 END +
-        CASE WHEN [Пк3] = 1 THEN 1 ELSE 0 END +
-        CASE WHEN [ДБО] = 1 THEN 1 ELSE 0 END +
-        CASE WHEN [Лмт] = 1 THEN 1 ELSE 0 END +
-        CASE WHEN [Прм] = 1 THEN 1 ELSE 0 END +
-        CASE WHEN [Пк1] = 1 THEN 1 ELSE 0 END +
-        CASE WHEN [Пк4] = 1 THEN 1 ELSE 0 END +
-        CASE WHEN [Пк5] = 1 THEN 1 ELSE 0 END +
-        CASE WHEN [Пк6] = 1 THEN 1 ELSE 0 END AS flags_count
+IF OBJECT_ID('tempdb..#dchbo_clients') IS NOT NULL
+    DROP TABLE #dchbo_clients;
 
-    FROM ehd.attr_DepoFLConditions AS t WITH (NOLOCK)
-),
-ranked AS (
-    SELECT
-        src.*,
+IF OBJECT_ID('tempdb..#dchbo_deposits') IS NOT NULL
+    DROP TABLE #dchbo_deposits;
 
-        COUNT(*) OVER (
-            PARTITION BY PROMO_GROUP, flags_mask
-        ) AS combination_frequency,
 
-        MIN(DT_OPEN_FACT) OVER (
-            PARTITION BY PROMO_GROUP, flags_mask
-        ) AS first_dt_open_fact,
+/* ============================================================
+   1. Клиенты, у которых хотя бы один срочный вклад
+      на дату отчёта отмечен как ДЧБО
+   ============================================================ */
+SELECT DISTINCT
+      CAST(t.cli_id AS bigint) AS cli_id
+INTO #dchbo_clients
+FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
+WHERE
+    t.dt_rep       = @DtRep
+    AND t.section_name = N'Срочные'
+    AND t.block_name   = N'Привлечение ФЛ'
+    AND t.acc_role     = N'LIAB'
+    AND t.od_flag      = 1
+    AND t.cur          = '810'
+    AND t.out_rub IS NOT NULL
+    AND t.out_rub >= 0
+    AND t.TSEGMENTNAME = N'ДЧБО';
 
-        MAX(DT_OPEN_FACT) OVER (
-            PARTITION BY PROMO_GROUP, flags_mask
-        ) AS last_dt_open_fact,
 
-        SUM(COALESCE(START_DEPOSIT, 0)) OVER (
-            PARTITION BY PROMO_GROUP, flags_mask
-        ) AS total_start_deposit,
+/* ============================================================
+   2. Все срочные вклады найденных ДЧБО-клиентов
 
-        SUM(
-            CASE
-                WHEN DT_OPEN_FACT >= DATEFROMPARTS(2026, 1, 1)
-                THEN 1
-                ELSE 0
-            END
-        ) OVER (
-            PARTITION BY PROMO_GROUP, flags_mask
-        ) AS deposits_count_from_2026,
-
-        SUM(
-            CASE
-                WHEN DT_OPEN_FACT >= DATEFROMPARTS(2026, 1, 1)
-                THEN COALESCE(START_DEPOSIT, 0)
-                ELSE 0
-            END
-        ) OVER (
-            PARTITION BY PROMO_GROUP, flags_mask
-        ) AS start_deposit_from_2026,
-
-        ROW_NUMBER() OVER (
-            PARTITION BY PROMO_GROUP, flags_mask
-            ORDER BY
-                DT_OPEN_FACT DESC,
-                START_DEPOSIT DESC,
-                DT_UPDATE DESC,
-                CON_ID DESC
-        ) AS rn
-
-    FROM src
-)
+      Здесь TSEGMENTNAME — маркировка конкретного вклада.
+      Поэтому у ДЧБО-клиента отдельный вклад может быть отмечен
+      как "Розничный бизнес".
+   ============================================================ */
 SELECT
-    PROMO_GROUP,
+      CAST(t.cli_id AS bigint) AS cli_id
+    , CAST(t.con_id AS bigint) AS con_id
+    , CAST(t.dt_open AS date) AS dt_open
+    , CAST(t.dt_close_plan AS date) AS dt_close_plan
+    , t.is_floatrate
+    , t.TSEGMENTNAME
+    , t.PROD_NAME_res
+    , CAST(t.out_rub AS decimal(38,6)) AS out_rub
+    , CAST(1 AS int) AS is_dchbo_client
+INTO #dchbo_deposits
+FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
+INNER JOIN #dchbo_clients c
+    ON c.cli_id = CAST(t.cli_id AS bigint)
+WHERE
+    t.dt_rep       = @DtRep
+    AND t.section_name = N'Срочные'
+    AND t.block_name   = N'Привлечение ФЛ'
+    AND t.acc_role     = N'LIAB'
+    AND t.od_flag      = 1
+    AND t.cur          = '810'
+    AND t.out_rub IS NOT NULL
+    AND t.out_rub >= 0;
 
-    flags_mask,
-    flags_count,
-    combination_frequency,
 
-    first_dt_open_fact,
-    last_dt_open_fact,
-
-    total_start_deposit,
-    deposits_count_from_2026,
-    start_deposit_from_2026,
-
-    -- Пример самого свежего и наиболее крупного вклада
-    CON_ID,
-    CLI_ID,
-    DT_OPEN_FACT,
-    DT_CLOSE_PLAN,
-    DT_CLOSE_FACT,
-    DEPOSIT_ADD_CONDITIONS,
-    PROMO_CODE,
-    START_DEPOSIT,
-    selected_options,
-
-    [Зрп],
-    [Пнс],
-    [Нов],
-    [НДП],
-    [НДМ],
-    [Мпл],
-    [Прл],
-    [Пр2],
-    [Пр3],
-    [Пк2],
-    [От1],
-    [От2],
-    [От3],
-    [Пк3],
-    [ДБО],
-    [Лмт],
-    [Прм],
-    [Пк1],
-    [Пк4],
-    [Пк5],
-    [Пк6],
-
-    DT_UPDATE,
-    loaddate
-FROM ranked
-WHERE rn = 1
+/* ============================================================
+   3. Детальная витрина вкладов ДЧБО-клиентов
+   ============================================================ */
+SELECT
+      cli_id
+    , con_id
+    , dt_open
+    , dt_close_plan
+    , is_floatrate
+    , TSEGMENTNAME
+    , PROD_NAME_res
+    , out_rub
+    , is_dchbo_client
+FROM #dchbo_deposits
 ORDER BY
-    PROMO_GROUP,
-    flags_count,
-    combination_frequency DESC,
-    flags_mask;
+      cli_id
+    , dt_open
+    , con_id;
+
+
+/* ============================================================
+   4. Сколько вкладов ДЧБО-клиентов отмечены
+      как "Розничный бизнес"
+   ============================================================ */
+SELECT
+      COUNT(*) AS retail_deposit_count
+    , COUNT(DISTINCT cli_id) AS clients_with_retail_deposits_count
+    , SUM(out_rub) AS retail_deposit_volume
+FROM #dchbo_deposits
+WHERE TSEGMENTNAME = N'Розничный бизнес';
+
+
+/* ============================================================
+   5. Полное распределение вкладов ДЧБО-клиентов
+      по фактической маркировке TSEGMENTNAME
+   ============================================================ */
+SELECT
+      ISNULL(TSEGMENTNAME, N'Не указано') AS TSEGMENTNAME
+    , COUNT(*) AS deposit_count
+    , COUNT(DISTINCT cli_id) AS client_count
+    , SUM(out_rub) AS deposit_volume
+FROM #dchbo_deposits
+GROUP BY
+    ISNULL(TSEGMENTNAME, N'Не указано')
+ORDER BY
+    deposit_volume DESC;
