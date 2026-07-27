@@ -1,1 +1,1 @@
-=IF(C$2>360-$A3;0;MAX(-30%;MIN(20%;$B3-INDEX($B$1:$B$363;ROW()+C$2))))
+=MAX(-30;MIN(20;IF($A15<=decr_term;IF($A15=1;(base_rate-discount-$B$2)*100;((base_rate-discount-$B$2)+($F$14-INDEX($F:$F;ROW()-1)))*100);IF($A15=1;(base_rate-$B$2)*100;((base_rate-$B$2)+($F$14-INDEX($F:$F;ROW()-1)))*100)))
