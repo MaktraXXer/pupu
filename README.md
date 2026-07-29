@@ -1,77 +1,90 @@
-Option Explicit
+DECLARE @dt_start DATE = '2026-03-12';
+DECLARE @dt_end   DATE = '2026-03-31';
 
-Sub sendEmail_TopGraphBottom()
+;WITH base AS (
+    SELECT
+        b.dt_rep,
+        b.cli_id,
+        SUM(b.out_rub) AS client_out_rub
+    FROM [ALM].[ALM].[VW_Balance_Rest_All] b WITH (NOLOCK)
+    WHERE b.dt_rep >= @dt_start
+      AND b.dt_rep <= @dt_end
+      AND b.cur = '810'
+      AND b.section_name = N'Накопительный счёт'
+      AND b.od_flag = 1
+      AND b.prod_id = 654
+      AND b.block_name = N'Привлечение ФЛ'
+    GROUP BY
+        b.dt_rep,
+        b.cli_id
+),
+agg AS (
+    SELECT
+        dt_rep,
 
-    Dim inputSheet As Worksheet
-    Dim reportSheet As Worksheet
-    Dim reportRange As Range
+        SUM(
+            CASE
+                WHEN client_out_rub <= 1500000
+                THEN client_out_rub
+                ELSE 0
+            END
+        ) AS out_rub_to_1_5m,
 
-    Dim OutApp As Object
-    Dim OutMail As Object
-    Dim wEditor As Object
-    Dim wdSel As Object
+        SUM(
+            CASE
+                WHEN client_out_rub > 1500000
+                 AND client_out_rub <= 10000000
+                THEN client_out_rub
+                ELSE 0
+            END
+        ) AS out_rub_1_5m_to_10m,
 
-    Dim t As String
+        SUM(
+            CASE
+                WHEN client_out_rub > 10000000
+                 AND client_out_rub <= 30000000
+                THEN client_out_rub
+                ELSE 0
+            END
+        ) AS out_rub_10m_to_30m,
 
-    On Error GoTo ErrHandler
+        SUM(
+            CASE
+                WHEN client_out_rub > 30000000
+                THEN client_out_rub
+                ELSE 0
+            END
+        ) AS out_rub_over_30m
 
-    Set inputSheet = ThisWorkbook.Worksheets("Input")
-    Set reportSheet = ThisWorkbook.Worksheets("Email")
-    Set reportRange = reportSheet.Range("A1:P91")
+    FROM base
+    GROUP BY dt_rep
+),
+dates AS (
+    SELECT @dt_start AS dt_rep
 
-    t = Format(inputSheet.Range("B2").Value, "DD.MM.YYYY")
+    UNION ALL
 
-    Set OutApp = CreateObject("Outlook.Application")
-    Set OutMail = OutApp.CreateItem(0)
+    SELECT DATEADD(DAY, 1, dt_rep)
+    FROM dates
+    WHERE dt_rep < @dt_end
+)
+SELECT
+    d.dt_rep,
 
-    With OutMail
-        .To = "ALM@domrf.ru; liquidity.treasury@domrf.ru"
-        .Subject = "Спреды ЕТС в терминах КС+ на " & t
-        .Display
-    End With
+    COALESCE(a.out_rub_to_1_5m, 0)
+        AS [Остаток до 1.5 млн включительно],
 
-    Set wEditor = OutMail.GetInspector.WordEditor
-    Set wdSel = wEditor.Application.Selection
+    COALESCE(a.out_rub_1_5m_to_10m, 0)
+        AS [Остаток свыше 1.5 до 10 млн включительно],
 
-    reportSheet.Activate
-    reportRange.Select
-    reportRange.Copy
+    COALESCE(a.out_rub_10m_to_30m, 0)
+        AS [Остаток свыше 10 до 30 млн включительно],
 
-    DoEvents
-    Application.Wait Now + TimeValue("0:00:01")
+    COALESCE(a.out_rub_over_30m, 0)
+        AS [Остаток свыше 30 млн]
 
-    OutApp.ActiveWindow.Activate
-    wdSel.Paste
-
-    DoEvents
-    Application.Wait Now + TimeValue("0:00:01")
-
-    OutMail.Save
-
-    If inputSheet.Range("G6").Value = True Then
-        OutMail.Send
-    End If
-
-CleanExit:
-    On Error Resume Next
-
-    Application.CutCopyMode = False
-
-    reportSheet.Activate
-    reportSheet.Range("A1").Select
-
-    Set wdSel = Nothing
-    Set wEditor = Nothing
-    Set OutMail = Nothing
-    Set OutApp = Nothing
-    Set reportRange = Nothing
-    Set reportSheet = Nothing
-    Set inputSheet = Nothing
-
-    Exit Sub
-
-ErrHandler:
-    MsgBox "Ошибка: " & Err.Description, vbExclamation
-    Resume CleanExit
-
-End Sub
+FROM dates d
+LEFT JOIN agg a
+    ON a.dt_rep = d.dt_rep
+ORDER BY d.dt_rep
+OPTION (MAXRECURSION 0);
