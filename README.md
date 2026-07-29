@@ -1,1 +1,77 @@
-=MAX(-30;MIN(20;IF($A15<=decr_term;IF($A15=1;(base_rate-discount-$B$2)*100;((base_rate-discount-$B$2)+($F$14-INDEX($F:$F;ROW()-1)))*100);IF($A15=1;(base_rate-$B$2)*100;((base_rate-$B$2)+($F$14-INDEX($F:$F;ROW()-1)))*100)))
+Option Explicit
+
+Sub sendEmail_TopGraphBottom()
+
+    Dim inputSheet As Worksheet
+    Dim reportSheet As Worksheet
+    Dim reportRange As Range
+
+    Dim OutApp As Object
+    Dim OutMail As Object
+    Dim wEditor As Object
+    Dim wdSel As Object
+
+    Dim t As String
+
+    On Error GoTo ErrHandler
+
+    Set inputSheet = ThisWorkbook.Worksheets("Input")
+    Set reportSheet = ThisWorkbook.Worksheets("Email")
+    Set reportRange = reportSheet.Range("A1:P91")
+
+    t = Format(inputSheet.Range("B2").Value, "DD.MM.YYYY")
+
+    Set OutApp = CreateObject("Outlook.Application")
+    Set OutMail = OutApp.CreateItem(0)
+
+    With OutMail
+        .To = "ALM@domrf.ru; liquidity.treasury@domrf.ru"
+        .Subject = "Спреды ЕТС в терминах КС+ на " & t
+        .Display
+    End With
+
+    Set wEditor = OutMail.GetInspector.WordEditor
+    Set wdSel = wEditor.Application.Selection
+
+    reportSheet.Activate
+    reportRange.Select
+    reportRange.Copy
+
+    DoEvents
+    Application.Wait Now + TimeValue("0:00:01")
+
+    OutApp.ActiveWindow.Activate
+    wdSel.Paste
+
+    DoEvents
+    Application.Wait Now + TimeValue("0:00:01")
+
+    OutMail.Save
+
+    If inputSheet.Range("G6").Value = True Then
+        OutMail.Send
+    End If
+
+CleanExit:
+    On Error Resume Next
+
+    Application.CutCopyMode = False
+
+    reportSheet.Activate
+    reportSheet.Range("A1").Select
+
+    Set wdSel = Nothing
+    Set wEditor = Nothing
+    Set OutMail = Nothing
+    Set OutApp = Nothing
+    Set reportRange = Nothing
+    Set reportSheet = Nothing
+    Set inputSheet = Nothing
+
+    Exit Sub
+
+ErrHandler:
+    MsgBox "Ошибка: " & Err.Description, vbExclamation
+    Resume CleanExit
+
+End Sub
