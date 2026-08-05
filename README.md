@@ -33,6 +33,16 @@ Sub sendEmail_TopGraphBottom()
     Set wEditor = OutMail.GetInspector.WordEditor
     Set wdSel = wEditor.Application.Selection
 
+    OutApp.ActiveWindow.Activate
+
+    ' Текст письма
+    wdSel.TypeText "Коллеги, добрый день!"
+    wdSel.TypeParagraph
+    wdSel.TypeText "Присылаю отчёт о спредах фиксированных ЕТС к ключевой ставке."
+    wdSel.TypeParagraph
+    wdSel.TypeParagraph
+
+    ' Копирование диапазона Email!A1:P91
     reportSheet.Activate
     reportRange.Select
     reportRange.Copy
