@@ -1,6 +1,6 @@
 Option Explicit
 
-Sub calc_matrix_with_montecarlo_fast_persist_v4()
+Sub calc_matrix_with_montecarlo_fast_persist_v3_minfix()
 
     Dim wsG As Worksheet, wsUp As Worksheet, wsRun As Worksheet
     Dim wsCpr As Worksheet, wsTs As Worksheet, wsIn As Worksheet
@@ -60,32 +60,30 @@ Sub calc_matrix_with_montecarlo_fast_persist_v4()
     Set rngB6 = wsG.Range("B6")
     Set rngD2 = wsG.Range("D2")
     Set rngQ8 = wsG.Range("S8")
-
     Set rngB10 = wsG.Range("B10")
     Set rngB11 = wsG.Range("B11")
     Set rngB12 = wsG.Range("B12")
+
+    ' TS
     Set rngC12 = wsG.Range("C12")
 
     ' Предзагрузка сетки
     Dim arrDiscounts As Variant, arrTerms As Variant
 
-    arrDiscounts = To2DArray(wsIn.Range( _
-        wsIn.Cells(min_row, 2), _
-        wsIn.Cells(max_row, 2)).Value2)
+    arrDiscounts = To2DArray( _
+        wsIn.Range(wsIn.Cells(min_row, 2), _
+                   wsIn.Cells(max_row, 2)).Value2)
 
-    arrTerms = To2DArray(wsIn.Range( _
-        wsIn.Cells(2, min_col), _
-        wsIn.Cells(2, max_col)).Value2)
+    arrTerms = To2DArray( _
+        wsIn.Range(wsIn.Cells(2, min_col), _
+                   wsIn.Cells(2, max_col)).Value2)
 
     Dim i As Long, k As Long, sc As Long
     Dim rr As Long, cc As Long
     Dim rVal As Variant, tVal As Variant
 
-    Dim sumUp As Double, sumRun As Double
-    Dim sumCpr As Double, sumTs As Double
-
-    Dim avgUp As Double, avgRun As Double
-    Dim avgCpr As Double, avgTs As Double
+    Dim sumUp As Double, sumRun As Double, sumCpr As Double, sumTs As Double
+    Dim avgUp As Double, avgRun As Double, avgCpr As Double, avgTs As Double
 
     Dim savedCells As Long, skippedCells As Long
     savedCells = 0
@@ -125,12 +123,12 @@ Sub calc_matrix_with_montecarlo_fast_persist_v4()
             rr = min_row + i - 1
             cc = min_col + k - 1
 
-            ' Пропускаем только если заполнены ВСЕ 4 матрицы
+            ' Пропускаем уже заполненные клетки
+            ' ОСТАВЛЕНО РОВНО КАК В РАБОЧЕМ МАКРОСЕ
             If SKIP_FILLED_CELLS Then
                 If Len(wsUp.Cells(rr, cc).Value2) > 0 _
                    And Len(wsRun.Cells(rr, cc).Value2) > 0 _
-                   And Len(wsCpr.Cells(rr, cc).Value2) > 0 _
-                   And Len(wsTs.Cells(rr, cc).Value2) > 0 Then
+                   And Len(wsCpr.Cells(rr, cc).Value2) > 0 Then
 
                     skippedCells = skippedCells + 1
                     GoTo NextCell
@@ -145,21 +143,20 @@ Sub calc_matrix_with_montecarlo_fast_persist_v4()
             sumCpr = 0#
             sumTs = 0#
 
-            ' Прогон сценариев Монте-Карло
             For sc = startSc To endSc
 
                 rngQ8.Value2 = sc
-
                 Application.Calculate
 
                 sumUp = sumUp + CDbl(rngB10.Value2)
                 sumRun = sumRun + CDbl(rngB11.Value2)
                 sumCpr = sumCpr + CDbl(rngB12.Value2)
+
+                ' Новый показатель TS
                 sumTs = sumTs + CDbl(rngC12.Value2)
 
             Next sc
 
-            ' Средние по всем сценариям
             avgUp = sumUp / nSc
             avgRun = sumRun / nSc
             avgCpr = sumCpr / nSc
@@ -169,6 +166,8 @@ Sub calc_matrix_with_montecarlo_fast_persist_v4()
             wsUp.Cells(rr, cc).Value2 = avgUp
             wsRun.Cells(rr, cc).Value2 = avgRun
             wsCpr.Cells(rr, cc).Value2 = avgCpr
+
+            ' Новый результат
             wsTs.Cells(rr, cc).Value2 = avgTs
 
             savedCells = savedCells + 1
