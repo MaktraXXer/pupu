@@ -10,6 +10,7 @@ DECLARE @ExitTo   date = @EndDate;
 DECLARE @OpenFrom date = DATEADD(day, 1, @BaseDate);
 DECLARE @OpenTo   date = @EndDate;
 
+
 IF OBJECT_ID('tempdb..#bal_base') IS NOT NULL DROP TABLE #bal_base;
 IF OBJECT_ID('tempdb..#bal_end') IS NOT NULL DROP TABLE #bal_end;
 IF OBJECT_ID('tempdb..#attr_flags') IS NOT NULL DROP TABLE #attr_flags;
@@ -29,13 +30,6 @@ SELECT
     , t.section_name
     , t.PROD_NAME_res
     , CAST(t.out_rub AS decimal(38,6)) AS out_rub
-    , CAST(t.rate_con AS decimal(18,6)) AS rate_con
-    , CASE
-          WHEN NULLIF(LTRIM(RTRIM(COALESCE(t.conv, ''))), '') IS NULL
-              THEN 'AT_THE_END'
-          ELSE UPPER(LTRIM(RTRIM(t.conv)))
-      END AS conv_norm
-    , CAST(t.termdays AS int) AS termdays
     , t.TSEGMENTNAME
 INTO #bal_base
 FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
@@ -65,13 +59,6 @@ SELECT
     , t.section_name
     , t.PROD_NAME_res
     , CAST(t.out_rub AS decimal(38,6)) AS out_rub
-    , CAST(t.rate_con AS decimal(18,6)) AS rate_con
-    , CASE
-          WHEN NULLIF(LTRIM(RTRIM(COALESCE(t.conv, ''))), '') IS NULL
-              THEN 'AT_THE_END'
-          ELSE UPPER(LTRIM(RTRIM(t.conv)))
-      END AS conv_norm
-    , CAST(t.termdays AS int) AS termdays
     , t.TSEGMENTNAME
 INTO #bal_end
 FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
@@ -90,21 +77,24 @@ WHERE
 
 
 /* ============================================================
-   3. Последние актуальные признаки договора
+   3. Признаки договоров из attr_DepoFLConditions
 
-   Таблица attr_DepoFLConditions читается один раз.
+   Таблицу читаем один раз.
 
    По каждому con_id берём последнюю запись:
-   1) по DT_UPDATE;
-   2) затем по loaddate.
+   1. DT_UPDATE DESC
+   2. loaddate DESC
 
-   Выделяем признаки:
+   Нужные группы:
    - Нов
    - Пр2 / Пр3
    - НДП / НДМ
    - Пк2 / От1
+   - Пк3 / Пк6
    - Мпл
    - Пнс
+
+   ФУ определяется отдельно по PROD_NAME_res.
    ============================================================ */
 WITH relevant_con_id AS (
     SELECT con_id
@@ -129,7 +119,7 @@ attr_ranked AS (
               ELSE 0
           END AS is_nov_flag
 
-        /* Пр2 или Пр3 */
+        /* Пр2 + Пр3 */
         , CASE
               WHEN ISNULL(TRY_CAST(a.[Пр2] AS int), 0) = 1
                 OR ISNULL(TRY_CAST(a.[Пр3] AS int), 0) = 1
@@ -137,7 +127,7 @@ attr_ranked AS (
               ELSE 0
           END AS is_pr2_pr3_flag
 
-        /* НДП или НДМ */
+        /* НДП + НДМ */
         , CASE
               WHEN ISNULL(TRY_CAST(a.[НДП] AS int), 0) = 1
                 OR ISNULL(TRY_CAST(a.[НДМ] AS int), 0) = 1
@@ -145,7 +135,7 @@ attr_ranked AS (
               ELSE 0
           END AS is_ndp_ndm_flag
 
-        /* Пк2 или От1 */
+        /* Пк2 + От1 */
         , CASE
               WHEN ISNULL(TRY_CAST(a.[Пк2] AS int), 0) = 1
                 OR ISNULL(TRY_CAST(a.[От1] AS int), 0) = 1
@@ -153,7 +143,15 @@ attr_ranked AS (
               ELSE 0
           END AS is_pk2_ot1_flag
 
-        /* Мпл */
+        /* Пк3 + Пк6 */
+        , CASE
+              WHEN ISNULL(TRY_CAST(a.[Пк3] AS int), 0) = 1
+                OR ISNULL(TRY_CAST(a.[Пк6] AS int), 0) = 1
+                  THEN 1
+              ELSE 0
+          END AS is_pk3_pk6_flag
+
+        /* МПЛ */
         , CASE
               WHEN ISNULL(TRY_CAST(a.[Мпл] AS int), 0) = 1
                   THEN 1
@@ -185,6 +183,7 @@ SELECT
     , is_pr2_pr3_flag
     , is_ndp_ndm_flag
     , is_pk2_ot1_flag
+    , is_pk3_pk6_flag
     , is_mpl_flag
     , is_pns_flag
 INTO #attr_flags
@@ -193,15 +192,15 @@ WHERE rn = 1;
 
 
 /* ============================================================
-   4. Две категории клиентов
+   4. База клиентов
 
    01. Вкладчики к выходу:
-       есть срочный вклад на @BaseDate с плановым закрытием
+       на @BaseDate есть срочный вклад с dt_close_plan
        в периоде @BaseDate + 1 ... @EndDate.
 
    02. НС без вкладов к выходу:
-       есть НС на @BaseDate, но нет срочного вклада
-       к выходу в анализируемом периоде.
+       на @BaseDate есть НС,
+       но нет срочного вклада к выходу.
    ============================================================ */
 SELECT
       x.cli_id
@@ -224,7 +223,7 @@ FROM (
 
     UNION ALL
 
-    /* 02. Клиенты с НС без вкладов к выходу */
+    /* 02. НС без вкладов к выходу */
     SELECT
           ns.cli_id
         , CAST(
@@ -245,13 +244,17 @@ FROM (
         )
     GROUP BY
         ns.cli_id
+
 ) x;
 
 
 /* ============================================================
-   5. Общие расчёты и маркировки
+   5. Общие расчёты
    ============================================================ */
 WITH client_flags AS (
+
+    /* Если хотя бы один продукт клиента на стартовом балансе
+       отмечен ДЧБО — клиент считается ДЧБО */
     SELECT
           c.cli_id
         , CASE
@@ -274,16 +277,17 @@ WITH client_flags AS (
 
 
 /* ============================================================
-   Вклады к выходу на уровне con_id
+   ВКЛАДЫ К ВЫХОДУ
+
+   Сначала один con_id = одна строка.
    ============================================================ */
 exit_by_con AS (
     SELECT
           b.cli_id
         , b.con_id
-        , MIN(b.dt_open) AS dt_open
         , SUM(b.out_rub) AS out_rub
 
-        /* ФУ определяется по PROD_NAME_res */
+        /* ФУ */
         , MAX(
               CASE
                   WHEN b.PROD_NAME_res IN (
@@ -304,12 +308,13 @@ exit_by_con AS (
               END
           ) AS is_fu_flag
 
-        , MAX(ISNULL(a.is_nov_flag, 0)) AS is_nov_flag
-        , MAX(ISNULL(a.is_pr2_pr3_flag, 0)) AS is_pr2_pr3_flag
-        , MAX(ISNULL(a.is_ndp_ndm_flag, 0)) AS is_ndp_ndm_flag
-        , MAX(ISNULL(a.is_pk2_ot1_flag, 0)) AS is_pk2_ot1_flag
-        , MAX(ISNULL(a.is_mpl_flag, 0)) AS is_mpl_flag
-        , MAX(ISNULL(a.is_pns_flag, 0)) AS is_pns_flag
+        , MAX(ISNULL(a.is_nov_flag, 0))       AS is_nov_flag
+        , MAX(ISNULL(a.is_pr2_pr3_flag, 0))   AS is_pr2_pr3_flag
+        , MAX(ISNULL(a.is_ndp_ndm_flag, 0))   AS is_ndp_ndm_flag
+        , MAX(ISNULL(a.is_pk2_ot1_flag, 0))   AS is_pk2_ot1_flag
+        , MAX(ISNULL(a.is_pk3_pk6_flag, 0))   AS is_pk3_pk6_flag
+        , MAX(ISNULL(a.is_mpl_flag, 0))       AS is_mpl_flag
+        , MAX(ISNULL(a.is_pns_flag, 0))       AS is_pns_flag
 
     FROM #bal_base b
     INNER JOIN #client_scope c
@@ -327,16 +332,17 @@ exit_by_con AS (
 
 
 /* ============================================================
-   Приоритет вкладов к выходу:
+   Приоритет классификации вкладов к выходу:
 
    1. ФУ
    2. Нов
    3. Пр2 / Пр3
    4. НДП / НДМ
    5. Пк2 / От1
-   6. МПЛ
-   7. Пнс
-   8. Остальные
+   6. Пк3 / Пк6
+   7. МПЛ
+   8. Пнс
+   9. Остальные
    ============================================================ */
 exit_classified AS (
     SELECT
@@ -360,6 +366,9 @@ exit_classified AS (
               WHEN e.is_pk2_ot1_flag = 1
                   THEN N'pk2_ot1'
 
+              WHEN e.is_pk3_pk6_flag = 1
+                  THEN N'pk3_pk6'
+
               WHEN e.is_mpl_flag = 1
                   THEN N'mpl'
 
@@ -374,142 +383,108 @@ exit_classified AS (
 
 
 /* ============================================================
-   Агрегация вкладов к выходу до уровня клиента
-
-   Дополнительно ставим флаги наличия у клиента
-   хотя бы одного вклада каждой из 7 специальных категорий.
+   Суммы вкладов к выходу +
+   клиентские флаги наличия каждой категории
    ============================================================ */
 exit_sum AS (
     SELECT
           cli_id
 
-        /* Общая сумма вкладов к выходу */
         , SUM(out_rub) AS exit_td_sum
 
-        /* Суммы по категориям */
+
+        /* =========================
+           СУММЫ
+           ========================= */
+
         , SUM(
-              CASE
-                  WHEN exit_category = N'fu'
-                      THEN out_rub
-                  ELSE 0
-              END
+              CASE WHEN exit_category = N'fu'
+                   THEN out_rub ELSE 0 END
           ) AS exit_fu_td_sum
 
         , SUM(
-              CASE
-                  WHEN exit_category = N'nov'
-                      THEN out_rub
-                  ELSE 0
-              END
+              CASE WHEN exit_category = N'nov'
+                   THEN out_rub ELSE 0 END
           ) AS exit_nov_td_sum
 
         , SUM(
-              CASE
-                  WHEN exit_category = N'pr2_pr3'
-                      THEN out_rub
-                  ELSE 0
-              END
+              CASE WHEN exit_category = N'pr2_pr3'
+                   THEN out_rub ELSE 0 END
           ) AS exit_pr2_pr3_td_sum
 
         , SUM(
-              CASE
-                  WHEN exit_category = N'ndp_ndm'
-                      THEN out_rub
-                  ELSE 0
-              END
+              CASE WHEN exit_category = N'ndp_ndm'
+                   THEN out_rub ELSE 0 END
           ) AS exit_ndp_ndm_td_sum
 
         , SUM(
-              CASE
-                  WHEN exit_category = N'pk2_ot1'
-                      THEN out_rub
-                  ELSE 0
-              END
+              CASE WHEN exit_category = N'pk2_ot1'
+                   THEN out_rub ELSE 0 END
           ) AS exit_pk2_ot1_td_sum
 
         , SUM(
-              CASE
-                  WHEN exit_category = N'mpl'
-                      THEN out_rub
-                  ELSE 0
-              END
+              CASE WHEN exit_category = N'pk3_pk6'
+                   THEN out_rub ELSE 0 END
+          ) AS exit_pk3_pk6_td_sum
+
+        , SUM(
+              CASE WHEN exit_category = N'mpl'
+                   THEN out_rub ELSE 0 END
           ) AS exit_mpl_td_sum
 
         , SUM(
-              CASE
-                  WHEN exit_category = N'pns'
-                      THEN out_rub
-                  ELSE 0
-              END
+              CASE WHEN exit_category = N'pns'
+                   THEN out_rub ELSE 0 END
           ) AS exit_pns_td_sum
 
         , SUM(
-              CASE
-                  WHEN exit_category = N'other'
-                      THEN out_rub
-                  ELSE 0
-              END
+              CASE WHEN exit_category = N'other'
+                   THEN out_rub ELSE 0 END
           ) AS exit_other_td_sum
 
 
-        /* ====================================================
-           Флаги наличия вкладов к выходу по категориям
-           ==================================================== */
+        /* =========================
+           КЛИЕНТСКИЕ ФЛАГИ
+           ========================= */
 
         , MAX(
-              CASE
-                  WHEN exit_category = N'fu'
-                      THEN 1
-                  ELSE 0
-              END
+              CASE WHEN exit_category = N'fu'
+                   THEN 1 ELSE 0 END
           ) AS has_fu_exit_td_flag
 
         , MAX(
-              CASE
-                  WHEN exit_category = N'nov'
-                      THEN 1
-                  ELSE 0
-              END
+              CASE WHEN exit_category = N'nov'
+                   THEN 1 ELSE 0 END
           ) AS has_nov_exit_td_flag
 
         , MAX(
-              CASE
-                  WHEN exit_category = N'pr2_pr3'
-                      THEN 1
-                  ELSE 0
-              END
+              CASE WHEN exit_category = N'pr2_pr3'
+                   THEN 1 ELSE 0 END
           ) AS has_pr2_pr3_exit_td_flag
 
         , MAX(
-              CASE
-                  WHEN exit_category = N'ndp_ndm'
-                      THEN 1
-                  ELSE 0
-              END
+              CASE WHEN exit_category = N'ndp_ndm'
+                   THEN 1 ELSE 0 END
           ) AS has_ndp_ndm_exit_td_flag
 
         , MAX(
-              CASE
-                  WHEN exit_category = N'pk2_ot1'
-                      THEN 1
-                  ELSE 0
-              END
+              CASE WHEN exit_category = N'pk2_ot1'
+                   THEN 1 ELSE 0 END
           ) AS has_pk2_ot1_exit_td_flag
 
         , MAX(
-              CASE
-                  WHEN exit_category = N'mpl'
-                      THEN 1
-                  ELSE 0
-              END
+              CASE WHEN exit_category = N'pk3_pk6'
+                   THEN 1 ELSE 0 END
+          ) AS has_pk3_pk6_exit_td_flag
+
+        , MAX(
+              CASE WHEN exit_category = N'mpl'
+                   THEN 1 ELSE 0 END
           ) AS has_mpl_exit_td_flag
 
         , MAX(
-              CASE
-                  WHEN exit_category = N'pns'
-                      THEN 1
-                  ELSE 0
-              END
+              CASE WHEN exit_category = N'pns'
+                   THEN 1 ELSE 0 END
           ) AS has_pns_exit_td_flag
 
     FROM exit_classified
@@ -520,12 +495,11 @@ exit_sum AS (
 
 /* ============================================================
    Есть ли у клиента другие срочные вклады,
-   не попадающие в период выхода
+   которые НЕ выходят в анализируемом периоде
    ============================================================ */
 other_td_flag AS (
     SELECT
           c.cli_id
-
         , CASE
               WHEN EXISTS (
                   SELECT 1
@@ -541,62 +515,53 @@ other_td_flag AS (
                   THEN 1
               ELSE 0
           END AS has_other_rub_td_flag
-
     FROM #client_scope c
 ),
 
 
 /* ============================================================
-   Остаток НС на начало
+   НС на начало
    ============================================================ */
 ns_start AS (
     SELECT
           b.cli_id
         , SUM(b.out_rub) AS ns_start_sum
-
     FROM #bal_base b
     INNER JOIN #client_scope c
         ON c.cli_id = b.cli_id
-
     WHERE
         b.section_name = N'Накопительный счёт'
-
     GROUP BY
         b.cli_id
 ),
 
 
 /* ============================================================
-   Остаток НС на конец
+   НС на конец
    ============================================================ */
 ns_end AS (
     SELECT
           e.cli_id
         , SUM(e.out_rub) AS ns_end_sum
-
     FROM #bal_end e
     INNER JOIN #client_scope c
         ON c.cli_id = e.cli_id
-
     WHERE
         e.section_name = N'Накопительный счёт'
-
     GROUP BY
         e.cli_id
 ),
 
 
 /* ============================================================
-   Клиентский флаг получения SMS сохраняется
+   Клиентский флаг получения SMS
    ============================================================ */
 sms_clients AS (
     SELECT DISTINCT
           CAST(m.cli_id AS bigint) AS cli_id
-
     FROM alm.ehd.ODS_058_VI_MESSAGE2DWH m WITH (NOLOCK)
     INNER JOIN #client_scope c
         ON c.cli_id = CAST(m.cli_id AS bigint)
-
     WHERE
         m.msgbegindate >= @OpenFrom
         AND m.msgbegindate < DATEADD(day, 1, @OpenTo)
@@ -605,16 +570,18 @@ sms_clients AS (
 
 
 /* ============================================================
-   Открытые вклады на уровне con_id
+   ОТКРЫТЫЕ ВКЛАДЫ
+
+   Только вклады, открытые в анализируемом периоде.
+   Один con_id = одна строка.
    ============================================================ */
 opened_by_con AS (
     SELECT
           b.cli_id
         , b.con_id
-        , MIN(b.dt_open) AS dt_open
         , SUM(b.out_rub) AS out_rub
 
-        /* ФУ определяется по PROD_NAME_res */
+        /* ФУ */
         , MAX(
               CASE
                   WHEN b.PROD_NAME_res IN (
@@ -635,24 +602,23 @@ opened_by_con AS (
               END
           ) AS is_fu_flag
 
-        , MAX(ISNULL(a.is_nov_flag, 0)) AS is_nov_flag
-        , MAX(ISNULL(a.is_pr2_pr3_flag, 0)) AS is_pr2_pr3_flag
-        , MAX(ISNULL(a.is_ndp_ndm_flag, 0)) AS is_ndp_ndm_flag
-        , MAX(ISNULL(a.is_pk2_ot1_flag, 0)) AS is_pk2_ot1_flag
-        , MAX(ISNULL(a.is_mpl_flag, 0)) AS is_mpl_flag
-        , MAX(ISNULL(a.is_pns_flag, 0)) AS is_pns_flag
+        , MAX(ISNULL(a.is_nov_flag, 0))       AS is_nov_flag
+        , MAX(ISNULL(a.is_pr2_pr3_flag, 0))   AS is_pr2_pr3_flag
+        , MAX(ISNULL(a.is_ndp_ndm_flag, 0))   AS is_ndp_ndm_flag
+        , MAX(ISNULL(a.is_pk2_ot1_flag, 0))   AS is_pk2_ot1_flag
+        , MAX(ISNULL(a.is_pk3_pk6_flag, 0))   AS is_pk3_pk6_flag
+        , MAX(ISNULL(a.is_mpl_flag, 0))       AS is_mpl_flag
+        , MAX(ISNULL(a.is_pns_flag, 0))       AS is_pns_flag
 
     FROM #bal_end b
     INNER JOIN #client_scope c
         ON c.cli_id = b.cli_id
     LEFT JOIN #attr_flags a
         ON a.con_id = b.con_id
-
     WHERE
         b.section_name = N'Срочные'
         AND b.dt_open >= @OpenFrom
         AND b.dt_open <= @OpenTo
-
     GROUP BY
           b.cli_id
         , b.con_id
@@ -660,16 +626,17 @@ opened_by_con AS (
 
 
 /* ============================================================
-   Приоритет открытых вкладов:
+   Приоритет классификации открытых вкладов:
 
    1. ФУ
    2. Нов
    3. Пр2 / Пр3
    4. НДП / НДМ
    5. Пк2 / От1
-   6. МПЛ
-   7. Пнс
-   8. Остальные
+   6. Пк3 / Пк6
+   7. МПЛ
+   8. Пнс
+   9. Остальные
    ============================================================ */
 opened_classified AS (
     SELECT
@@ -693,6 +660,9 @@ opened_classified AS (
               WHEN o.is_pk2_ot1_flag = 1
                   THEN N'pk2_ot1'
 
+              WHEN o.is_pk3_pk6_flag = 1
+                  THEN N'pk3_pk6'
+
               WHEN o.is_mpl_flag = 1
                   THEN N'mpl'
 
@@ -707,145 +677,111 @@ opened_classified AS (
 
 
 /* ============================================================
-   Агрегация открытых вкладов до уровня клиента
-
-   Помимо объёмов добавляем клиентские флаги:
-   был ли открыт хотя бы один вклад каждой специальной категории.
+   Суммы открытых вкладов +
+   клиентские флаги наличия открытий каждой категории
    ============================================================ */
 opened_agg AS (
     SELECT
           cli_id
 
-        /* Суммы открытий */
+
+        /* =========================
+           СУММЫ
+           ========================= */
+
         , SUM(
-              CASE
-                  WHEN open_category = N'fu'
-                      THEN out_rub
-                  ELSE 0
-              END
+              CASE WHEN open_category = N'fu'
+                   THEN out_rub ELSE 0 END
           ) AS opened_fu
 
         , SUM(
-              CASE
-                  WHEN open_category = N'nov'
-                      THEN out_rub
-                  ELSE 0
-              END
+              CASE WHEN open_category = N'nov'
+                   THEN out_rub ELSE 0 END
           ) AS opened_nov
 
         , SUM(
-              CASE
-                  WHEN open_category = N'pr2_pr3'
-                      THEN out_rub
-                  ELSE 0
-              END
+              CASE WHEN open_category = N'pr2_pr3'
+                   THEN out_rub ELSE 0 END
           ) AS opened_pr2_pr3
 
         , SUM(
-              CASE
-                  WHEN open_category = N'ndp_ndm'
-                      THEN out_rub
-                  ELSE 0
-              END
+              CASE WHEN open_category = N'ndp_ndm'
+                   THEN out_rub ELSE 0 END
           ) AS opened_ndp_ndm
 
         , SUM(
-              CASE
-                  WHEN open_category = N'pk2_ot1'
-                      THEN out_rub
-                  ELSE 0
-              END
+              CASE WHEN open_category = N'pk2_ot1'
+                   THEN out_rub ELSE 0 END
           ) AS opened_pk2_ot1
 
         , SUM(
-              CASE
-                  WHEN open_category = N'mpl'
-                      THEN out_rub
-                  ELSE 0
-              END
+              CASE WHEN open_category = N'pk3_pk6'
+                   THEN out_rub ELSE 0 END
+          ) AS opened_pk3_pk6
+
+        , SUM(
+              CASE WHEN open_category = N'mpl'
+                   THEN out_rub ELSE 0 END
           ) AS opened_mpl
 
         , SUM(
-              CASE
-                  WHEN open_category = N'pns'
-                      THEN out_rub
-                  ELSE 0
-              END
+              CASE WHEN open_category = N'pns'
+                   THEN out_rub ELSE 0 END
           ) AS opened_pns
 
         , SUM(
-              CASE
-                  WHEN open_category = N'other'
-                      THEN out_rub
-                  ELSE 0
-              END
+              CASE WHEN open_category = N'other'
+                   THEN out_rub ELSE 0 END
           ) AS opened_other
 
         , SUM(out_rub) AS opened_total
 
 
-        /* ====================================================
-           Флаги наличия открытий по 7 специальным категориям
-           ==================================================== */
+        /* =========================
+           КЛИЕНТСКИЕ ФЛАГИ ОТКРЫТИЙ
+           ========================= */
 
         , MAX(
-              CASE
-                  WHEN open_category = N'fu'
-                      THEN 1
-                  ELSE 0
-              END
+              CASE WHEN open_category = N'fu'
+                   THEN 1 ELSE 0 END
           ) AS has_opened_fu_flag
 
         , MAX(
-              CASE
-                  WHEN open_category = N'nov'
-                      THEN 1
-                  ELSE 0
-              END
+              CASE WHEN open_category = N'nov'
+                   THEN 1 ELSE 0 END
           ) AS has_opened_nov_flag
 
         , MAX(
-              CASE
-                  WHEN open_category = N'pr2_pr3'
-                      THEN 1
-                  ELSE 0
-              END
+              CASE WHEN open_category = N'pr2_pr3'
+                   THEN 1 ELSE 0 END
           ) AS has_opened_pr2_pr3_flag
 
         , MAX(
-              CASE
-                  WHEN open_category = N'ndp_ndm'
-                      THEN 1
-                  ELSE 0
-              END
+              CASE WHEN open_category = N'ndp_ndm'
+                   THEN 1 ELSE 0 END
           ) AS has_opened_ndp_ndm_flag
 
         , MAX(
-              CASE
-                  WHEN open_category = N'pk2_ot1'
-                      THEN 1
-                  ELSE 0
-              END
+              CASE WHEN open_category = N'pk2_ot1'
+                   THEN 1 ELSE 0 END
           ) AS has_opened_pk2_ot1_flag
 
         , MAX(
-              CASE
-                  WHEN open_category = N'mpl'
-                      THEN 1
-                  ELSE 0
-              END
+              CASE WHEN open_category = N'pk3_pk6'
+                   THEN 1 ELSE 0 END
+          ) AS has_opened_pk3_pk6_flag
+
+        , MAX(
+              CASE WHEN open_category = N'mpl'
+                   THEN 1 ELSE 0 END
           ) AS has_opened_mpl_flag
 
         , MAX(
-              CASE
-                  WHEN open_category = N'pns'
-                      THEN 1
-                  ELSE 0
-              END
+              CASE WHEN open_category = N'pns'
+                   THEN 1 ELSE 0 END
           ) AS has_opened_pns_flag
 
     FROM opened_classified
-
     GROUP BY
         cli_id
 )
@@ -859,10 +795,9 @@ SELECT
     , c.client_base_type
     , f.client_segment AS segment_flag
 
-    /* Клиент получал SMS за анализируемый период */
+    /* Получал ли клиент SMS */
     , CASE
-          WHEN sms.cli_id IS NOT NULL
-              THEN 1
+          WHEN sms.cli_id IS NOT NULL THEN 1
           ELSE 0
       END AS is_sms_sent
 
@@ -882,7 +817,6 @@ SELECT
           WHEN c.client_base_type = N'01. Вкладчики к выходу'
               THEN N'3. Выход|НС >= 5 млн'
 
-
           WHEN c.client_base_type = N'02. НС без вкладов к выходу'
                AND ISNULL(ns1.ns_start_sum, 0) <= 1000000
               THEN N'1. Выход|НС <= 1.0 млн'
@@ -899,7 +833,7 @@ SELECT
 
 
     /* ========================================================
-       Вклады к выходу: суммы
+       Вклады к выходу — объёмы
        ======================================================== */
     , ISNULL(e.exit_td_sum, 0) AS exit_td_sum
 
@@ -908,23 +842,25 @@ SELECT
     , ISNULL(e.exit_pr2_pr3_td_sum, 0) AS exit_pr2_pr3_td_sum
     , ISNULL(e.exit_ndp_ndm_td_sum, 0) AS exit_ndp_ndm_td_sum
     , ISNULL(e.exit_pk2_ot1_td_sum, 0) AS exit_pk2_ot1_td_sum
+    , ISNULL(e.exit_pk3_pk6_td_sum, 0) AS exit_pk3_pk6_td_sum
     , ISNULL(e.exit_mpl_td_sum, 0) AS exit_mpl_td_sum
     , ISNULL(e.exit_pns_td_sum, 0) AS exit_pns_td_sum
     , ISNULL(e.exit_other_td_sum, 0) AS exit_other_td_sum
 
 
     /* ========================================================
-       Вклады к выходу: клиентские флаги
+       Вклады к выходу — клиентские флаги
        ======================================================== */
     , ISNULL(e.has_fu_exit_td_flag, 0) AS has_fu_exit_td_flag
     , ISNULL(e.has_nov_exit_td_flag, 0) AS has_nov_exit_td_flag
     , ISNULL(e.has_pr2_pr3_exit_td_flag, 0) AS has_pr2_pr3_exit_td_flag
     , ISNULL(e.has_ndp_ndm_exit_td_flag, 0) AS has_ndp_ndm_exit_td_flag
     , ISNULL(e.has_pk2_ot1_exit_td_flag, 0) AS has_pk2_ot1_exit_td_flag
+    , ISNULL(e.has_pk3_pk6_exit_td_flag, 0) AS has_pk3_pk6_exit_td_flag
     , ISNULL(e.has_mpl_exit_td_flag, 0) AS has_mpl_exit_td_flag
     , ISNULL(e.has_pns_exit_td_flag, 0) AS has_pns_exit_td_flag
 
-    /* Старый флаг других вкладов вне окна выхода */
+    /* Другие срочные вклады вне окна выхода */
     , ISNULL(ot.has_other_rub_td_flag, 0) AS has_other_rub_td_flag
 
 
@@ -953,13 +889,14 @@ SELECT
 
 
     /* ========================================================
-       Открытые вклады: суммы
+       Открытые вклады — объёмы
        ======================================================== */
     , ISNULL(o.opened_fu, 0) AS opened_fu
     , ISNULL(o.opened_nov, 0) AS opened_nov
     , ISNULL(o.opened_pr2_pr3, 0) AS opened_pr2_pr3
     , ISNULL(o.opened_ndp_ndm, 0) AS opened_ndp_ndm
     , ISNULL(o.opened_pk2_ot1, 0) AS opened_pk2_ot1
+    , ISNULL(o.opened_pk3_pk6, 0) AS opened_pk3_pk6
     , ISNULL(o.opened_mpl, 0) AS opened_mpl
     , ISNULL(o.opened_pns, 0) AS opened_pns
     , ISNULL(o.opened_other, 0) AS opened_other
@@ -967,38 +904,34 @@ SELECT
 
 
     /* ========================================================
-       Открытые вклады: клиентские флаги
+       Открытые вклады — клиентские флаги
+
+       Именно наличие хотя бы одного открытого вклада
+       соответствующей категории за период.
        ======================================================== */
     , ISNULL(o.has_opened_fu_flag, 0) AS has_opened_fu_flag
     , ISNULL(o.has_opened_nov_flag, 0) AS has_opened_nov_flag
     , ISNULL(o.has_opened_pr2_pr3_flag, 0) AS has_opened_pr2_pr3_flag
     , ISNULL(o.has_opened_ndp_ndm_flag, 0) AS has_opened_ndp_ndm_flag
     , ISNULL(o.has_opened_pk2_ot1_flag, 0) AS has_opened_pk2_ot1_flag
+    , ISNULL(o.has_opened_pk3_pk6_flag, 0) AS has_opened_pk3_pk6_flag
     , ISNULL(o.has_opened_mpl_flag, 0) AS has_opened_mpl_flag
     , ISNULL(o.has_opened_pns_flag, 0) AS has_opened_pns_flag
 
 INTO #client_mart
-
 FROM #client_scope c
-
 LEFT JOIN client_flags f
     ON f.cli_id = c.cli_id
-
 LEFT JOIN sms_clients sms
     ON sms.cli_id = c.cli_id
-
 LEFT JOIN exit_sum e
     ON e.cli_id = c.cli_id
-
 LEFT JOIN other_td_flag ot
     ON ot.cli_id = c.cli_id
-
 LEFT JOIN ns_start ns1
     ON ns1.cli_id = c.cli_id
-
 LEFT JOIN ns_end ns2
     ON ns2.cli_id = c.cli_id
-
 LEFT JOIN opened_agg o
     ON o.cli_id = c.cli_id;
 
@@ -1014,31 +947,34 @@ SELECT
     , base_amount_flag
 
 
-    /* Вклады к выходу: суммы */
+    /* Вклады к выходу — объёмы */
     , exit_td_sum
+
     , exit_fu_td_sum
     , exit_nov_td_sum
     , exit_pr2_pr3_td_sum
     , exit_ndp_ndm_td_sum
     , exit_pk2_ot1_td_sum
+    , exit_pk3_pk6_td_sum
     , exit_mpl_td_sum
     , exit_pns_td_sum
     , exit_other_td_sum
 
 
-    /* Вклады к выходу: флаги */
+    /* Вклады к выходу — наличие категорий */
     , has_fu_exit_td_flag
     , has_nov_exit_td_flag
     , has_pr2_pr3_exit_td_flag
     , has_ndp_ndm_exit_td_flag
     , has_pk2_ot1_exit_td_flag
+    , has_pk3_pk6_exit_td_flag
     , has_mpl_exit_td_flag
     , has_pns_exit_td_flag
 
     , has_other_rub_td_flag
 
 
-    /* НС */
+    /* Накопительные счета */
     , ns_start_sum
     , has_ns_gt_1000_flag
     , ns_end_sum
@@ -1046,24 +982,26 @@ SELECT
     , ns_decrease_flag
 
 
-    /* Открытые вклады: суммы */
+    /* Открытые вклады — объёмы */
     , opened_fu
     , opened_nov
     , opened_pr2_pr3
     , opened_ndp_ndm
     , opened_pk2_ot1
+    , opened_pk3_pk6
     , opened_mpl
     , opened_pns
     , opened_other
     , opened_total
 
 
-    /* Открытые вклады: флаги */
+    /* Открытые вклады — наличие категорий */
     , has_opened_fu_flag
     , has_opened_nov_flag
     , has_opened_pr2_pr3_flag
     , has_opened_ndp_ndm_flag
     , has_opened_pk2_ot1_flag
+    , has_opened_pk3_pk6_flag
     , has_opened_mpl_flag
     , has_opened_pns_flag
 
