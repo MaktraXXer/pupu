@@ -1,224 +1,516 @@
-DECLARE @DT_FROM date = '2025-01-01';
-DECLARE @DT_TO   date = DATEADD(day, -2, CAST(GETDATE() AS date));
+# =============================================================================
+# ШАГ 3. МОДЕЛЬНАЯ ОЦЕНКА CAP / FLOOR / IRS
+#
+# Сценарии:
+#     CIR++ -> RUONIA
+#
+# Proxy КС:
+#     KS_proxy = RUONIA + basis
+#
+# Дисконтирование:
+#     ТОЛЬКО по текущей рыночной OIS-кривой ZCYC
+#
+#     DF(0,t) = exp(-ZCYC(t) * t)
+#
+# Все Monte-Carlo сценарии используют одинаковые рыночные DF.
+#
+# ВАЖНО:
+# Сохраняем временную индексацию исходной версии:
+#     ставка X[1] используется для выплаты в 1M,
+#     X[2] — для выплаты в 2M,
+#     ...
+#
+# Именно так считался прежний benchmark, дававший ~0.476%
+# для 6M FLOOR со strike 14%.
+# =============================================================================
 
-WITH calendar AS (
-    SELECT 
-        CAST([Date] AS date) AS [Date]
-    FROM ALM.info.VW_calendar WITH (NOLOCK)
-    WHERE [Date] BETWEEN @DT_FROM AND @DT_TO
-),
-together AS (
-    SELECT
-        'НС' AS section_name,
-        CAST(dt_rep AS date) AS dt_rep,
-        data_scope,
-        out_rub_total,
-        rate_con
-    FROM ALM_TEST.mail.balance_metrics_savings WITH (NOLOCK)
-
-    UNION ALL
-
-    SELECT
-        'ДВС' AS section_name,
-        CAST(dt_rep AS date) AS dt_rep,
-        data_scope,
-        out_rub_total,
-        CASE 
-            WHEN data_scope = 'новые'
-                THEN FIRST_VALUE(rate_con) OVER (
-                    PARTITION BY dt_rep
-                    ORDER BY CASE WHEN data_scope = 'портфель' THEN 0 ELSE 1 END
-                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                )
-            ELSE rate_con
-        END AS rate_con
-    FROM ALM_TEST.mail.balance_metrics_dvs WITH (NOLOCK)
-),
-DVS_FL AS (
-    SELECT
-        t.section_name,
-        t.dt_rep,
-        t.data_scope,
-        t.out_rub_total,
-        t.rate_con + 0.0048 AS rate_con,
-        kr.KEY_RATE,
-        t.rate_con + 0.0048 - kr.KEY_RATE AS spread_keyrate
-    FROM together t
-    LEFT JOIN ALM_TEST.WORK.ForecastKey_Cache kr WITH (NOLOCK)
-        ON t.dt_rep = kr.dt_rep
-       AND kr.term = 1
-    WHERE t.dt_rep >= @DT_FROM
-),
-v_fl_fix AS (
-    SELECT
-        'вклады ФЛ с фикс ставкой' AS section_name,
-        CAST(t.[Date] AS date) AS dt_rep,
-        CASE
-            WHEN t.[Тип отчета] = 'Новые день ко дню' THEN 'новые'
-            WHEN t.[Тип отчета] = 'Срез' THEN 'портфель'
-        END AS data_scope,
-        t.balance_rub AS out_rub_total,
-        t.[MonthlyCONV_RATE_SSV] AS rate_con,
-        t.[MonthlyCONV_ForecastKeyRate] AS KEY_RATE,
-        t.[Spread_KeyRate] AS spread_keyrate
-    FROM [ALM_TEST].[WORK].[vGroupDepositInterestsRate_For_FL] t WITH (NOLOCK)
-    WHERE t.[Date] >= @DT_FROM
-      AND t.[Date] <= @DT_TO
-      AND t.[Признак опциональности для ФЛ] = 'all option_type'
-      AND t.[Сегмент ФЛ] = 'all segment'
-      AND t.[Срочн. бакеты] = 'all termgroup'
-      AND t.[Тип маржи] = 'all margin'
-      AND t.[Сегмент бизнеса] = 'all segment'
-      AND t.[Тип клиента] = 'all client'
-      AND t.[Тип отчета] IN ('Срез', 'Новые день ко дню')
-      AND t.[Спред к КС бакеты] = 'all spread bucket'
-),
-v_fl_float AS (
-    -- портфель плавающих вкладов ФЛ
-    SELECT
-        'вклады ФЛ с плав ставкой' AS section_name,
-        CAST(cal.[Date] AS date) AS dt_rep,
-        'портфель' AS data_scope,
-
-        SUM(ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])) AS out_rub_total,
-
-        SUM(
-            (
-                kr.[KEY_RATE]
-                + fl.[correction] / 100.0
-                + ssv.[rate]
-            ) * ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])
-        ) / NULLIF(SUM(ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])), 0) AS rate_con,
-
-        kr.[KEY_RATE] AS KEY_RATE,
-
-        SUM(
-            (
-                fl.[correction] / 100.0
-                + ssv.[rate]
-            ) * ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])
-        ) / NULLIF(SUM(ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])), 0) AS spread_keyrate
-
-    FROM [LIQUIDITY].[liq].[VW_FloatContracts] fl WITH (NOLOCK)
-
-    JOIN [LIQUIDITY].[liq].[DepositContract_all] dep WITH (NOLOCK)
-        ON fl.[con_id] = dep.[CON_ID]
-
-    JOIN calendar cal
-        ON cal.[Date] BETWEEN fl.[dt_from] AND fl.[dt_to]
-       AND cal.[Date] >= dep.[DT_OPEN]
-       AND cal.[Date] <  dep.[DT_CLOSE]
-
-    LEFT JOIN [LIQUIDITY].[liq].[DepositContract_Saldo] sald WITH (NOLOCK)
-        ON dep.[CON_ID] = sald.[CON_ID]
-       AND cal.[Date] BETWEEN sald.[DT_FROM] AND sald.[DT_TO]
-
-    LEFT JOIN ALM_TEST.WORK.ForecastKey_Cache kr WITH (NOLOCK)
-        ON cal.[Date] = kr.dt_rep
-       AND kr.term = 1
-
-    JOIN ALM.info.VW_SSVrates ssv WITH (NOLOCK)
-        ON cal.[Date] BETWEEN ssv.[dt_from] AND ssv.[dt_to]
-
-    WHERE LOWER(fl.[comment]) LIKE '%фл%'
-      AND kr.[KEY_RATE] IS NOT NULL
-
-    GROUP BY
-        CAST(cal.[Date] AS date),
-        kr.[KEY_RATE]
+import numpy as np
+import pandas as pd
+from IPython.display import display
 
 
-    UNION ALL
+# =============================================================================
+# 1. НАСТРОЙКИ
+# =============================================================================
+
+# RUONIA -> proxy КС
+# 0.002 = +0.20 п.п.
+ks_minus_ruonia_basis = 0.002
+
+# Месячный accrual
+accrual = 1.0 / 12.0
+
+# Количество MC-сценариев для CAP / FLOOR / IRS
+n_sim_report = 100_000
+
+# Seed для воспроизводимости
+report_seed = 228
 
 
-    -- новые плавающие вклады ФЛ
-    SELECT
-        'вклады ФЛ с плав ставкой' AS section_name,
-        CAST(cal.[Date] AS date) AS dt_rep,
-        'новые' AS data_scope,
+# Сроки CAP / FLOOR
+maturities_years = [
+    0.5,
+    1,
+    2,
+    3,
+    4,
+    5
+]
 
-        SUM(ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])) AS out_rub_total,
 
-        SUM(
-            (
-                kr.[KEY_RATE]
-                + fl.[correction] / 100.0
-                + ssv.[rate]
-            ) * ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])
-        ) / NULLIF(SUM(ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])), 0) AS rate_con,
-
-        kr.[KEY_RATE] AS KEY_RATE,
-
-        SUM(
-            (
-                fl.[correction] / 100.0
-                + ssv.[rate]
-            ) * ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])
-        ) / NULLIF(SUM(ISNULL(sald.[OUT_RUB], dep.[BALANCE_RUB])), 0) AS spread_keyrate
-
-    FROM [LIQUIDITY].[liq].[VW_FloatContracts] fl WITH (NOLOCK)
-
-    JOIN [LIQUIDITY].[liq].[DepositContract_all] dep WITH (NOLOCK)
-        ON fl.[con_id] = dep.[CON_ID]
-
-    JOIN calendar cal
-        ON cal.[Date] = CAST(dep.[DT_OPEN] AS date)
-       AND cal.[Date] BETWEEN fl.[dt_from] AND fl.[dt_to]
-
-    LEFT JOIN [LIQUIDITY].[liq].[DepositContract_Saldo] sald WITH (NOLOCK)
-        ON dep.[CON_ID] = sald.[CON_ID]
-       AND cal.[Date] BETWEEN sald.[DT_FROM] AND sald.[DT_TO]
-
-    LEFT JOIN ALM_TEST.WORK.ForecastKey_Cache kr WITH (NOLOCK)
-        ON cal.[Date] = kr.dt_rep
-       AND kr.term = 1
-
-    JOIN ALM.info.VW_SSVrates ssv WITH (NOLOCK)
-        ON cal.[Date] BETWEEN ssv.[dt_from] AND ssv.[dt_to]
-
-    WHERE LOWER(fl.[comment]) LIKE '%фл%'
-      AND kr.[KEY_RATE] IS NOT NULL
-
-    GROUP BY
-        CAST(cal.[Date] AS date),
-        kr.[KEY_RATE]
+# Страйки CAP
+cap_strikes = np.arange(
+    0.120,
+    0.180 + 1e-12,
+    0.005
 )
 
-SELECT
-    section_name,
-    dt_rep,
-    data_scope,
-    out_rub_total,
-    rate_con,
-    KEY_RATE,
-    spread_keyrate
-FROM DVS_FL
 
-UNION ALL
+# Страйки FLOOR
+floor_strikes = np.arange(
+    0.100,
+    0.145 + 1e-12,
+    0.005
+)
 
-SELECT
-    section_name,
-    dt_rep,
-    data_scope,
-    out_rub_total,
-    rate_con,
-    KEY_RATE,
-    spread_keyrate
-FROM v_fl_fix
 
-UNION ALL
+# Сроки IRS
+irs_tenors_months = {
+    '3M': 3,
+    '6M': 6,
+    '9M': 9,
+    '1Y': 12,
+    '2Y': 24,
+    '3Y': 36,
+    '4Y': 48,
+    '5Y': 60
+}
 
-SELECT
-    section_name,
-    dt_rep,
-    data_scope,
-    out_rub_total,
-    rate_con,
-    KEY_RATE,
-    spread_keyrate
-FROM v_fl_float
 
-ORDER BY
-    dt_rep,
-    section_name,
-    data_scope;
+# =============================================================================
+# 2. РЫНОЧНЫЕ OIS DISCOUNT FACTORS
+# =============================================================================
+
+def ois_discount_factors(months):
+    """
+    Рыночные OIS discount factors:
+
+        DF(0,t) = exp(-ZCYC(t) * t)
+
+    Возвращает:
+        DF(1M), DF(2M), ..., DF(months)
+    """
+
+    times = (
+        np.arange(
+            1,
+            months + 1,
+            dtype=float
+        )
+        / 12.0
+    )
+
+    zero_rates = np.asarray(
+        ZCYC(times),
+        dtype=float
+    )
+
+    return np.exp(
+        -zero_rates * times
+    )
+
+
+# =============================================================================
+# 3. RUONIA -> PROXY КС
+# =============================================================================
+
+def ruonia_to_ks_proxy(
+    ruonia_paths,
+    basis=ks_minus_ruonia_basis
+):
+    """
+    KS_proxy(t) = RUONIA(t) + basis
+
+    По умолчанию:
+        basis = 0.002 = 0.20 п.п.
+    """
+
+    ruonia_paths = np.asarray(
+        ruonia_paths,
+        dtype=float
+    )
+
+    return (
+        ruonia_paths
+        + float(basis)
+    )
+
+
+# =============================================================================
+# 4. CAP / FLOOR
+# =============================================================================
+
+def option_matrix_ois(
+    ruonia_paths,
+    strikes,
+    maturities,
+    option_type,
+    basis=ks_minus_ruonia_basis
+):
+    """
+    Upfront-премия CAP / FLOOR
+    в % от номинала.
+
+    Payoff:
+
+        CAP:
+            max(KS_proxy - strike, 0)
+
+        FLOOR:
+            max(strike - KS_proxy, 0)
+
+    Дисконтирование:
+
+        DF(0,t) = exp(-ZCYC(t) * t)
+
+    ВАЖНО:
+    сохраняется временная индексация исходного расчёта:
+
+        X[1] -> выплата в 1M
+        X[2] -> выплата в 2M
+        ...
+    """
+
+    ruonia_paths = np.asarray(
+        ruonia_paths,
+        dtype=float
+    )
+
+    if ruonia_paths.ndim != 2:
+        raise ValueError(
+            'ruonia_paths должен быть двумерным массивом.'
+        )
+
+    ks_paths = ruonia_to_ks_proxy(
+        ruonia_paths,
+        basis=basis
+    )
+
+    option_type = option_type.lower()
+
+    if option_type not in ('cap', 'floor'):
+        raise ValueError(
+            "option_type должен быть 'cap' или 'floor'."
+        )
+
+    result = pd.DataFrame(
+        index=[
+            f'{strike * 100:.1f}%'
+            for strike in strikes
+        ],
+        columns=[
+            f'{maturity:g}Y'
+            for maturity in maturities
+        ],
+        dtype=float
+    )
+
+    for maturity in maturities:
+
+        months = int(
+            round(
+                maturity * 12
+            )
+        )
+
+        if ruonia_paths.shape[0] < months + 1:
+            raise ValueError(
+                f'Для срока {maturity:g}Y необходимо '
+                f'не менее {months + 1} строк сценариев.'
+            )
+
+        # ---------------------------------------------------------------------
+        # КЛЮЧЕВОЙ МОМЕНТ:
+        #
+        # Сохраняем исходную временную привязку:
+        #
+        # X[1] ... X[months]
+        #
+        # Было именно так в старой версии, которая давала ~0.476%.
+        # ---------------------------------------------------------------------
+
+        rates = ks_paths[
+            1:months + 1,
+            :
+        ]
+
+        # DF до дат выплат:
+        # 1M ... months
+        dfs = ois_discount_factors(
+            months
+        )[:, None]
+
+        for strike in strikes:
+
+            if option_type == 'cap':
+
+                payoff_rate = np.maximum(
+                    rates - strike,
+                    0.0
+                )
+
+            else:
+
+                payoff_rate = np.maximum(
+                    strike - rates,
+                    0.0
+                )
+
+            # PV в каждом MC-сценарии
+            scenario_pv = np.sum(
+                payoff_rate
+                * accrual
+                * dfs,
+                axis=0
+            )
+
+            # Средняя цена по сценариям
+            premium_fraction = float(
+                np.mean(
+                    scenario_pv
+                )
+            )
+
+            # % от номинала
+            premium_percent = (
+                premium_fraction
+                * 100.0
+            )
+
+            result.loc[
+                f'{strike * 100:.1f}%',
+                f'{maturity:g}Y'
+            ] = premium_percent
+
+    return result
+
+
+# =============================================================================
+# 5. IRS MID
+# =============================================================================
+
+def irs_mid_ois(
+    ruonia_paths,
+    tenors_months=irs_tenors_months,
+    basis=ks_minus_ruonia_basis
+):
+    """
+    Модельный fair IRS MID.
+
+    Плавающая ставка:
+
+        KS_proxy = RUONIA + basis
+
+    Дисконтирование:
+
+        по текущей рыночной OIS-кривой.
+
+    Fair rate:
+
+        K =
+            E[PV floating leg]
+            /
+            PV01 fixed leg
+
+    Сохраняем ту же временную индексацию,
+    что и в исходной версии:
+        X[1] ... X[months]
+    """
+
+    ruonia_paths = np.asarray(
+        ruonia_paths,
+        dtype=float
+    )
+
+    if ruonia_paths.ndim != 2:
+        raise ValueError(
+            'ruonia_paths должен быть двумерным массивом.'
+        )
+
+    ks_paths = ruonia_to_ks_proxy(
+        ruonia_paths,
+        basis=basis
+    )
+
+    rows = []
+
+    for tenor, months in tenors_months.items():
+
+        if ruonia_paths.shape[0] < months + 1:
+            raise ValueError(
+                f'Для IRS {tenor} необходимо '
+                f'не менее {months + 1} строк сценариев.'
+            )
+
+        # ---------------------------------------------------------------------
+        # Та же индексация, что в исходном расчёте IRS
+        # ---------------------------------------------------------------------
+
+        monthly_rates = ks_paths[
+            1:months + 1,
+            :
+        ]
+
+        # Средняя модельная proxy КС
+        expected_monthly_rates = np.mean(
+            monthly_rates,
+            axis=1
+        )
+
+        # Рыночные OIS DF:
+        # 1M ... months
+        dfs = ois_discount_factors(
+            months
+        )
+
+        # PV плавающей ноги
+        floating_leg_pv = float(
+            np.sum(
+                expected_monthly_rates
+                * accrual
+                * dfs
+            )
+        )
+
+        # PV01 фиксированной ноги
+        fixed_leg_annuity = float(
+            np.sum(
+                accrual
+                * dfs
+            )
+        )
+
+        fair_irs_rate = (
+            floating_leg_pv
+            / fixed_leg_annuity
+        )
+
+        rows.append({
+            'tenor': tenor,
+            'months': months,
+            'model_mid': fair_irs_rate
+        })
+
+    return (
+        pd.DataFrame(rows)
+        .set_index('tenor')
+    )
+
+
+# =============================================================================
+# 6. ОДИН MONTE-CARLO ПРОГОН ДЛЯ ВСЕГО ОТЧЁТА
+# =============================================================================
+
+np.random.seed(
+    report_seed
+)
+
+X_report_ruonia = MC_simulations(
+    T=360,
+    n_sim=n_sim_report,
+    a=opt_ats['a'],
+    theta=opt_ats['theta'],
+    s=opt_ats['s'],
+    debug=False
+)
+
+
+# =============================================================================
+# 7. CAP
+# =============================================================================
+
+cap_matrix_ois = option_matrix_ois(
+    ruonia_paths=X_report_ruonia,
+    strikes=cap_strikes,
+    maturities=maturities_years,
+    option_type='cap'
+)
+
+
+# =============================================================================
+# 8. FLOOR
+# =============================================================================
+
+floor_matrix_ois = option_matrix_ois(
+    ruonia_paths=X_report_ruonia,
+    strikes=floor_strikes,
+    maturities=maturities_years,
+    option_type='floor'
+)
+
+
+# =============================================================================
+# 9. IRS
+# =============================================================================
+
+model_irs_ois = irs_mid_ois(
+    ruonia_paths=X_report_ruonia
+)
+
+
+# =============================================================================
+# 10. ВЫВОД
+# =============================================================================
+
+print(
+    '\nCAP — модельная upfront-премия, % от номинала'
+)
+
+display(
+    cap_matrix_ois.round(4)
+)
+
+
+print(
+    '\nFLOOR — модельная upfront-премия, % от номинала'
+)
+
+display(
+    floor_matrix_ois.round(4)
+)
+
+
+print(
+    '\nМодельный IRS MID, %'
+)
+
+irs_display = pd.DataFrame(
+    index=model_irs_ois.index
+)
+
+irs_display[
+    'Model IRS MID, %'
+] = (
+    model_irs_ois['model_mid']
+    * 100.0
+)
+
+display(
+    irs_display.round(4)
+)
+
+
+# =============================================================================
+# 11. КОНТРОЛЬНАЯ ТОЧКА
+# =============================================================================
+
+print(
+    '\nКонтроль: 6M FLOOR, strike 14.0%'
+)
+
+print(
+    floor_matrix_ois.loc[
+        '14.0%',
+        '0.5Y'
+    ]
+)
