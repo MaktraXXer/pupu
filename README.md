@@ -1,43 +1,70 @@
-## Чувствительность к волатильности
+USE [LIQUIDITY];
+SET NOCOUNT ON;
 
-В модели CIR++ параметр $s$ определяет масштаб случайных колебаний ставки:
+DECLARE @CliId bigint = 1234567890;
+DECLARE @DateFrom date = '2026-05-31';
+DECLARE @DateTo   date = '2026-08-31';
 
-$$
-dx_t=a(\theta-x_t)dt+s\sqrt{x_t}\,dW_t
-$$
 
-В базовом сценарии:
+/* ============================================================
+   Договоры конкретного клиента + история их фактического сальдо
+   ============================================================ */
 
-$$
-s=0.10
-$$
+WITH contracts AS
+(
+    SELECT
+          d.CON_ID
+        , d.CLI_ID
+        , MIN(CAST(d.DT_OPEN AS date)) AS DT_OPEN
+        , MAX(CAST(d.DT_CLOSE_PLAN AS date)) AS DT_CLOSE_PLAN
+        , MAX(d.PROD_TYPE) AS PROD_TYPE
+        , MAX(d.PROD_NAME) AS PROD_NAME
+        , MAX(d.TSEGMENTNAME) AS TSEGMENTNAME
+        , MAX(d.isfloat) AS isfloat
 
-При этом $s=0.10$ **не означает волатильность RUONIA 10 п.п.** Фактический локальный масштаб колебаний зависит от уровня RUONIA:
+    FROM [LIQUIDITY].[liq].[DepositInterestRate] d WITH (NOLOCK)
 
-$$
-\sigma_{RUONIA}=s\sqrt{x}
-$$
+    WHERE
+        d.CLI_ID = @CliId
 
-Например, при RUONIA = 15%:
+    GROUP BY
+          d.CON_ID
+        , d.CLI_ID
+)
 
-$$
-\sigma_{RUONIA}=0.10\sqrt{0.15}\approx3.87\text{ п.п.}
-$$
+SELECT
+      c.CLI_ID
+    , c.CON_ID
 
-На горизонте 10 лет волатильность оценивается как **стандартное отклонение значений RUONIA через 10 лет по всем Monte-Carlo сценариям**, а не напрямую из $s$.
+    , c.DT_OPEN
+    , c.DT_CLOSE_PLAN
 
-### Анализ чувствительности
+    , c.PROD_TYPE
+    , c.PROD_NAME
+    , c.TSEGMENTNAME
+    , c.isfloat
 
-Изменяем только $s$, оставляя остальные параметры модели неизменными:
+    /* период, в котором действовал этот остаток */
+    , CAST(s.DT_FROM AS date) AS saldo_from
+    , CAST(s.DT_TO AS date) AS saldo_to
 
-| Сценарий | Параметр $s$ |
-|---|---:|
-| Волатильность −10% | 0.09 |
-| Базовый | 0.10 |
-| Волатильность +10% | 0.11 |
+    /* фактический остаток */
+    , CAST(s.OUT_RUB AS decimal(38,2)) AS out_rub
 
-При **$s=0.09$** сценарии RUONIA становятся более узкими, вероятность сильных отклонений уменьшается и ожидается снижение стоимости процентной опционности.
+FROM contracts c
 
-При **$s=0.11$** разброс сценариев RUONIA увеличивается, сильные движения ставок становятся более вероятными и ожидается рост стоимости процентной опционности.
+INNER JOIN [LIQUIDITY].[liq].[DepositContract_Saldo] s WITH (NOLOCK)
+    ON s.CON_ID = c.CON_ID
 
-Для оценки эффекта сравниваются волатильность RUONIA на горизонте 10 лет и итоговая стоимость ипотечного опциона в трех сценариях.
+WHERE
+    s.DT_FROM <= @DateTo
+
+    AND
+    (
+        s.DT_TO IS NULL
+        OR s.DT_TO >= @DateFrom
+    )
+
+ORDER BY
+      c.CON_ID
+    , s.DT_FROM;
