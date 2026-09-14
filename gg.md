@@ -1,1237 +1,478 @@
-# =============================================================================
-# MASTER COMPARISON
-#
-# ВАЖНО:
-#
-# Этот блок НИЧЕГО НЕ ПЕРЕСЧИТЫВАЕТ.
-#
-# Он НЕ запускает:
-#     - Historical calibration
-#     - Market calibration
-#     - Combined calibration
-#     - option_price_pct()
-#     - MC_simulations()
-#
-# Он использует только уже готовые результаты:
-#
-#     RESULT_HISTORY
-#     RESULT_MARKET
-#     RESULT_COMBINED
-#
-# Поэтому сравниваются именно те результаты,
-# которые были фактически рассчитаны в запусках №1-3.
-# =============================================================================
-
-
-# =============================================================================
-# 0. ПРОВЕРКА НАЛИЧИЯ РЕЗУЛЬТАТОВ
-# =============================================================================
-
-required_results = {
-    'Historical': 'RESULT_HISTORY',
-    'Market': 'RESULT_MARKET',
-    'Combined': 'RESULT_COMBINED'
-}
-
-
-for name, variable_name in required_results.items():
-
-    if variable_name not in globals():
-
-        raise RuntimeError(
-            f'{variable_name} не найден.\n'
-            f'Сначала выполни соответствующий запуск: {name}.'
-        )
-
-
-RESULTS = {
-    'Historical': RESULT_HISTORY,
-    'Market': RESULT_MARKET,
-    'Combined': RESULT_COMBINED
-}
-
+USE ALM_TEST;
+GO
+
+IF OBJECT_ID('[WORK].[trf_rates_upload]', 'U') IS NOT NULL
+    DROP TABLE [WORK].[trf_rates_upload];
+GO
+
+CREATE TABLE [WORK].[trf_rates_upload]
+(
+    ID                  bigint IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    CON_ID              bigint              NULL,
+    DT_FROM             date                NULL,
+    DT_TO               date                NULL,
+    TRF_RATE_TYPE       varchar(50)         NULL,
+    TRF_RATE            decimal(18,10)      NULL,
+    CON_NO              varchar(100)        NULL,
+    DT_OPEN_FACT        date                NULL,
+    MATUR               int                 NULL,
+    CUR                 int                 NULL,
+    PROD_NAME           nvarchar(255)       NULL,
+    CLI_SHORT_NAME      nvarchar(500)       NULL,
+    LOAD_DT             datetime2(0)        NOT NULL DEFAULT GETDATE()
+);
+GO
 
-print(
-    'Все три результата найдены.'
-)
+
+Option Explicit
 
-print(
-    'Master comparison использует сохранённые результаты '
-    'и ничего повторно не калибрует.'
-)
-
-
-# =============================================================================
-# 1. СРАВНЕНИЕ ПАРАМЕТРОВ КАЛИБРОВКИ
-# =============================================================================
-
-parameter_rows = []
-
-
-for name, result in RESULTS.items():
-
-    c = result[
-        'calibration'
-    ]
-
-    a_q = c[
-        'a'
-    ]
-
-    theta_q = c[
-        'theta'
-    ]
-
-    p_a = c.get(
-        'p_a',
-        np.nan
-    )
-
-    p_theta = c.get(
-        'p_theta',
-        np.nan
-    )
-
-
-    # Half-life Q
-    half_life_q = (
-        np.log(2.0)
-        / a_q
-        if (
-            np.isfinite(a_q)
-            and a_q > 0
-        )
-        else np.nan
-    )
-
-
-    # Half-life P
-    half_life_p = (
-        np.log(2.0)
-        / p_a
-        if (
-            np.isfinite(p_a)
-            and p_a > 0
-        )
-        else np.nan
-    )
-
-
-    parameter_rows.append({
-
-        'Calibration':
-            name,
-
-        # ---------------------------------------------------------------------
-        # Q-параметры:
-        # используются для pricing и итогового MC
-        # ---------------------------------------------------------------------
-
-        'a_Q':
-            a_q,
-
-        'theta_Q':
-            theta_q,
-
-        's':
-            c['s'],
-
-        'Half-life Q, years':
-            half_life_q,
-
-        # ---------------------------------------------------------------------
-        # P-параметры:
-        # historical / combined
-        # ---------------------------------------------------------------------
-
-        'a_P':
-            p_a,
-
-        'theta_P':
-            p_theta,
-
-        'Half-life P, years':
-            half_life_p,
-
-        # ---------------------------------------------------------------------
-        # Market price of risk
-        # ---------------------------------------------------------------------
-
-        'lambda':
-            c.get(
-                'lambda',
-                np.nan
-            ),
-
-        # ---------------------------------------------------------------------
-        # Метрики качества
-        # ---------------------------------------------------------------------
-
-        'Historical NLL':
-            c.get(
-                'hist_nll',
-                np.nan
-            ),
-
-        'Market RMSE, % notional':
-            c.get(
-                'market_rmse_pct',
-                np.nan
-            )
-    })
-
-
-parameter_comparison = (
-    pd.DataFrame(
-        parameter_rows
-    )
-    .set_index(
-        'Calibration'
-    )
-)
-
-
-print(
-    '\n'
-    + '=' * 90
-)
-
-print(
-    '1. PARAMETERS'
-)
-
-print(
-    '=' * 90
-)
-
-
-display(
-    parameter_comparison.round(6)
-)
-
-
-# =============================================================================
-# 2. MARKET OPTION FIT
-#
-# КРИТИЧНО:
-#
-# Здесь НЕ вызывается option_price_pct().
-#
-# Берём сохранённый market_fit из каждого RESULT_*.
-# Поэтому никакая последующая правка функций,
-# basis или временной индексации не изменит результаты
-# уже выполненных запусков.
-# =============================================================================
-
-market_fit_keys = [
-    'option_type',
-    'strike',
-    'maturity'
-]
-
-
-# За основу берём market quotes,
-# сохранённые при Historical run
-
-historical_fit = (
-    RESULTS[
-        'Historical'
-    ][
-        'market_fit'
-    ].copy()
-)
-
-
-market_compare = (
-    historical_fit[
-        market_fit_keys
-        + [
-            'market_offer_pct'
-        ]
-    ]
-    .copy()
-)
-
-
-# =============================================================================
-# Добавляем фактические результаты каждого режима
-# =============================================================================
-
-for name, result in RESULTS.items():
-
-    fit = (
-        result[
-            'market_fit'
-        ]
-        .copy()
-    )
-
-
-    required_columns = (
-        market_fit_keys
-        + [
-            'market_offer_pct',
-            'model_raw_pct',
-            'model_offer_pct',
-            'error_pct'
-        ]
-    )
-
-
-    missing_columns = [
-        column
-        for column in required_columns
-        if column not in fit.columns
-    ]
-
-
-    if missing_columns:
-
-        raise RuntimeError(
-            f'В market_fit для {name} '
-            f'отсутствуют поля: '
-            f'{missing_columns}'
-        )
-
-
-    fit_for_merge = (
-        fit[
-            market_fit_keys
-            + [
-                'model_raw_pct',
-                'model_offer_pct',
-                'error_pct'
-            ]
-        ]
-        .rename(
-            columns={
-                'model_raw_pct':
-                    f'{name} raw',
-
-                'model_offer_pct':
-                    f'{name} offer',
-
-                'error_pct':
-                    f'{name} error'
-            }
-        )
-    )
-
-
-    market_compare = (
-        market_compare.merge(
-            fit_for_merge,
-            on=market_fit_keys,
-            how='left',
-            validate='one_to_one'
-        )
-    )
-
-
-print(
-    '\n'
-    + '=' * 90
-)
-
-print(
-    '2. MARKET CAP / FLOOR FIT'
-)
-
-print(
-    '=' * 90
-)
-
-
-display(
-    market_compare.round(5)
-)
-
-
-# =============================================================================
-# 3. МЕТРИКИ КАЧЕСТВА MARKET FIT
-#
-# Если OPTION_SELECTION = 'both',
-# сохраняем ту же логику, что использовалась при calibration:
-#
-# CAP и FLOOR имеют одинаковый вес,
-# независимо от количества страйков.
-# =============================================================================
-
-quality_rows = []
-quality_by_type_rows = []
-
-
-for name, result in RESULTS.items():
-
-    fit = (
-        result[
-            'market_fit'
-        ]
-        .copy()
-    )
-
-
-    option_types = (
-        fit[
-            'option_type'
-        ]
-        .unique()
-    )
-
-
-    mse_by_type = []
-    mae_by_type = []
-
-
-    for option_type in option_types:
-
-        errors = (
-            fit.loc[
-                fit[
-                    'option_type'
-                ] == option_type,
-                'error_pct'
-            ]
-            .to_numpy(
-                dtype=float
-            )
-        )
-
-
-        mse_type = (
-            np.mean(
-                errors ** 2
-            )
-        )
-
-        mae_type = (
-            np.mean(
-                np.abs(
-                    errors
-                )
-            )
-        )
-
-
-        mse_by_type.append(
-            mse_type
-        )
-
-        mae_by_type.append(
-            mae_type
-        )
-
-
-        quality_by_type_rows.append({
-
-            'Calibration':
-                name,
-
-            'Option type':
-                option_type,
-
-            'RMSE, % notional':
-                np.sqrt(
-                    mse_type
-                ),
-
-            'MAE, % notional':
-                mae_type,
-
-            'Max abs error, % notional':
-                np.max(
-                    np.abs(
-                        errors
-                    )
-                )
-        })
-
-
-    # Та же balanced-логика,
-    # что используется в option_market_loss()
-
-    balanced_mse = (
-        np.mean(
-            mse_by_type
-        )
-    )
-
-    balanced_mae = (
-        np.mean(
-            mae_by_type
-        )
-    )
-
-
-    quality_rows.append({
-
-        'Calibration':
-            name,
-
-        'Balanced RMSE, % notional':
-            np.sqrt(
-                balanced_mse
-            ),
-
-        'Balanced MAE, % notional':
-            balanced_mae,
-
-        'Stored calibration RMSE':
-            result[
-                'calibration'
-            ].get(
-                'market_rmse_pct',
-                np.nan
-            )
-    })
+Sub Upload_TRF_Rates_To_SQL()
+
+    Const SERVER_NAME As String = "YOUR_SQL_SERVER"
+    Const DATABASE_NAME As String = "ALM_TEST"
 
+    ' ADO constants
+    Const adCmdText As Long = 1
+    Const adBigInt As Long = 20
+    Const adInteger As Long = 3
+    Const adDBDate As Long = 133
+    Const adVarChar As Long = 200
+    Const adVarWChar As Long = 202
+    Const adDecimal As Long = 14
+    Const adParamInput As Long = 1
 
-quality_table = (
-    pd.DataFrame(
-        quality_rows
-    )
-    .set_index(
-        'Calibration'
-    )
-)
+    Dim cn As Object
+    Dim cmd As Object
+    Dim ws As Worksheet
 
+    Dim lastRow As Long
+    Dim r As Long
+    Dim loadedRows As Long
 
-quality_by_type = (
-    pd.DataFrame(
-        quality_by_type_rows
-    )
-    .set_index(
-        [
-            'Calibration',
-            'Option type'
-        ]
-    )
-)
+    Dim vConId As Variant
+    Dim vDtFrom As Variant
+    Dim vDtTo As Variant
+    Dim vRateType As Variant
+    Dim vRate As Variant
+    Dim vConNo As Variant
+    Dim vDtOpen As Variant
+    Dim vMatur As Variant
+    Dim vCur As Variant
+    Dim vProdName As Variant
+    Dim vCliName As Variant
 
+    Set ws = ActiveSheet
 
-print(
-    '\n'
-    + '=' * 90
-)
+    lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
 
-print(
-    '3. MARKET FIT QUALITY'
-)
+    If lastRow < 2 Then
+        MsgBox "Нет данных для загрузки.", vbExclamation
+        Exit Sub
+    End If
 
-print(
-    '=' * 90
-)
+    Set cn = CreateObject("ADODB.Connection")
 
+    cn.ConnectionString = _
+        "Provider=MSOLEDBSQL;" & _
+        "Server=" & SERVER_NAME & ";" & _
+        "Database=" & DATABASE_NAME & ";" & _
+        "Trusted_Connection=Yes;"
 
-display(
-    quality_table.round(6)
-)
+    On Error GoTo ErrHandler
 
+    cn.Open
+    cn.BeginTrans
 
-print(
-    '\nMarket fit отдельно по типам опционов:'
-)
+    For r = 2 To lastRow
 
+        ' Полностью пустые строки не грузим
+        If Application.WorksheetFunction.CountA(ws.Range("A" & r & ":K" & r)) > 0 Then
 
-display(
-    quality_by_type.round(6)
-)
+            ' ==========================================
+            ' ЯВНОЕ ПРИВЕДЕНИЕ ТИПОВ
+            ' ==========================================
 
+            ' A - CON_ID -> BIGINT
+            vConId = ToBigIntOrNull(ws.Cells(r, "A").Value2, "CON_ID", r)
 
-# =============================================================================
-# 4. СРАВНЕНИЕ FLOOR 6M И 1Y
-#
-# Берём уже рассчитанные полные FLOOR-матрицы
-# из RESULT_HISTORY / RESULT_MARKET / RESULT_COMBINED.
-#
-# Никакого повторного pricing.
-# =============================================================================
+            ' B - DT_FROM -> DATE
+            vDtFrom = ToDateOrNull(ws.Cells(r, "B"), "DT_FROM", r)
 
-def build_floor_comparison(
-    maturity
-):
+            ' C - DT_TO -> DATE
+            vDtTo = ToDateOrNull(ws.Cells(r, "C"), "DT_TO", r)
 
-    column_name = (
-        f'{maturity:g}Y'
-    )
+            ' D - TRF_RATE_TYPE -> VARCHAR(50)
+            vRateType = ToStringOrNull(ws.Cells(r, "D").Value2, 50, "TRF_RATE_TYPE", r)
 
+            ' E - TRF_RATE -> DECIMAL(18,10)
+            vRate = ToDecimalOrNull(ws.Cells(r, "E").Value2, "TRF_RATE", r)
 
-    # Используем одинаковую сетку страйков
-    # из сохранённой Historical matrix
+            ' F - CON_NO -> VARCHAR(100)
+            vConNo = ToStringOrNull(ws.Cells(r, "F").Value2, 100, "CON_NO", r)
 
-    base_index = (
-        RESULTS[
-            'Historical'
-        ][
-            'floor'
-        ]
-        .index
-    )
+            ' G - DT_OPEN_FACT -> DATE
+            vDtOpen = ToDateOrNull(ws.Cells(r, "G"), "DT_OPEN_FACT", r)
 
+            ' H - MATUR -> INT
+            vMatur = ToIntegerOrNull(ws.Cells(r, "H").Value2, "MATUR", r)
 
-    comparison = pd.DataFrame(
-        index=base_index
-    )
+            ' I - CUR -> INT
+            vCur = ToIntegerOrNull(ws.Cells(r, "I").Value2, "CUR", r)
 
+            ' J - PROD_NAME -> NVARCHAR(255)
+            vProdName = ToStringOrNull(ws.Cells(r, "J").Value2, 255, "PROD_NAME", r)
 
-    comparison.index.name = (
-        'Strike'
-    )
+            ' K - CLI_SHORT_NAME -> NVARCHAR(500)
+            vCliName = ToStringOrNull(ws.Cells(r, "K").Value2, 500, "CLI_SHORT_NAME", r)
 
+            ' ==========================================
+            ' INSERT
+            ' ==========================================
 
-    # -------------------------------------------------------------------------
-    # Добавляем котировки Трейдинга,
-    # если они существуют для данного срока и страйка
-    # -------------------------------------------------------------------------
+            Set cmd = CreateObject("ADODB.Command")
 
-    trading_values = []
+            With cmd
 
+                .ActiveConnection = cn
+                .CommandType = adCmdText
 
-    for strike_label in base_index:
+                .CommandText = _
+                    "INSERT INTO [WORK].[trf_rates_upload] (" & _
+                    "CON_ID, DT_FROM, DT_TO, TRF_RATE_TYPE, TRF_RATE, " & _
+                    "CON_NO, DT_OPEN_FACT, MATUR, CUR, PROD_NAME, CLI_SHORT_NAME" & _
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 
-        strike_decimal = (
-            float(
-                strike_label.replace(
-                    '%',
-                    ''
-                )
-            )
-            / 100.0
-        )
+                .Parameters.Append _
+                    .CreateParameter("@CON_ID", adBigInt, adParamInput, , vConId)
 
+                .Parameters.Append _
+                    .CreateParameter("@DT_FROM", adDBDate, adParamInput, , vDtFrom)
 
-        trading_value = (
-            np.nan
-        )
+                .Parameters.Append _
+                    .CreateParameter("@DT_TO", adDBDate, adParamInput, , vDtTo)
 
+                .Parameters.Append _
+                    .CreateParameter("@TRF_RATE_TYPE", adVarChar, adParamInput, 50, vRateType)
 
-        if maturity in (
-            TRADING_FLOOR_PCT.columns
-        ):
+                Dim pRate As Object
+                Set pRate = .CreateParameter("@TRF_RATE", adDecimal, adParamInput, , vRate)
 
-            trading_index = (
-                TRADING_FLOOR_PCT
-                .index
-                .to_numpy(
-                    dtype=float
-                )
-            )
+                pRate.Precision = 18
+                pRate.NumericScale = 10
 
+                .Parameters.Append pRate
 
-            matches = np.where(
-                np.isclose(
-                    trading_index,
-                    strike_decimal,
-                    atol=1e-12
-                )
-            )[0]
+                .Parameters.Append _
+                    .CreateParameter("@CON_NO", adVarChar, adParamInput, 100, vConNo)
 
+                .Parameters.Append _
+                    .CreateParameter("@DT_OPEN_FACT", adDBDate, adParamInput, , vDtOpen)
 
-            if len(matches) > 0:
+                .Parameters.Append _
+                    .CreateParameter("@MATUR", adInteger, adParamInput, , vMatur)
 
-                matched_strike = (
-                    TRADING_FLOOR_PCT
-                    .index[
-                        matches[0]
-                    ]
-                )
+                .Parameters.Append _
+                    .CreateParameter("@CUR", adInteger, adParamInput, , vCur)
 
+                .Parameters.Append _
+                    .CreateParameter("@PROD_NAME", adVarWChar, adParamInput, 255, vProdName)
 
-                trading_value = float(
-                    TRADING_FLOOR_PCT.loc[
-                        matched_strike,
-                        maturity
-                    ]
-                )
+                .Parameters.Append _
+                    .CreateParameter("@CLI_SHORT_NAME", adVarWChar, adParamInput, 500, vCliName)
 
+                .Execute
 
-        trading_values.append(
-            trading_value
-        )
+            End With
 
+            loadedRows = loadedRows + 1
 
-    comparison[
-        'Trading'
-    ] = trading_values
+        End If
 
+    Next r
 
-    # -------------------------------------------------------------------------
-    # Добавляем три модели
-    # -------------------------------------------------------------------------
+    cn.CommitTrans
+    cn.Close
 
-    for name, result in RESULTS.items():
+    MsgBox _
+        "Загрузка завершена." & vbCrLf & _
+        "Загружено строк: " & loadedRows, _
+        vbInformation
 
-        floor_matrix = (
-            result[
-                'floor'
-            ]
-        )
+    Exit Sub
 
 
-        if column_name not in (
-            floor_matrix.columns
-        ):
+ErrHandler:
 
-            raise RuntimeError(
-                f'В FLOOR matrix для {name} '
-                f'нет срока {column_name}.'
-            )
+    On Error Resume Next
 
+    If Not cn Is Nothing Then
+        cn.RollbackTrans
+        cn.Close
+    End If
 
-        comparison[
-            name
-        ] = (
-            floor_matrix[
-                column_name
-            ]
-            .reindex(
-                base_index
-            )
-            .to_numpy(
-                dtype=float
-            )
-        )
+    MsgBox _
+        "Загрузка отменена." & vbCrLf & vbCrLf & _
+        "Строка Excel: " & r & vbCrLf & _
+        Err.Description, _
+        vbCritical
 
+End Sub
 
-    return comparison
 
+' ============================================================
+' BIGINT
+' ============================================================
+Private Function ToBigIntOrNull( _
+    ByVal v As Variant, _
+    ByVal fieldName As String, _
+    ByVal rowNum As Long) As Variant
 
-floor_comparison_6m = (
-    build_floor_comparison(
-        0.5
-    )
-)
+    Dim x As Variant
 
+    If IsBlankValue(v) Then
+        ToBigIntOrNull = Null
+        Exit Function
+    End If
 
-floor_comparison_1y = (
-    build_floor_comparison(
-        1.0
-    )
-)
+    If IsError(v) Then
+        Err.Raise vbObjectError + 1001, , _
+            "Поле " & fieldName & _
+            " в строке " & rowNum & _
+            ": ошибка Excel в ячейке."
+    End If
 
+    If Not IsNumeric(v) Then
+        Err.Raise vbObjectError + 1002, , _
+            "Поле " & fieldName & _
+            " в строке " & rowNum & _
+            ": ожидалось целое число, получено [" & CStr(v) & "]."
+    End If
 
-print(
-    '\n'
-    + '=' * 90
-)
+    x = CDec(v)
 
-print(
-    '4. FLOOR 6M COMPARISON'
-)
+    If x <> Fix(x) Then
+        Err.Raise vbObjectError + 1003, , _
+            "Поле " & fieldName & _
+            " в строке " & rowNum & _
+            ": значение должно быть целым, получено [" & CStr(v) & "]."
+    End If
 
-print(
-    '=' * 90
-)
+    ToBigIntOrNull = x
 
+End Function
 
-display(
-    floor_comparison_6m.round(4)
-)
 
+' ============================================================
+' INT
+' ============================================================
+Private Function ToIntegerOrNull( _
+    ByVal v As Variant, _
+    ByVal fieldName As String, _
+    ByVal rowNum As Long) As Variant
 
-print(
-    '\n'
-    + '=' * 90
-)
+    Dim x As Double
 
-print(
-    'FLOOR 1Y COMPARISON'
-)
+    If IsBlankValue(v) Then
+        ToIntegerOrNull = Null
+        Exit Function
+    End If
 
-print(
-    '=' * 90
-)
+    If IsError(v) Then
+        Err.Raise vbObjectError + 1010, , _
+            "Поле " & fieldName & _
+            " в строке " & rowNum & _
+            ": ошибка Excel в ячейке."
+    End If
 
+    If Not IsNumeric(v) Then
+        Err.Raise vbObjectError + 1011, , _
+            "Поле " & fieldName & _
+            " в строке " & rowNum & _
+            ": ожидалось целое число, получено [" & CStr(v) & "]."
+    End If
 
-display(
-    floor_comparison_1y.round(4)
-)
+    x = CDbl(v)
 
+    If x <> Fix(x) Then
+        Err.Raise vbObjectError + 1012, , _
+            "Поле " & fieldName & _
+            " в строке " & rowNum & _
+            ": значение должно быть целым, получено [" & CStr(v) & "]."
+    End If
 
-# =============================================================================
-# 5. MONTE-CARLO COMPARISON
-#
-# Используем сохранённые 1000 сценариев каждого запуска.
-#
-# НОВЫЕ сценарии здесь НЕ генерируются.
-# =============================================================================
+    If x < -2147483648# Or x > 2147483647# Then
+        Err.Raise vbObjectError + 1013, , _
+            "Поле " & fieldName & _
+            " в строке " & rowNum & _
+            ": значение выходит за диапазон SQL INT."
+    End If
 
-mc_rows = []
+    ToIntegerOrNull = CLng(x)
 
+End Function
 
-MC_CHECK_YEARS = [
-    0.5,
-    1,
-    2,
-    3,
-    5,
-    10,
-    20,
-    30
-]
 
+' ============================================================
+' DECIMAL(18,10)
+' ============================================================
+Private Function ToDecimalOrNull( _
+    ByVal v As Variant, _
+    ByVal fieldName As String, _
+    ByVal rowNum As Long) As Variant
 
-for name, result in RESULTS.items():
+    Dim x As Variant
 
-    paths = np.asarray(
-        result[
-            'ks_paths'
-        ],
-        dtype=float
-    )
+    If IsBlankValue(v) Then
+        ToDecimalOrNull = Null
+        Exit Function
+    End If
 
+    If IsError(v) Then
+        Err.Raise vbObjectError + 1020, , _
+            "Поле " & fieldName & _
+            " в строке " & rowNum & _
+            ": ошибка Excel в ячейке."
+    End If
 
-    if paths.ndim != 2:
+    If Not IsNumeric(v) Then
+        Err.Raise vbObjectError + 1021, , _
+            "Поле " & fieldName & _
+            " в строке " & rowNum & _
+            ": ожидалось число, получено [" & CStr(v) & "]."
+    End If
 
-        raise RuntimeError(
-            f'ks_paths для {name} '
-            f'имеет некорректную размерность.'
-        )
+    x = CDec(v)
 
+    ' DECIMAL(18,10) = максимум 8 цифр до запятой
+    If Abs(x) >= CDec(100000000#) Then
+        Err.Raise vbObjectError + 1022, , _
+            "Поле " & fieldName & _
+            " в строке " & rowNum & _
+            ": значение не помещается в DECIMAL(18,10)."
+    End If
 
-    expected_rows = (
-        FORECAST_MONTHS
-        + 1
-    )
+    ' Явно округляем до 10 знаков после запятой
+    x = CDec(Application.WorksheetFunction.Round(CDbl(x), 10))
 
+    ToDecimalOrNull = x
 
-    if (
-        paths.shape[0]
-        != expected_rows
-    ):
+End Function
 
-        raise RuntimeError(
-            f'Для {name} ожидалось '
-            f'{expected_rows} месяцев, '
-            f'получено {paths.shape[0]}.'
-        )
 
+' ============================================================
+' DATE
+' ============================================================
+Private Function ToDateOrNull( _
+    ByVal cell As Range, _
+    ByVal fieldName As String, _
+    ByVal rowNum As Long) As Variant
 
-    row = {
+    Dim v As Variant
+    Dim d As Date
+    Dim s As String
 
-        'Calibration':
-            name,
+    v = cell.Value
 
-        'N scenarios':
-            paths.shape[1]
-    }
+    If IsBlankValue(v) Then
+        ToDateOrNull = Null
+        Exit Function
+    End If
 
+    If IsError(v) Then
+        Err.Raise vbObjectError + 1030, , _
+            "Поле " & fieldName & _
+            " в строке " & rowNum & _
+            ": ошибка Excel в ячейке."
+    End If
 
-    # -------------------------------------------------------------------------
-    # Контрольные горизонты
-    # -------------------------------------------------------------------------
+    ' Если Excel хранит настоящую дату —
+    ' берем именно внутреннее значение Excel
+    If IsNumeric(cell.Value2) Then
 
-    for year in MC_CHECK_YEARS:
+        If CDbl(cell.Value2) <= 0 Then
+            Err.Raise vbObjectError + 1031, , _
+                "Поле " & fieldName & _
+                " в строке " & rowNum & _
+                ": некорректная дата [" & cell.Text & "]."
+        End If
 
-        idx = int(
-            round(
-                year
-                * 12
-            )
-        )
+        d = CDate(cell.Value)
 
+    Else
 
-        values = (
-            paths[
-                idx,
-                :
-            ]
-        )
+        ' Если дата записана текстом
+        s = Trim$(CStr(v))
 
+        If Not IsDate(s) Then
+            Err.Raise vbObjectError + 1032, , _
+                "Поле " & fieldName & _
+                " в строке " & rowNum & _
+                ": невозможно преобразовать [" & s & "] в дату."
+        End If
 
-        row[
-            f'Mean {year:g}Y, %'
-        ] = (
-            np.mean(
-                values
-            )
-            * 100
-        )
+        d = CDate(s)
 
+    End If
 
-        row[
-            f'Median {year:g}Y, %'
-        ] = (
-            np.median(
-                values
-            )
-            * 100
-        )
+    ' Убираем время полностью
+    ToDateOrNull = DateSerial(Year(d), Month(d), Day(d))
 
+End Function
 
-        row[
-            f'Std {year:g}Y, п.п.'
-        ] = (
-            np.std(
-                values,
-                ddof=1
-            )
-            * 100
-        )
 
+' ============================================================
+' STRING
+' ============================================================
+Private Function ToStringOrNull( _
+    ByVal v As Variant, _
+    ByVal maxLength As Long, _
+    ByVal fieldName As String, _
+    ByVal rowNum As Long) As Variant
 
-        row[
-            f'P05 {year:g}Y, %'
-        ] = (
-            np.quantile(
-                values,
-                0.05
-            )
-            * 100
-        )
+    Dim s As String
 
+    If IsBlankValue(v) Then
+        ToStringOrNull = Null
+        Exit Function
+    End If
 
-        row[
-            f'P95 {year:g}Y, %'
-        ] = (
-            np.quantile(
-                values,
-                0.95
-            )
-            * 100
-        )
+    If IsError(v) Then
+        Err.Raise vbObjectError + 1040, , _
+            "Поле " & fieldName & _
+            " в строке " & rowNum & _
+            ": ошибка Excel в ячейке."
+    End If
 
+    s = Trim$(CStr(v))
 
-    # -------------------------------------------------------------------------
-    # Средняя cross-sectional volatility на горизонте 0-5Y
-    # -------------------------------------------------------------------------
+    If Len(s) > maxLength Then
+        Err.Raise vbObjectError + 1041, , _
+            "Поле " & fieldName & _
+            " в строке " & rowNum & _
+            ": длина " & Len(s) & _
+            " символов, максимум " & maxLength & "."
+    End If
 
-    first_5y = (
-        paths[
-            :61,
-            :
-        ]
-    )
+    ToStringOrNull = s
 
+End Function
 
-    cross_sectional_std_5y = (
-        np.std(
-            first_5y,
-            axis=1,
-            ddof=1
-        )
-    )
 
+' ============================================================
+' Проверка пустого значения
+' ============================================================
+Private Function IsBlankValue(ByVal v As Variant) As Boolean
 
-    row[
-        'Average cross-sectional std 0-5Y, п.п.'
-    ] = (
-        np.mean(
-            cross_sectional_std_5y
-        )
-        * 100
-    )
+    If IsError(v) Then
+        IsBlankValue = False
+    ElseIf IsEmpty(v) Then
+        IsBlankValue = True
+    ElseIf IsNull(v) Then
+        IsBlankValue = True
+    ElseIf VarType(v) = vbString Then
+        IsBlankValue = (Len(Trim$(v)) = 0)
+    Else
+        IsBlankValue = False
+    End If
 
-
-    # -------------------------------------------------------------------------
-    # Волатильность месячных изменений сценариев 0-5Y
-    # -------------------------------------------------------------------------
-
-    monthly_changes_5y = (
-        np.diff(
-            first_5y,
-            axis=0
-        )
-    )
-
-
-    row[
-        'Std monthly changes 0-5Y, п.п.'
-    ] = (
-        np.std(
-            monthly_changes_5y,
-            ddof=1
-        )
-        * 100
-    )
-
-
-    mc_rows.append(
-        row
-    )
-
-
-mc_comparison = (
-    pd.DataFrame(
-        mc_rows
-    )
-    .set_index(
-        'Calibration'
-    )
-)
-
-
-print(
-    '\n'
-    + '=' * 90
-)
-
-print(
-    '5. MONTE-CARLO COMPARISON'
-)
-
-print(
-    '=' * 90
-)
-
-
-display(
-    mc_comparison.round(4)
-)
-
-
-# =============================================================================
-# 6. СРАВНЕНИЕ СРЕДНИХ ТРАЕКТОРИЙ
-# =============================================================================
-
-years = (
-    np.arange(
-        FORECAST_MONTHS + 1,
-        dtype=float
-    )
-    / 12.0
-)
-
-
-mean_paths_comparison = pd.DataFrame({
-    'month':
-        np.arange(
-            FORECAST_MONTHS + 1
-        ),
-
-    'year':
-        years
-})
-
-
-for name, result in RESULTS.items():
-
-    paths = np.asarray(
-        result[
-            'ks_paths'
-        ],
-        dtype=float
-    )
-
-
-    mean_paths_comparison[
-        name
-    ] = (
-        np.mean(
-            paths,
-            axis=1
-        )
-        * 100
-    )
-
-
-plt.figure(
-    figsize=(
-        12,
-        5
-    )
-)
-
-
-for name in RESULTS:
-
-    plt.plot(
-        years,
-        mean_paths_comparison[
-            name
-        ],
-        label=name
-    )
-
-
-plt.title(
-    'Средняя траектория proxy КС'
-)
-
-plt.xlabel(
-    'Годы'
-)
-
-plt.ylabel(
-    'Ставка, %'
-)
-
-plt.grid(
-    True
-)
-
-plt.legend()
-
-plt.show()
-
-
-# =============================================================================
-# 7. СРАВНЕНИЕ ВОЛАТИЛЬНОСТИ ТРАЕКТОРИЙ
-# =============================================================================
-
-vol_paths_comparison = pd.DataFrame({
-    'month':
-        np.arange(
-            FORECAST_MONTHS + 1
-        ),
-
-    'year':
-        years
-})
-
-
-for name, result in RESULTS.items():
-
-    paths = np.asarray(
-        result[
-            'ks_paths'
-        ],
-        dtype=float
-    )
-
-
-    vol_paths_comparison[
-        name
-    ] = (
-        np.std(
-            paths,
-            axis=1,
-            ddof=1
-        )
-        * 100
-    )
-
-
-plt.figure(
-    figsize=(
-        12,
-        5
-    )
-)
-
-
-for name in RESULTS:
-
-    plt.plot(
-        years,
-        vol_paths_comparison[
-            name
-        ],
-        label=name
-    )
-
-
-plt.title(
-    'Разброс Monte-Carlo сценариев'
-)
-
-plt.xlabel(
-    'Годы'
-)
-
-plt.ylabel(
-    'Стандартное отклонение, п.п.'
-)
-
-plt.grid(
-    True
-)
-
-plt.legend()
-
-plt.show()
-
-
-# =============================================================================
-# 8. СОХРАНЕНИЕ MASTER COMPARISON
-# =============================================================================
-
-comparison_file = (
-    OUTPUT_DIR
-    / (
-        'CIRPP_master_comparison_'
-        f'{report_date:%Y%m%d}.xlsx'
-    )
-)
-
-
-with pd.ExcelWriter(
-    comparison_file,
-    engine='openpyxl'
-) as writer:
-
-
-    parameter_comparison.to_excel(
-        writer,
-        sheet_name='parameters'
-    )
-
-
-    market_compare.to_excel(
-        writer,
-        sheet_name='option_fit',
-        index=False
-    )
-
-
-    quality_table.to_excel(
-        writer,
-        sheet_name='fit_quality'
-    )
-
-
-    quality_by_type.to_excel(
-        writer,
-        sheet_name='fit_by_type'
-    )
-
-
-    floor_comparison_6m.to_excel(
-        writer,
-        sheet_name='floor_6M'
-    )
-
-
-    floor_comparison_1y.to_excel(
-        writer,
-        sheet_name='floor_1Y'
-    )
-
-
-    mc_comparison.to_excel(
-        writer,
-        sheet_name='MC_comparison'
-    )
-
-
-    mean_paths_comparison.to_excel(
-        writer,
-        sheet_name='mean_paths',
-        index=False
-    )
-
-
-    vol_paths_comparison.to_excel(
-        writer,
-        sheet_name='vol_paths',
-        index=False
-    )
-
-
-print(
-    '\n'
-    + '=' * 90
-)
-
-print(
-    'MASTER COMPARISON ЗАВЕРШЁН'
-)
-
-print(
-    '=' * 90
-)
-
-print(
-    f'\nФайл сохранён:\n'
-    f'{comparison_file}'
-)
+End Function
