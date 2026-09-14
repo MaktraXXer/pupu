@@ -2,32 +2,26 @@ Option Explicit
 
 Sub Upload_TRF_Rates_To_SQL()
 
+    Const adCmdText As Long = 1
+    Const adParamInput As Long = 1
+    Const adBigInt As Long = 20
+    Const adInteger As Long = 3
+    Const adDBDate As Long = 133
+    Const adVarChar As Long = 200
+    Const adVarWChar As Long = 202
+    Const adDecimal As Long = 14
+
     Dim cn As Object
+    Dim cmd As Object
+    Dim p As Object
     Dim ws As Worksheet
-    Dim lastCell As Range
-    Dim lastRow As Long
     Dim r As Long
     Dim cnt As Long
-    Dim sql As String
     Dim errText As String
 
     On Error GoTo ErrHandler
 
     Set ws = ActiveSheet
-
-    Set lastCell = ws.Cells.Find(What:="*", _
-                                 After:=ws.Cells(1, 1), _
-                                 LookAt:=xlPart, _
-                                 LookIn:=xlFormulas, _
-                                 SearchOrder:=xlByRows, _
-                                 SearchDirection:=xlPrevious)
-
-    If lastCell Is Nothing Or lastCell.Row < 2 Then
-        MsgBox "Нет данных для загрузки.", vbExclamation
-        Exit Sub
-    End If
-
-    lastRow = lastCell.Row
 
     Set cn = CreateObject("ADODB.Connection")
 
@@ -40,29 +34,52 @@ Sub Upload_TRF_Rates_To_SQL()
     cn.Open
     cn.BeginTrans
 
-    For r = 2 To lastRow
+    Set cmd = CreateObject("ADODB.Command")
+
+    Set cmd.ActiveConnection = cn
+    cmd.CommandType = adCmdText
+
+    cmd.CommandText = _
+        "INSERT INTO [WORK].[trf_rates_upload] " & _
+        "(CON_ID, DT_FROM, DT_TO, TRF_RATE_TYPE, TRF_RATE, CON_NO, " & _
+        "DT_OPEN_FACT, MATUR, CUR, PROD_NAME, CLI_SHORT_NAME) " & _
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+
+    cmd.Parameters.Append cmd.CreateParameter("p1", adBigInt, adParamInput)
+    cmd.Parameters.Append cmd.CreateParameter("p2", adDBDate, adParamInput)
+    cmd.Parameters.Append cmd.CreateParameter("p3", adDBDate, adParamInput)
+    cmd.Parameters.Append cmd.CreateParameter("p4", adVarChar, adParamInput, 50)
+
+    Set p = cmd.CreateParameter("p5", adDecimal, adParamInput)
+    p.Precision = 18
+    p.NumericScale = 10
+    cmd.Parameters.Append p
+
+    cmd.Parameters.Append cmd.CreateParameter("p6", adVarChar, adParamInput, 100)
+    cmd.Parameters.Append cmd.CreateParameter("p7", adDBDate, adParamInput)
+    cmd.Parameters.Append cmd.CreateParameter("p8", adInteger, adParamInput)
+    cmd.Parameters.Append cmd.CreateParameter("p9", adInteger, adParamInput)
+    cmd.Parameters.Append cmd.CreateParameter("p10", adVarWChar, adParamInput, 255)
+    cmd.Parameters.Append cmd.CreateParameter("p11", adVarWChar, adParamInput, 500)
+
+    For r = 2 To 553
 
         If Application.WorksheetFunction.CountA(ws.Range("A" & r & ":K" & r)) > 0 Then
 
-            sql = _
-                "INSERT INTO [WORK].[trf_rates_upload] (" & _
-                "CON_ID, DT_FROM, DT_TO, TRF_RATE_TYPE, TRF_RATE, " & _
-                "CON_NO, DT_OPEN_FACT, MATUR, CUR, PROD_NAME, CLI_SHORT_NAME" & _
-                ") VALUES (" & _
-                SqlBigInt(ws.Cells(r, "A").Value2, "CON_ID", r) & ", " & _
-                SqlDate(ws.Cells(r, "B"), "DT_FROM", r) & ", " & _
-                SqlDate(ws.Cells(r, "C"), "DT_TO", r) & ", " & _
-                SqlText(ws.Cells(r, "D").Value2) & ", " & _
-                SqlDecimal(ws.Cells(r, "E").Value2, "TRF_RATE", r) & ", " & _
-                SqlText(ws.Cells(r, "F").Value2) & ", " & _
-                SqlDate(ws.Cells(r, "G"), "DT_OPEN_FACT", r) & ", " & _
-                SqlInt(ws.Cells(r, "H").Value2, "MATUR", r) & ", " & _
-                SqlInt(ws.Cells(r, "I").Value2, "CUR", r) & ", " & _
-                SqlTextN(ws.Cells(r, "J").Value2) & ", " & _
-                SqlTextN(ws.Cells(r, "K").Value2) & _
-                ")"
+            cmd.Parameters(0).Value = GetInteger(ws.Cells(r, "A"), "CON_ID", r)
+            cmd.Parameters(1).Value = GetDateValue(ws.Cells(r, "B"), "DT_FROM", r)
+            cmd.Parameters(2).Value = GetDateValue(ws.Cells(r, "C"), "DT_TO", r)
+            cmd.Parameters(3).Value = GetText(ws.Cells(r, "D"))
+            cmd.Parameters(4).Value = GetNumber(ws.Cells(r, "E"), "TRF_RATE", r)
+            cmd.Parameters(5).Value = GetText(ws.Cells(r, "F"))
+            cmd.Parameters(6).Value = GetDateValue(ws.Cells(r, "G"), "DT_OPEN_FACT", r)
+            cmd.Parameters(7).Value = GetInteger(ws.Cells(r, "H"), "MATUR", r)
+            cmd.Parameters(8).Value = GetInteger(ws.Cells(r, "I"), "CUR", r)
+            cmd.Parameters(9).Value = GetText(ws.Cells(r, "J"))
+            cmd.Parameters(10).Value = GetText(ws.Cells(r, "K"))
 
-            cn.Execute sql
+            cmd.Execute
+
             cnt = cnt + 1
 
         End If
@@ -73,6 +90,7 @@ Sub Upload_TRF_Rates_To_SQL()
     cn.Close
 
     MsgBox "Готово. Загружено строк: " & cnt, vbInformation
+
     Exit Sub
 
 ErrHandler:
@@ -82,8 +100,10 @@ ErrHandler:
     On Error Resume Next
 
     If Not cn Is Nothing Then
-        cn.RollbackTrans
-        cn.Close
+        If cn.State <> 0 Then
+            cn.RollbackTrans
+            cn.Close
+        End If
     End If
 
     MsgBox _
@@ -95,136 +115,81 @@ ErrHandler:
 End Sub
 
 
-Private Function SqlBigInt(v As Variant, fieldName As String, rowNum As Long) As String
+Private Function GetText(c As Range) As Variant
 
-    Dim x As Variant
-
-    If IsEmptyValue(v) Then
-        SqlBigInt = "NULL"
-        Exit Function
+    If IsError(c.Value) Then
+        Err.Raise vbObjectError + 100, , "Ошибка Excel в " & c.Address
     End If
 
-    If Not IsNumeric(v) Then
-        Err.Raise vbObjectError + 1, , _
-            fieldName & ": ожидалось целое число. Строка " & rowNum
+    If Len(Trim$(CStr(c.Value))) = 0 Then
+        GetText = Null
+    Else
+        GetText = Trim$(CStr(c.Value))
     End If
-
-    x = CDec(v)
-
-    If x <> Fix(x) Then
-        Err.Raise vbObjectError + 2, , _
-            fieldName & ": ожидалось целое число. Строка " & rowNum
-    End If
-
-    SqlBigInt = Replace(CStr(x), Application.DecimalSeparator, ".")
 
 End Function
 
 
-Private Function SqlInt(v As Variant, fieldName As String, rowNum As Long) As String
+Private Function GetInteger(c As Range, fieldName As String, rowNum As Long) As Variant
 
     Dim x As Double
 
-    If IsEmptyValue(v) Then
-        SqlInt = "NULL"
+    If Len(Trim$(CStr(c.Value))) = 0 Then
+        GetInteger = Null
         Exit Function
     End If
 
-    If Not IsNumeric(v) Then
-        Err.Raise vbObjectError + 3, , _
-            fieldName & ": ожидалось целое число. Строка " & rowNum
+    If Not IsNumeric(c.Value2) Then
+        Err.Raise vbObjectError + 101, , _
+            fieldName & ": не число, строка " & rowNum
     End If
 
-    x = CDbl(v)
+    x = CDbl(c.Value2)
 
     If x <> Fix(x) Then
-        Err.Raise vbObjectError + 4, , _
-            fieldName & ": ожидалось целое число. Строка " & rowNum
+        Err.Raise vbObjectError + 102, , _
+            fieldName & ": значение не целое, строка " & rowNum
     End If
 
-    SqlInt = CStr(CLng(x))
+    GetInteger = x
 
 End Function
 
 
-Private Function SqlDecimal(v As Variant, fieldName As String, rowNum As Long) As String
+Private Function GetNumber(c As Range, fieldName As String, rowNum As Long) As Variant
 
-    Dim x As Double
-    Dim s As String
-
-    If IsEmptyValue(v) Then
-        SqlDecimal = "NULL"
+    If Len(Trim$(CStr(c.Value))) = 0 Then
+        GetNumber = Null
         Exit Function
     End If
 
-    If Not IsNumeric(v) Then
-        Err.Raise vbObjectError + 5, , _
-            fieldName & ": ожидалось число. Строка " & rowNum
+    If Not IsNumeric(c.Value2) Then
+        Err.Raise vbObjectError + 103, , _
+            fieldName & ": не число, строка " & rowNum
     End If
 
-    x = CDbl(v)
-
-    s = Format$(x, "0.0000000000")
-    s = Replace(s, Application.DecimalSeparator, ".")
-
-    SqlDecimal = s
+    GetNumber = CDbl(c.Value2)
 
 End Function
 
 
-Private Function SqlDate(c As Range, fieldName As String, rowNum As Long) As String
+Private Function GetDateValue(c As Range, fieldName As String, rowNum As Long) As Variant
 
     Dim d As Date
 
-    If IsEmptyValue(c.Value2) Then
-        SqlDate = "NULL"
+    If Len(Trim$(CStr(c.Value))) = 0 Then
+        GetDateValue = Null
         Exit Function
     End If
 
     If Not IsDate(c.Value) Then
-        Err.Raise vbObjectError + 6, , _
-            fieldName & ": некорректная дата [" & c.Text & "]. Строка " & rowNum
+        Err.Raise vbObjectError + 104, , _
+            fieldName & ": некорректная дата [" & c.Text & _
+            "], строка " & rowNum
     End If
 
     d = CDate(c.Value)
 
-    SqlDate = "'" & Format$(d, "yyyy-mm-dd") & "'"
-
-End Function
-
-
-Private Function SqlText(v As Variant) As String
-
-    If IsEmptyValue(v) Then
-        SqlText = "NULL"
-    Else
-        SqlText = "'" & Replace(Trim$(CStr(v)), "'", "''") & "'"
-    End If
-
-End Function
-
-
-Private Function SqlTextN(v As Variant) As String
-
-    If IsEmptyValue(v) Then
-        SqlTextN = "NULL"
-    Else
-        SqlTextN = "N'" & Replace(Trim$(CStr(v)), "'", "''") & "'"
-    End If
-
-End Function
-
-
-Private Function IsEmptyValue(v As Variant) As Boolean
-
-    If IsError(v) Then
-        IsEmptyValue = False
-    ElseIf IsNull(v) Or IsEmpty(v) Then
-        IsEmptyValue = True
-    ElseIf VarType(v) = vbString Then
-        IsEmptyValue = (Len(Trim$(CStr(v))) = 0)
-    Else
-        IsEmptyValue = False
-    End If
+    GetDateValue = DateSerial(Year(d), Month(d), Day(d))
 
 End Function
