@@ -1,32 +1,4 @@
-/* ================================================================
-   ПОДНЕВНАЯ ДИНАМИКА ВКЛАДОВ И НС ПО 3 КЛИЕНТАМ
-   ИСТОЧНИК: ALM.ALM.vw_balance_rest_all
-
-   ПЕРИОД:
-       01.01.2026 - 26.09.2026
-
-   ФИЛЬТРЫ:
-       block_name   = 'Привлечение ФЛ'
-       section_name IN ('Срочные', 'Накопительный счет')
-       od_flag      = 1
-
-   РЕЗУЛЬТАТ 1:
-       dt_rep
-       cli_id
-       cur
-       deposit_balance
-       ns_balance
-       deposit_rate
-       ns_rate
-       early_close_flag
-       early_close_count
-       early_close_rate
-       early_close_balance_rub
-
-   РЕЗУЛЬТАТ 2:
-       все строки живых вкладов + НС на 26.09.2026
-       со всеми полями исходного vw_balance_rest_all
-   ================================================================ */
+USE [ALM_TEST];
 
 SET NOCOUNT ON;
 
@@ -38,155 +10,420 @@ SET NOCOUNT ON;
 DECLARE @DateFrom date = '2026-01-01';
 DECLARE @DateTo   date = '2026-09-26';
 
+/* Нужен только для определения исчезновений 01.01.2026 */
+DECLARE @SeedDate date = DATEADD(day, -1, @DateFrom);
+
 
 
 /* ================================================================
-   1. ТРИ КЛИЕНТА
+   1. КЛИЕНТЫ
 
-   МЕНЯТЬ ТОЛЬКО ЭТИ ЗНАЧЕНИЯ
+   МЕНЯТЬ ТОЛЬКО ЭТИ ТРИ CLI_ID
    ================================================================ */
 
 DROP TABLE IF EXISTS #clients;
 
 CREATE TABLE #clients
 (
-    cli_id bigint NOT NULL PRIMARY KEY
+    cli_id bigint NOT NULL
 );
 
 INSERT INTO #clients (cli_id)
 VALUES
-      (1111111111)      -- CLI_ID 1
-    , (2222222222)      -- CLI_ID 2
-    , (3333333333);     -- CLI_ID 3
+      (1111111111)
+    , (2222222222)
+    , (3333333333);
 
 
 
 /* ================================================================
-   2. ТАБЛИЦА ДЛЯ ПОДНЕВНЫХ СНИМКОВ
+   2. ДНЕВНАЯ СЫРАЯ ВЫГРУЗКА
 
-   Сюда циклом складываем только нужные строки.
+   Создаём структуру из самого VIEW, но без строк.
 
-   ВАЖНО:
-   никакой DepositContract_Saldo здесь больше нет.
+   В #day_balance в каждый момент времени находится
+   ТОЛЬКО ОДИН ДЕНЬ.
+
+   На последней дате 26.09.2026 таблицу не очищаем,
+   чтобы потом вывести все исходные поля живых договоров.
    ================================================================ */
 
-DROP TABLE IF EXISTS #balance_raw;
+DROP TABLE IF EXISTS #day_balance;
 
-CREATE TABLE #balance_raw
+SELECT TOP (0)
+    b.*
+INTO #day_balance
+FROM [ALM].[ALM].[vw_balance_rest_all] b;
+
+
+
+/* ================================================================
+   3. КОМПАКТНЫЙ СПИСОК ДОГОВОРОВ ТЕКУЩЕГО ДНЯ
+
+   Одна строка:
+       DATE + CLI_ID + CON_ID + SECTION + CUR
+
+   Даже если в исходном балансе по одному CON_ID несколько строк,
+   здесь они схлопываются.
+   ================================================================ */
+
+DROP TABLE IF EXISTS #curr_contracts;
+
+CREATE TABLE #curr_contracts
 (
-      dt_rep       date           NOT NULL
-    , cli_id       bigint         NOT NULL
-    , con_id       bigint         NOT NULL
+      dt_rep        date
+    , cli_id        bigint
+    , con_id        bigint
+    , section_name  nvarchar(100)
+    , cur           nvarchar(20)
 
-    , section_name nvarchar(100)  NOT NULL
-    , cur           varchar(20)    NOT NULL
+    , out_rub       decimal(38,6)
+    , rate_con      decimal(18,10)
 
-    , out_rub       decimal(38,6)  NULL
-    , rate_con      decimal(18,10) NULL
-
-    , dt_open       date           NULL
-    , dt_close      date           NULL
+    , dt_open       date
+    , dt_close      date
 );
 
 
 
 /* ================================================================
-   3. ЦИКЛ ПО ДАТАМ
+   4. ДОГОВОРЫ ПРЕДЫДУЩЕГО ДНЯ
 
-   На каждой дате обращаемся к vw_balance_rest_all
-   только за:
-       - 3 клиентами
-       - Привлечением ФЛ
-       - Срочными + НС
-       - od_flag = 1
+   Нужны только для определения:
 
-   Это специально сделано циклом, чтобы не вытаскивать
-   огромный диапазон баланса целиком.
+       был вчера
+       +
+       сегодня отсутствует
+
+       => считаем досрочным исчезновением
+   ================================================================ */
+
+DROP TABLE IF EXISTS #prev_contracts;
+
+CREATE TABLE #prev_contracts
+(
+      dt_rep        date
+    , cli_id        bigint
+    , con_id        bigint
+    , section_name  nvarchar(100)
+    , cur           nvarchar(20)
+
+    , out_rub       decimal(38,6)
+    , rate_con      decimal(18,10)
+
+    , dt_open       date
+    , dt_close      date
+);
+
+
+
+/* ================================================================
+   5. КОМПАКТНЫЕ ДНЕВНЫЕ РЕЗУЛЬТАТЫ
+
+   Здесь уже всего несколько строк на день.
+   ================================================================ */
+
+DROP TABLE IF EXISTS #daily_result;
+
+CREATE TABLE #daily_result
+(
+      dt_rep              date
+    , cli_id              bigint
+    , cur                 nvarchar(20)
+
+    , deposit_balance     decimal(38,6)
+    , ns_balance          decimal(38,6)
+
+    , deposit_rate        decimal(18,10)
+    , ns_rate             decimal(18,10)
+);
+
+
+
+/* ================================================================
+   6. ДОСРОЧНЫЕ ИСЧЕЗНОВЕНИЯ
+
+   Здесь сразу агрегированные результаты,
+   сырые закрытые договоры хранить не нужно.
+   ================================================================ */
+
+DROP TABLE IF EXISTS #early_close;
+
+CREATE TABLE #early_close
+(
+      dt_rep                    date
+    , cli_id                    bigint
+    , cur                       nvarchar(20)
+
+    , early_close_flag          tinyint
+    , early_close_count         int
+
+    , early_close_rate          decimal(18,10)
+    , early_close_balance_rub   decimal(38,6)
+);
+
+
+
+/* ================================================================
+   7. СПИСОК ВАЛЮТ КЛИЕНТОВ
+
+   Маленькая таблица.
+   Нужна, чтобы в финале построить полное ежедневное полотно,
+   включая дни с нулевым остатком.
+   ================================================================ */
+
+DROP TABLE IF EXISTS #client_currency;
+
+CREATE TABLE #client_currency
+(
+      cli_id bigint
+    , cur    nvarchar(20)
+);
+
+
+
+/* ================================================================
+   8. ЗАГРУЖАЕМ ТОЛЬКО 31.12.2025
+
+   Это стартовый снимок для сравнения с 01.01.2026.
+
+   К VIEW ОБРАЩАЕМСЯ РОВНО ОДИН РАЗ.
+   ================================================================ */
+
+TRUNCATE TABLE #day_balance;
+
+
+INSERT INTO #day_balance
+
+SELECT
+    b.*
+
+FROM [ALM].[ALM].[vw_balance_rest_all] b WITH (NOLOCK)
+
+INNER JOIN #clients c
+    ON c.cli_id = b.cli_id
+
+WHERE
+    b.dt_rep >= @SeedDate
+
+    AND b.dt_rep < DATEADD(day, 1, @SeedDate)
+
+    AND b.block_name = N'Привлечение ФЛ'
+
+    AND b.section_name IN
+    (
+          N'Срочные'
+        , N'Накопительный счет'
+    )
+
+    AND b.od_flag = 1
+
+    AND b.con_id IS NOT NULL
+
+OPTION (MAXDOP 1);
+
+
+
+/* ================================================================
+   9. ИЗ 31.12 СОЗДАЁМ PREV_CONTRACTS
+
+   После этого сырой баланс 31.12 больше не нужен.
+   ================================================================ */
+
+INSERT INTO #prev_contracts
+(
+      dt_rep
+    , cli_id
+    , con_id
+    , section_name
+    , cur
+    , out_rub
+    , rate_con
+    , dt_open
+    , dt_close
+)
+
+SELECT
+      @SeedDate
+
+    , CAST(b.cli_id AS bigint)
+    , CAST(b.con_id AS bigint)
+
+    , CAST(b.section_name AS nvarchar(100))
+
+
+    /* Нормализация валюты */
+    , CASE
+          WHEN b.cur IS NULL
+              THEN N'UNKNOWN'
+
+          WHEN UPPER(
+                   LTRIM(
+                       RTRIM(
+                           CAST(b.cur AS nvarchar(20))
+                       )
+                   )
+               ) IN
+               (
+                   N'810',
+                   N'643',
+                   N'RUR',
+                   N'RUB'
+               )
+              THEN N'RUR'
+
+          ELSE
+              UPPER(
+                  LTRIM(
+                      RTRIM(
+                          CAST(b.cur AS nvarchar(20))
+                      )
+                  )
+              )
+      END AS cur
+
+
+    /* Остаток договора */
+    , SUM(
+          ISNULL(
+              TRY_CAST(
+                  b.out_rub AS decimal(38,6)
+              ),
+              0
+          )
+      ) AS out_rub
+
+
+    /* Ставка договора.
+       В нормальной ситуации по одному CON_ID одна ставка. */
+    , MAX(
+          TRY_CAST(
+              b.rate_con AS decimal(18,10)
+          )
+      ) AS rate_con
+
+
+    , MIN(
+          TRY_CAST(
+              b.dt_open AS date
+          )
+      ) AS dt_open
+
+
+    , MAX(
+          TRY_CAST(
+              b.dt_close AS date
+          )
+      ) AS dt_close
+
+
+FROM #day_balance b
+
+GROUP BY
+      b.cli_id
+    , b.con_id
+    , b.section_name
+
+    , CASE
+          WHEN b.cur IS NULL
+              THEN N'UNKNOWN'
+
+          WHEN UPPER(
+                   LTRIM(
+                       RTRIM(
+                           CAST(b.cur AS nvarchar(20))
+                       )
+                   )
+               ) IN
+               (
+                   N'810',
+                   N'643',
+                   N'RUR',
+                   N'RUB'
+               )
+              THEN N'RUR'
+
+          ELSE
+              UPPER(
+                  LTRIM(
+                      RTRIM(
+                          CAST(b.cur AS nvarchar(20))
+                      )
+                  )
+              )
+      END;
+
+
+
+/* Валюты также запоминаем */
+
+INSERT INTO #client_currency
+(
+      cli_id
+    , cur
+)
+
+SELECT DISTINCT
+      p.cli_id
+    , p.cur
+
+FROM #prev_contracts p;
+
+
+
+/* ================================================================
+   10. ОСНОВНОЙ ЦИКЛ
+
+   01.01.2026 - 26.09.2026
+
+   ВАЖНО:
+
+   на каждой итерации:
+
+   1. очищаем сырые данные прошлого дня
+   2. ОДИН РАЗ вызываем vw_balance_rest_all на новую дату
+   3. сразу схлопываем данные до договоров
+   4. считаем агрегаты
+   5. ищем исчезнувшие вклады
+   6. текущие договоры становятся предыдущими
+   7. идём дальше
+
+   Поэтому сырые данные 269 дней одновременно
+   НИКОГДА не хранятся.
    ================================================================ */
 
 DECLARE @CurrentDate date = @DateFrom;
 
+
 WHILE @CurrentDate <= @DateTo
 BEGIN
 
-    INSERT INTO #balance_raw
-    (
-          dt_rep
-        , cli_id
-        , con_id
-        , section_name
-        , cur
-        , out_rub
-        , rate_con
-        , dt_open
-        , dt_close
-    )
+
+    /* ============================================================
+       10.1. УБИРАЕМ СЫРЬЁ ПРЕДЫДУЩЕГО ДНЯ
+       ============================================================ */
+
+    TRUNCATE TABLE #day_balance;
+
+    TRUNCATE TABLE #curr_contracts;
+
+
+
+    /* ============================================================
+       10.2. РОВНО ОДИН ЗАПРОС К БАЛАНСУ НА ЭТУ ДАТУ
+       ============================================================ */
+
+    INSERT INTO #day_balance
 
     SELECT
-          CAST(b.dt_rep AS date)
-
-        , CAST(b.cli_id AS bigint)
-
-        , CAST(b.con_id AS bigint)
-
-        , CAST(b.section_name AS nvarchar(100))
-
-
-        /* --------------------------------------------------------
-           Нормализуем рубли:
-
-           810 / 643 / RUB / RUR -> RUR
-           -------------------------------------------------------- */
-        , CASE
-              WHEN UPPER(
-                       LTRIM(
-                           RTRIM(
-                               CAST(b.cur AS varchar(20))
-                           )
-                       )
-                   ) IN ('810', '643', 'RUB', 'RUR')
-                  THEN 'RUR'
-
-              WHEN b.cur IS NULL
-                  THEN 'UNKNOWN'
-
-              ELSE
-                  UPPER(
-                      LTRIM(
-                          RTRIM(
-                              CAST(b.cur AS varchar(20))
-                          )
-                      )
-                  )
-          END AS cur
-
-
-        /* Остаток */
-        , TRY_CAST(
-              b.out_rub AS decimal(38,6)
-          ) AS out_rub
-
-
-        /* Ставка договора */
-        , TRY_CAST(
-              b.rate_con AS decimal(18,10)
-          ) AS rate_con
-
-
-        , CAST(b.dt_open AS date)
-
-        , CAST(b.dt_close AS date)
-
+        b.*
 
     FROM [ALM].[ALM].[vw_balance_rest_all] b WITH (NOLOCK)
 
     INNER JOIN #clients c
         ON c.cli_id = b.cli_id
 
-
     WHERE
-
-        /* Используем диапазон, чтобы не CAST'овать поле в WHERE */
         b.dt_rep >= @CurrentDate
 
         AND b.dt_rep < DATEADD(day, 1, @CurrentDate)
@@ -205,8 +442,456 @@ BEGIN
         AND b.od_flag = 1
 
 
-    OPTION (RECOMPILE);
+        AND b.con_id IS NOT NULL
 
+
+    /* Не даём небольшому пользовательскому запросу
+       занимать много параллельных потоков сервера */
+    OPTION (MAXDOP 1);
+
+
+
+    /* ============================================================
+       10.3. СХЛОПЫВАЕМ СЫРОЙ ДЕНЬ ДО УРОВНЯ ДОГОВОРА
+       ============================================================ */
+
+    INSERT INTO #curr_contracts
+    (
+          dt_rep
+        , cli_id
+        , con_id
+        , section_name
+        , cur
+        , out_rub
+        , rate_con
+        , dt_open
+        , dt_close
+    )
+
+    SELECT
+          @CurrentDate
+
+        , CAST(b.cli_id AS bigint)
+
+        , CAST(b.con_id AS bigint)
+
+        , CAST(
+              b.section_name AS nvarchar(100)
+          )
+
+
+        /* Валюта */
+        , CASE
+              WHEN b.cur IS NULL
+                  THEN N'UNKNOWN'
+
+              WHEN UPPER(
+                       LTRIM(
+                           RTRIM(
+                               CAST(b.cur AS nvarchar(20))
+                           )
+                       )
+                   ) IN
+                   (
+                       N'810',
+                       N'643',
+                       N'RUR',
+                       N'RUB'
+                   )
+                  THEN N'RUR'
+
+              ELSE
+                  UPPER(
+                      LTRIM(
+                          RTRIM(
+                              CAST(b.cur AS nvarchar(20))
+                          )
+                      )
+                  )
+          END AS cur
+
+
+        /* Остаток договора */
+        , SUM(
+              ISNULL(
+                  TRY_CAST(
+                      b.out_rub AS decimal(38,6)
+                  ),
+                  0
+              )
+          ) AS out_rub
+
+
+        /* Ставка */
+        , MAX(
+              TRY_CAST(
+                  b.rate_con AS decimal(18,10)
+              )
+          ) AS rate_con
+
+
+        , MIN(
+              TRY_CAST(
+                  b.dt_open AS date
+              )
+          ) AS dt_open
+
+
+        , MAX(
+              TRY_CAST(
+                  b.dt_close AS date
+              )
+          ) AS dt_close
+
+
+    FROM #day_balance b
+
+
+    GROUP BY
+          b.cli_id
+        , b.con_id
+        , b.section_name
+
+        , CASE
+              WHEN b.cur IS NULL
+                  THEN N'UNKNOWN'
+
+              WHEN UPPER(
+                       LTRIM(
+                           RTRIM(
+                               CAST(b.cur AS nvarchar(20))
+                           )
+                       )
+                   ) IN
+                   (
+                       N'810',
+                       N'643',
+                       N'RUR',
+                       N'RUB'
+                   )
+                  THEN N'RUR'
+
+              ELSE
+                  UPPER(
+                      LTRIM(
+                          RTRIM(
+                              CAST(b.cur AS nvarchar(20))
+                          )
+                      )
+                  )
+          END;
+
+
+
+    /* ============================================================
+       10.4. ЗАПОМИНАЕМ НОВЫЕ ВАЛЮТЫ
+
+       Таблица микроскопическая, поэтому индекс тут не нужен.
+       ============================================================ */
+
+    INSERT INTO #client_currency
+    (
+          cli_id
+        , cur
+    )
+
+    SELECT DISTINCT
+          d.cli_id
+        , d.cur
+
+    FROM #curr_contracts d
+
+    WHERE NOT EXISTS
+    (
+        SELECT 1
+
+        FROM #client_currency cc
+
+        WHERE
+            cc.cli_id = d.cli_id
+            AND cc.cur = d.cur
+    );
+
+
+
+    /* ============================================================
+       10.5. ДНЕВНЫЕ ОСТАТКИ И СТАВКИ
+       ============================================================ */
+
+    INSERT INTO #daily_result
+    (
+          dt_rep
+        , cli_id
+        , cur
+
+        , deposit_balance
+        , ns_balance
+
+        , deposit_rate
+        , ns_rate
+    )
+
+    SELECT
+          @CurrentDate
+
+        , d.cli_id
+        , d.cur
+
+
+        /* --------------------------------------------------------
+           Срочные вклады
+           -------------------------------------------------------- */
+        , SUM(
+              CASE
+                  WHEN d.section_name = N'Срочные'
+                      THEN d.out_rub
+
+                  ELSE 0
+              END
+          ) AS deposit_balance
+
+
+        /* --------------------------------------------------------
+           Накопительные счета
+           -------------------------------------------------------- */
+        , SUM(
+              CASE
+                  WHEN d.section_name = N'Накопительный счет'
+                      THEN d.out_rub
+
+                  ELSE 0
+              END
+          ) AS ns_balance
+
+
+        /* --------------------------------------------------------
+           Средневзвешенная ставка срочных вкладов
+           -------------------------------------------------------- */
+        , CAST(
+
+              SUM(
+                  CASE
+                      WHEN d.section_name = N'Срочные'
+                           AND d.rate_con IS NOT NULL
+
+                          THEN
+                              d.out_rub
+                              * d.rate_con
+
+                      ELSE 0
+                  END
+              )
+
+              /
+
+              NULLIF(
+                  SUM(
+                      CASE
+                          WHEN d.section_name = N'Срочные'
+                               AND d.rate_con IS NOT NULL
+
+                              THEN d.out_rub
+
+                          ELSE 0
+                      END
+                  ),
+                  0
+              )
+
+          AS decimal(18,10)) AS deposit_rate
+
+
+        /* --------------------------------------------------------
+           Средневзвешенная ставка накопительных счетов
+           -------------------------------------------------------- */
+        , CAST(
+
+              SUM(
+                  CASE
+                      WHEN d.section_name = N'Накопительный счет'
+                           AND d.rate_con IS NOT NULL
+
+                          THEN
+                              d.out_rub
+                              * d.rate_con
+
+                      ELSE 0
+                  END
+              )
+
+              /
+
+              NULLIF(
+                  SUM(
+                      CASE
+                          WHEN d.section_name = N'Накопительный счет'
+                               AND d.rate_con IS NOT NULL
+
+                              THEN d.out_rub
+
+                          ELSE 0
+                      END
+                  ),
+                  0
+              )
+
+          AS decimal(18,10)) AS ns_rate
+
+
+    FROM #curr_contracts d
+
+    GROUP BY
+          d.cli_id
+        , d.cur;
+
+
+
+    /* ============================================================
+       10.6. ДОСРОЧНЫЕ ИСЧЕЗНОВЕНИЯ
+
+       Берём только вчерашние СРОЧНЫЕ вклады.
+
+       Если вчера CON_ID был,
+       а сегодня CON_ID отсутствует вообще,
+       считаем его закрытым.
+
+       Остаток и ставка =
+       данные последнего дня существования договора.
+
+       НС здесь НЕ считаются досрочными закрытиями.
+       ============================================================ */
+
+    INSERT INTO #early_close
+    (
+          dt_rep
+        , cli_id
+        , cur
+
+        , early_close_flag
+        , early_close_count
+
+        , early_close_rate
+        , early_close_balance_rub
+    )
+
+    SELECT
+          @CurrentDate
+
+        , p.cli_id
+        , p.cur
+
+        , CAST(1 AS tinyint)
+
+
+        /* Сколько договоров исчезло */
+        , COUNT(*) AS early_close_count
+
+
+        /* Средневзвешенная ставка исчезнувших договоров */
+        , CAST(
+
+              SUM(
+                  CASE
+                      WHEN p.rate_con IS NOT NULL
+
+                          THEN
+                              p.out_rub
+                              * p.rate_con
+
+                      ELSE 0
+                  END
+              )
+
+              /
+
+              NULLIF(
+                  SUM(
+                      CASE
+                          WHEN p.rate_con IS NOT NULL
+                              THEN p.out_rub
+
+                          ELSE 0
+                      END
+                  ),
+                  0
+              )
+
+          AS decimal(18,10)) AS early_close_rate
+
+
+        /* Остаток на последний день жизни */
+        , SUM(
+              p.out_rub
+          ) AS early_close_balance_rub
+
+
+    FROM #prev_contracts p
+
+
+    WHERE
+        p.section_name = N'Срочные'
+
+
+        /* Сегодня CON_ID отсутствует */
+        AND NOT EXISTS
+        (
+            SELECT 1
+
+            FROM #curr_contracts n
+
+            WHERE
+                n.cli_id = p.cli_id
+
+                AND n.con_id = p.con_id
+        )
+
+
+    GROUP BY
+          p.cli_id
+        , p.cur;
+
+
+
+    /* ============================================================
+       10.7. ТЕКУЩИЙ ДЕНЬ СТАНОВИТСЯ ПРЕДЫДУЩИМ
+
+       Старый предыдущий день полностью удаляется.
+       ============================================================ */
+
+    TRUNCATE TABLE #prev_contracts;
+
+
+    INSERT INTO #prev_contracts
+    (
+          dt_rep
+        , cli_id
+        , con_id
+        , section_name
+        , cur
+        , out_rub
+        , rate_con
+        , dt_open
+        , dt_close
+    )
+
+    SELECT
+          dt_rep
+        , cli_id
+        , con_id
+        , section_name
+        , cur
+        , out_rub
+        , rate_con
+        , dt_open
+        , dt_close
+
+    FROM #curr_contracts;
+
+
+
+    /* ============================================================
+       10.8. СЛЕДУЮЩАЯ ДАТА
+       ============================================================ */
 
     SET @CurrentDate =
         DATEADD(day, 1, @CurrentDate);
@@ -215,106 +900,12 @@ END;
 
 
 
-/* Индекс ставим уже после загрузки */
-
-CREATE CLUSTERED INDEX IX_balance_raw
-ON #balance_raw
-(
-      dt_rep
-    , cli_id
-    , con_id
-);
-
-
-
 /* ================================================================
-   4. СХЛОПЫВАЕМ ДУБЛИ ОДНОГО ДОГОВОРА
+   11. RESULT SET №1
+       ПОЛНОЕ ПОДНЕВНОЕ ПОЛОТНО
 
-   Если один CON_ID вдруг представлен несколькими строками
-   внутри одного DT_REP, сначала агрегируем его.
-
-   Одна строка:
-
-       DT_REP
-       CLI_ID
-       CON_ID
-       SECTION_NAME
-       CUR
+   После завершения цикла тяжёлый VIEW больше не вызывается.
    ================================================================ */
-
-DROP TABLE IF EXISTS #contract_daily;
-
-SELECT
-      dt_rep
-    , cli_id
-    , con_id
-    , section_name
-    , cur
-
-
-    /* Остаток договора */
-    , SUM(
-          ISNULL(out_rub, 0)
-      ) AS out_rub
-
-
-    /* У одного договора ставка должна быть одна.
-       MAX защищает от технических дублей. */
-    , MAX(rate_con) AS rate_con
-
-
-    , MIN(dt_open) AS dt_open
-
-    , MAX(dt_close) AS dt_close
-
-
-INTO #contract_daily
-
-FROM #balance_raw
-
-GROUP BY
-      dt_rep
-    , cli_id
-    , con_id
-    , section_name
-    , cur;
-
-
-CREATE UNIQUE CLUSTERED INDEX IX_contract_daily
-ON #contract_daily
-(
-      dt_rep
-    , cli_id
-    , con_id
-    , section_name
-    , cur
-);
-
-
-
-CREATE NONCLUSTERED INDEX IX_contract_daily_con
-ON #contract_daily
-(
-      cli_id
-    , con_id
-    , dt_rep
-)
-
-INCLUDE
-(
-      section_name
-    , cur
-    , out_rub
-    , rate_con
-);
-
-
-
-/* ================================================================
-   5. КАЛЕНДАРЬ
-   ================================================================ */
-
-DROP TABLE IF EXISTS #calendar;
 
 ;WITH calendar AS
 (
@@ -332,391 +923,6 @@ DROP TABLE IF EXISTS #calendar;
 )
 
 SELECT
-    dt_rep
-
-INTO #calendar
-
-FROM calendar
-
-OPTION (MAXRECURSION 0);
-
-
-CREATE UNIQUE CLUSTERED INDEX IX_calendar
-ON #calendar (dt_rep);
-
-
-
-/* ================================================================
-   6. СПИСОК ВАЛЮТ КАЖДОГО КЛИЕНТА
-
-   Благодаря этому получим полное полотно:
-       дата × клиент × валюта
-
-   даже когда на конкретную дату остаток = 0.
-   ================================================================ */
-
-DROP TABLE IF EXISTS #client_currency;
-
-SELECT DISTINCT
-      cli_id
-    , cur
-
-INTO #client_currency
-
-FROM #contract_daily;
-
-
-CREATE UNIQUE CLUSTERED INDEX IX_client_currency
-ON #client_currency
-(
-      cli_id
-    , cur
-);
-
-
-
-/* ================================================================
-   7. ОСНОВНЫЕ ПОДНЕВНЫЕ ПОКАЗАТЕЛИ
-
-   Срочные:
-       deposit_balance
-       deposit_rate
-
-   Накопительный счет:
-       ns_balance
-       ns_rate
-
-   Ставка:
-       SUM(out_rub * rate_con)
-       -----------------------
-           SUM(out_rub)
-   ================================================================ */
-
-DROP TABLE IF EXISTS #daily_agg;
-
-SELECT
-      d.dt_rep
-    , d.cli_id
-    , d.cur
-
-
-    /* ============================================================
-       ОСТАТОК СРОЧНЫХ ВКЛАДОВ
-       ============================================================ */
-
-    , SUM(
-          CASE
-              WHEN d.section_name = N'Срочные'
-                  THEN d.out_rub
-
-              ELSE 0
-          END
-      ) AS deposit_balance
-
-
-    /* ============================================================
-       ОСТАТОК НАКОПИТЕЛЬНЫХ СЧЕТОВ
-       ============================================================ */
-
-    , SUM(
-          CASE
-              WHEN d.section_name = N'Накопительный счет'
-                  THEN d.out_rub
-
-              ELSE 0
-          END
-      ) AS ns_balance
-
-
-    /* ============================================================
-       СРЕДНЕВЗВЕШЕННАЯ СТАВКА ВКЛАДОВ
-       ============================================================ */
-
-    , CAST(
-
-          SUM(
-              CASE
-                  WHEN d.section_name = N'Срочные'
-                       AND d.rate_con IS NOT NULL
-
-                      THEN
-                          d.out_rub
-                          * d.rate_con
-
-                  ELSE 0
-              END
-          )
-
-          /
-
-          NULLIF(
-              SUM(
-                  CASE
-                      WHEN d.section_name = N'Срочные'
-                           AND d.rate_con IS NOT NULL
-
-                          THEN d.out_rub
-
-                      ELSE 0
-                  END
-              ),
-              0
-          )
-
-      AS decimal(18,10)) AS deposit_rate
-
-
-    /* ============================================================
-       СРЕДНЕВЗВЕШЕННАЯ СТАВКА НС
-       ============================================================ */
-
-    , CAST(
-
-          SUM(
-              CASE
-                  WHEN d.section_name = N'Накопительный счет'
-                       AND d.rate_con IS NOT NULL
-
-                      THEN
-                          d.out_rub
-                          * d.rate_con
-
-                  ELSE 0
-              END
-          )
-
-          /
-
-          NULLIF(
-              SUM(
-                  CASE
-                      WHEN d.section_name = N'Накопительный счет'
-                           AND d.rate_con IS NOT NULL
-
-                          THEN d.out_rub
-
-                      ELSE 0
-                  END
-              ),
-              0
-          )
-
-      AS decimal(18,10)) AS ns_rate
-
-
-INTO #daily_agg
-
-FROM #contract_daily d
-
-GROUP BY
-      d.dt_rep
-    , d.cli_id
-    , d.cur;
-
-
-CREATE UNIQUE CLUSTERED INDEX IX_daily_agg
-ON #daily_agg
-(
-      dt_rep
-    , cli_id
-    , cur
-);
-
-
-
-/* ================================================================
-   8. ОПРЕДЕЛЯЕМ ДОСРОЧНО ИСЧЕЗНУВШИЕ ВКЛАДЫ
-
-   ЛОГИКА:
-
-   если срочный вклад:
-
-       есть в балансе на дату T
-
-   но:
-
-       отсутствует в балансе на T + 1
-
-   значит на T + 1 считаем событие досрочного закрытия.
-
-
-   Например:
-
-       10.05:
-           CON_ID 123
-           остаток = 1 000 000
-           RATE = 15%
-
-       11.05:
-           CON_ID 123 отсутствует
-
-   Тогда на 11.05:
-
-       early_close_flag        = 1
-       early_close_count       = 1
-       early_close_balance_rub = 1 000 000
-       early_close_rate        = 15%
-
-   ВАЖНО:
-   объём и ставка берутся из последнего дня,
-   когда вклад ещё был жив.
-   ================================================================ */
-
-DROP TABLE IF EXISTS #early_close_detail;
-
-SELECT
-      DATEADD(day, 1, p.dt_rep) AS dt_rep
-
-    , p.cli_id
-    , p.cur
-    , p.con_id
-
-    , p.out_rub AS balance_before_close
-
-    , p.rate_con AS rate_before_close
-
-    , p.dt_open
-    , p.dt_close
-
-
-INTO #early_close_detail
-
-FROM #contract_daily p
-
-
-WHERE
-    p.section_name = N'Срочные'
-
-
-    /* Следующая дата должна входить в горизонт */
-    AND p.dt_rep < @DateTo
-
-
-    /* На следующий календарный день
-       этого CON_ID уже нет */
-    AND NOT EXISTS
-    (
-        SELECT 1
-
-        FROM #contract_daily n
-
-        WHERE
-            n.cli_id = p.cli_id
-
-            AND n.con_id = p.con_id
-
-            AND n.dt_rep =
-                DATEADD(day, 1, p.dt_rep)
-    );
-
-
-CREATE UNIQUE CLUSTERED INDEX IX_early_close_detail
-ON #early_close_detail
-(
-      dt_rep
-    , cli_id
-    , cur
-    , con_id
-);
-
-
-
-/* ================================================================
-   9. АГРЕГАЦИЯ ДОСРОЧЕК
-
-   На дату + клиента + валюту:
-
-   - флаг
-   - число закрывшихся вкладов
-   - рублёвый объём
-   - средневзвешенная ставка
-   ================================================================ */
-
-DROP TABLE IF EXISTS #early_close;
-
-SELECT
-      dt_rep
-    , cli_id
-    , cur
-
-
-    /* Было ли исчезновение хотя бы одного вклада */
-    , CAST(1 AS tinyint) AS early_close_flag
-
-
-    /* Сколько договоров исчезло */
-    , COUNT(*) AS early_close_count
-
-
-    /* Сколько денег было на них
-       в последний день перед исчезновением */
-    , SUM(
-          balance_before_close
-      ) AS early_close_balance_rub
-
-
-    /* Средневзвешенная ставка исчезнувших вкладов */
-    , CAST(
-
-          SUM(
-              CASE
-                  WHEN rate_before_close IS NOT NULL
-
-                      THEN
-                          balance_before_close
-                          * rate_before_close
-
-                  ELSE 0
-              END
-          )
-
-          /
-
-          NULLIF(
-              SUM(
-                  CASE
-                      WHEN rate_before_close IS NOT NULL
-
-                          THEN balance_before_close
-
-                      ELSE 0
-                  END
-              ),
-              0
-          )
-
-      AS decimal(18,10)) AS early_close_rate
-
-
-INTO #early_close
-
-FROM #early_close_detail
-
-GROUP BY
-      dt_rep
-    , cli_id
-    , cur;
-
-
-CREATE UNIQUE CLUSTERED INDEX IX_early_close
-ON #early_close
-(
-      dt_rep
-    , cli_id
-    , cur
-);
-
-
-
-/* ================================================================
-   10. РЕЗУЛЬТАТ №1
-       ПОЛНОЕ ПОДНЕВНОЕ ПОЛОТНО
-
-   Одна строка:
-       DT_REP + CLI_ID + CUR
-   ================================================================ */
-
-SELECT
       cal.dt_rep
 
     , cc.cli_id
@@ -724,9 +930,9 @@ SELECT
     , cc.cur
 
 
-    /* ============================================================
-       ОСТАТКИ
-       ============================================================ */
+    /* ------------------------------------------------------------
+       Остатки
+       ------------------------------------------------------------ */
 
     , ISNULL(
           d.deposit_balance,
@@ -740,18 +946,18 @@ SELECT
       ) AS ns_balance
 
 
-    /* ============================================================
-       СТАВКИ
-       ============================================================ */
+    /* ------------------------------------------------------------
+       Ставки
+       ------------------------------------------------------------ */
 
     , d.deposit_rate
 
     , d.ns_rate
 
 
-    /* ============================================================
-       ДОСРОЧКА
-       ============================================================ */
+    /* ------------------------------------------------------------
+       Досрочные исчезновения
+       ------------------------------------------------------------ */
 
     , ISNULL(
           e.early_close_flag,
@@ -759,112 +965,76 @@ SELECT
       ) AS early_close_flag
 
 
-    /* Количество вкладов,
-       исчезнувших из баланса в этот день */
     , ISNULL(
           e.early_close_count,
           0
       ) AS early_close_count
 
 
-    /* Средневзвешенная ставка
-       этих вкладов в последний день до исчезновения */
     , e.early_close_rate
 
 
-    /* Их суммарный остаток
-       в последний день до исчезновения */
     , ISNULL(
           e.early_close_balance_rub,
           CAST(0 AS decimal(38,6))
       ) AS early_close_balance_rub
 
 
-FROM #calendar cal
+FROM calendar cal
 
 CROSS JOIN #client_currency cc
 
 
-LEFT JOIN #daily_agg d
+LEFT JOIN #daily_result d
     ON  d.dt_rep = cal.dt_rep
     AND d.cli_id = cc.cli_id
-    AND d.cur    = cc.cur
+    AND d.cur = cc.cur
 
 
 LEFT JOIN #early_close e
     ON  e.dt_rep = cal.dt_rep
     AND e.cli_id = cc.cli_id
-    AND e.cur    = cc.cur
+    AND e.cur = cc.cur
 
 
 ORDER BY
       cal.dt_rep
     , cc.cli_id
-    , cc.cur;
+    , cc.cur
+
+OPTION (MAXRECURSION 0);
 
 
 
 /* ================================================================
-   11. РЕЗУЛЬТАТ №2
-       ВСЕ ЖИВЫЕ ВКЛАДЫ И НАКОПИТЕЛЬНЫЕ СЧЕТА
-       НА ПОСЛЕДНЮЮ ДАТУ
+   12. RESULT SET №2
+       ВСЕ ЖИВЫЕ ВКЛАДЫ + НС НА 26.09.2026
 
-   ЕДИНЫЙ SELECT.
+   НИКАКОГО ПОВТОРНОГО ОБРАЩЕНИЯ К VIEW НЕТ.
 
-   Критерий "живой":
-       строка реально присутствует
-       в vw_balance_rest_all на @DateTo
+   В #day_balance после окончания цикла осталась
+   именно выгрузка @DateTo = 26.09.2026.
 
-   Возвращаем ВСЕ исходные поля.
-
-   Дополнительно balance_type:
-       DEPOSIT
-       NS
+   Выводим ВСЕ исходные поля VIEW.
    ================================================================ */
 
 SELECT
       CASE
           WHEN b.section_name = N'Срочные'
-              THEN 'DEPOSIT'
+              THEN N'DEPOSIT'
 
           WHEN b.section_name = N'Накопительный счет'
-              THEN 'NS'
+              THEN N'NS'
 
-          ELSE 'OTHER'
+          ELSE N'OTHER'
       END AS balance_type
 
     , b.*
 
-
-FROM [ALM].[ALM].[vw_balance_rest_all] b WITH (NOLOCK)
-
-INNER JOIN #clients c
-    ON c.cli_id = b.cli_id
-
-
-WHERE
-    b.dt_rep >= @DateTo
-
-    AND b.dt_rep < DATEADD(day, 1, @DateTo)
-
-
-    AND b.block_name = N'Привлечение ФЛ'
-
-
-    AND b.section_name IN
-    (
-          N'Срочные'
-        , N'Накопительный счет'
-    )
-
-
-    AND b.od_flag = 1
-
+FROM #day_balance b
 
 ORDER BY
       b.cli_id
     , b.section_name
     , b.cur
-    , b.con_id
-
-OPTION (RECOMPILE);
+    , b.con_id;
