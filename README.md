@@ -1,109 +1,155 @@
 /* ============================================================
-   ПРОВЕРКА:
-   ВСЕ ФАКТИЧЕСКИ ЖИВЫЕ ВКЛАДЫ КЛИЕНТОВ НА 26.09.2026
+   ВСЕ ВКЛАДЫ, КОТОРЫЕ ФОРМИРУЮТ DEPOSIT_BALANCE
+   НА 26.09.2026 В ОСНОВНОМ РАСЧЁТЕ
 
-   Живой вклад = по CON_ID существует ненулевой OUT_RUB
-   в DepositContract_Saldo, действующий на @CheckDate.
-
-   #clients уже создан предыдущим скриптом.
+   Используем непосредственно #saldo из основного скрипта,
+   поэтому сумма этих строк должна совпасть
+   с deposit_balance первого Result Set.
    ============================================================ */
 
-DECLARE @CheckDate date = '2026-09-26';
+DECLARE @CheckDate2 date = '2026-09-26';
 
 
-/* ------------------------------------------------------------
-   1. Находим все CON_ID с фактическим остатком на дату
-   ------------------------------------------------------------ */
+/* ============================================================
+   1. Сначала схлопываем сальдо до одного CON_ID
+   ============================================================ */
 
-DROP TABLE IF EXISTS #live_deposits_2609;
+DROP TABLE IF EXISTS #live_dep_check;
 
 SELECT
-      s.CON_ID AS con_id
+      s.cli_id
+    , s.cur
+    , s.con_id
 
-    /* фактический остаток вклада на дату */
     , SUM(
-          CAST(s.OUT_RUB AS decimal(38,6))
-      ) AS balance_rub_2609
+          CAST(s.balance_rub AS decimal(38,6))
+      ) AS balance_rub
 
-INTO #live_deposits_2609
+INTO #live_dep_check
 
-FROM [LIQUIDITY].[liq].[DepositContract_Saldo] s WITH (NOLOCK)
+FROM #saldo s
 
 WHERE
-    s.DT_FROM <= @CheckDate
+    s.contract_type = 'DEP'
 
-    AND
-    (
-        s.DT_TO IS NULL
-        OR s.DT_TO >= @CheckDate
-    )
-
-    AND s.OUT_RUB IS NOT NULL
+    AND @CheckDate2
+        BETWEEN s.effective_from
+            AND s.effective_to
 
 GROUP BY
-    s.CON_ID
+      s.cli_id
+    , s.cur
+    , s.con_id
 
 HAVING
     SUM(
-        CAST(s.OUT_RUB AS decimal(38,6))
+        CAST(s.balance_rub AS decimal(38,6))
     ) <> 0;
 
 
-CREATE UNIQUE CLUSTERED INDEX IX_live_deposits_2609
-ON #live_deposits_2609 (con_id);
+CREATE UNIQUE CLUSTERED INDEX IX_live_dep_check
+ON #live_dep_check (con_id);
 
 
 
-/* ------------------------------------------------------------
-   2. Оставляем только вклады наших 3 клиентов
+/* ============================================================
+   2. ВЫВОДИМ ВСЕ ЖИВЫЕ ВКЛАДЫ
 
-   Для каждого CON_ID берём последнюю известную запись SNAP,
-   чтобы вывести ВСЕ атрибуты договора.
+   Берём атрибуты из последнего доступного SNAP
+   по каждому найденному CON_ID.
 
-   Факт "живой / не живой" определяется НЕ SNAP,
-   а наличием фактического сальдо выше.
-   ------------------------------------------------------------ */
+   ВАЖНО:
+   OUTER APPLY, а не CROSS APPLY.
 
-;WITH snap_ranked AS
+   Поэтому даже если для CON_ID почему-либо не найдётся
+   строка SNAP, сам CON_ID всё равно будет показан.
+   ============================================================ */
+
+SELECT
+      l.cli_id
+    , l.cur
+    , l.con_id
+
+    /* Остаток, который реально вошёл
+       в deposit_balance на 26.09 */
+    , l.balance_rub AS balance_rub_2609
+
+
+    /* Поля договора */
+    , dc.dt_open
+    , dc.dt_close
+    , dc.dt_close_plan
+    , dc.fallback_rate
+
+
+    /* Поля последнего SNAP */
+    , snap.DT_REP          AS snap_dt_rep
+    , snap.RATE            AS snap_rate
+    , snap.CUR             AS snap_cur
+    , snap.BALANCE_RUB     AS snap_balance_rub
+    , snap.PROD_NAME       AS prod_name
+    , snap.TSEGMENTNAME    AS tsegmentname
+
+
+FROM #live_dep_check l
+
+
+/* Реестр договора из основного расчёта */
+LEFT JOIN #deposit_contracts dc
+    ON dc.con_id = l.con_id
+
+
+/* Последняя найденная запись SNAP */
+OUTER APPLY
 (
-    SELECT
-          d.*
-
-        , ROW_NUMBER() OVER
-          (
-              PARTITION BY d.CON_ID
-
-              ORDER BY
-                    d.DT_REP DESC
-          ) AS rn_live_check
+    SELECT TOP (1)
+          d.DT_REP
+        , d.RATE
+        , d.CUR
+        , d.BALANCE_RUB
+        , d.PROD_NAME
+        , d.TSEGMENTNAME
 
     FROM [ALM_TEST].[WORK].[DepositInterestsRateSnap] d WITH (NOLOCK)
 
-    INNER JOIN #clients c
-        ON c.cli_id = d.CLI_ID
-
-    INNER JOIN #live_deposits_2609 l
-        ON l.con_id = d.CON_ID
-
     WHERE
-        d.[TSEGMENTNAME] = N'Розничный бизнес'
-)
+        d.CON_ID = l.con_id
 
-SELECT
-      s.*
+    ORDER BY
+        d.DT_REP DESC
 
-    /* отдельно добавляем фактический остаток именно на 26.09 */
-    , l.balance_rub_2609
+) snap
 
-FROM snap_ranked s
-
-INNER JOIN #live_deposits_2609 l
-    ON l.con_id = s.CON_ID
-
-WHERE
-    s.rn_live_check = 1
 
 ORDER BY
-      s.CLI_ID
-    , s.CUR
-    , s.CON_ID;
+      l.cli_id
+    , l.cur
+    , l.balance_rub DESC
+    , l.con_id;
+
+
+
+/* ============================================================
+   3. КОНТРОЛЬНАЯ СУММА
+
+   Должна совпасть с DEPOSIT_BALANCE
+   первого Result Set на 26.09
+   ============================================================ */
+
+SELECT
+      cli_id
+    , cur
+
+    , COUNT(*) AS deposit_count
+
+    , SUM(balance_rub) AS deposit_balance_check
+
+FROM #live_dep_check
+
+GROUP BY
+      cli_id
+    , cur
+
+ORDER BY
+      cli_id
+    , cur;
