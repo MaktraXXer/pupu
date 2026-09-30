@@ -1,24 +1,21 @@
-Да. Здесь правильнее **не удалять таблицу**: текущий `PRIMARY KEY (observation_month, cli_id)` полезен и это единственный явно заданный индекс. Просто добавим 8 новых полей. Исторические строки получат в них `0`; если нужны корректные PK2/OT1 за старые месяцы, эти месяцы затем надо перезапустить с `@ReplaceExisting = 1`.
-
-Клиентские категории после изменения будут взаимоисключающими с приоритетом:
+Да. Меняем только смысл бывшей группы `Пк3/Пк6`:
 
 ```text
-01. Вкладчики к выходу
-02. НС без вкладов к выходу
-03. Открывшие вклад
-04. Открывшие НС
+было: Пк3 OR Пк6
+стало: Пк3 OR Пк6 OR Пк7
 ```
 
-Для `03` и `04` факт открытия определяется той же архитектурой, что уже используется процедурой: продукт присутствует на `#bal_end`, а `dt_open` попадает внутрь текущего периода. Старые `01/02` вообще не меняются.
+Её приоритет относительно остальных категорий **не меняется**. Остальные поля и логика, включая отдельные `PK2/OT1`, не затрагиваются.
 
-Новые PK2/OT1-поля — **только детализация** существующей категории `pk2_ot1`. Общие `exit_pk2_ot1_td_sum`, `opened_pk2_ot1` и их флаги сохраняются неизменными. Если одновременно `Пк2=1` и `От1=1`, для детализации договор относится в `Пк2`, поэтому двойного счёта нет:
+Старую статистику я предлагаю очистить, потому что исторические `pk3_pk6` были посчитаны без `[Пк7]`. Таблицу удалять не требуется — достаточно переименовать 4 поля и сделать `TRUNCATE`.
 
-```text
-exit_pk2_ot1_td_sum = exit_pk2_td_sum + exit_ot1_td_sum
-opened_pk2_ot1      = opened_pk2 + opened_ot1
-```
+## 1. Обновление таблицы
 
-## А. Обновление таблицы
+Этот скрипт:
+
+- переименует четыре старых поля;
+- сохранит структуру таблицы и PK;
+- удалит старые рассчитанные строки, чтобы потом пересчитать историю уже с `Пк7`.
 
 ```sql
 USE [ALM_TEST];
@@ -26,126 +23,125 @@ GO
 
 
 /* ============================================================
-   Добавляем детализацию общей категории Пк2 / От1.
+   1. ПЕРЕИМЕНОВЫВАЕМ ПОЛЯ
 
-   Существующие данные НЕ удаляются.
-   Старым строкам новые показатели устанавливаются в 0.
+   Пк3 / Пк6
+       ->
+   Пк3 / Пк6 / Пк7
    ============================================================ */
 
 
-/* ---------- Вклады к выходу: суммы ---------- */
+/* ---------- сумма вкладов к выходу ---------- */
 
 IF COL_LENGTH(
        'alm_report.depo_fl_client_monthly_stats',
-       'exit_pk2_td_sum'
+       'exit_pk3_pk6_td_sum'
+   ) IS NOT NULL
+   AND COL_LENGTH(
+       'alm_report.depo_fl_client_monthly_stats',
+       'exit_pk3_pk6_pk7_td_sum'
    ) IS NULL
 BEGIN
-    ALTER TABLE [alm_report].[depo_fl_client_monthly_stats]
-    ADD [exit_pk2_td_sum] decimal(38,6) NOT NULL
-        CONSTRAINT [DF_depo_fl_stats_exit_pk2_td_sum]
-        DEFAULT (0) WITH VALUES;
+
+    EXEC sys.sp_rename
+          N'alm_report.depo_fl_client_monthly_stats.exit_pk3_pk6_td_sum'
+        , N'exit_pk3_pk6_pk7_td_sum'
+        , N'COLUMN';
+
 END;
 GO
 
 
+/* ---------- флаг вклада к выходу ---------- */
+
 IF COL_LENGTH(
        'alm_report.depo_fl_client_monthly_stats',
-       'exit_ot1_td_sum'
+       'has_pk3_pk6_exit_td_flag'
+   ) IS NOT NULL
+   AND COL_LENGTH(
+       'alm_report.depo_fl_client_monthly_stats',
+       'has_pk3_pk6_pk7_exit_td_flag'
    ) IS NULL
 BEGIN
-    ALTER TABLE [alm_report].[depo_fl_client_monthly_stats]
-    ADD [exit_ot1_td_sum] decimal(38,6) NOT NULL
-        CONSTRAINT [DF_depo_fl_stats_exit_ot1_td_sum]
-        DEFAULT (0) WITH VALUES;
+
+    EXEC sys.sp_rename
+          N'alm_report.depo_fl_client_monthly_stats.has_pk3_pk6_exit_td_flag'
+        , N'has_pk3_pk6_pk7_exit_td_flag'
+        , N'COLUMN';
+
 END;
 GO
 
 
-/* ---------- Вклады к выходу: флаги ---------- */
+/* ---------- сумма открытых вкладов ---------- */
 
 IF COL_LENGTH(
        'alm_report.depo_fl_client_monthly_stats',
-       'has_pk2_exit_td_flag'
+       'opened_pk3_pk6'
+   ) IS NOT NULL
+   AND COL_LENGTH(
+       'alm_report.depo_fl_client_monthly_stats',
+       'opened_pk3_pk6_pk7'
    ) IS NULL
 BEGIN
-    ALTER TABLE [alm_report].[depo_fl_client_monthly_stats]
-    ADD [has_pk2_exit_td_flag] bit NOT NULL
-        CONSTRAINT [DF_depo_fl_stats_has_pk2_exit]
-        DEFAULT (0) WITH VALUES;
+
+    EXEC sys.sp_rename
+          N'alm_report.depo_fl_client_monthly_stats.opened_pk3_pk6'
+        , N'opened_pk3_pk6_pk7'
+        , N'COLUMN';
+
 END;
 GO
 
 
+/* ---------- флаг открытого вклада ---------- */
+
 IF COL_LENGTH(
        'alm_report.depo_fl_client_monthly_stats',
-       'has_ot1_exit_td_flag'
+       'has_opened_pk3_pk6_flag'
+   ) IS NOT NULL
+   AND COL_LENGTH(
+       'alm_report.depo_fl_client_monthly_stats',
+       'has_opened_pk3_pk6_pk7_flag'
    ) IS NULL
 BEGIN
-    ALTER TABLE [alm_report].[depo_fl_client_monthly_stats]
-    ADD [has_ot1_exit_td_flag] bit NOT NULL
-        CONSTRAINT [DF_depo_fl_stats_has_ot1_exit]
-        DEFAULT (0) WITH VALUES;
+
+    EXEC sys.sp_rename
+          N'alm_report.depo_fl_client_monthly_stats.has_opened_pk3_pk6_flag'
+        , N'has_opened_pk3_pk6_pk7_flag'
+        , N'COLUMN';
+
 END;
 GO
 
 
-/* ---------- Открытые вклады: суммы ---------- */
+/* ============================================================
+   2. ОЧИЩАЕМ СТАРУЮ СТАТИСТИКУ
 
-IF COL_LENGTH(
-       'alm_report.depo_fl_client_monthly_stats',
-       'opened_pk2'
-   ) IS NULL
-BEGIN
-    ALTER TABLE [alm_report].[depo_fl_client_monthly_stats]
-    ADD [opened_pk2] decimal(38,6) NOT NULL
-        CONSTRAINT [DF_depo_fl_stats_opened_pk2]
-        DEFAULT (0) WITH VALUES;
-END;
-GO
+   Это нужно, потому что старые месяцы были рассчитаны
+   без признака Пк7.
 
+   Структура таблицы, PK и остальные столбцы сохраняются.
+   ============================================================ */
 
-IF COL_LENGTH(
-       'alm_report.depo_fl_client_monthly_stats',
-       'opened_ot1'
-   ) IS NULL
-BEGIN
-    ALTER TABLE [alm_report].[depo_fl_client_monthly_stats]
-    ADD [opened_ot1] decimal(38,6) NOT NULL
-        CONSTRAINT [DF_depo_fl_stats_opened_ot1]
-        DEFAULT (0) WITH VALUES;
-END;
-GO
-
-
-/* ---------- Открытые вклады: флаги ---------- */
-
-IF COL_LENGTH(
-       'alm_report.depo_fl_client_monthly_stats',
-       'has_opened_pk2_flag'
-   ) IS NULL
-BEGIN
-    ALTER TABLE [alm_report].[depo_fl_client_monthly_stats]
-    ADD [has_opened_pk2_flag] bit NOT NULL
-        CONSTRAINT [DF_depo_fl_stats_has_opened_pk2]
-        DEFAULT (0) WITH VALUES;
-END;
-GO
-
-
-IF COL_LENGTH(
-       'alm_report.depo_fl_client_monthly_stats',
-       'has_opened_ot1_flag'
-   ) IS NULL
-BEGIN
-    ALTER TABLE [alm_report].[depo_fl_client_monthly_stats]
-    ADD [has_opened_ot1_flag] bit NOT NULL
-        CONSTRAINT [DF_depo_fl_stats_has_opened_ot1]
-        DEFAULT (0) WITH VALUES;
-END;
+TRUNCATE TABLE
+    [alm_report].[depo_fl_client_monthly_stats];
 GO
 ```
 
-## Б. Новая процедура целиком
+После этого новая схема использует:
+
+```text
+exit_pk3_pk6_pk7_td_sum
+has_pk3_pk6_pk7_exit_td_flag
+
+opened_pk3_pk6_pk7
+has_opened_pk3_pk6_pk7_flag
+```
+
+---
+
+# 2. Новая процедура
 
 ```sql
 USE [ALM_TEST];
@@ -173,37 +169,43 @@ BEGIN
 
 
     /* ========================================================
-       0. Проверка параметров
+       0. ПРОВЕРКА ПАРАМЕТРОВ
        ======================================================== */
 
     IF @StartBaseDate IS NULL
        OR @FinalEndDate IS NULL
     BEGIN
+
         THROW 51000,
               N'Необходимо передать @StartBaseDate и @FinalEndDate.',
               1;
+
     END;
 
 
     IF @FinalEndDate <= @StartBaseDate
     BEGIN
+
         THROW 51001,
               N'@FinalEndDate должен быть больше @StartBaseDate.',
               1;
+
     END;
 
 
     IF @StartBaseDate <> EOMONTH(@StartBaseDate)
     BEGIN
+
         THROW 51002,
               N'@StartBaseDate должен быть последним календарным днём месяца.',
               1;
+
     END;
 
 
 
     /* ========================================================
-       Исключённые клиенты
+       ИСКЛЮЧЁННЫЕ КЛИЕНТЫ
        ======================================================== */
 
     CREATE TABLE #excluded_clients
@@ -224,7 +226,7 @@ BEGIN
 
 
     /* ========================================================
-       Переменные периода
+       ПЕРЕМЕННЫЕ ПЕРИОДА
        ======================================================== */
 
     DECLARE @BaseDate date = @StartBaseDate;
@@ -244,7 +246,7 @@ BEGIN
 
 
     /* ========================================================
-       1. Первый snapshot
+       1. ПЕРВЫЙ SNAPSHOT
        ======================================================== */
 
     SELECT
@@ -281,6 +283,7 @@ BEGIN
     OPTION (RECOMPILE);
 
 
+
     IF NOT EXISTS
     (
         SELECT 1
@@ -298,7 +301,6 @@ BEGIN
 
 
 
-    /* Следующий snapshot */
     SELECT TOP (0)
         *
     INTO #bal_end
@@ -315,7 +317,7 @@ BEGIN
 
 
         /* ====================================================
-           Конец следующего периода
+           КОНЕЦ ТЕКУЩЕГО ПЕРИОДА
            ==================================================== */
 
         SET @EndDate =
@@ -354,7 +356,7 @@ BEGIN
 
 
         /* ====================================================
-           3. Следующий snapshot
+           3. СЛЕДУЮЩИЙ SNAPSHOT
            ==================================================== */
 
         TRUNCATE TABLE #bal_end;
@@ -423,7 +425,7 @@ BEGIN
 
 
         /* ====================================================
-           Уже загруженный месяц
+           ЕСЛИ МЕСЯЦ УЖЕ ЕСТЬ И НЕ НУЖНО ЕГО ПЕРЕСЧИТЫВАТЬ
            ==================================================== */
 
         IF @ReplaceExisting = 0
@@ -456,16 +458,14 @@ BEGIN
 
 
         /* ====================================================
-           4. БАЗА КЛИЕНТОВ
+           4. КЛИЕНТСКИЙ SCOPE
 
-           Приоритет категорий:
+           Приоритет:
 
-           01. вклад к выходу
-           02. НС на начало без вклада к выходу
-           03. открыл срочный вклад
-           04. открыл НС
-
-           Категории взаимоисключающие.
+           01. Есть вклад к выходу
+           02. Есть НС на начало, но нет вклада к выходу
+           03. Открыл вклад
+           04. Открыл НС
            ==================================================== */
 
         IF OBJECT_ID('tempdb..#client_scope') IS NOT NULL
@@ -532,7 +532,7 @@ BEGIN
         scope_union AS
         (
             /* ================================================
-               01. Вкладчики к выходу
+               01. ВКЛАДЧИКИ К ВЫХОДУ
                ================================================ */
 
             SELECT
@@ -550,7 +550,7 @@ BEGIN
 
 
             /* ================================================
-               02. НС без вкладов к выходу
+               02. НС БЕЗ ВКЛАДОВ К ВЫХОДУ
                ================================================ */
 
             SELECT
@@ -566,8 +566,11 @@ BEGIN
             WHERE NOT EXISTS
             (
                 SELECT 1
+
                 FROM exit_clients e
-                WHERE e.cli_id = n.cli_id
+
+                WHERE
+                    e.cli_id = n.cli_id
             )
 
 
@@ -575,11 +578,7 @@ BEGIN
 
 
             /* ================================================
-               03. Открывшие вклад
-
-               Нет вклада к выходу.
-               Нет НС на начало.
-               В течение периода открыт срочный вклад.
+               03. ОТКРЫВШИЕ ВКЛАД
                ================================================ */
 
             SELECT
@@ -595,15 +594,21 @@ BEGIN
             WHERE NOT EXISTS
             (
                 SELECT 1
+
                 FROM exit_clients e
-                WHERE e.cli_id = o.cli_id
+
+                WHERE
+                    e.cli_id = o.cli_id
             )
 
             AND NOT EXISTS
             (
                 SELECT 1
+
                 FROM ns_base_clients n
-                WHERE n.cli_id = o.cli_id
+
+                WHERE
+                    n.cli_id = o.cli_id
             )
 
 
@@ -611,12 +616,7 @@ BEGIN
 
 
             /* ================================================
-               04. Открывшие НС
-
-               Нет вклада к выходу.
-               Нет НС на начало.
-               Не попал в "Открывшие вклад".
-               В периоде открыт НС.
+               04. ОТКРЫВШИЕ НС
                ================================================ */
 
             SELECT
@@ -632,22 +632,31 @@ BEGIN
             WHERE NOT EXISTS
             (
                 SELECT 1
+
                 FROM exit_clients e
-                WHERE e.cli_id = n.cli_id
+
+                WHERE
+                    e.cli_id = n.cli_id
             )
 
             AND NOT EXISTS
             (
                 SELECT 1
+
                 FROM ns_base_clients nb
-                WHERE nb.cli_id = n.cli_id
+
+                WHERE
+                    nb.cli_id = n.cli_id
             )
 
             AND NOT EXISTS
             (
                 SELECT 1
+
                 FROM opened_td_clients td
-                WHERE td.cli_id = n.cli_id
+
+                WHERE
+                    td.cli_id = n.cli_id
             )
         )
 
@@ -678,7 +687,7 @@ BEGIN
 
 
         /* ====================================================
-           5. Только необходимые con_id
+           5. НУЖНЫЕ CON_ID
            ==================================================== */
 
         IF OBJECT_ID('tempdb..#relevant_con_ids') IS NOT NULL
@@ -728,12 +737,9 @@ BEGIN
 
 
         /* ====================================================
-           6. Признаки договоров
+           6. ПРИЗНАКИ ДОГОВОРОВ
 
-           ВАЖНО:
-           Пк2 и От1 храним:
-           - отдельно;
-           - вместе для существующей бизнес-классификации.
+           Пк3 / Пк6 / Пк7 теперь единая бизнес-категория.
            ==================================================== */
 
         IF OBJECT_ID('tempdb..#attr_flags') IS NOT NULL
@@ -815,7 +821,7 @@ BEGIN
                   END AS is_ot1_flag
 
 
-                /* Старая общая бизнес-категория */
+                /* Общая бизнес-категория Пк2 / От1 */
                 , CASE
                       WHEN ISNULL(
                                TRY_CAST(a.[Пк2] AS int),
@@ -833,7 +839,10 @@ BEGIN
                   END AS is_pk2_ot1_flag
 
 
-                /* Пк3 / Пк6 */
+                /* =================================================
+                   Пк3 / Пк6 / Пк7
+                   ================================================= */
+
                 , CASE
                       WHEN ISNULL(
                                TRY_CAST(a.[Пк3] AS int),
@@ -845,10 +854,15 @@ BEGIN
                                0
                            ) = 1
 
+                        OR ISNULL(
+                               TRY_CAST(a.[Пк7] AS int),
+                               0
+                           ) = 1
+
                           THEN 1
 
                       ELSE 0
-                  END AS is_pk3_pk6_flag
+                  END AS is_pk3_pk6_pk7_flag
 
 
                 /* МПЛ */
@@ -883,8 +897,9 @@ BEGIN
                   ) AS rn
 
 
-            FROM [ALM].[ehd].[attr_DepoFLConditions] a
-                 WITH (NOLOCK)
+            FROM
+                [ALM].[ehd].[attr_DepoFLConditions] a
+                WITH (NOLOCK)
 
             INNER JOIN #relevant_con_ids r
                 ON r.con_id =
@@ -903,7 +918,8 @@ BEGIN
             , is_ot1_flag
             , is_pk2_ot1_flag
 
-            , is_pk3_pk6_flag
+            , is_pk3_pk6_pk7_flag
+
             , is_mpl_flag
             , is_pns_flag
 
@@ -911,7 +927,8 @@ BEGIN
 
         FROM attr_ranked
 
-        WHERE rn = 1;
+        WHERE
+            rn = 1;
 
 
         CREATE UNIQUE CLUSTERED INDEX
@@ -921,7 +938,7 @@ BEGIN
 
 
         /* ====================================================
-           7. Расчёт и запись месяца
+           7. РАСЧЁТ И ЗАПИСЬ
            ==================================================== */
 
         BEGIN TRY
@@ -945,19 +962,11 @@ BEGIN
 
             ;WITH client_flags AS
             (
-                /* ============================================
-                   Для старых групп сегмент определяется
-                   как раньше — по стартовому snapshot.
-
-                   Для новых 03/04, если на старте клиента
-                   не было, разрешаем определить ДЧБО
-                   по конечному snapshot.
-                   ============================================ */
-
                 SELECT
                       c.cli_id
 
                     , CASE
+
                           WHEN EXISTS
                           (
                               SELECT 1
@@ -1061,21 +1070,20 @@ BEGIN
                         AS is_ndp_ndm_flag
 
 
-                    /* Новая детализация */
                     , MAX(ISNULL(a.is_pk2_flag, 0))
                         AS is_pk2_flag
 
                     , MAX(ISNULL(a.is_ot1_flag, 0))
                         AS is_ot1_flag
 
-
-                    /* Общая категория сохраняется */
                     , MAX(ISNULL(a.is_pk2_ot1_flag, 0))
                         AS is_pk2_ot1_flag
 
 
-                    , MAX(ISNULL(a.is_pk3_pk6_flag, 0))
-                        AS is_pk3_pk6_flag
+                    /* Пк3 / Пк6 / Пк7 */
+                    , MAX(ISNULL(a.is_pk3_pk6_pk7_flag, 0))
+                        AS is_pk3_pk6_pk7_flag
+
 
                     , MAX(ISNULL(a.is_mpl_flag, 0))
                         AS is_mpl_flag
@@ -1106,8 +1114,19 @@ BEGIN
 
 
             /* ================================================
-               Старая приоритетная бизнес-классификация
-               НЕ МЕНЯЕТСЯ.
+               ПРИОРИТЕТ КАТЕГОРИЙ
+
+               Место группы не меняется:
+
+               1 ФУ
+               2 Нов
+               3 Пр2 / Пр3
+               4 НДП / НДМ
+               5 Пк2 / От1
+               6 Пк3 / Пк6 / Пк7
+               7 МПЛ
+               8 Пнс
+               9 прочие
                ================================================ */
 
             exit_classified AS
@@ -1137,8 +1156,8 @@ BEGIN
                           WHEN e.is_pk2_ot1_flag = 1
                               THEN N'pk2_ot1'
 
-                          WHEN e.is_pk3_pk6_flag = 1
-                              THEN N'pk3_pk6'
+                          WHEN e.is_pk3_pk6_pk7_flag = 1
+                              THEN N'pk3_pk6_pk7'
 
                           WHEN e.is_mpl_flag = 1
                               THEN N'mpl'
@@ -1165,7 +1184,7 @@ BEGIN
 
 
                     /* ========================================
-                       Старые объёмы
+                       ОБЪЁМЫ
                        ======================================== */
 
                     , SUM(
@@ -1204,7 +1223,7 @@ BEGIN
                       ) AS exit_ndp_ndm_td_sum
 
 
-                    /* Общая Пк2 / От1 — БЕЗ ИЗМЕНЕНИЙ */
+                    /* Общая Пк2 / От1 */
                     , SUM(
                           CASE
                               WHEN exit_category = N'pk2_ot1'
@@ -1214,13 +1233,7 @@ BEGIN
                       ) AS exit_pk2_ot1_td_sum
 
 
-                    /* ========================================
-                       НОВОЕ: Пк2 отдельно
-
-                       Если стоят одновременно Пк2 и От1,
-                       относим договор в Пк2.
-                       ======================================== */
-
+                    /* Пк2 отдельно */
                     , SUM(
                           CASE
                               WHEN exit_category = N'pk2_ot1'
@@ -1231,12 +1244,7 @@ BEGIN
                       ) AS exit_pk2_td_sum
 
 
-                    /* ========================================
-                       НОВОЕ: От1 отдельно
-
-                       Только если на договоре нет Пк2.
-                       ======================================== */
-
+                    /* От1 отдельно */
                     , SUM(
                           CASE
                               WHEN exit_category = N'pk2_ot1'
@@ -1248,13 +1256,14 @@ BEGIN
                       ) AS exit_ot1_td_sum
 
 
+                    /* Пк3 / Пк6 / Пк7 */
                     , SUM(
                           CASE
-                              WHEN exit_category = N'pk3_pk6'
+                              WHEN exit_category = N'pk3_pk6_pk7'
                                   THEN out_rub
                               ELSE 0
                           END
-                      ) AS exit_pk3_pk6_td_sum
+                      ) AS exit_pk3_pk6_pk7_td_sum
 
 
                     , SUM(
@@ -1286,7 +1295,7 @@ BEGIN
 
 
                     /* ========================================
-                       Старые флаги
+                       ФЛАГИ
                        ======================================== */
 
                     , MAX(
@@ -1325,7 +1334,6 @@ BEGIN
                       ) AS has_ndp_ndm_exit_td_flag
 
 
-                    /* Общий старый флаг */
                     , MAX(
                           CASE
                               WHEN exit_category = N'pk2_ot1'
@@ -1335,7 +1343,7 @@ BEGIN
                       ) AS has_pk2_ot1_exit_td_flag
 
 
-                    /* НОВЫЙ Пк2 */
+                    /* Пк2 отдельно */
                     , MAX(
                           CASE
                               WHEN exit_category = N'pk2_ot1'
@@ -1346,7 +1354,7 @@ BEGIN
                       ) AS has_pk2_exit_td_flag
 
 
-                    /* НОВЫЙ От1 */
+                    /* От1 отдельно */
                     , MAX(
                           CASE
                               WHEN exit_category = N'pk2_ot1'
@@ -1358,13 +1366,14 @@ BEGIN
                       ) AS has_ot1_exit_td_flag
 
 
+                    /* Пк3 / Пк6 / Пк7 */
                     , MAX(
                           CASE
-                              WHEN exit_category = N'pk3_pk6'
+                              WHEN exit_category = N'pk3_pk6_pk7'
                                   THEN 1
                               ELSE 0
                           END
-                      ) AS has_pk3_pk6_exit_td_flag
+                      ) AS has_pk3_pk6_pk7_exit_td_flag
 
 
                     , MAX(
@@ -1394,7 +1403,7 @@ BEGIN
 
 
             /* ================================================
-               Другие вклады вне окна
+               ДРУГИЕ ВКЛАДЫ ВНЕ ОКНА
                ================================================ */
 
             other_td_flag AS
@@ -1432,7 +1441,7 @@ BEGIN
 
 
             /* ================================================
-               НС на начало
+               НС НА НАЧАЛО
                ================================================ */
 
             ns_start AS
@@ -1456,7 +1465,7 @@ BEGIN
 
 
             /* ================================================
-               НС на конец
+               НС НА КОНЕЦ
                ================================================ */
 
             ns_end AS
@@ -1554,21 +1563,20 @@ BEGIN
                         AS is_ndp_ndm_flag
 
 
-                    /* Новая детализация */
                     , MAX(ISNULL(a.is_pk2_flag, 0))
                         AS is_pk2_flag
 
                     , MAX(ISNULL(a.is_ot1_flag, 0))
                         AS is_ot1_flag
 
-
-                    /* Общая старая категория */
                     , MAX(ISNULL(a.is_pk2_ot1_flag, 0))
                         AS is_pk2_ot1_flag
 
 
-                    , MAX(ISNULL(a.is_pk3_pk6_flag, 0))
-                        AS is_pk3_pk6_flag
+                    /* Пк3 / Пк6 / Пк7 */
+                    , MAX(ISNULL(a.is_pk3_pk6_pk7_flag, 0))
+                        AS is_pk3_pk6_pk7_flag
+
 
                     , MAX(ISNULL(a.is_mpl_flag, 0))
                         AS is_mpl_flag
@@ -1609,7 +1617,6 @@ BEGIN
                     , o.is_ot1_flag
 
 
-                    /* Бизнес-приоритет НЕ МЕНЯЕТСЯ */
                     , CASE
                           WHEN o.is_fu_flag = 1
                               THEN N'fu'
@@ -1626,8 +1633,8 @@ BEGIN
                           WHEN o.is_pk2_ot1_flag = 1
                               THEN N'pk2_ot1'
 
-                          WHEN o.is_pk3_pk6_flag = 1
-                              THEN N'pk3_pk6'
+                          WHEN o.is_pk3_pk6_pk7_flag = 1
+                              THEN N'pk3_pk6_pk7'
 
                           WHEN o.is_mpl_flag = 1
                               THEN N'mpl'
@@ -1651,7 +1658,7 @@ BEGIN
 
 
                     /* ========================================
-                       Старые объёмы
+                       ОБЪЁМЫ
                        ======================================== */
 
                     , SUM(
@@ -1690,7 +1697,6 @@ BEGIN
                       ) AS opened_ndp_ndm
 
 
-                    /* Общая категория сохраняется */
                     , SUM(
                           CASE
                               WHEN open_category = N'pk2_ot1'
@@ -1700,7 +1706,7 @@ BEGIN
                       ) AS opened_pk2_ot1
 
 
-                    /* НОВОЕ: Пк2 */
+                    /* Пк2 отдельно */
                     , SUM(
                           CASE
                               WHEN open_category = N'pk2_ot1'
@@ -1711,7 +1717,7 @@ BEGIN
                       ) AS opened_pk2
 
 
-                    /* НОВОЕ: От1 */
+                    /* От1 отдельно */
                     , SUM(
                           CASE
                               WHEN open_category = N'pk2_ot1'
@@ -1723,13 +1729,14 @@ BEGIN
                       ) AS opened_ot1
 
 
+                    /* Пк3 / Пк6 / Пк7 */
                     , SUM(
                           CASE
-                              WHEN open_category = N'pk3_pk6'
+                              WHEN open_category = N'pk3_pk6_pk7'
                                   THEN out_rub
                               ELSE 0
                           END
-                      ) AS opened_pk3_pk6
+                      ) AS opened_pk3_pk6_pk7
 
 
                     , SUM(
@@ -1765,7 +1772,7 @@ BEGIN
 
 
                     /* ========================================
-                       Старые флаги
+                       ФЛАГИ
                        ======================================== */
 
                     , MAX(
@@ -1804,7 +1811,6 @@ BEGIN
                       ) AS has_opened_ndp_ndm_flag
 
 
-                    /* Старый общий */
                     , MAX(
                           CASE
                               WHEN open_category = N'pk2_ot1'
@@ -1814,7 +1820,7 @@ BEGIN
                       ) AS has_opened_pk2_ot1_flag
 
 
-                    /* НОВЫЙ Пк2 */
+                    /* Пк2 отдельно */
                     , MAX(
                           CASE
                               WHEN open_category = N'pk2_ot1'
@@ -1825,7 +1831,7 @@ BEGIN
                       ) AS has_opened_pk2_flag
 
 
-                    /* НОВЫЙ От1 */
+                    /* От1 отдельно */
                     , MAX(
                           CASE
                               WHEN open_category = N'pk2_ot1'
@@ -1837,13 +1843,14 @@ BEGIN
                       ) AS has_opened_ot1_flag
 
 
+                    /* Пк3 / Пк6 / Пк7 */
                     , MAX(
                           CASE
-                              WHEN open_category = N'pk3_pk6'
+                              WHEN open_category = N'pk3_pk6_pk7'
                                   THEN 1
                               ELSE 0
                           END
-                      ) AS has_opened_pk3_pk6_flag
+                      ) AS has_opened_pk3_pk6_pk7_flag
 
 
                     , MAX(
@@ -1902,11 +1909,11 @@ BEGIN
 
                 , exit_pk2_ot1_td_sum
 
-                /* НОВЫЕ */
                 , exit_pk2_td_sum
                 , exit_ot1_td_sum
 
-                , exit_pk3_pk6_td_sum
+                , exit_pk3_pk6_pk7_td_sum
+
                 , exit_mpl_td_sum
                 , exit_pns_td_sum
                 , exit_other_td_sum
@@ -1920,11 +1927,11 @@ BEGIN
 
                 , has_pk2_ot1_exit_td_flag
 
-                /* НОВЫЕ */
                 , has_pk2_exit_td_flag
                 , has_ot1_exit_td_flag
 
-                , has_pk3_pk6_exit_td_flag
+                , has_pk3_pk6_pk7_exit_td_flag
+
                 , has_mpl_exit_td_flag
                 , has_pns_exit_td_flag
 
@@ -1947,11 +1954,11 @@ BEGIN
 
                 , opened_pk2_ot1
 
-                /* НОВЫЕ */
                 , opened_pk2
                 , opened_ot1
 
-                , opened_pk3_pk6
+                , opened_pk3_pk6_pk7
+
                 , opened_mpl
                 , opened_pns
                 , opened_other
@@ -1966,11 +1973,11 @@ BEGIN
 
                 , has_opened_pk2_ot1_flag
 
-                /* НОВЫЕ */
                 , has_opened_pk2_flag
                 , has_opened_ot1_flag
 
-                , has_opened_pk3_pk6_flag
+                , has_opened_pk3_pk6_pk7_flag
+
                 , has_opened_mpl_flag
                 , has_opened_pns_flag
             )
@@ -1997,14 +2004,7 @@ BEGIN
 
 
                 /* ============================================
-                   Бакет
-
-                   Логика старых 01/02 НЕ меняется.
-
-                   Для новых 03/04:
-                   поле остаётся "Не определено".
-                   Их объёмы описываются соответственно
-                   opened_* и ns_end_sum.
+                   БАКЕТ
                    ============================================ */
 
                 , CASE
@@ -2088,16 +2088,13 @@ BEGIN
                 , ISNULL(e.exit_pr2_pr3_td_sum, 0)
                 , ISNULL(e.exit_ndp_ndm_td_sum, 0)
 
-
-                /* Общая старая категория */
                 , ISNULL(e.exit_pk2_ot1_td_sum, 0)
 
-                /* НОВЫЕ */
                 , ISNULL(e.exit_pk2_td_sum, 0)
                 , ISNULL(e.exit_ot1_td_sum, 0)
 
+                , ISNULL(e.exit_pk3_pk6_pk7_td_sum, 0)
 
-                , ISNULL(e.exit_pk3_pk6_td_sum, 0)
                 , ISNULL(e.exit_mpl_td_sum, 0)
                 , ISNULL(e.exit_pns_td_sum, 0)
                 , ISNULL(e.exit_other_td_sum, 0)
@@ -2105,7 +2102,7 @@ BEGIN
 
 
                 /* ============================================
-                   ФЛАГИ ВКЛАДОВ К ВЫХОДУ
+                   ФЛАГИ ВЫХОДОВ
                    ============================================ */
 
                 , ISNULL(e.has_fu_exit_td_flag, 0)
@@ -2113,16 +2110,13 @@ BEGIN
                 , ISNULL(e.has_pr2_pr3_exit_td_flag, 0)
                 , ISNULL(e.has_ndp_ndm_exit_td_flag, 0)
 
-
-                /* Общий старый */
                 , ISNULL(e.has_pk2_ot1_exit_td_flag, 0)
 
-                /* НОВЫЕ */
                 , ISNULL(e.has_pk2_exit_td_flag, 0)
                 , ISNULL(e.has_ot1_exit_td_flag, 0)
 
+                , ISNULL(e.has_pk3_pk6_pk7_exit_td_flag, 0)
 
-                , ISNULL(e.has_pk3_pk6_exit_td_flag, 0)
                 , ISNULL(e.has_mpl_exit_td_flag, 0)
                 , ISNULL(e.has_pns_exit_td_flag, 0)
 
@@ -2142,9 +2136,7 @@ BEGIN
                                ns1.ns_start_sum,
                                0
                            ) > 1000
-
                           THEN 1
-
                       ELSE 0
                   END
 
@@ -2161,9 +2153,7 @@ BEGIN
                           ISNULL(ns2.ns_end_sum, 0)
                           <
                           ISNULL(ns1.ns_start_sum, 0)
-
                           THEN 1
-
                       ELSE 0
                   END
 
@@ -2178,16 +2168,13 @@ BEGIN
                 , ISNULL(o.opened_pr2_pr3, 0)
                 , ISNULL(o.opened_ndp_ndm, 0)
 
-
-                /* Общая старая */
                 , ISNULL(o.opened_pk2_ot1, 0)
 
-                /* НОВЫЕ */
                 , ISNULL(o.opened_pk2, 0)
                 , ISNULL(o.opened_ot1, 0)
 
+                , ISNULL(o.opened_pk3_pk6_pk7, 0)
 
-                , ISNULL(o.opened_pk3_pk6, 0)
                 , ISNULL(o.opened_mpl, 0)
                 , ISNULL(o.opened_pns, 0)
                 , ISNULL(o.opened_other, 0)
@@ -2204,16 +2191,13 @@ BEGIN
                 , ISNULL(o.has_opened_pr2_pr3_flag, 0)
                 , ISNULL(o.has_opened_ndp_ndm_flag, 0)
 
-
-                /* Общий старый */
                 , ISNULL(o.has_opened_pk2_ot1_flag, 0)
 
-                /* НОВЫЕ */
                 , ISNULL(o.has_opened_pk2_flag, 0)
                 , ISNULL(o.has_opened_ot1_flag, 0)
 
+                , ISNULL(o.has_opened_pk3_pk6_pk7_flag, 0)
 
-                , ISNULL(o.has_opened_pk3_pk6_flag, 0)
                 , ISNULL(o.has_opened_mpl_flag, 0)
                 , ISNULL(o.has_opened_pns_flag, 0)
 
@@ -2261,7 +2245,7 @@ BEGIN
 
 
         /* ====================================================
-           8. Чистим temp текущего месяца
+           8. ЧИСТИМ TEMP
            ==================================================== */
 
         DROP TABLE #attr_flags;
@@ -2272,8 +2256,6 @@ BEGIN
 
         /* ====================================================
            9. СКОЛЬЖЕНИЕ
-
-           end текущего месяца становится base следующего.
            ==================================================== */
 
         IF @EndDate < @FinalEndDate
@@ -2317,50 +2299,15 @@ END;
 GO
 ```
 
-## В. Пример запуска
-
-Для твоего текущего сценария — база на **31 августа**, статистика сентября по **6 сентября 2026**:
+В этой версии `[Пк7]` просто расширяет старую группу:
 
 ```sql
-EXEC [ALM_TEST].[alm_report].[usp_load_depo_fl_client_monthly_stats]
-
-      @StartBaseDate    = '2026-08-31'
-    , @FinalEndDate     = '2026-09-06'
-    , @ReplaceExisting  = 1;
+CASE
+    WHEN [Пк3] = 1
+      OR [Пк6] = 1
+      OR [Пк7] = 1
+    THEN 1
+END
 ```
 
-Когда появится полный сентябрь:
-
-```sql
-EXEC [ALM_TEST].[alm_report].[usp_load_depo_fl_client_monthly_stats]
-
-      @StartBaseDate    = '2026-08-31'
-    , @FinalEndDate     = '2026-09-30'
-    , @ReplaceExisting  = 1;
-```
-
-А после запуска можно проверить состав новых четырёх групп:
-
-```sql
-SELECT
-      observation_month
-    , client_base_type
-    , COUNT(*) AS clients
-    , SUM(exit_td_sum) AS exit_td_sum
-    , SUM(opened_total) AS opened_total
-    , SUM(ns_start_sum) AS ns_start_sum
-    , SUM(ns_end_sum) AS ns_end_sum
-
-FROM [ALM_TEST].[alm_report].[depo_fl_client_monthly_stats]
-
-WHERE observation_month = '2026-09-01'
-
-GROUP BY
-      observation_month
-    , client_base_type
-
-ORDER BY
-    client_base_type;
-```
-
-Ключевой момент: новая детализация PK2/OT1 сделана **внутри уже присвоенной общей категории `pk2_ot1`**. Поэтому вклад, который из-за более высокого приоритета относится, например, к `nov`, не начнёт внезапно учитываться в `exit_pk2_td_sum` только потому, что у него технически стоит `[Пк2]=1`. Это сохраняет существующую бизнес-логику полностью.
+Приоритет категории остаётся тем же: она по-прежнему идёт **после `Пк2/От1` и до `МПЛ`**. Поэтому никаких побочных изменений в распределении остальных групп, кроме договоров с новым `[Пк7]`, не происходит.
