@@ -1,533 +1,694 @@
-Да, так делать можно как упрощённое модельное допущение, если вы считаете:
+USE [ALM_TEST];
+SET NOCOUNT ON;
 
-KS_t = RUONIA_t + 0{,}20\%
+DECLARE @DateFrom date = '2026-05-31';
+DECLARE @DateTo   date = '2026-08-31';
 
-то есть basis между ключевой ставкой и RUONIA:
 
-* постоянный;
-* детерминированный;
-* одинаковый на всём горизонте.
+IF OBJECT_ID('tempdb..#contracts') IS NOT NULL DROP TABLE #contracts;
+IF OBJECT_ID('tempdb..#attr_flags') IS NOT NULL DROP TABLE #attr_flags;
+IF OBJECT_ID('tempdb..#contract_category') IS NOT NULL DROP TABLE #contract_category;
+IF OBJECT_ID('tempdb..#daily_delta') IS NOT NULL DROP TABLE #daily_delta;
 
-Тогда ваши траектории X остаются траекториями RUONIA, а непосредственно перед расчётом payoff переводятся в траектории ключевой ставки прибавлением 0.002.
 
-Предыдущая логика:
+/* ============================================================
+   1. РЕЕСТР ДОГОВОРОВ
+   ============================================================ */
 
-current_ks - model_rate_0
+WITH contract_ranked AS
+(
+    SELECT
+          CAST(d.CON_ID AS bigint) AS con_id
+        , CAST(d.DT_OPEN AS date) AS dt_open
+        , CAST(d.DT_CLOSE AS date) AS dt_close
+        , d.PROD_NAME
 
-была менее прозрачной: она подбирала basis из стартовых значений модели. Теперь basis задаётся явно как экономическое предположение.
+        , CASE
+              WHEN ISNULL(TRY_CAST(d.isfloat AS int), 0) = 1
+                  THEN 1
+              ELSE 0
+          END AS is_float_flag
 
-Следствие относительно оценки опциона непосредственно на RUONIA:
+        , ROW_NUMBER() OVER
+          (
+              PARTITION BY d.CON_ID
+              ORDER BY d.DT_REP DESC
+          ) AS rn
 
-* cap на КС станет дороже, потому что ставка для payoff выше на 0,2 п.п.;
-* floor на КС станет дешевле, потому что вероятность ухода ниже страйка уменьшается.
+    FROM [ALM_TEST].[WORK].[DepositInterestsRateSnap] d WITH (NOLOCK)
 
-1. Исправленный общий блок
+    WHERE
+        d.DT_OPEN <= @DateTo
+        AND d.[TSEGMENTNAME] = 'Розничный бизнес'
+),
 
-import numpy as np
-import pandas as pd
-# =============================================================================
-# ПАРАМЕТРЫ ОПЦИОНОВ
-# =============================================================================
-# Текущая ключевая ставка.
-# Нужна для контроля, но не используется для автоматической подгонки basis.
-current_ks = 0.1425
-# Предположение:
-# RUONIA в среднем ниже ключевой ставки на 0.20 п.п.
-#
-# 0.20 процентного пункта = 0.002 в десятичном формате.
-ks_minus_ruonia_basis = 0.0020
-maturities_years = [
-    0.5,
-    1,
-    2,
-    3,
-    4,
-    5
-]
-cap_strikes = np.arange(
-    0.135,
-    0.180 + 1e-12,
-    0.005
-)
-floor_strikes = np.arange(
-    0.115,
-    0.145 + 1e-12,
-    0.005
-)
-notional_rub = 500_000_000.0
-# Ежемесячная доля года:
-# payoff = max(...) * 1/12
-accrual = 1.0 / 12.0
-# Настройки Monte Carlo
-n_sim_options = 20_000
-option_seed = 42
-# =============================================================================
-# ДИСКОНТИРОВАНИЕ ЧЕРЕЗ ZCYC
-# =============================================================================
-def discount_factors_from_zcyc(months):
-    """
-    Возвращает детерминированные OIS discount factors:
-        DF(1M), DF(2M), ..., DF(months)
-    ZCYC(t) возвращает непрерывную zero-rate,
-    где t выражен в годах:
-        DF(0,t) = exp(-ZCYC(t) * t)
-    """
-    times = (
-        np.arange(
-            1,
-            months + 1,
-            dtype=float
+contracts_filtered AS
+(
+    SELECT
+          con_id
+        , dt_open
+        , dt_close
+        , PROD_NAME
+        , is_float_flag
+
+    FROM contract_ranked
+
+    WHERE
+        rn = 1
+        AND dt_open <= @DateTo
+        AND
+        (
+            dt_close IS NULL
+            OR dt_close >= @DateFrom
         )
-        / 12.0
-    )
-    zero_rates = np.asarray(
-        ZCYC(times),
-        dtype=float
-    )
-    discount_factors = np.exp(
-        -zero_rates * times
-    )
-    return discount_factors
-# =============================================================================
-# ПЕРЕХОД ОТ МОДЕЛЬНОЙ RUONIA К КЛЮЧЕВОЙ СТАВКЕ
-# =============================================================================
-def ruonia_paths_to_key_rate(
-    ruonia_paths,
-    basis=ks_minus_ruonia_basis
-):
-    """
-    Переводит модельные траектории RUONIA
-    в приближённые траектории ключевой ставки.
-    Предположение:
-        KS_t = RUONIA_t + basis
-    По умолчанию:
-        basis = 0.002 = 0.20 п.п.
-    Важно:
-    basis здесь постоянный на всём горизонте.
-    """
-    ruonia_paths = np.asarray(
-        ruonia_paths,
-        dtype=float
-    )
-    key_rate_paths = (
-        ruonia_paths
-        + float(basis)
-    )
-    return key_rate_paths
-# =============================================================================
-# РАСЧЁТ МАТРИЦЫ CAP ИЛИ FLOOR
-# =============================================================================
-def option_matrix_from_paths(
-    ruonia_paths,
-    strikes,
-    maturities,
-    option_type,
-    basis=ks_minus_ruonia_basis
-):
-    """
-    Рассчитывает upfront-премию
-    в процентах от номинала.
-    Исходные paths являются траекториями RUONIA.
-    Для payoff используются траектории ключевой ставки:
-        KS_t = RUONIA_t + basis
-    Ежемесячный payoff:
-        Cap:
-            max(KS_t - strike, 0) / 12
-        Floor:
-            max(strike - KS_t, 0) / 12
-    Дисконтирование:
-        по текущей OIS zero curve через ZCYC.
-    Результат:
-        upfront-премия в процентах от номинала.
-    """
-    key_rate_paths = ruonia_paths_to_key_rate(
-        ruonia_paths=ruonia_paths,
-        basis=basis
-    )
-    result = pd.DataFrame(
-        index=[
-            f'{strike * 100:.1f}%'
-            for strike in strikes
-        ],
-        columns=[
-            f'{maturity:g}Y'
-            for maturity in maturities
-        ],
-        dtype=float
-    )
-    option_type = option_type.lower()
-    if option_type not in (
-        'cap',
-        'floor'
-    ):
-        raise ValueError(
-            "option_type должен быть 'cap' или 'floor'"
+)
+
+SELECT
+      con_id
+    , dt_open
+    , dt_close
+    , PROD_NAME
+    , is_float_flag
+INTO #contracts
+FROM contracts_filtered;
+
+
+CREATE UNIQUE CLUSTERED INDEX IX_contracts_con_id
+ON #contracts (con_id);
+
+
+/* ============================================================
+   2. ДОПОЛНИТЕЛЬНЫЕ ПРИЗНАКИ ДОГОВОРОВ
+
+   Пк2 и От1 теперь ОТДЕЛЬНЫЕ признаки.
+   ============================================================ */
+
+WITH attr_ranked AS
+(
+    SELECT
+          CAST(a.CON_ID AS bigint) AS con_id
+
+        /* Нов */
+        , CASE
+              WHEN ISNULL(TRY_CAST(a.[Нов] AS int), 0) = 1
+                  THEN 1
+              ELSE 0
+          END AS is_nov_flag
+
+        /* Пр2 + Пр3 */
+        , CASE
+              WHEN ISNULL(TRY_CAST(a.[Пр2] AS int), 0) = 1
+                OR ISNULL(TRY_CAST(a.[Пр3] AS int), 0) = 1
+                  THEN 1
+              ELSE 0
+          END AS is_pr2_pr3_flag
+
+        /* НДП + НДМ */
+        , CASE
+              WHEN ISNULL(TRY_CAST(a.[НДП] AS int), 0) = 1
+                OR ISNULL(TRY_CAST(a.[НДМ] AS int), 0) = 1
+                  THEN 1
+              ELSE 0
+          END AS is_ndp_ndm_flag
+
+        /* Пк2 отдельно */
+        , CASE
+              WHEN ISNULL(TRY_CAST(a.[Пк2] AS int), 0) = 1
+                  THEN 1
+              ELSE 0
+          END AS is_pk2_flag
+
+        /* От1 отдельно */
+        , CASE
+              WHEN ISNULL(TRY_CAST(a.[От1] AS int), 0) = 1
+                  THEN 1
+              ELSE 0
+          END AS is_ot1_flag
+
+        /* Пк3 + Пк6 */
+        , CASE
+              WHEN ISNULL(TRY_CAST(a.[Пк3] AS int), 0) = 1
+                OR ISNULL(TRY_CAST(a.[Пк6] AS int), 0) = 1
+                  THEN 1
+              ELSE 0
+          END AS is_pk3_pk6_flag
+
+        /* МПЛ */
+        , CASE
+              WHEN ISNULL(TRY_CAST(a.[Мпл] AS int), 0) = 1
+                  THEN 1
+              ELSE 0
+          END AS is_mpl_flag
+
+        /* Пнс */
+        , CASE
+              WHEN ISNULL(TRY_CAST(a.[Пнс] AS int), 0) = 1
+                  THEN 1
+              ELSE 0
+          END AS is_pns_flag
+
+        , ROW_NUMBER() OVER
+          (
+              PARTITION BY a.CON_ID
+              ORDER BY
+                    a.DT_UPDATE DESC
+                  , a.loaddate DESC
+          ) AS rn
+
+    FROM [ALM].[ehd].[attr_DepoFLConditions] a WITH (NOLOCK)
+
+    INNER JOIN #contracts c
+        ON a.CON_ID = c.con_id
+)
+
+SELECT
+      con_id
+    , is_nov_flag
+    , is_pr2_pr3_flag
+    , is_ndp_ndm_flag
+    , is_pk2_flag
+    , is_ot1_flag
+    , is_pk3_pk6_flag
+    , is_mpl_flag
+    , is_pns_flag
+INTO #attr_flags
+FROM attr_ranked
+WHERE rn = 1;
+
+
+CREATE UNIQUE CLUSTERED INDEX IX_attr_flags_con_id
+ON #attr_flags (con_id);
+
+
+/* ============================================================
+   3. КАТЕГОРИЯ ДОГОВОРА
+
+   Приоритет:
+
+   1. FLOAT
+   2. ФУ
+   3. Нов
+   4. Пр2 / Пр3
+   5. НДП / НДМ
+   6. Пк2
+   7. От1
+   8. Пк3 / Пк6
+   9. МПЛ
+   10. Пнс
+   11. Остальные
+   ============================================================ */
+
+SELECT
+      c.con_id
+    , c.dt_open
+    , c.dt_close
+
+    , CASE
+
+          /* 1. FLOAT */
+          WHEN c.is_float_flag = 1
+              THEN N'float'
+
+
+          /* 2. ФУ */
+          WHEN c.PROD_NAME IN
+          (
+                N'Надёжный прайм'
+              , N'Надёжный VIP'
+              , N'Надёжный премиум'
+              , N'Надёжный промо'
+              , N'Надёжный старт'
+              , N'Надёжный Т2'
+              , N'Надёжный Мегафон'
+              , N'Надёжный процент'
+              , N'Надёжныйпроцент'
+              , N'Могучий'
+              , N'Надёжный'
+          )
+              THEN N'fu'
+
+
+          /* 3. Нов */
+          WHEN ISNULL(a.is_nov_flag, 0) = 1
+              THEN N'nov'
+
+
+          /* 4. Пр2 / Пр3 */
+          WHEN ISNULL(a.is_pr2_pr3_flag, 0) = 1
+              THEN N'pr2_pr3'
+
+
+          /* 5. НДП / НДМ */
+          WHEN ISNULL(a.is_ndp_ndm_flag, 0) = 1
+              THEN N'ndp_ndm'
+
+
+          /* 6. Пк2 */
+          WHEN ISNULL(a.is_pk2_flag, 0) = 1
+              THEN N'pk2'
+
+
+          /* 7. От1 */
+          WHEN ISNULL(a.is_ot1_flag, 0) = 1
+              THEN N'ot1'
+
+
+          /* 8. Пк3 / Пк6 */
+          WHEN ISNULL(a.is_pk3_pk6_flag, 0) = 1
+              THEN N'pk3_pk6'
+
+
+          /* 9. МПЛ */
+          WHEN ISNULL(a.is_mpl_flag, 0) = 1
+              THEN N'mpl'
+
+
+          /* 10. Пнс */
+          WHEN ISNULL(a.is_pns_flag, 0) = 1
+              THEN N'pns'
+
+
+          /* 11. Остальные */
+          ELSE N'other'
+
+      END AS deposit_category
+
+INTO #contract_category
+
+FROM #contracts c
+
+LEFT JOIN #attr_flags a
+    ON a.con_id = c.con_id;
+
+
+CREATE UNIQUE CLUSTERED INDEX IX_contract_category_con_id
+ON #contract_category (con_id);
+
+
+/* ============================================================
+   4. ИСТОРИЯ САЛЬДО -> СОБЫТИЯ
+   ============================================================ */
+
+CREATE TABLE #daily_delta
+(
+      dt_rep date NOT NULL
+        PRIMARY KEY CLUSTERED
+
+    , delta_float decimal(38,6) NOT NULL
+    , delta_fu decimal(38,6) NOT NULL
+    , delta_nov decimal(38,6) NOT NULL
+    , delta_pr2_pr3 decimal(38,6) NOT NULL
+    , delta_ndp_ndm decimal(38,6) NOT NULL
+
+    , delta_pk2 decimal(38,6) NOT NULL
+    , delta_ot1 decimal(38,6) NOT NULL
+
+    , delta_pk3_pk6 decimal(38,6) NOT NULL
+    , delta_mpl decimal(38,6) NOT NULL
+    , delta_pns decimal(38,6) NOT NULL
+    , delta_other decimal(38,6) NOT NULL
+);
+
+
+;WITH saldo_clipped AS
+(
+    SELECT
+          cc.con_id
+        , cc.deposit_category
+        , CAST(s.OUT_RUB AS decimal(38,6)) AS out_rub
+
+        , bounds_from.effective_from
+        , bounds_to.effective_to
+
+    FROM [LIQUIDITY].[liq].[DepositContract_Saldo] s WITH (NOLOCK)
+
+    INNER JOIN #contract_category cc
+        ON cc.con_id = s.CON_ID
+
+
+    CROSS APPLY
+    (
+        SELECT MAX(v.dt) AS effective_from
+
+        FROM
+        (
+            VALUES
+                  (CAST(s.DT_FROM AS date))
+                , (cc.dt_open)
+                , (@DateFrom)
+        ) v(dt)
+
+    ) bounds_from
+
+
+    CROSS APPLY
+    (
+        SELECT MIN(v.dt) AS effective_to
+
+        FROM
+        (
+            VALUES
+                  (
+                      ISNULL(
+                          CAST(s.DT_TO AS date),
+                          @DateTo
+                      )
+                  )
+                , (
+                      ISNULL(
+                          cc.dt_close,
+                          @DateTo
+                      )
+                  )
+                , (@DateTo)
+        ) v(dt)
+
+    ) bounds_to
+
+
+    WHERE
+        s.DT_FROM <= @DateTo
+
+        AND
+        (
+            s.DT_TO IS NULL
+            OR s.DT_TO >= @DateFrom
         )
-    for maturity in maturities:
-        months = int(
-            round(
-                maturity * 12
-            )
+
+        AND s.OUT_RUB IS NOT NULL
+
+        AND bounds_from.effective_from
+            <= bounds_to.effective_to
+),
+
+
+saldo_events AS
+(
+    SELECT
+          e.event_date
+        , s.deposit_category
+        , e.delta
+
+    FROM saldo_clipped s
+
+    CROSS APPLY
+    (
+        VALUES
+
+        (
+              s.effective_from
+            , s.out_rub
         )
-        if key_rate_paths.shape[0] < months + 1:
-            raise ValueError(
-                f'Для срока {maturity:g}Y необходимо '
-                f'не менее {months + 1} строк в paths.'
-            )
-        # Ставки, соответствующие выплатам
-        # в месяцы 1...months.
-        rates = key_rate_paths[
-            1:months + 1,
-            :
-        ]
-        # Дисконт-факторы:
-        # DF(1M)...DF(months)
-        dfs = discount_factors_from_zcyc(
-            months
-        )[:, None]
-        for strike in strikes:
-            if option_type == 'cap':
-                intrinsic = np.maximum(
-                    rates - strike,
-                    0.0
-                )
-            else:
-                intrinsic = np.maximum(
-                    strike - rates,
-                    0.0
-                )
-            # Дисконтированный PV по каждому сценарию.
-            # Получаем долю от номинала.
-            scenario_pv_fraction = np.sum(
-                intrinsic
-                * accrual
-                * dfs,
-                axis=0
-            )
-            # Monte Carlo expectation
-            premium_fraction = np.mean(
-                scenario_pv_fraction
-            )
-            # Перевод доли номинала
-            # в проценты от номинала.
-            premium_percent = (
-                premium_fraction
-                * 100.0
-            )
-            result.loc[
-                f'{strike * 100:.1f}%',
-                f'{maturity:g}Y'
-            ] = premium_percent
-    return result
-def show_option_matrices(
-    cap_matrix,
-    floor_matrix
-):
-    print(
-        '\nCAP на ключевую ставку, '
-        'upfront % от номинала'
-    )
-    display(
-        cap_matrix.round(4)
-    )
-    print(
-        '\nFLOOR на ключевую ставку, '
-        'upfront % от номинала'
-    )
-    display(
-        floor_matrix.round(4)
-    )
 
-2. Метод 1: одна симуляция RUONIA на 360 месяцев
+        ,
 
-# =============================================================================
-# МЕТОД 1
-# ОДНА СИМУЛЯЦИЯ RUONIA НА 360 МЕСЯЦЕВ
-# =============================================================================
-np.random.seed(
-    option_seed
-)
-X_360_ruonia = MC_simulations(
-    T=360,
-    n_sim=n_sim_options,
-    a=opt_ats['a'],
-    theta=opt_ats['theta'],
-    s=opt_ats['s'],
-    debug=False
-)
-cap_matrix_method_1 = option_matrix_from_paths(
-    ruonia_paths=X_360_ruonia,
-    strikes=cap_strikes,
-    maturities=maturities_years,
-    option_type='cap',
-    basis=ks_minus_ruonia_basis
-)
-floor_matrix_method_1 = option_matrix_from_paths(
-    ruonia_paths=X_360_ruonia,
-    strikes=floor_strikes,
-    maturities=maturities_years,
-    option_type='floor',
-    basis=ks_minus_ruonia_basis
-)
-show_option_matrices(
-    cap_matrix_method_1,
-    floor_matrix_method_1
-)
+        (
+              CASE
+                  WHEN s.effective_to < @DateTo
+                      THEN DATEADD(day, 1, s.effective_to)
+                  ELSE NULL
+              END
 
-Пример перевода в рубли:
-
-premium_percent = (
-    cap_matrix_method_1.loc[
-        '15.0%',
-        '2Y'
-    ]
-)
-premium_rub = (
-    premium_percent
-    / 100.0
-    * notional_rub
-)
-print(
-    f'Cap на КС 15.0%, 2Y: '
-    f'{premium_percent:.4f}% '
-    f'= {premium_rub:,.0f} руб.'
-)
-
-3. Метод 2: отдельная симуляция RUONIA до каждого срока
-
-# =============================================================================
-# МЕТОД 2
-# ОТДЕЛЬНАЯ СИМУЛЯЦИЯ RUONIA ДО СРОКА КАЖДОГО ОПЦИОНА
-# =============================================================================
-def option_matrices_separate_horizons(
-    n_sim,
-    seed,
-    basis=ks_minus_ruonia_basis
-):
-    cap_result = pd.DataFrame(
-        index=[
-            f'{strike * 100:.1f}%'
-            for strike in cap_strikes
-        ],
-        columns=[
-            f'{maturity:g}Y'
-            for maturity in maturities_years
-        ],
-        dtype=float
-    )
-    floor_result = pd.DataFrame(
-        index=[
-            f'{strike * 100:.1f}%'
-            for strike in floor_strikes
-        ],
-        columns=[
-            f'{maturity:g}Y'
-            for maturity in maturities_years
-        ],
-        dtype=float
-    )
-    for maturity in maturities_years:
-        months = int(
-            round(
-                maturity * 12
-            )
+            , -s.out_rub
         )
-        # Возвращаем генератор к тому же seed,
-        # чтобы начальные случайные числа совпадали
-        # с общей 360-месячной симуляцией.
-        np.random.seed(
-            seed
-        )
-        ruonia_paths = MC_simulations(
-            T=months,
-            n_sim=n_sim,
-            a=opt_ats['a'],
-            theta=opt_ats['theta'],
-            s=opt_ats['s'],
-            debug=False
-        )
-        cap_one = option_matrix_from_paths(
-            ruonia_paths=ruonia_paths,
-            strikes=cap_strikes,
-            maturities=[maturity],
-            option_type='cap',
-            basis=basis
-        )
-        floor_one = option_matrix_from_paths(
-            ruonia_paths=ruonia_paths,
-            strikes=floor_strikes,
-            maturities=[maturity],
-            option_type='floor',
-            basis=basis
-        )
-        column = (
-            f'{maturity:g}Y'
-        )
-        cap_result[column] = (
-            cap_one[column]
-        )
-        floor_result[column] = (
-            floor_one[column]
-        )
-    return (
-        cap_result,
-        floor_result
-    )
-cap_matrix_method_2, floor_matrix_method_2 = (
-    option_matrices_separate_horizons(
-        n_sim=n_sim_options,
-        seed=option_seed,
-        basis=ks_minus_ruonia_basis
-    )
-)
-show_option_matrices(
-    cap_matrix_method_2,
-    floor_matrix_method_2
-)
 
-4. Полезно сразу сравнить с оценкой без basis
+    ) e(event_date, delta)
 
-Так вы увидите чистый эффект предположения, что КС выше RUONIA на 0,2 п.п.
+    WHERE
+        e.event_date IS NOT NULL
+),
 
-cap_matrix_ruonia_only = option_matrix_from_paths(
-    ruonia_paths=X_360_ruonia,
-    strikes=cap_strikes,
-    maturities=maturities_years,
-    option_type='cap',
-    basis=0.0
-)
-floor_matrix_ruonia_only = option_matrix_from_paths(
-    ruonia_paths=X_360_ruonia,
-    strikes=floor_strikes,
-    maturities=maturities_years,
-    option_type='floor',
-    basis=0.0
-)
-cap_basis_effect = (
-    cap_matrix_method_1
-    - cap_matrix_ruonia_only
-)
-floor_basis_effect = (
-    floor_matrix_method_1
-    - floor_matrix_ruonia_only
-)
-print(
-    '\nВлияние basis +0.20 п.п. на CAP, '
-    'п.п. upfront'
-)
-display(
-    cap_basis_effect.round(4)
-)
-print(
-    '\nВлияние basis +0.20 п.п. на FLOOR, '
-    'п.п. upfront'
-)
-display(
-    floor_basis_effect.round(4)
+
+events_agg AS
+(
+    SELECT
+          event_date
+
+        , SUM(
+              CASE WHEN deposit_category = N'float'
+                   THEN delta ELSE 0 END
+          ) AS delta_float
+
+        , SUM(
+              CASE WHEN deposit_category = N'fu'
+                   THEN delta ELSE 0 END
+          ) AS delta_fu
+
+        , SUM(
+              CASE WHEN deposit_category = N'nov'
+                   THEN delta ELSE 0 END
+          ) AS delta_nov
+
+        , SUM(
+              CASE WHEN deposit_category = N'pr2_pr3'
+                   THEN delta ELSE 0 END
+          ) AS delta_pr2_pr3
+
+        , SUM(
+              CASE WHEN deposit_category = N'ndp_ndm'
+                   THEN delta ELSE 0 END
+          ) AS delta_ndp_ndm
+
+
+        /* Пк2 отдельно */
+        , SUM(
+              CASE WHEN deposit_category = N'pk2'
+                   THEN delta ELSE 0 END
+          ) AS delta_pk2
+
+
+        /* От1 отдельно */
+        , SUM(
+              CASE WHEN deposit_category = N'ot1'
+                   THEN delta ELSE 0 END
+          ) AS delta_ot1
+
+
+        , SUM(
+              CASE WHEN deposit_category = N'pk3_pk6'
+                   THEN delta ELSE 0 END
+          ) AS delta_pk3_pk6
+
+        , SUM(
+              CASE WHEN deposit_category = N'mpl'
+                   THEN delta ELSE 0 END
+          ) AS delta_mpl
+
+        , SUM(
+              CASE WHEN deposit_category = N'pns'
+                   THEN delta ELSE 0 END
+          ) AS delta_pns
+
+        , SUM(
+              CASE WHEN deposit_category = N'other'
+                   THEN delta ELSE 0 END
+          ) AS delta_other
+
+    FROM saldo_events
+
+    GROUP BY
+        event_date
 )
 
-Ожидаемо:
 
-cap_basis_effect >= 0
-
-и:
-
-floor_basis_effect <= 0
-
-с точностью до численных погрешностей.
-
-Насколько это справедливо
-
-Для первого приближения — справедливо. Вы делаете явное предположение:
-
-KS_t-RUONIA_t=0{,}20\%
-
-на всех будущих датах и во всех сценариях.
-
-Но есть три ограничения.
-
-1. Разница не обязательно постоянна
-
-Фактический спред может зависеть от:
-
-* режима денежно-кредитной политики;
-* состояния ликвидности;
-* периода усреднения резервов;
-* ожиданий изменения КС;
-* технических факторов денежного рынка.
-
-Поэтому более реалистично было бы иметь:
-
-KS_t=RUONIA_t+b_t,
-
-где b_t может меняться.
-
-2. Текущий basis может отличаться от исторического среднего
-
-При текущей КС 14,25% предположение даёт текущую RUONIA:
-
-14{,}25\%-0{,}20\%=14{,}05\%.
-
-Стоит проверить, близко ли это к:
-
-X_360_ruonia[0, 0]
-
-Если модель стартует, например, с 13,70%, то после прибавления 0,20% стартовая модельная КС будет 13,90%, а не 14,25%.
-
-Проверка:
-
-model_ruonia_0 = float(
-    X_360_ruonia[0, 0]
-)
-model_key_rate_0 = (
-    model_ruonia_0
-    + ks_minus_ruonia_basis
-)
-print(
-    'Model RUONIA 0:',
-    model_ruonia_0
-)
-print(
-    'Model KS 0:',
-    model_key_rate_0
-)
-print(
-    'Actual KS:',
-    current_ks
-)
-print(
-    'Start mismatch:',
-    model_key_rate_0 - current_ks
+INSERT INTO #daily_delta
+(
+      dt_rep
+    , delta_float
+    , delta_fu
+    , delta_nov
+    , delta_pr2_pr3
+    , delta_ndp_ndm
+    , delta_pk2
+    , delta_ot1
+    , delta_pk3_pk6
+    , delta_mpl
+    , delta_pns
+    , delta_other
 )
 
-Если расхождение существенное, надо решить, что важнее:
+SELECT
+      event_date
+    , delta_float
+    , delta_fu
+    , delta_nov
+    , delta_pr2_pr3
+    , delta_ndp_ndm
+    , delta_pk2
+    , delta_ot1
+    , delta_pk3_pk6
+    , delta_mpl
+    , delta_pns
+    , delta_other
 
-* фиксированный исторический basis 0.002;
-* либо точное совпадение стартовой КС.
+FROM events_agg;
 
-3. Дисконтирование по RUONIA OIS остаётся нормальным
 
-Даже если payoff зависит от КС, дисконтировать его по OIS RUONIA-кривой логично:
+/* ============================================================
+   5. КАЛЕНДАРЬ + НАКОПИТЕЛЬНЫЕ ОСТАТКИ
+   ============================================================ */
 
-DF(0,t)=e^{-ZCYC(t)t}.
+;WITH calendar AS
+(
+    SELECT
+        @DateFrom AS dt_rep
 
-То есть:
+    UNION ALL
 
-* индекс payoff — ключевая ставка;
-* discount curve — OIS RUONIA.
+    SELECT
+        DATEADD(day, 1, dt_rep)
 
-Это нормальное разделение.
+    FROM calendar
 
-Итоговая схема:
+    WHERE dt_rep < @DateTo
+),
 
-\boxed{
-X_t^{RUONIA}
-\rightarrow
-X_t^{KS}=X_t^{RUONIA}+0{,}20\%
-\rightarrow
-\text{cap/floor payoff}
-\rightarrow
-\text{OIS-дисконтирование}
-}
+daily AS
+(
+    SELECT
+          c.dt_rep
 
-Она методологически понятнее предыдущей автоматической подгонки basis через current_ks - model_rate_0.
+        , ISNULL(d.delta_float, 0) AS delta_float
+        , ISNULL(d.delta_fu, 0) AS delta_fu
+        , ISNULL(d.delta_nov, 0) AS delta_nov
+        , ISNULL(d.delta_pr2_pr3, 0) AS delta_pr2_pr3
+        , ISNULL(d.delta_ndp_ndm, 0) AS delta_ndp_ndm
+
+        , ISNULL(d.delta_pk2, 0) AS delta_pk2
+        , ISNULL(d.delta_ot1, 0) AS delta_ot1
+
+        , ISNULL(d.delta_pk3_pk6, 0) AS delta_pk3_pk6
+        , ISNULL(d.delta_mpl, 0) AS delta_mpl
+        , ISNULL(d.delta_pns, 0) AS delta_pns
+        , ISNULL(d.delta_other, 0) AS delta_other
+
+    FROM calendar c
+
+    LEFT JOIN #daily_delta d
+        ON d.dt_rep = c.dt_rep
+),
+
+balances AS
+(
+    SELECT
+          dt_rep
+
+        , SUM(delta_float) OVER
+          (
+              ORDER BY dt_rep
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+          ) AS balance_float
+
+        , SUM(delta_fu) OVER
+          (
+              ORDER BY dt_rep
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+          ) AS balance_fu
+
+        , SUM(delta_nov) OVER
+          (
+              ORDER BY dt_rep
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+          ) AS balance_nov
+
+        , SUM(delta_pr2_pr3) OVER
+          (
+              ORDER BY dt_rep
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+          ) AS balance_pr2_pr3
+
+        , SUM(delta_ndp_ndm) OVER
+          (
+              ORDER BY dt_rep
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+          ) AS balance_ndp_ndm
+
+
+        /* Пк2 отдельно */
+        , SUM(delta_pk2) OVER
+          (
+              ORDER BY dt_rep
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+          ) AS balance_pk2
+
+
+        /* От1 отдельно */
+        , SUM(delta_ot1) OVER
+          (
+              ORDER BY dt_rep
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+          ) AS balance_ot1
+
+
+        , SUM(delta_pk3_pk6) OVER
+          (
+              ORDER BY dt_rep
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+          ) AS balance_pk3_pk6
+
+        , SUM(delta_mpl) OVER
+          (
+              ORDER BY dt_rep
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+          ) AS balance_mpl
+
+        , SUM(delta_pns) OVER
+          (
+              ORDER BY dt_rep
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+          ) AS balance_pns
+
+        , SUM(delta_other) OVER
+          (
+              ORDER BY dt_rep
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+          ) AS balance_other
+
+    FROM daily
+)
+
+
+/* ============================================================
+   6. РЕЗУЛЬТАТ
+   ============================================================ */
+
+SELECT
+      dt_rep
+
+    , balance_float
+    , balance_fu
+    , balance_nov
+    , balance_pr2_pr3
+    , balance_ndp_ndm
+
+    /* Теперь два отдельных столбца */
+    , balance_pk2
+    , balance_ot1
+
+    , balance_pk3_pk6
+    , balance_mpl
+    , balance_pns
+    , balance_other
+
+
+    /* Полный остаток */
+    , (
+          balance_float
+        + balance_fu
+        + balance_nov
+        + balance_pr2_pr3
+        + balance_ndp_ndm
+        + balance_pk2
+        + balance_ot1
+        + balance_pk3_pk6
+        + balance_mpl
+        + balance_pns
+        + balance_other
+      ) AS balance_total
+
+FROM balances
+
+ORDER BY
+    dt_rep
+
+OPTION (MAXRECURSION 0, RECOMPILE);
