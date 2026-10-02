@@ -1,25 +1,33 @@
 USE [ALM];
 SET NOCOUNT ON;
+SET DEADLOCK_PRIORITY LOW;
 
 
 /* ============================================================
    ПАРАМЕТРЫ
    ============================================================ */
 
-DECLARE @OpenFrom      date = '2026-09-22';
-DECLARE @OpenTo        date = '2026-10-01';
+DECLARE @HistoryFrom  date = '2026-07-01';
+DECLARE @BaseDate     date = '2026-09-22';
+DECLARE @AnalysisDate date = '2026-10-01';
 
-DECLARE @HistoryFrom   date = '2026-07-01';
-DECLARE @BaseDate      date = '2026-09-22';
-DECLARE @AnalysisDate  date = '2026-10-01';
+DECLARE @OpenFrom     date = '2026-09-22';
+DECLARE @OpenTo       date = '2026-10-01';
+
+/*
+    7 = читать историю недельными кусками.
+    Если БД тяжело -> поставить 3.
+*/
+DECLARE @ChunkDays int = 7;
 
 
 /* ============================================================
-   ЧИСТИМ TEMP
+   CLEANUP
    ============================================================ */
 
-DROP TABLE IF EXISTS #pk7_clients;
 DROP TABLE IF EXISTS #pk7_openings;
+DROP TABLE IF EXISTS #pk7_clients;
+DROP TABLE IF EXISTS #history;
 DROP TABLE IF EXISTS #bal_2209;
 DROP TABLE IF EXISTS #bal_0110;
 DROP TABLE IF EXISTS #relevant_con_ids;
@@ -27,61 +35,114 @@ DROP TABLE IF EXISTS #attr_latest;
 DROP TABLE IF EXISTS #exit_contracts;
 
 
+
 /* ============================================================
-   1. КОГОРТА:
-      клиенты, открывшие вклад с Пк7
-      с 22.09.2026 по 01.10.2026 включительно
+   1. ВКЛАДЫ Пк7, ОТКРЫТЫЕ 22.09 - 01.10
+
+   Сначала берём последнюю запись по каждому CON_ID.
    ============================================================ */
 
-SELECT DISTINCT
-      TRY_CAST(a.CLI_ID AS bigint)      AS cli_id
-    , TRY_CAST(a.CON_ID AS bigint)      AS con_id
-    , CAST(a.DT_OPEN_FACT AS date)      AS dt_open_fact
-    , CAST(a.DT_CLOSE_PLAN AS date)     AS dt_close_plan
-    , CAST(a.DT_CLOSE_FACT AS date)     AS dt_close_fact
+;WITH a AS
+(
+    SELECT
+          TRY_CAST(x.CON_ID AS bigint) AS con_id
+        , TRY_CAST(x.CLI_ID AS bigint) AS cli_id
 
-    , a.DEPOSIT_ADD_CONDITIONS
-    , a.PROMO_CODE
-    , a.PROMO_GROUP
-    , a.START_DEPOSIT
+        , x.DT_OPEN_FACT
+        , x.DT_CLOSE_PLAN
+        , x.DT_CLOSE_FACT
+
+        , x.DEPOSIT_ADD_CONDITIONS
+        , x.PROMO_CODE
+        , x.PROMO_GROUP
+        , x.START_DEPOSIT
+
+        , ISNULL(TRY_CAST(x.[Пк7] AS int),0) AS pk7
+
+        , ROW_NUMBER() OVER
+          (
+              PARTITION BY x.CON_ID
+              ORDER BY
+                    x.DT_UPDATE DESC
+                  , x.loaddate DESC
+          ) AS rn
+
+    FROM [ALM].[ehd].[attr_DepoFLConditions] x WITH (NOLOCK)
+
+    WHERE
+            x.DT_OPEN_FACT >= @OpenFrom
+        AND x.DT_OPEN_FACT < DATEADD(day,1,@OpenTo)
+)
+
+SELECT
+      con_id
+    , cli_id
+
+    , CAST(DT_OPEN_FACT AS date)  AS dt_open_fact
+    , CAST(DT_CLOSE_PLAN AS date) AS dt_close_plan
+    , CAST(DT_CLOSE_FACT AS date) AS dt_close_fact
+
+    , DEPOSIT_ADD_CONDITIONS
+    , PROMO_CODE
+    , PROMO_GROUP
+    , START_DEPOSIT
 
 INTO #pk7_openings
 
-FROM [ALM].[ehd].[attr_DepoFLConditions] a WITH (NOLOCK)
+FROM a
 
 WHERE
-        ISNULL(TRY_CAST(a.[Пк7] AS int),0) = 1
-    AND CAST(a.DT_OPEN_FACT AS date)
-            BETWEEN @OpenFrom AND @OpenTo
-    AND a.CLI_ID IS NOT NULL;
+        rn = 1
+    AND pk7 = 1
+    AND cli_id IS NOT NULL
+    AND con_id IS NOT NULL;
 
+
+CREATE UNIQUE CLUSTERED INDEX IX_pk7_openings_con
+    ON #pk7_openings(con_id);
 
 CREATE INDEX IX_pk7_openings_cli
-ON #pk7_openings(cli_id);
-
-CREATE INDEX IX_pk7_openings_con
-ON #pk7_openings(con_id);
+    ON #pk7_openings(cli_id);
 
 
 
-SELECT DISTINCT
-    cli_id
+/* ============================================================
+   2. КОГОРТА КЛИЕНТОВ
+
+   ВАЖНО:
+   создаём cli_id ТОГО ЖЕ ТИПА,
+   что cli_id во VW_balance_rest_all.
+
+   Поэтому дальше не нужен CAST(t.cli_id...)
+   на огромной view.
+   ============================================================ */
+
+SELECT TOP (0)
+    t.cli_id
 
 INTO #pk7_clients
 
-FROM #pk7_openings
-
-WHERE cli_id IS NOT NULL;
+FROM [ALM].[ALM].[VW_balance_rest_all] t;
 
 
-CREATE UNIQUE CLUSTERED INDEX IX_pk7_clients
-ON #pk7_clients(cli_id);
+INSERT INTO #pk7_clients
+(
+    cli_id
+)
+SELECT DISTINCT
+    p.cli_id
+
+FROM #pk7_openings p;
+
+
+CREATE UNIQUE CLUSTERED INDEX IX_pk7_clients_cli
+    ON #pk7_clients(cli_id);
 
 
 
 /* ============================================================
    РЕЗУЛЬТАТ 0
-   КАКИЕ ИМЕННО ВКЛАДЫ С Пк7 СФОРМИРОВАЛИ КОГОРТУ
+   КТО ВОШЁЛ В КОГОРТУ Пк7
    ============================================================ */
 
 SELECT
@@ -89,7 +150,6 @@ SELECT
     , con_id
     , dt_open_fact
     , dt_close_plan
-    , dt_close_fact
     , START_DEPOSIT
     , DEPOSIT_ADD_CONDITIONS
     , PROMO_CODE
@@ -99,192 +159,264 @@ FROM #pk7_openings
 
 ORDER BY
       cli_id
-    , dt_open_fact
     , con_id;
 
 
 
 /* ============================================================
-   2. ИСТОРИЯ БАЛАНСА ЭТИХ КЛИЕНТОВ
-      01.07.2026 - 22.09.2026
+   3. ИСТОРИЯ БАЛАНСА
 
-      Один клиент / одна дата:
-      - срочные
-      - НС
-      - общий баланс
+   ВМЕСТО ОДНОГО ЗАПРОСА ЗА 84 ДНЯ
+   ЧИТАЕМ КУСКАМИ ПО @ChunkDays.
+
+   В историю сохраняется только:
+   дата / вклады / НС / всего
+
+   То есть не раздуваем temp таблицу клиентскими строками.
    ============================================================ */
 
-SELECT
-      b.dt_rep
-    , CAST(b.cli_id AS bigint) AS cli_id
+CREATE TABLE #history
+(
+      dt_rep    date NOT NULL
+    , td_sum    decimal(38,2) NOT NULL
+    , ns_sum    decimal(38,2) NOT NULL
+    , total_sum decimal(38,2) NOT NULL
+);
 
-    , SUM(
-        CASE
-            WHEN b.section_name = N'Срочные'
-                THEN b.out_rub
-            ELSE 0
-        END
-      ) AS td_sum
 
-    , SUM(
-        CASE
-            WHEN b.section_name = N'Накопительный счёт'
-                THEN b.out_rub
-            ELSE 0
-        END
-      ) AS ns_sum
+DECLARE @ChunkFrom date = @HistoryFrom;
+DECLARE @ChunkTo   date;
 
-    , SUM(b.out_rub) AS total_sum
 
-FROM [ALM].[ALM].[VW_balance_rest_all] b WITH (NOLOCK)
+WHILE @ChunkFrom <= @BaseDate
+BEGIN
 
-INNER JOIN #pk7_clients c
-    ON c.cli_id = CAST(b.cli_id AS bigint)
+    SET @ChunkTo =
+        DATEADD(day,@ChunkDays,@ChunkFrom);
 
-WHERE
-        b.dt_rep BETWEEN @HistoryFrom AND @BaseDate
+    IF @ChunkTo > DATEADD(day,1,@BaseDate)
+        SET @ChunkTo = DATEADD(day,1,@BaseDate);
 
-    AND b.section_name IN
+
+    INSERT INTO #history
+    (
+          dt_rep
+        , td_sum
+        , ns_sum
+        , total_sum
+    )
+
+    SELECT
+          t.dt_rep
+
+        , SUM(
+            CASE
+                WHEN t.section_name = N'Срочные'
+                    THEN t.out_rub
+                ELSE 0
+            END
+          ) AS td_sum
+
+        , SUM(
+            CASE
+                WHEN t.section_name = N'Накопительный счёт'
+                    THEN t.out_rub
+                ELSE 0
+            END
+          ) AS ns_sum
+
+        , SUM(t.out_rub) AS total_sum
+
+    FROM [ALM].[ALM].[VW_balance_rest_all] t WITH (NOLOCK)
+
+    INNER JOIN #pk7_clients c
+        ON c.cli_id = t.cli_id
+
+    WHERE
+            t.dt_rep >= @ChunkFrom
+        AND t.dt_rep <  @ChunkTo
+
+        AND t.section_name IN
         (
             N'Срочные',
             N'Накопительный счёт'
         )
 
-    AND b.block_name = N'Привлечение ФЛ'
-    AND b.acc_role   = N'LIAB'
-    AND b.od_flag    = 1
-    AND b.cur        = '810'
+        AND t.block_name = N'Привлечение ФЛ'
+        AND t.acc_role   = N'LIAB'
+        AND t.od_flag    = 1
+        AND t.cur        = '810'
 
-    AND b.out_rub IS NOT NULL
-    AND b.out_rub >= 0
+        AND t.out_rub IS NOT NULL
+        AND t.out_rub >= 0
 
-GROUP BY
-      b.dt_rep
-    , CAST(b.cli_id AS bigint)
+    GROUP BY
+        t.dt_rep
 
-ORDER BY
-      cli_id
-    , dt_rep
+    OPTION
+    (
+        RECOMPILE,
+        MAXDOP 2
+    );
 
-OPTION (RECOMPILE);
+
+    SET @ChunkFrom = @ChunkTo;
+
+
+    /*
+        Небольшая пауза между тяжёлыми чтениями.
+        Можно убрать ночью.
+    */
+    IF @ChunkFrom <= @BaseDate
+        WAITFOR DELAY '00:00:01';
+
+END;
 
 
 
 /* ============================================================
-   3. SNAPSHOT НА 22.09
+   РЕЗУЛЬТАТ 1
+   ДИНАМИКА КОГОРТЫ
    ============================================================ */
 
 SELECT
-      CAST(b.cli_id AS bigint)          AS cli_id
-    , CAST(b.con_id AS bigint)          AS con_id
+      dt_rep
+    , td_sum
+    , ns_sum
+    , total_sum
 
-    , CAST(b.dt_open AS date)           AS dt_open
-    , CAST(b.dt_close_plan AS date)     AS dt_close_plan
+FROM #history
 
-    , b.section_name
-    , b.PROD_NAME_res
-    , b.TSEGMENTNAME
+ORDER BY dt_rep;
 
-    , CAST(b.out_rub AS decimal(38,2))  AS out_rub
 
-    , b.rate_con
-    , b.termdays
+
+/* ============================================================
+   4. SNAPSHOT 22.09
+
+   Один день -> намного легче истории.
+   ============================================================ */
+
+SELECT
+      t.cli_id
+    , t.con_id
+
+    , CAST(t.dt_open AS date)       AS dt_open
+    , CAST(t.dt_close_plan AS date) AS dt_close_plan
+
+    , t.section_name
+    , t.PROD_NAME_res
+    , t.TSEGMENTNAME
+
+    , CAST(t.out_rub AS decimal(38,2)) AS out_rub
+
+    , t.rate_con
+    , t.termdays
 
 INTO #bal_2209
 
-FROM [ALM].[ALM].[VW_balance_rest_all] b WITH (NOLOCK)
+FROM [ALM].[ALM].[VW_balance_rest_all] t WITH (NOLOCK)
 
 INNER JOIN #pk7_clients c
-    ON c.cli_id = CAST(b.cli_id AS bigint)
+    ON c.cli_id = t.cli_id
 
 WHERE
-        b.dt_rep = @BaseDate
+        t.dt_rep = @BaseDate
 
-    AND b.section_name IN
-        (
-            N'Срочные',
-            N'Накопительный счёт'
-        )
+    AND t.section_name IN
+    (
+        N'Срочные',
+        N'Накопительный счёт'
+    )
 
-    AND b.block_name = N'Привлечение ФЛ'
-    AND b.acc_role   = N'LIAB'
-    AND b.od_flag    = 1
-    AND b.cur        = '810'
+    AND t.block_name = N'Привлечение ФЛ'
+    AND t.acc_role   = N'LIAB'
+    AND t.od_flag    = 1
+    AND t.cur        = '810'
 
-    AND b.out_rub IS NOT NULL
-    AND b.out_rub >= 0
+    AND t.out_rub IS NOT NULL
+    AND t.out_rub >= 0
 
-OPTION (RECOMPILE);
+OPTION
+(
+    RECOMPILE,
+    MAXDOP 2
+);
 
 
-CREATE INDEX IX_bal2209_cli
-ON #bal_2209(cli_id);
+CREATE INDEX IX_bal_2209_cli
+    ON #bal_2209(cli_id);
 
-CREATE INDEX IX_bal2209_con
-ON #bal_2209(con_id);
+CREATE INDEX IX_bal_2209_con
+    ON #bal_2209(con_id);
 
 
 
 /* ============================================================
-   4. SNAPSHOT НА 01.10
+   5. SNAPSHOT 01.10
    ============================================================ */
 
 SELECT
-      CAST(b.cli_id AS bigint)          AS cli_id
-    , CAST(b.con_id AS bigint)          AS con_id
+      t.cli_id
+    , t.con_id
 
-    , CAST(b.dt_open AS date)           AS dt_open
-    , CAST(b.dt_close_plan AS date)     AS dt_close_plan
+    , CAST(t.dt_open AS date)       AS dt_open
+    , CAST(t.dt_close_plan AS date) AS dt_close_plan
 
-    , b.section_name
-    , b.PROD_NAME_res
-    , b.TSEGMENTNAME
+    , t.section_name
+    , t.PROD_NAME_res
+    , t.TSEGMENTNAME
 
-    , CAST(b.out_rub AS decimal(38,2))  AS out_rub
+    , CAST(t.out_rub AS decimal(38,2)) AS out_rub
 
-    , b.rate_con
-    , b.termdays
+    , t.rate_con
+    , t.termdays
 
 INTO #bal_0110
 
-FROM [ALM].[ALM].[VW_balance_rest_all] b WITH (NOLOCK)
+FROM [ALM].[ALM].[VW_balance_rest_all] t WITH (NOLOCK)
 
 INNER JOIN #pk7_clients c
-    ON c.cli_id = CAST(b.cli_id AS bigint)
+    ON c.cli_id = t.cli_id
 
 WHERE
-        b.dt_rep = @AnalysisDate
+        t.dt_rep = @AnalysisDate
 
-    AND b.section_name IN
-        (
-            N'Срочные',
-            N'Накопительный счёт'
-        )
+    AND t.section_name IN
+    (
+        N'Срочные',
+        N'Накопительный счёт'
+    )
 
-    AND b.block_name = N'Привлечение ФЛ'
-    AND b.acc_role   = N'LIAB'
-    AND b.od_flag    = 1
-    AND b.cur        = '810'
+    AND t.block_name = N'Привлечение ФЛ'
+    AND t.acc_role   = N'LIAB'
+    AND t.od_flag    = 1
+    AND t.cur        = '810'
 
-    AND b.out_rub IS NOT NULL
-    AND b.out_rub >= 0
+    AND t.out_rub IS NOT NULL
+    AND t.out_rub >= 0
 
-OPTION (RECOMPILE);
+OPTION
+(
+    RECOMPILE,
+    MAXDOP 2
+);
 
 
-CREATE INDEX IX_bal0110_cli
-ON #bal_0110(cli_id);
+CREATE INDEX IX_bal_0110_cli
+    ON #bal_0110(cli_id);
 
-CREATE INDEX IX_bal0110_con
-ON #bal_0110(con_id);
+CREATE INDEX IX_bal_0110_con
+    ON #bal_0110(con_id);
 
 
 
 /* ============================================================
-   5. ВСЕ НУЖНЫЕ CON_ID
+   6. НУЖНЫЕ CON_ID
    ============================================================ */
 
-SELECT con_id
+SELECT DISTINCT
+    con_id
 
 INTO #relevant_con_ids
 
@@ -294,27 +426,27 @@ FROM
     FROM #bal_2209
     WHERE con_id IS NOT NULL
 
-    UNION
+    UNION ALL
 
     SELECT con_id
     FROM #bal_0110
     WHERE con_id IS NOT NULL
 
-    UNION
+    UNION ALL
 
     SELECT con_id
     FROM #pk7_openings
     WHERE con_id IS NOT NULL
-) q;
+) x;
 
 
 CREATE UNIQUE CLUSTERED INDEX IX_relevant_con_ids
-ON #relevant_con_ids(con_id);
+    ON #relevant_con_ids(con_id);
 
 
 
 /* ============================================================
-   6. ПОСЛЕДНЯЯ ЗАПИСЬ ПО НАДБАВКАМ / УСЛОВИЯМ ВКЛАДА
+   7. ПОСЛЕДНИЕ ПРИЗНАКИ НАДБАВОК
    ============================================================ */
 
 ;WITH a AS
@@ -381,8 +513,10 @@ SELECT
     , [Зрп]
     , [Пнс]
     , [Нов]
+
     , [НДП]
     , [НДМ]
+
     , [Мпл]
 
     , [Прл]
@@ -413,15 +547,12 @@ WHERE rn = 1;
 
 
 CREATE UNIQUE CLUSTERED INDEX IX_attr_latest
-ON #attr_latest(con_id);
+    ON #attr_latest(con_id);
 
 
 
 /* ============================================================
-   7. ВКЛАДЫ К ВЫХОДУ НА 22.09
-
-      Вклад существует на 22.09
-      и планово заканчивается 22.09-01.10
+   8. ВКЛАДЫ К ВЫХОДУ НА 22.09
    ============================================================ */
 
 SELECT
@@ -431,7 +562,9 @@ SELECT
     , b.dt_open
     , b.dt_close_plan
 
-    , DATEDIFF(day,b.dt_open,b.dt_close_plan) AS term_days_calc
+    , DATEDIFF(day,b.dt_open,b.dt_close_plan)
+        AS term_days_calc
+
     , b.termdays
 
     , b.PROD_NAME_res
@@ -448,8 +581,10 @@ SELECT
     , a.[Зрп]
     , a.[Пнс]
     , a.[Нов]
+
     , a.[НДП]
     , a.[НДМ]
+
     , a.[Мпл]
 
     , a.[Прл]
@@ -481,17 +616,20 @@ LEFT JOIN #attr_latest a
 
 WHERE
         b.section_name = N'Срочные'
-    AND b.dt_close_plan BETWEEN @BaseDate AND @AnalysisDate;
+
+    AND b.dt_close_plan >= @BaseDate
+    AND b.dt_close_plan <= @AnalysisDate;
 
 
 
 /* ============================================================
-   РЕЗУЛЬТАТ 1
-   ПОКОНТРАКТНАЯ ВЫГРУЗКА ВКЛАДОВ К ВЫХОДУ
+   РЕЗУЛЬТАТ 2
+   ПОКОНТРАКТНЫЕ ВКЛАДЫ К ВЫХОДУ
    ============================================================ */
 
 SELECT *
 FROM #exit_contracts
+
 ORDER BY
       cli_id
     , dt_close_plan
@@ -500,15 +638,13 @@ ORDER BY
 
 
 /* ============================================================
-   РЕЗУЛЬТАТ 2
-   ПОКЛИЕНТНЫЙ СРЕЗ НА 22.09
+   РЕЗУЛЬТАТ 3
+   КЛИЕНТ НА 22.09
 
-   - был ли вклад к выходу
-   - объём вкладов к выходу
-   - количество вкладов к выходу
-   - есть ли ненулевой НС
+   - есть вклад к выходу
+   - объём
+   - количество
    - остаток НС
-   - прочие вклады
    ============================================================ */
 
 ;WITH exit_agg AS
@@ -516,7 +652,7 @@ ORDER BY
     SELECT
           cli_id
         , COUNT(DISTINCT con_id) AS exit_td_count
-        , SUM(out_rub) AS exit_td_sum
+        , SUM(out_rub)           AS exit_td_sum
 
     FROM #exit_contracts
 
@@ -531,30 +667,8 @@ ns AS
 
     FROM #bal_2209
 
-    WHERE section_name = N'Накопительный счёт'
-
-    GROUP BY cli_id
-),
-
-other_td AS
-(
-    SELECT
-          cli_id
-
-        , SUM(
-            CASE
-                WHEN NOT (
-                        dt_close_plan BETWEEN @BaseDate
-                                          AND @AnalysisDate
-                    )
-                THEN out_rub
-                ELSE 0
-            END
-          ) AS other_td_sum
-
-    FROM #bal_2209
-
-    WHERE section_name = N'Срочные'
+    WHERE
+        section_name = N'Накопительный счёт'
 
     GROUP BY cli_id
 )
@@ -563,21 +677,25 @@ SELECT
       c.cli_id
 
     , CASE
-        WHEN e.cli_id IS NOT NULL THEN 1
-        ELSE 0
+          WHEN e.cli_id IS NOT NULL
+              THEN 1
+          ELSE 0
       END AS has_exit_td_flag
 
-    , ISNULL(e.exit_td_count,0) AS exit_td_count
-    , ISNULL(e.exit_td_sum,0)   AS exit_td_sum
+    , ISNULL(e.exit_td_count,0)
+        AS exit_td_count
+
+    , ISNULL(e.exit_td_sum,0)
+        AS exit_td_sum
 
     , CASE
-        WHEN ISNULL(n.ns_sum,0) > 0 THEN 1
-        ELSE 0
+          WHEN ISNULL(n.ns_sum,0) > 0
+              THEN 1
+          ELSE 0
       END AS has_ns_nonzero_flag
 
-    , ISNULL(n.ns_sum,0) AS ns_sum
-
-    , ISNULL(o.other_td_sum,0) AS other_td_sum
+    , ISNULL(n.ns_sum,0)
+        AS ns_sum
 
 FROM #pk7_clients c
 
@@ -587,23 +705,18 @@ LEFT JOIN exit_agg e
 LEFT JOIN ns n
     ON n.cli_id = c.cli_id
 
-LEFT JOIN other_td o
-    ON o.cli_id = c.cli_id
-
-ORDER BY c.cli_id;
+ORDER BY
+    c.cli_id;
 
 
 
 /* ============================================================
-   РЕЗУЛЬТАТ 3
-   СОСТОЯНИЕ НА 01.10
+   РЕЗУЛЬТАТ 4
+   ЧТО КЛИЕНТ ИМЕЕТ НА 01.10
 
-   Для каждого клиента:
-   - сколько новых вкладов Пк7
-   - объём новых вкладов Пк7
-   - сколько остальных новых вкладов
-   - объём остальных новых вкладов
-   - всего новых вкладов
+   Вклады, открытые 22.09-01.10:
+   - Пк7
+   - остальные
    - НС на 01.10
    ============================================================ */
 
@@ -630,7 +743,9 @@ ORDER BY c.cli_id;
 
     WHERE
             b.section_name = N'Срочные'
-        AND b.dt_open BETWEEN @OpenFrom AND @OpenTo
+
+        AND b.dt_open >= @OpenFrom
+        AND b.dt_open <= @OpenTo
 
     GROUP BY
           b.cli_id
@@ -656,7 +771,6 @@ opened_client AS
             END
           ) AS opened_pk7_sum
 
-
         , SUM(
             CASE
                 WHEN is_pk7 = 0 THEN 1
@@ -670,7 +784,6 @@ opened_client AS
                 ELSE 0
             END
           ) AS opened_other_sum
-
 
         , COUNT(*) AS opened_total_count
         , SUM(out_rub) AS opened_total_sum
@@ -688,7 +801,8 @@ ns AS
 
     FROM #bal_0110
 
-    WHERE section_name = N'Накопительный счёт'
+    WHERE
+        section_name = N'Накопительный счёт'
 
     GROUP BY cli_id
 )
@@ -725,18 +839,5 @@ LEFT JOIN opened_client o
 LEFT JOIN ns n
     ON n.cli_id = c.cli_id
 
-ORDER BY c.cli_id;
-
-
-
-/* ============================================================
-   CLEANUP
-   ============================================================ */
-
-DROP TABLE IF EXISTS #exit_contracts;
-DROP TABLE IF EXISTS #attr_latest;
-DROP TABLE IF EXISTS #relevant_con_ids;
-DROP TABLE IF EXISTS #bal_0110;
-DROP TABLE IF EXISTS #bal_2209;
-DROP TABLE IF EXISTS #pk7_openings;
-DROP TABLE IF EXISTS #pk7_clients;
+ORDER BY
+    c.cli_id;
