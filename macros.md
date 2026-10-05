@@ -6,11 +6,11 @@ SET NOCOUNT ON;
    ПАРАМЕТРЫ
    ============================================================ */
 
-DECLARE @dt_rep       date = '2026-10-03';   -- snapshot для первого отчёта
-DECLARE @date_from    date = '2026-10-01';   -- открытия с
-DECLARE @date_to      date = '2026-10-03';   -- открытия по
+DECLARE @dt_rep       date = '2026-10-03';
+DECLARE @date_from    date = '2026-10-01';
+DECLARE @date_to      date = '2026-10-03';
 
-DECLARE @control_dt   date = '2026-09-30';   -- дата проверки A/B/C
+DECLARE @control_dt   date = '2026-09-30';
 
 DECLARE @eps decimal(9,6) = 0.0005;
 
@@ -18,11 +18,8 @@ DECLARE @eps decimal(9,6) = 0.0005;
 
 /* ============================================================
    ============================================================
-   1. ПЕРВЫЙ ОТЧЁТ:
-      ОТКРЫТИЯ + ОБЫЧНЫЕ СРОКИ + РК
-
-      РК определяется напрямую через:
-      ALM_TEST.WORK.promo_new_money_rate_dict
+   1. ОСНОВНОЙ ОТЧЁТ
+      ОБЫЧНЫЕ СРОКИ + РК
    ============================================================
    ============================================================ */
 
@@ -48,7 +45,8 @@ DECLARE @eps decimal(9,6) = 0.0005;
        AND fk.TERM   = t.termdays
 
     WHERE
-        t.dt_rep       = @dt_rep
+        t.dt_rep = @dt_rep
+
         AND t.section_name = N'Срочные'
         AND t.block_name   = N'Привлечение ФЛ'
         AND t.acc_role     = N'LIAB'
@@ -61,7 +59,8 @@ DECLARE @eps decimal(9,6) = 0.0005;
         AND CAST(t.dt_open AS date)
             BETWEEN @date_from AND @date_to
 
-        /* ФУ как и раньше не входят */
+
+        /* ФУ как и в исходном скрипте исключаем */
         AND t.PROD_NAME_res NOT IN
         (
               N'Надёжный прайм'
@@ -80,44 +79,84 @@ DECLARE @eps decimal(9,6) = 0.0005;
 ),
 
 
+
+/* ============================================================
+   ОДНА СТРОКА НА ДОГОВОР
+   ============================================================ */
+
 by_con AS
 (
     SELECT
-          dt_open
-        , con_id
-        , MIN(cli_id) AS cli_id
+          b.dt_open
+        , b.con_id
 
-        , SUM(out_rub) AS out_rub
-        , MIN(rate_con) AS rate_con_class
-        , MIN(termdays) AS termdays
+        , MIN(b.cli_id) AS cli_id
+
+        , SUM(b.out_rub) AS out_rub
+
+        , MIN(b.rate_con) AS rate_con_class
+
+        , MIN(b.termdays) AS termdays
+
+
+        /* ====================================================
+           КОНВЕНЦИЯ ДЛЯ СПРАВОЧНИКА
+
+           NULL / пусто / AT_THE_END -> AT_THE_END
+           ВСЁ ОСТАЛЬНОЕ            -> NOT_AT_THE_END
+
+           Поэтому 1M и любые другие значения
+           корректно попадают в NOT_AT_THE_END
+           ==================================================== */
 
         , CASE
-            WHEN MIN(
+
+            WHEN
+                MIN(
                     NULLIF(
-                        LTRIM(RTRIM(COALESCE(conv,''))),
+                        LTRIM(RTRIM(COALESCE(b.conv,''))),
                         ''
                     )
-                 ) IS NULL
+                ) IS NULL
+
                 THEN 'AT_THE_END'
 
-            ELSE UPPER(
-                    LTRIM(RTRIM(MIN(conv)))
-                 )
-          END AS conv_norm
+
+            WHEN
+                UPPER(
+                    LTRIM(
+                        RTRIM(
+                            MIN(
+                                NULLIF(
+                                    LTRIM(RTRIM(COALESCE(b.conv,''))),
+                                    ''
+                                )
+                            )
+                        )
+                    )
+                ) = 'AT_THE_END'
+
+                THEN 'AT_THE_END'
+
+
+            ELSE 'NOT_AT_THE_END'
+
+          END AS conv_type_dict
+
 
 
         /* клиентская ставка */
         , SUM(
             CASE
-                WHEN rate_con IS NOT NULL
-                    THEN out_rub * rate_con
+                WHEN b.rate_con IS NOT NULL
+                    THEN b.out_rub * b.rate_con
             END
           ) AS wsum_rate_con
 
         , SUM(
             CASE
-                WHEN rate_con IS NOT NULL
-                    THEN out_rub
+                WHEN b.rate_con IS NOT NULL
+                    THEN b.out_rub
             END
           ) AS wden_rate_con
 
@@ -125,15 +164,15 @@ by_con AS
         /* ТС */
         , SUM(
             CASE
-                WHEN rate_trf IS NOT NULL
-                    THEN out_rub * rate_trf
+                WHEN b.rate_trf IS NOT NULL
+                    THEN b.out_rub * b.rate_trf
             END
           ) AS wsum_rate_trf
 
         , SUM(
             CASE
-                WHEN rate_trf IS NOT NULL
-                    THEN out_rub
+                WHEN b.rate_trf IS NOT NULL
+                    THEN b.out_rub
             END
           ) AS wden_rate_trf
 
@@ -141,33 +180,38 @@ by_con AS
         /* прогнозный КС */
         , SUM(
             CASE
-                WHEN AVG_KEY_RATE IS NOT NULL
-                    THEN out_rub * AVG_KEY_RATE
+                WHEN b.AVG_KEY_RATE IS NOT NULL
+                    THEN b.out_rub * b.AVG_KEY_RATE
             END
           ) AS wsum_avg_key_rate
 
         , SUM(
             CASE
-                WHEN AVG_KEY_RATE IS NOT NULL
-                    THEN out_rub
+                WHEN b.AVG_KEY_RATE IS NOT NULL
+                    THEN b.out_rub
             END
           ) AS wden_avg_key_rate
 
-    FROM base
+    FROM base b
 
     GROUP BY
-          dt_open
-        , con_id
+          b.dt_open
+        , b.con_id
 ),
 
+
+
+/* ============================================================
+   НАДБАВКИ
+   ============================================================ */
 
 attr_ranked AS
 (
     SELECT
           TRY_CAST(a.CON_ID AS bigint) AS con_id
 
-        /* запрещённые для РК надбавки */
         , CASE
+
             WHEN
                    ISNULL(TRY_CAST(a.[Пк3] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[Пк6] AS int),0) = 1
@@ -183,12 +227,16 @@ attr_ranked AS
                 OR ISNULL(TRY_CAST(a.[Пнс] AS int),0) = 1
 
                 THEN 1
+
             ELSE 0
+
           END AS forbidden_markup
+
 
         , ROW_NUMBER() OVER
           (
               PARTITION BY a.CON_ID
+
               ORDER BY
                     a.DT_UPDATE DESC
                   , a.loaddate DESC
@@ -197,7 +245,8 @@ attr_ranked AS
     FROM ALM.ehd.attr_DepoFLConditions a WITH (NOLOCK)
 
     INNER JOIN by_con b
-        ON b.con_id = TRY_CAST(a.CON_ID AS bigint)
+        ON b.con_id =
+           TRY_CAST(a.CON_ID AS bigint)
 ),
 
 
@@ -213,12 +262,16 @@ attr AS
 ),
 
 
+
+/* ============================================================
+   ОБЫЧНЫЙ БАКЕТ
+   ============================================================ */
+
 prepared AS
 (
     SELECT
           b.*
 
-        /* обычный бакет срока */
         , CASE
             WHEN termdays BETWEEN 28   AND 44   THEN 31
             WHEN termdays BETWEEN 45   AND 79   THEN 61
@@ -248,70 +301,111 @@ prepared AS
 ),
 
 
+
+/* ============================================================
+   МАТЧ К СПРАВОЧНИКУ РК
+   ============================================================ */
+
 classified AS
 (
     SELECT
           p.*
 
-        /* если матчится справочник — берём его term_bucket */
-        , d.term_bucket AS promo_term_bucket
+        , d.term_bucket
+            AS promo_term_bucket
 
         , CASE
             WHEN d.term_bucket IS NOT NULL
              AND p.forbidden_markup = 0
                 THEN 1
+
             ELSE 0
           END AS is_rk
 
+
     FROM prepared p
+
 
     OUTER APPLY
     (
         SELECT TOP (1)
-            r.term_bucket
 
-        FROM ALM_TEST.WORK.promo_new_money_rate_dict r
+              r.term_bucket
+            , r.id
+
+        FROM
+            ALM_TEST.WORK.promo_new_money_rate_dict r
             WITH (NOLOCK)
 
         WHERE
             r.is_active = 1
 
+
             /* дата открытия */
             AND p.dt_open
                 BETWEEN r.date_from AND r.date_to
+
 
             /* срок */
             AND p.termdays
                 BETWEEN r.term_min AND r.term_max
 
-            /* тип выплаты */
-            AND p.conv_norm = r.conv_type
+
+            /* =================================================
+               КОНВЕНЦИЯ
+
+               p.conv_type_dict уже принимает только:
+
+               AT_THE_END
+               NOT_AT_THE_END
+
+               поэтому:
+
+               1M -> NOT_AT_THE_END
+               что угодно кроме AT_THE_END -> NOT_AT_THE_END
+               ================================================= */
+
+            AND p.conv_type_dict = r.conv_type
+
 
             /* сумма */
             AND p.out_rub
                 BETWEEN r.amount_from AND r.amount_to
 
+
             /* ставка */
             AND ABS(
-                    p.rate_con_class - r.promo_rate
+                    p.rate_con_class
+                    - r.promo_rate
                 ) <= @eps
+
 
         ORDER BY
               r.date_from DESC
             , r.id DESC
+
     ) d
 ),
 
 
+
+/* ============================================================
+   TALL
+   ============================================================ */
+
 tall AS
 (
+
     /* ========================================================
-       ОБЫЧНЫЕ ВКЛАДЫ
+       НЕ РК
        ======================================================== */
 
     SELECT
-          CAST(normal_term_bucket AS nvarchar(20))
-            AS [Срок, дн.]
+
+          CAST(
+              normal_term_bucket
+              AS nvarchar(20)
+          ) AS [Срок, дн.]
 
         , dt_open
             AS [Дата открытия]
@@ -319,37 +413,57 @@ tall AS
         , SUM(out_rub)
             AS [Объем, руб.]
 
+
         , CAST(
             SUM(wsum_rate_con)
-            / NULLIF(SUM(wden_rate_con),0)
+            /
+            NULLIF(
+                SUM(wden_rate_con),
+                0
+            )
             AS decimal(9,6)
           ) AS [Средневзв. ставка (клиент)]
 
+
         , CAST(
             SUM(wsum_rate_trf)
-            / NULLIF(SUM(wden_rate_trf),0)
+            /
+            NULLIF(
+                SUM(wden_rate_trf),
+                0
+            )
             AS decimal(9,6)
           ) AS [Средневзв. ставка (ТС)]
 
+
         , CAST(
             SUM(wsum_avg_key_rate)
-            / NULLIF(SUM(wden_avg_key_rate),0)
+            /
+            NULLIF(
+                SUM(wden_avg_key_rate),
+                0
+            )
             AS decimal(9,6)
           ) AS [Средневзв. прогнозный КС]
+
 
         , normal_term_bucket AS sort_term
         , 0 AS sort_rk
 
+
     FROM classified
 
-    WHERE is_rk = 0
+    WHERE
+        is_rk = 0
 
     GROUP BY
           normal_term_bucket
         , dt_open
 
 
+
     UNION ALL
+
 
 
     /* ========================================================
@@ -357,8 +471,11 @@ tall AS
        ======================================================== */
 
     SELECT
-          CONCAT(promo_term_bucket,N' РК')
-            AS [Срок, дн.]
+
+          CONCAT(
+              promo_term_bucket,
+              N' РК'
+          ) AS [Срок, дн.]
 
         , dt_open
             AS [Дата открытия]
@@ -366,30 +483,48 @@ tall AS
         , SUM(out_rub)
             AS [Объем, руб.]
 
+
         , CAST(
             SUM(wsum_rate_con)
-            / NULLIF(SUM(wden_rate_con),0)
+            /
+            NULLIF(
+                SUM(wden_rate_con),
+                0
+            )
             AS decimal(9,6)
           ) AS [Средневзв. ставка (клиент)]
 
+
         , CAST(
             SUM(wsum_rate_trf)
-            / NULLIF(SUM(wden_rate_trf),0)
+            /
+            NULLIF(
+                SUM(wden_rate_trf),
+                0
+            )
             AS decimal(9,6)
           ) AS [Средневзв. ставка (ТС)]
 
+
         , CAST(
             SUM(wsum_avg_key_rate)
-            / NULLIF(SUM(wden_avg_key_rate),0)
+            /
+            NULLIF(
+                SUM(wden_avg_key_rate),
+                0
+            )
             AS decimal(9,6)
           ) AS [Средневзв. прогнозный КС]
+
 
         , promo_term_bucket AS sort_term
         , 1 AS sort_rk
 
+
     FROM classified
 
-    WHERE is_rk = 1
+    WHERE
+        is_rk = 1
 
     GROUP BY
           promo_term_bucket
@@ -397,8 +532,9 @@ tall AS
 )
 
 
+
 /* ============================================================
-   RESULT SET №1
+   RESULT SET 1
    ============================================================ */
 
 SELECT
@@ -418,20 +554,11 @@ ORDER BY
 
 
 
+
+
 /* ============================================================
    ============================================================
-   2. КОНТРОЛЬ A / B / C НА @control_dt
-
-   A = НОВ / НДП / НДМ
-
-   B = договор подходит под
-       ALM_TEST.WORK.promo_new_money_rate_dict
-
-   C = прочие надбавки:
-       Пк3 Пк6 Пк7
-       Пр2 Пр3
-       Пк2 От1
-       Мпл Пнс
+   2. ПРОВЕРКА A / B / C НА БАЛАНСЕ
    ============================================================
    ============================================================ */
 
@@ -443,11 +570,13 @@ IF OBJECT_ID('tempdb..#bal_check') IS NOT NULL
 SELECT
       TRY_CAST(t.con_id AS bigint) AS con_id
 
-    , MIN(TRY_CAST(t.cli_id AS bigint))
-        AS cli_id
+    , MIN(
+        TRY_CAST(t.cli_id AS bigint)
+      ) AS cli_id
 
-    , MIN(CAST(t.dt_open AS date))
-        AS dt_open
+    , MIN(
+        CAST(t.dt_open AS date)
+      ) AS dt_open
 
     , MIN(t.TSEGMENTNAME)
         AS TSEGMENTNAME
@@ -461,23 +590,61 @@ SELECT
     , MIN(t.termdays)
         AS termdays
 
+
+    /* ========================================================
+       КОНВЕНЦИЯ ДЛЯ СПРАВОЧНИКА
+       ======================================================== */
+
     , CASE
-        WHEN MIN(
+
+        WHEN
+            MIN(
                 NULLIF(
-                    LTRIM(RTRIM(COALESCE(t.conv,''))),
+                    LTRIM(
+                        RTRIM(
+                            COALESCE(t.conv,'')
+                        )
+                    ),
                     ''
                 )
-             ) IS NULL
+            ) IS NULL
+
             THEN 'AT_THE_END'
 
-        ELSE UPPER(
-                LTRIM(RTRIM(MIN(t.conv)))
-             )
-      END AS conv_norm
+
+        WHEN
+            UPPER(
+                LTRIM(
+                    RTRIM(
+                        MIN(
+                            NULLIF(
+                                LTRIM(
+                                    RTRIM(
+                                        COALESCE(t.conv,'')
+                                    )
+                                ),
+                                ''
+                            )
+                        )
+                    )
+                )
+            ) = 'AT_THE_END'
+
+            THEN 'AT_THE_END'
+
+
+        ELSE 'NOT_AT_THE_END'
+
+      END AS conv_type_dict
+
 
 INTO #bal_check
 
-FROM ALM.ALM.VW_Balance_Rest_All t WITH (NOLOCK)
+
+FROM
+    ALM.ALM.VW_Balance_Rest_All t
+    WITH (NOLOCK)
+
 
 WHERE
     t.dt_rep = @control_dt
@@ -491,6 +658,7 @@ WHERE
     AND t.out_rub IS NOT NULL
     AND t.out_rub >= 0
 
+
 GROUP BY
     t.con_id;
 
@@ -500,8 +668,10 @@ CREATE UNIQUE CLUSTERED INDEX IX_bal_check
 
 
 
+
+
 /* ============================================================
-   НАДБАВКИ
+   НАДБАВКИ A / C
    ============================================================ */
 
 IF OBJECT_ID('tempdb..#attr_check') IS NOT NULL
@@ -514,20 +684,31 @@ IF OBJECT_ID('tempdb..#attr_check') IS NOT NULL
           TRY_CAST(a.CON_ID AS bigint) AS con_id
 
 
-        /* A = НОВ / НДП / НДМ */
+        /* ====================================================
+           A = НОВ / НДП / НДМ
+           ==================================================== */
+
         , CASE
+
             WHEN
                    ISNULL(TRY_CAST(a.[Нов] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[НДП] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[НДМ] AS int),0) = 1
 
                 THEN 1
+
             ELSE 0
+
           END AS flag_A
 
 
-        /* C = прочие надбавки */
+
+        /* ====================================================
+           C = остальные надбавки
+           ==================================================== */
+
         , CASE
+
             WHEN
                    ISNULL(TRY_CAST(a.[Пк3] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[Пк6] AS int),0) = 1
@@ -543,7 +724,9 @@ IF OBJECT_ID('tempdb..#attr_check') IS NOT NULL
                 OR ISNULL(TRY_CAST(a.[Пнс] AS int),0) = 1
 
                 THEN 1
+
             ELSE 0
+
           END AS flag_C
 
 
@@ -556,12 +739,17 @@ IF OBJECT_ID('tempdb..#attr_check') IS NOT NULL
                   , a.loaddate DESC
           ) AS rn
 
-    FROM ALM.ehd.attr_DepoFLConditions a WITH (NOLOCK)
+
+    FROM
+        ALM.ehd.attr_DepoFLConditions a
+        WITH (NOLOCK)
+
 
     INNER JOIN #bal_check b
         ON b.con_id =
            TRY_CAST(a.CON_ID AS bigint)
 )
+
 
 SELECT
       con_id
@@ -572,12 +760,15 @@ INTO #attr_check
 
 FROM x
 
-WHERE rn = 1;
+WHERE
+    rn = 1;
+
+
 
 
 
 /* ============================================================
-   ФИНАЛЬНЫЕ ФЛАГИ A / B / C
+   A / B / C
    ============================================================ */
 
 IF OBJECT_ID('tempdb..#result_check') IS NOT NULL
@@ -595,48 +786,68 @@ SELECT
 
 
     /* ========================================================
-       B = ПОДХОДИТ ПОД СПРАВОЧНИК
+       B = МАТЧИТСЯ СО СПРАВОЧНИКОМ
        ======================================================== */
 
     , CASE
+
         WHEN EXISTS
         (
             SELECT 1
 
-            FROM ALM_TEST.WORK.promo_new_money_rate_dict r
+            FROM
+                ALM_TEST.WORK.promo_new_money_rate_dict r
                 WITH (NOLOCK)
 
             WHERE
                 r.is_active = 1
 
+
                 /* дата открытия */
                 AND b.dt_open
-                    BETWEEN r.date_from AND r.date_to
+                    BETWEEN r.date_from
+                        AND r.date_to
+
 
                 /* срок */
                 AND b.termdays
-                    BETWEEN r.term_min AND r.term_max
+                    BETWEEN r.term_min
+                        AND r.term_max
 
-                /* тип выплаты */
-                AND b.conv_norm = r.conv_type
 
-                /* размер */
+                /* =================================================
+                   КОНВЕНЦИЯ
+
+                   1M и любой другой НЕ AT_THE_END
+                   здесь уже преобразован в NOT_AT_THE_END
+                   ================================================= */
+
+                AND b.conv_type_dict
+                    = r.conv_type
+
+
+                /* сумма */
                 AND b.out_rub
-                    BETWEEN r.amount_from AND r.amount_to
+                    BETWEEN r.amount_from
+                        AND r.amount_to
+
 
                 /* ставка */
                 AND ABS(
-                        b.rate_con - r.promo_rate
+                        b.rate_con
+                        - r.promo_rate
                     ) <= @eps
         )
 
             THEN 1
+
         ELSE 0
 
       END AS flag_B
 
 
 INTO #result_check
+
 
 FROM #bal_check b
 
@@ -645,12 +856,15 @@ LEFT JOIN #attr_check a
 
 
 
+
+
 /* ============================================================
-   RESULT SET №2
-   ОБЩАЯ ПРОВЕРКА МНОЖЕСТВ
+   RESULT SET 2
+   ОБЩИЕ A / B / C
    ============================================================ */
 
 SELECT
+
       SUM(out_rub)
         AS [Весь баланс]
 
@@ -719,10 +933,7 @@ SELECT
       ) AS [B без A]
 
 
-    /* ========================================================
-       C = остальные надбавки
-       ======================================================== */
-
+    /* C */
     , SUM(
         CASE
             WHEN flag_C = 1
@@ -765,101 +976,153 @@ SELECT
         END
       ) AS [C ∩ A ∩ B]
 
+
 FROM #result_check;
 
 
 
+
+
 /* ============================================================
-   RESULT SET №3
-   ТО ЖЕ ПО TSEGMENTNAME
+   RESULT SET 3
+   A / B / C ПО TSEGMENTNAME
    ============================================================ */
 
 SELECT
-      ISNULL(TSEGMENTNAME,N'NULL')
-        AS TSEGMENTNAME
+
+      ISNULL(
+          TSEGMENTNAME,
+          N'NULL'
+      ) AS TSEGMENTNAME
+
 
     , SUM(out_rub)
         AS [Весь баланс]
 
+
     , SUM(
-        CASE WHEN flag_A = 1
-             THEN out_rub ELSE 0 END
+        CASE
+            WHEN flag_A = 1
+                THEN out_rub
+            ELSE 0
+        END
       ) AS [A - НОВ НДП НДМ]
 
+
     , SUM(
-        CASE WHEN flag_B = 1
-             THEN out_rub ELSE 0 END
+        CASE
+            WHEN flag_B = 1
+                THEN out_rub
+            ELSE 0
+        END
       ) AS [B - По справочнику ставок]
 
+
     , SUM(
-        CASE WHEN flag_A = 1
-                  AND flag_B = 1
-             THEN out_rub ELSE 0 END
+        CASE
+            WHEN flag_A = 1
+             AND flag_B = 1
+                THEN out_rub
+            ELSE 0
+        END
       ) AS [A ∩ B]
 
+
     , SUM(
-        CASE WHEN flag_A = 1
-                  OR flag_B = 1
-             THEN out_rub ELSE 0 END
+        CASE
+            WHEN flag_A = 1
+              OR flag_B = 1
+                THEN out_rub
+            ELSE 0
+        END
       ) AS [A ∪ B]
 
-    , SUM(
-        CASE WHEN flag_A = 1
-                  AND flag_B = 0
-             THEN out_rub ELSE 0 END
-      ) AS [A без B]
 
     , SUM(
-        CASE WHEN flag_B = 1
-                  AND flag_A = 0
-             THEN out_rub ELSE 0 END
+        CASE
+            WHEN flag_A = 1
+             AND flag_B = 0
+                THEN out_rub
+            ELSE 0
+        END
+      ) AS [A без B]
+
+
+    , SUM(
+        CASE
+            WHEN flag_B = 1
+             AND flag_A = 0
+                THEN out_rub
+            ELSE 0
+        END
       ) AS [B без A]
 
 
-    /* C */
     , SUM(
-        CASE WHEN flag_C = 1
-             THEN out_rub ELSE 0 END
+        CASE
+            WHEN flag_C = 1
+                THEN out_rub
+            ELSE 0
+        END
       ) AS [C - Прочие надбавки]
 
+
     , SUM(
-        CASE WHEN flag_C = 1
-                  AND flag_A = 1
-             THEN out_rub ELSE 0 END
+        CASE
+            WHEN flag_C = 1
+             AND flag_A = 1
+                THEN out_rub
+            ELSE 0
+        END
       ) AS [C ∩ A]
 
-    , SUM(
-        CASE WHEN flag_C = 1
-                  AND flag_B = 1
-             THEN out_rub ELSE 0 END
-      ) AS [C ∩ B]
 
     , SUM(
-        CASE WHEN flag_C = 1
-                  AND flag_A = 1
-                  AND flag_B = 1
-             THEN out_rub ELSE 0 END
+        CASE
+            WHEN flag_C = 1
+             AND flag_B = 1
+                THEN out_rub
+            ELSE 0
+        END
+      ) AS [C ∩ B]
+
+
+    , SUM(
+        CASE
+            WHEN flag_C = 1
+             AND flag_A = 1
+             AND flag_B = 1
+                THEN out_rub
+            ELSE 0
+        END
       ) AS [C ∩ A ∩ B]
+
 
 FROM #result_check
 
+
 GROUP BY
     TSEGMENTNAME
+
 
 ORDER BY
     TSEGMENTNAME;
 
 
 
+
+
 /* ============================================================
-   RESULT SET №4
+   RESULT SET 4
    ПОДОГОВОРНАЯ ПРОВЕРКА
+
+   Добавил conv_type_dict, чтобы сразу видеть,
+   как фактическая conv была трактована для справочника
    ============================================================ */
 
 SELECT
       con_id
     , cli_id
-
     , TSEGMENTNAME
 
     , dt_open
@@ -867,7 +1130,8 @@ SELECT
 
     , out_rub
     , rate_con
-    , conv_norm
+
+    , conv_type_dict
 
     , flag_A
         AS [A_НОВ_НДП_НДМ]
@@ -878,12 +1142,15 @@ SELECT
     , flag_C
         AS [C_ПРОЧИЕ_НАДБАВКИ]
 
+
 FROM #result_check
+
 
 WHERE
        flag_A = 1
     OR flag_B = 1
     OR flag_C = 1
+
 
 ORDER BY
       TSEGMENTNAME
