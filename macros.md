@@ -1,18 +1,17 @@
 USE ALM;
 SET NOCOUNT ON;
 
-DECLARE @dt_rep      date = '2026-10-03';
-DECLARE @date_from   date = '2026-10-01';
-DECLARE @date_to     date = '2026-10-03';
+DECLARE @dt_rep     date = '2026-10-03';
+DECLARE @date_from  date = '2026-10-01';
+DECLARE @date_to    date = '2026-10-03';
 
-DECLARE @control_dt  date = '2026-09-30';
+DECLARE @control_dt date = '2026-09-30';
 
 DECLARE @eps decimal(9,6) = 0.0005;
 
 
 /* ============================================================
-   1. НОВЫЕ ПРИВЛЕЧЕНИЯ
-   con_id уже уникален
+   NEW DEPOSITS
    ============================================================ */
 
 IF OBJECT_ID('tempdb..#new_bal') IS NOT NULL DROP TABLE #new_bal;
@@ -35,12 +34,12 @@ INTO #new_bal
 FROM ALM.ALM.VW_Balance_Rest_All t WITH (NOLOCK)
 
 LEFT JOIN ALM_TEST.WORK.ForecastKey_Cache fk
-    ON fk.DT_REP = t.dt_open
+    ON fk.DT_REP = CAST(t.dt_open AS date)
    AND fk.TERM   = t.termdays
 
 WHERE
     t.dt_rep = @dt_rep
-    AND t.dt_open BETWEEN @date_from AND @date_to
+    AND CAST(t.dt_open AS date) BETWEEN @date_from AND @date_to
 
     AND t.section_name = N'Срочные'
     AND t.block_name   = N'Привлечение ФЛ'
@@ -54,7 +53,7 @@ WHERE
 
 
 /* ============================================================
-   2. БАЛАНС НА КОНТРОЛЬНУЮ ДАТУ
+   CONTROL BALANCE
    ============================================================ */
 
 IF OBJECT_ID('tempdb..#control_bal') IS NOT NULL DROP TABLE #control_bal;
@@ -89,13 +88,13 @@ WHERE
 
 
 /* ============================================================
-   3. ВСЕ НУЖНЫЕ CON_ID
+   REQUIRED CON_ID
    ============================================================ */
 
-IF OBJECT_ID('tempdb..#con_ids') IS NOT NULL DROP TABLE #con_ids;
+IF OBJECT_ID('tempdb..#ids') IS NOT NULL DROP TABLE #ids;
 
 SELECT con_id
-INTO #con_ids
+INTO #ids
 FROM
 (
     SELECT con_id FROM #new_bal
@@ -103,22 +102,21 @@ FROM
     SELECT con_id FROM #control_bal
 ) x;
 
-CREATE UNIQUE CLUSTERED INDEX IX_con_ids
-    ON #con_ids(con_id);
+CREATE UNIQUE CLUSTERED INDEX IX_ids
+    ON #ids(con_id);
 
 
 
 /* ============================================================
-   4. НАДБАВКИ — ОДИН РАЗ ДЛЯ ВСЕХ НУЖНЫХ ДОГОВОРОВ
+   ATTRIBUTES
 
-   new_money:
-       Нов / НДП / НДМ
+   new_money = NOV / NDP / NDM
 
-   other_markup:
-       Пк3 / Пк6 / Пк7
-       Пр2 / Пр3
-       Пк2 / От1
-       Мпл / Пнс
+   other_markup =
+   PK3 / PK6 / PK7
+   PR2 / PR3
+   PK2 / OT1
+   MPL / PNS
    ============================================================ */
 
 IF OBJECT_ID('tempdb..#attr') IS NOT NULL DROP TABLE #attr;
@@ -133,8 +131,9 @@ IF OBJECT_ID('tempdb..#attr') IS NOT NULL DROP TABLE #attr;
                    ISNULL(TRY_CAST(a.[Нов] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[НДП] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[НДМ] AS int),0) = 1
-            THEN 1 ELSE 0
-          END AS new_money_flag
+            THEN 1
+            ELSE 0
+          END AS new_money
 
         , CASE
             WHEN
@@ -147,8 +146,9 @@ IF OBJECT_ID('tempdb..#attr') IS NOT NULL DROP TABLE #attr;
                 OR ISNULL(TRY_CAST(a.[От1] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[Мпл] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[Пнс] AS int),0) = 1
-            THEN 1 ELSE 0
-          END AS other_markup_flag
+            THEN 1
+            ELSE 0
+          END AS other_markup
 
         , ROW_NUMBER() OVER
           (
@@ -160,14 +160,14 @@ IF OBJECT_ID('tempdb..#attr') IS NOT NULL DROP TABLE #attr;
 
     FROM ALM.ehd.attr_DepoFLConditions a WITH (NOLOCK)
 
-    INNER JOIN #con_ids c
-        ON c.con_id = TRY_CAST(a.CON_ID AS bigint)
+    INNER JOIN #ids i
+        ON i.con_id = TRY_CAST(a.CON_ID AS bigint)
 )
 
 SELECT
       con_id
-    , new_money_flag
-    , other_markup_flag
+    , new_money
+    , other_markup
 
 INTO #attr
 
@@ -181,7 +181,7 @@ CREATE UNIQUE CLUSTERED INDEX IX_attr
 
 
 /* ============================================================
-   5. НОВЫЕ ПРИВЛЕЧЕНИЯ — КЛАССИФИКАЦИЯ
+   CLASSIFY NEW DEPOSITS
    ============================================================ */
 
 IF OBJECT_ID('tempdb..#new') IS NOT NULL DROP TABLE #new;
@@ -210,28 +210,23 @@ SELECT
 
     , d.term_bucket AS promo_bucket
 
-
-    /* ========================================================
-       A:
-       ДЧБО ИЛИ Классический/Привилегия/Достояние
-       -> достаточно совпадения со справочником
-
-       B:
-       все остальные
-       -> справочник + НОВ/НДП/НДМ + нет других надбавок
-       ======================================================== */
-
     , CASE
         WHEN d.term_bucket IS NULL
             THEN 0
 
+        /* A */
         WHEN b.TSEGMENTNAME = N'ДЧБО'
           OR b.PROD_NAME_RES IN
-             (N'Классический',N'Привилегия',N'Достояние')
+             (
+                 N'Классический',
+                 N'Привилегия',
+                 N'Достояние'
+             )
             THEN 1
 
-        WHEN ISNULL(a.new_money_flag,0) = 1
-         AND ISNULL(a.other_markup_flag,0) = 0
+        /* B */
+        WHEN ISNULL(a.new_money,0) = 1
+         AND ISNULL(a.other_markup,0) = 0
             THEN 1
 
         ELSE 0
@@ -254,12 +249,14 @@ OUTER APPLY
     WHERE
         r.is_active = 1
 
-        AND b.dt_open
+        AND CAST(b.dt_open AS date)
             BETWEEN r.date_from AND r.date_to
 
         AND b.termdays
             BETWEEN r.term_min AND r.term_max
 
+        /* AT_THE_END отдельно,
+           любая другая conv -> NOT_AT_THE_END */
         AND r.conv_type =
             CASE
                 WHEN ISNULL(b.conv,'AT_THE_END') = 'AT_THE_END'
@@ -278,75 +275,77 @@ OUTER APPLY
 
 
 /* ============================================================
-   RESULT SET 1
-   НОВЫЕ ПРИВЛЕЧЕНИЯ
+   RESULT 1
    ============================================================ */
 
 SELECT
       CASE
           WHEN is_promo = 1
-              THEN CONCAT(promo_bucket,N' РК')
-          ELSE CAST(normal_bucket AS nvarchar(20))
-      END AS [Срок, дн.]
+              THEN CONCAT(promo_bucket, ' RK')
+          ELSE CAST(normal_bucket AS varchar(20))
+      END AS bucket
 
-    , CAST(dt_open AS date) AS [Дата открытия]
+    , CAST(dt_open AS date) AS open_date
 
-    , SUM(out_rub) AS [Объем, руб.]
+    , SUM(out_rub) AS volume
 
     , CAST(
         SUM(out_rub * rate_con)
-        / NULLIF(
+        /
+        NULLIF(
             SUM(CASE WHEN rate_con IS NOT NULL THEN out_rub END),
             0
         )
         AS decimal(9,6)
-      ) AS [Средневзв. ставка (клиент)]
+      ) AS client_rate
 
     , CAST(
         SUM(out_rub * rate_trf)
-        / NULLIF(
+        /
+        NULLIF(
             SUM(CASE WHEN rate_trf IS NOT NULL THEN out_rub END),
             0
         )
         AS decimal(9,6)
-      ) AS [Средневзв. ставка (ТС)]
+      ) AS trf_rate
 
     , CAST(
         SUM(out_rub * AVG_KEY_RATE)
-        / NULLIF(
+        /
+        NULLIF(
             SUM(CASE WHEN AVG_KEY_RATE IS NOT NULL THEN out_rub END),
             0
         )
         AS decimal(9,6)
-      ) AS [Средневзв. прогнозный КС]
+      ) AS forecast_key_rate
 
     , CAST(
         SUM(out_rub * termdays)
         / NULLIF(SUM(out_rub),0)
         AS decimal(18,2)
-      ) AS [Средневзв. контрактная срочность]
+      ) AS avg_termdays
 
 FROM #new
 
 GROUP BY
       CAST(dt_open AS date)
-    , CASE
-          WHEN is_promo = 1
-              THEN CONCAT(promo_bucket,N' РК')
-          ELSE CAST(normal_bucket AS nvarchar(20))
-      END
+    , is_promo
+    , normal_bucket
+    , promo_bucket
 
 ORDER BY
-      [Дата открытия]
-    , TRY_CONVERT(
-          int,
-          REPLACE([Срок, дн.],N' РК','')
-      );
+      CAST(dt_open AS date)
+    , CASE
+          WHEN is_promo = 1
+              THEN promo_bucket
+          ELSE normal_bucket
+      END
+    , is_promo;
 
 
 
 /* ============================================================
-   6. КОНТРОЛЬНЫЙ БАЛАНС
+   CLASSIFY CONTROL BALANCE
    ============================================================ */
 
 IF OBJECT_ID('tempdb..#control') IS NOT NULL DROP TABLE #control;
@@ -354,29 +353,32 @@ IF OBJECT_ID('tempdb..#control') IS NOT NULL DROP TABLE #control;
 SELECT
       b.*
 
-    , ISNULL(a.new_money_flag,0)
-        AS new_money_flag
-
-    , ISNULL(a.other_markup_flag,0)
-        AS other_markup_flag
+    , ISNULL(a.new_money,0) AS new_money
+    , ISNULL(a.other_markup,0) AS other_markup
 
     , CASE
-        WHEN d.term_bucket IS NOT NULL THEN 1
+        WHEN d.term_bucket IS NOT NULL
+            THEN 1
         ELSE 0
       END AS dict_match
-
 
     , CASE
         WHEN d.term_bucket IS NULL
             THEN 0
 
+        /* A */
         WHEN b.TSEGMENTNAME = N'ДЧБО'
           OR b.PROD_NAME_RES IN
-             (N'Классический',N'Привилегия',N'Достояние')
+             (
+                 N'Классический',
+                 N'Привилегия',
+                 N'Достояние'
+             )
             THEN 1
 
-        WHEN ISNULL(a.new_money_flag,0) = 1
-         AND ISNULL(a.other_markup_flag,0) = 0
+        /* B */
+        WHEN ISNULL(a.new_money,0) = 1
+         AND ISNULL(a.other_markup,0) = 0
             THEN 1
 
         ELSE 0
@@ -399,7 +401,7 @@ OUTER APPLY
     WHERE
         r.is_active = 1
 
-        AND b.dt_open
+        AND CAST(b.dt_open AS date)
             BETWEEN r.date_from AND r.date_to
 
         AND b.termdays
@@ -423,13 +425,11 @@ OUTER APPLY
 
 
 /* ============================================================
-   RESULT SET 2
-   ПРОВЕРКА БАЛАНСА
+   RESULT 2
    ============================================================ */
 
 SELECT
-      SUM(out_rub)
-        AS [Все вклады]
+      SUM(out_rub) AS total_volume
 
     , SUM(
         CASE
@@ -437,42 +437,42 @@ SELECT
                 THEN out_rub
             ELSE 0
         END
-      ) AS [Промо A+B]
+      ) AS promo_volume
 
     , SUM(
         CASE
             WHEN is_promo = 0
-             AND new_money_flag = 1
+             AND new_money = 1
                 THEN out_rub
             ELSE 0
         END
-      ) AS [Не промо, но НОВ НДП НДМ]
-
-    , SUM(
-        CASE
-            WHEN is_promo = 0
-             AND dict_match = 1
-                THEN out_rub
-            ELSE 0
-        END
-      ) AS [Не промо, но совпал справочник]
+      ) AS nonpromo_new_money
 
     , SUM(
         CASE
             WHEN is_promo = 0
              AND dict_match = 1
-             AND other_markup_flag = 1
                 THEN out_rub
             ELSE 0
         END
-      ) AS [Не промо, справочник + другие надбавки]
+      ) AS nonpromo_dict_match
 
     , SUM(
         CASE
-            WHEN other_markup_flag = 1
+            WHEN is_promo = 0
+             AND dict_match = 1
+             AND other_markup = 1
                 THEN out_rub
             ELSE 0
         END
-      ) AS [Все с другими надбавками]
+      ) AS nonpromo_dict_other_markup
+
+    , SUM(
+        CASE
+            WHEN other_markup = 1
+                THEN out_rub
+            ELSE 0
+        END
+      ) AS other_markup_volume
 
 FROM #control;
