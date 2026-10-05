@@ -1,11 +1,6 @@
 USE ALM;
 SET NOCOUNT ON;
 
-
-/* ============================================================
-   ПАРАМЕТРЫ
-   ============================================================ */
-
 DECLARE @dt_rep     date = '2026-10-03';
 DECLARE @date_from  date = '2026-10-01';
 DECLARE @date_to    date = '2026-10-03';
@@ -15,107 +10,75 @@ DECLARE @control_dt date = '2026-09-30';
 DECLARE @eps decimal(9,6) = 0.0005;
 
 
-
 /* ============================================================
-   ============================================================
-   ЧАСТЬ 1.
-   ОСНОВНОЙ ОТЧЁТ: СРОКИ + РК
-   ============================================================
+   ЧАСТЬ 1
+   НОВЫЕ ПРИВЛЕЧЕНИЯ
    ============================================================ */
 
-IF OBJECT_ID('tempdb..#main_bal') IS NOT NULL
-    DROP TABLE #main_bal;
-
+IF OBJECT_ID('tempdb..#main_bal') IS NOT NULL DROP TABLE #main_bal;
 
 SELECT
-      CAST(t.dt_open AS date) AS dt_open
-    , TRY_CAST(t.con_id AS bigint) AS con_id
+      TRY_CAST(t.con_id AS bigint) AS con_id
     , MIN(TRY_CAST(t.cli_id AS bigint)) AS cli_id
+    , CAST(t.dt_open AS date) AS dt_open
+
+    , MIN(t.TSEGMENTNAME)  AS TSEGMENTNAME
+    , MIN(t.PROD_NAME_res) AS PROD_NAME_res
 
     , SUM(t.out_rub) AS out_rub
 
     , MIN(t.rate_con) AS rate_con_class
     , MIN(t.termdays) AS termdays
 
-
-    /* фактическая конвенция */
     , CASE
-        WHEN MIN(
-                 NULLIF(
-                     LTRIM(RTRIM(COALESCE(t.conv,''))),
-                     ''
-                 )
-             ) IS NULL
+        WHEN MIN(NULLIF(LTRIM(RTRIM(COALESCE(t.conv,''))),'')) IS NULL
             THEN 'AT_THE_END'
-
-        ELSE UPPER(
-                 MIN(
-                     NULLIF(
-                         LTRIM(RTRIM(COALESCE(t.conv,''))),
-                         ''
-                     )
-                 )
-             )
+        ELSE UPPER(MIN(NULLIF(LTRIM(RTRIM(COALESCE(t.conv,''))),'')))
       END AS conv_norm
 
 
-    /* клиентская ставка */
-    , SUM(
-        CASE
+    /* веса клиентской ставки */
+    , SUM(CASE
             WHEN t.rate_con IS NOT NULL
-                THEN t.out_rub * t.rate_con
-        END
-      ) AS wsum_rate_con
+            THEN t.out_rub * t.rate_con
+          END) AS wsum_rate_con
 
-    , SUM(
-        CASE
+    , SUM(CASE
             WHEN t.rate_con IS NOT NULL
-                THEN t.out_rub
-        END
-      ) AS wden_rate_con
+            THEN t.out_rub
+          END) AS wden_rate_con
 
 
-    /* ТС */
-    , SUM(
-        CASE
+    /* веса ТС */
+    , SUM(CASE
             WHEN t.rate_trf IS NOT NULL
-                THEN t.out_rub * t.rate_trf
-        END
-      ) AS wsum_rate_trf
+            THEN t.out_rub * t.rate_trf
+          END) AS wsum_rate_trf
 
-    , SUM(
-        CASE
+    , SUM(CASE
             WHEN t.rate_trf IS NOT NULL
-                THEN t.out_rub
-        END
-      ) AS wden_rate_trf
+            THEN t.out_rub
+          END) AS wden_rate_trf
 
 
-    /* прогнозный КС */
-    , SUM(
-        CASE
+    /* веса прогнозного КС */
+    , SUM(CASE
             WHEN fk.AVG_KEY_RATE IS NOT NULL
-                THEN t.out_rub * fk.AVG_KEY_RATE
-        END
-      ) AS wsum_avg_key_rate
+            THEN t.out_rub * fk.AVG_KEY_RATE
+          END) AS wsum_avg_key_rate
 
-    , SUM(
-        CASE
+    , SUM(CASE
             WHEN fk.AVG_KEY_RATE IS NOT NULL
-                THEN t.out_rub
-        END
-      ) AS wden_avg_key_rate
-
+            THEN t.out_rub
+          END) AS wden_avg_key_rate
 
 INTO #main_bal
-
 
 FROM ALM.ALM.VW_Balance_Rest_All t WITH (NOLOCK)
 
 LEFT JOIN ALM_TEST.WORK.ForecastKey_Cache fk
     ON fk.DT_REP = CAST(t.dt_open AS date)
    AND fk.TERM   = t.termdays
-
 
 WHERE
     t.dt_rep = @dt_rep
@@ -132,29 +95,9 @@ WHERE
     AND CAST(t.dt_open AS date)
         BETWEEN @date_from AND @date_to
 
-
-    /* ФУ исключаем как раньше */
-    AND t.PROD_NAME_res NOT IN
-    (
-          N'Надёжный прайм'
-        , N'Надёжный VIP'
-        , N'Надёжный премиум'
-        , N'Надёжный промо'
-        , N'Надёжный старт'
-        , N'Надёжный Т2'
-        , N'Надёжный Мегафон'
-        , N'Надёжный процент'
-        , N'Могучий'
-        , N'Надёжный'
-        , N'ДОМа надёжно'
-        , N'Всё в ДОМ'
-    )
-
-
 GROUP BY
-      CAST(t.dt_open AS date)
-    , TRY_CAST(t.con_id AS bigint);
-
+      t.con_id
+    , CAST(t.dt_open AS date);
 
 
 CREATE UNIQUE CLUSTERED INDEX IX_main_bal
@@ -163,41 +106,45 @@ CREATE UNIQUE CLUSTERED INDEX IX_main_bal
 
 
 /* ============================================================
-   ПРОЧИЕ НАДБАВКИ, КОТОРЫЕ ИСКЛЮЧАЮТ РК
+   НАДБАВКИ
    ============================================================ */
 
-IF OBJECT_ID('tempdb..#main_attr') IS NOT NULL
-    DROP TABLE #main_attr;
-
+IF OBJECT_ID('tempdb..#main_attr') IS NOT NULL DROP TABLE #main_attr;
 
 ;WITH x AS
 (
     SELECT
           TRY_CAST(a.CON_ID AS bigint) AS con_id
 
+        /* новые деньги */
+        , CASE
+            WHEN
+                   ISNULL(TRY_CAST(a.[Нов] AS int),0) = 1
+                OR ISNULL(TRY_CAST(a.[НДП] AS int),0) = 1
+                OR ISNULL(TRY_CAST(a.[НДМ] AS int),0) = 1
+            THEN 1 ELSE 0
+          END AS flag_newmoney
+
+
+        /* прочие надбавки */
         , CASE
             WHEN
                    ISNULL(TRY_CAST(a.[Пк3] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[Пк6] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[Пк7] AS int),0) = 1
-
                 OR ISNULL(TRY_CAST(a.[Пр2] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[Пр3] AS int),0) = 1
-
                 OR ISNULL(TRY_CAST(a.[Пк2] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[От1] AS int),0) = 1
-
                 OR ISNULL(TRY_CAST(a.[Мпл] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[Пнс] AS int),0) = 1
+            THEN 1 ELSE 0
+          END AS flag_other_markup
 
-                THEN 1
-            ELSE 0
-          END AS forbidden_markup
 
         , ROW_NUMBER() OVER
           (
               PARTITION BY a.CON_ID
-
               ORDER BY
                     a.DT_UPDATE DESC
                   , a.loaddate DESC
@@ -211,27 +158,44 @@ IF OBJECT_ID('tempdb..#main_attr') IS NOT NULL
 
 SELECT
       con_id
-    , forbidden_markup
+    , flag_newmoney
+    , flag_other_markup
 
 INTO #main_attr
 
 FROM x
-
 WHERE rn = 1;
 
 
 
 /* ============================================================
-   КЛАССИФИКАЦИЯ + МАТЧ СО СПРАВОЧНИКОМ
+   ПОДГОТОВКА
    ============================================================ */
 
-IF OBJECT_ID('tempdb..#main_result') IS NOT NULL
-    DROP TABLE #main_result;
-
+IF OBJECT_ID('tempdb..#main_prepared') IS NOT NULL DROP TABLE #main_prepared;
 
 SELECT
       b.*
 
+    , ISNULL(a.flag_newmoney,0) AS flag_newmoney
+    , ISNULL(a.flag_other_markup,0) AS flag_other_markup
+
+
+    /* А: автоматическое промо */
+    , CASE
+        WHEN
+               b.TSEGMENTNAME = N'ДЧБО'
+            OR b.PROD_NAME_res IN
+               (
+                   N'Классический',
+                   N'Привилегия',
+                   N'Достояние'
+               )
+        THEN 1 ELSE 0
+      END AS is_auto_promo
+
+
+    /* обычный срок */
     , CASE
         WHEN b.termdays BETWEEN 28   AND 44   THEN 31
         WHEN b.termdays BETWEEN 45   AND 79   THEN 61
@@ -251,105 +215,140 @@ SELECT
         ELSE b.termdays
       END AS normal_term_bucket
 
-
-    , d.term_bucket AS promo_term_bucket
-
-
-    , CASE
-        WHEN d.term_bucket IS NOT NULL
-         AND ISNULL(a.forbidden_markup,0) = 0
-            THEN 1
-        ELSE 0
-      END AS is_rk
-
-
-INTO #main_result
-
+INTO #main_prepared
 
 FROM #main_bal b
 
-
 LEFT JOIN #main_attr a
-    ON a.con_id = b.con_id
-
-
-OUTER APPLY
-(
-    SELECT TOP (1)
-          r.term_bucket
-
-    FROM ALM_TEST.WORK.promo_new_money_rate_dict r
-        WITH (NOLOCK)
-
-    WHERE
-        r.is_active = 1
-
-
-        /* дата открытия */
-        AND b.dt_open
-            BETWEEN r.date_from AND r.date_to
-
-
-        /* срок */
-        AND b.termdays
-            BETWEEN r.term_min AND r.term_max
-
-
-        /* ====================================================
-           КОНВЕНЦИЯ
-
-           AT_THE_END -> AT_THE_END
-
-           всё остальное:
-           1M
-           3M
-           другие варианты
-           -> NOT_AT_THE_END
-           ==================================================== */
-
-        AND r.conv_type =
-            CASE
-                WHEN b.conv_norm = 'AT_THE_END'
-                    THEN 'AT_THE_END'
-                ELSE 'NOT_AT_THE_END'
-            END
-
-
-        /* сумма */
-        AND b.out_rub
-            BETWEEN r.amount_from AND r.amount_to
-
-
-        /* ставка */
-        AND ABS(
-                b.rate_con_class
-                - r.promo_rate
-            ) <= @eps
-
-
-    ORDER BY
-          r.date_from DESC
-        , r.id DESC
-
-) d;
+    ON a.con_id = b.con_id;
 
 
 
 /* ============================================================
-   RESULT SET 1
+   МАТЧ К СПРАВОЧНИКУ + ФИНАЛЬНЫЙ ФЛАГ ПРОМО
+   ============================================================ */
+
+IF OBJECT_ID('tempdb..#main_result') IS NOT NULL DROP TABLE #main_result;
+
+SELECT
+      p.*
+
+    , d.id          AS dict_id
+    , d.term_bucket AS dict_term_bucket
+    , d.promo_rate  AS dict_rate
+
+    , CASE
+        WHEN p.is_auto_promo = 1
+            THEN 1
+
+        WHEN p.is_auto_promo = 0
+         AND p.flag_newmoney = 1
+         AND d.id IS NOT NULL
+            THEN 1
+
+        ELSE 0
+      END AS is_promo
+
+
+    /* срок промо:
+       если справочник сматчился — его term_bucket;
+       для AUTO пытаемся взять активный промо-бакет по дате+сроку;
+       иначе обычный mapping
+    */
+    , COALESCE(
+          d.term_bucket,
+          db.term_bucket,
+          p.normal_term_bucket
+      ) AS promo_term_bucket
+
+INTO #main_result
+
+FROM #main_prepared p
+
+
+/* полный матч справочника */
+OUTER APPLY
+(
+    SELECT TOP (1)
+          r.id
+        , r.term_bucket
+        , r.promo_rate
+
+    FROM ALM_TEST.WORK.promo_new_money_rate_dict r WITH (NOLOCK)
+
+    WHERE
+        r.is_active = 1
+
+        AND p.dt_open
+            BETWEEN r.date_from AND r.date_to
+
+        AND p.termdays
+            BETWEEN r.term_min AND r.term_max
+
+        AND r.conv_type =
+            CASE
+                WHEN p.conv_norm = 'AT_THE_END'
+                    THEN 'AT_THE_END'
+                ELSE 'NOT_AT_THE_END'
+            END
+
+        AND p.out_rub
+            BETWEEN r.amount_from AND r.amount_to
+
+        AND ABS(
+                p.rate_con_class - r.promo_rate
+            ) <= @eps
+
+    ORDER BY
+          r.date_from DESC
+        , r.id DESC
+) d
+
+
+/* только для определения названия срока AUTO-промо */
+OUTER APPLY
+(
+    SELECT TOP (1)
+        r.term_bucket
+
+    FROM ALM_TEST.WORK.promo_new_money_rate_dict r WITH (NOLOCK)
+
+    WHERE
+        r.is_active = 1
+
+        AND p.dt_open
+            BETWEEN r.date_from AND r.date_to
+
+        AND p.termdays
+            BETWEEN r.term_min AND r.term_max
+
+    ORDER BY
+          r.date_from DESC
+        , r.id DESC
+) db;
+
+
+
+/* ============================================================
+   RESULT SET №1
+   НОВЫЕ ПРИВЛЕЧЕНИЯ
+
+   Промо показываем отдельными строками:
+   61 РК / 91 РК / 122 РК и т.д.
    ============================================================ */
 
 ;WITH tall AS
 (
-    /* обычные */
     SELECT
-          CAST(normal_term_bucket AS nvarchar(20))
-            AS [Срок, дн.]
+          CASE
+            WHEN is_promo = 1
+                THEN CONCAT(promo_term_bucket,N' РК')
+            ELSE CAST(normal_term_bucket AS nvarchar(20))
+          END AS [Срок, дн.]
 
         , dt_open AS [Дата открытия]
 
-        , SUM(out_rub)
-            AS [Объем, руб.]
+        , SUM(out_rub) AS [Объем, руб.]
 
         , CAST(
             SUM(wsum_rate_con)
@@ -369,59 +368,21 @@ OUTER APPLY
             AS decimal(9,6)
           ) AS [Средневзв. прогнозный КС]
 
-        , normal_term_bucket AS sort_term
-        , 0 AS sort_rk
+        , CASE
+            WHEN is_promo = 1
+                THEN promo_term_bucket
+            ELSE normal_term_bucket
+          END AS sort_term
+
+        , is_promo AS sort_promo
 
     FROM #main_result
 
-    WHERE is_rk = 0
-
     GROUP BY
-          normal_term_bucket
-        , dt_open
-
-
-    UNION ALL
-
-
-    /* РК */
-    SELECT
-          CONCAT(promo_term_bucket,N' РК')
-            AS [Срок, дн.]
-
-        , dt_open AS [Дата открытия]
-
-        , SUM(out_rub)
-            AS [Объем, руб.]
-
-        , CAST(
-            SUM(wsum_rate_con)
-            / NULLIF(SUM(wden_rate_con),0)
-            AS decimal(9,6)
-          ) AS [Средневзв. ставка (клиент)]
-
-        , CAST(
-            SUM(wsum_rate_trf)
-            / NULLIF(SUM(wden_rate_trf),0)
-            AS decimal(9,6)
-          ) AS [Средневзв. ставка (ТС)]
-
-        , CAST(
-            SUM(wsum_avg_key_rate)
-            / NULLIF(SUM(wden_avg_key_rate),0)
-            AS decimal(9,6)
-          ) AS [Средневзв. прогнозный КС]
-
-        , promo_term_bucket AS sort_term
-        , 1 AS sort_rk
-
-    FROM #main_result
-
-    WHERE is_rk = 1
-
-    GROUP BY
-          promo_term_bucket
-        , dt_open
+          dt_open
+        , is_promo
+        , promo_term_bucket
+        , normal_term_bucket
 )
 
 SELECT
@@ -437,7 +398,7 @@ FROM tall
 ORDER BY
       [Дата открытия]
     , sort_term
-    , sort_rk;
+    , sort_promo;
 
 
 
@@ -445,63 +406,36 @@ ORDER BY
 
 /* ============================================================
    ============================================================
-   ЧАСТЬ 2.
-   ПРОВЕРКА A / B / C НА БАЛАНСЕ
+   ЧАСТЬ 2
+   БАЛАНС НА @control_dt
    ============================================================
    ============================================================ */
 
-IF OBJECT_ID('tempdb..#bal_check') IS NOT NULL
-    DROP TABLE #bal_check;
-
+IF OBJECT_ID('tempdb..#bal_check') IS NOT NULL DROP TABLE #bal_check;
 
 SELECT
       TRY_CAST(t.con_id AS bigint) AS con_id
+    , MIN(TRY_CAST(t.cli_id AS bigint)) AS cli_id
 
-    , MIN(TRY_CAST(t.cli_id AS bigint))
-        AS cli_id
+    , MIN(CAST(t.dt_open AS date)) AS dt_open
 
-    , MIN(CAST(t.dt_open AS date))
-        AS dt_open
+    , MIN(t.TSEGMENTNAME)  AS TSEGMENTNAME
+    , MIN(t.PROD_NAME_res) AS PROD_NAME_res
 
-    , MIN(t.TSEGMENTNAME)
-        AS TSEGMENTNAME
+    , SUM(t.out_rub) AS out_rub
 
-    , SUM(t.out_rub)
-        AS out_rub
+    , MIN(t.rate_con) AS rate_con
+    , MIN(t.termdays) AS termdays
 
-    , MIN(t.rate_con)
-        AS rate_con
-
-    , MIN(t.termdays)
-        AS termdays
-
-
-    /* фактическая conv */
     , CASE
-        WHEN MIN(
-                 NULLIF(
-                     LTRIM(RTRIM(COALESCE(t.conv,''))),
-                     ''
-                 )
-             ) IS NULL
+        WHEN MIN(NULLIF(LTRIM(RTRIM(COALESCE(t.conv,''))),'')) IS NULL
             THEN 'AT_THE_END'
-
-        ELSE UPPER(
-                 MIN(
-                     NULLIF(
-                         LTRIM(RTRIM(COALESCE(t.conv,''))),
-                         ''
-                     )
-                 )
-             )
+        ELSE UPPER(MIN(NULLIF(LTRIM(RTRIM(COALESCE(t.conv,''))),'')))
       END AS conv_norm
-
 
 INTO #bal_check
 
-
 FROM ALM.ALM.VW_Balance_Rest_All t WITH (NOLOCK)
-
 
 WHERE
     t.dt_rep = @control_dt
@@ -515,7 +449,6 @@ WHERE
     AND t.out_rub IS NOT NULL
     AND t.out_rub >= 0
 
-
 GROUP BY
     t.con_id;
 
@@ -526,310 +459,357 @@ CREATE UNIQUE CLUSTERED INDEX IX_bal_check
 
 
 /* ============================================================
-   A = НОВ / НДП / НДМ
-   C = ПРОЧИЕ
+   НАДБАВКИ
    ============================================================ */
 
-IF OBJECT_ID('tempdb..#attr_check') IS NOT NULL
-    DROP TABLE #attr_check;
-
+IF OBJECT_ID('tempdb..#attr_check') IS NOT NULL DROP TABLE #attr_check;
 
 ;WITH x AS
 (
     SELECT
           TRY_CAST(a.CON_ID AS bigint) AS con_id
 
-
-        /* A */
         , CASE
             WHEN
                    ISNULL(TRY_CAST(a.[Нов] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[НДП] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[НДМ] AS int),0) = 1
+            THEN 1 ELSE 0
+          END AS flag_newmoney
 
-                THEN 1
-            ELSE 0
-          END AS flag_A
-
-
-        /* C */
         , CASE
             WHEN
                    ISNULL(TRY_CAST(a.[Пк3] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[Пк6] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[Пк7] AS int),0) = 1
-
                 OR ISNULL(TRY_CAST(a.[Пр2] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[Пр3] AS int),0) = 1
-
                 OR ISNULL(TRY_CAST(a.[Пк2] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[От1] AS int),0) = 1
-
                 OR ISNULL(TRY_CAST(a.[Мпл] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[Пнс] AS int),0) = 1
-
-                THEN 1
-            ELSE 0
-          END AS flag_C
-
+            THEN 1 ELSE 0
+          END AS flag_other_markup
 
         , ROW_NUMBER() OVER
           (
               PARTITION BY a.CON_ID
-
               ORDER BY
                     a.DT_UPDATE DESC
                   , a.loaddate DESC
           ) AS rn
 
-
     FROM ALM.ehd.attr_DepoFLConditions a WITH (NOLOCK)
 
     INNER JOIN #bal_check b
-        ON b.con_id =
-           TRY_CAST(a.CON_ID AS bigint)
+        ON b.con_id = TRY_CAST(a.CON_ID AS bigint)
 )
-
 
 SELECT
       con_id
-    , flag_A
-    , flag_C
+    , flag_newmoney
+    , flag_other_markup
 
 INTO #attr_check
 
 FROM x
-
 WHERE rn = 1;
 
 
 
 /* ============================================================
-   B = МАТЧ СО СПРАВОЧНИКОМ
+   ФИНАЛЬНАЯ КЛАССИФИКАЦИЯ БАЛАНСА
    ============================================================ */
 
-IF OBJECT_ID('tempdb..#result_check') IS NOT NULL
-    DROP TABLE #result_check;
-
+IF OBJECT_ID('tempdb..#result_check') IS NOT NULL DROP TABLE #result_check;
 
 SELECT
       b.*
 
-    , ISNULL(a.flag_A,0)
-        AS flag_A
+    , ISNULL(a.flag_newmoney,0)
+        AS flag_newmoney
 
-    , ISNULL(a.flag_C,0)
-        AS flag_C
+    , ISNULL(a.flag_other_markup,0)
+        AS flag_other_markup
 
 
+    /* A */
     , CASE
-        WHEN EXISTS
-        (
-            SELECT 1
-
-            FROM ALM_TEST.WORK.promo_new_money_rate_dict r
-                WITH (NOLOCK)
-
-            WHERE
-                r.is_active = 1
-
-
-                /* дата открытия */
-                AND b.dt_open
-                    BETWEEN r.date_from AND r.date_to
+        WHEN
+               b.TSEGMENTNAME = N'ДЧБО'
+            OR b.PROD_NAME_res IN
+               (
+                   N'Классический',
+                   N'Привилегия',
+                   N'Достояние'
+               )
+        THEN 1 ELSE 0
+      END AS is_auto_promo
 
 
-                /* срок */
-                AND b.termdays
-                    BETWEEN r.term_min AND r.term_max
-
-
-                /* конвенция */
-                AND r.conv_type =
-                    CASE
-                        WHEN b.conv_norm = 'AT_THE_END'
-                            THEN 'AT_THE_END'
-                        ELSE 'NOT_AT_THE_END'
-                    END
-
-
-                /* сумма */
-                AND b.out_rub
-                    BETWEEN r.amount_from AND r.amount_to
-
-
-                /* ставка */
-                AND ABS(
-                        b.rate_con
-                        - r.promo_rate
-                    ) <= @eps
-        )
-
+    /* B: полный матч справочника */
+    , CASE
+        WHEN d.id IS NOT NULL
             THEN 1
         ELSE 0
+      END AS dict_match
 
-      END AS flag_B
 
+    /* итоговый промо */
+    , CASE
+
+        WHEN
+               b.TSEGMENTNAME = N'ДЧБО'
+            OR b.PROD_NAME_res IN
+               (
+                   N'Классический',
+                   N'Привилегия',
+                   N'Достояние'
+               )
+            THEN 1
+
+        WHEN
+               ISNULL(a.flag_newmoney,0) = 1
+           AND d.id IS NOT NULL
+            THEN 1
+
+        ELSE 0
+
+      END AS is_promo
+
+
+    /* информация из справочника */
+    , d.id AS dict_id
+    , d.term_bucket AS dict_term_bucket
+    , d.promo_rate AS dict_promo_rate
+    , d.campaign_name
 
 INTO #result_check
-
 
 FROM #bal_check b
 
 LEFT JOIN #attr_check a
-    ON a.con_id = b.con_id;
+    ON a.con_id = b.con_id
+
+OUTER APPLY
+(
+    SELECT TOP (1)
+          r.id
+        , r.term_bucket
+        , r.promo_rate
+        , r.campaign_name
+
+    FROM ALM_TEST.WORK.promo_new_money_rate_dict r WITH (NOLOCK)
+
+    WHERE
+        r.is_active = 1
+
+        AND b.dt_open
+            BETWEEN r.date_from AND r.date_to
+
+        AND b.termdays
+            BETWEEN r.term_min AND r.term_max
+
+        AND r.conv_type =
+            CASE
+                WHEN b.conv_norm = 'AT_THE_END'
+                    THEN 'AT_THE_END'
+                ELSE 'NOT_AT_THE_END'
+            END
+
+        AND b.out_rub
+            BETWEEN r.amount_from AND r.amount_to
+
+        AND ABS(
+                b.rate_con - r.promo_rate
+            ) <= @eps
+
+    ORDER BY
+          r.date_from DESC
+        , r.id DESC
+) d;
 
 
 
 /* ============================================================
-   RESULT SET 2 — ОБЩИЕ МНОЖЕСТВА
+   RESULT SET №2
+   КОНТРОЛЬНЫЕ ОБЪЁМЫ НА ДАТУ
    ============================================================ */
 
 SELECT
       SUM(out_rub)
         AS [Весь баланс]
 
+
+    /* все промо */
     , SUM(
-        CASE WHEN flag_A = 1
+        CASE WHEN is_promo = 1
              THEN out_rub ELSE 0 END
-      ) AS [A - НОВ НДП НДМ]
+      ) AS [Промо всего]
 
+
+    /* промо по правилу А */
     , SUM(
-        CASE WHEN flag_B = 1
+        CASE WHEN is_auto_promo = 1
              THEN out_rub ELSE 0 END
-      ) AS [B - По справочнику ставок]
+      ) AS [Промо AUTO - ДЧБО или продукт]
 
+
+    /* промо по правилу Б */
     , SUM(
-        CASE WHEN flag_A = 1
-                  AND flag_B = 1
-             THEN out_rub ELSE 0 END
-      ) AS [A ∩ B]
+        CASE
+            WHEN is_auto_promo = 0
+             AND flag_newmoney = 1
+             AND dict_match = 1
+            THEN out_rub ELSE 0
+        END
+      ) AS [Промо - НДП НДМ НОВ + справочник]
 
+
+    /* всё, что НЕ признали промо */
     , SUM(
-        CASE WHEN flag_A = 1
-                  OR flag_B = 1
+        CASE WHEN is_promo = 0
              THEN out_rub ELSE 0 END
-      ) AS [A ∪ B]
+      ) AS [Не промо всего]
 
+
+    /* =========================================
+       ПОЧЕМУ НЕ ПОПАЛО В ПРОМО
+       ========================================= */
+
+    /* есть новые деньги, но промо не признали */
     , SUM(
-        CASE WHEN flag_A = 1
-                  AND flag_B = 0
-             THEN out_rub ELSE 0 END
-      ) AS [A без B]
+        CASE
+            WHEN is_promo = 0
+             AND flag_newmoney = 1
+            THEN out_rub ELSE 0
+        END
+      ) AS [Не промо - есть НДП НДМ НОВ]
 
+
+    /* конкретно: надбавка есть, справочника нет */
     , SUM(
-        CASE WHEN flag_B = 1
-                  AND flag_A = 0
-             THEN out_rub ELSE 0 END
-      ) AS [B без A]
+        CASE
+            WHEN is_promo = 0
+             AND flag_newmoney = 1
+             AND dict_match = 0
+            THEN out_rub ELSE 0
+        END
+      ) AS [Не промо - НДП НДМ НОВ без справочника]
 
 
-    /* C */
+    /* ставка/условия подходят, надбавки новых денег нет */
     , SUM(
-        CASE WHEN flag_C = 1
-             THEN out_rub ELSE 0 END
-      ) AS [C - Прочие надбавки]
+        CASE
+            WHEN is_promo = 0
+             AND flag_newmoney = 0
+             AND dict_match = 1
+            THEN out_rub ELSE 0
+        END
+      ) AS [Не промо - справочник без НДП НДМ НОВ]
 
+
+    /* вообще подходят под справочник */
     , SUM(
-        CASE WHEN flag_C = 1
-                  AND flag_A = 1
-             THEN out_rub ELSE 0 END
-      ) AS [C ∩ A]
+        CASE
+            WHEN is_promo = 0
+             AND dict_match = 1
+            THEN out_rub ELSE 0
+        END
+      ) AS [Не промо - есть матч справочника]
 
+
+    /* прочие надбавки */
     , SUM(
-        CASE WHEN flag_C = 1
-                  AND flag_B = 1
-             THEN out_rub ELSE 0 END
-      ) AS [C ∩ B]
+        CASE
+            WHEN is_promo = 0
+             AND flag_other_markup = 1
+            THEN out_rub ELSE 0
+        END
+      ) AS [Не промо - прочие надбавки]
 
+
+    /* ровно интересующая остаточная группа */
     , SUM(
-        CASE WHEN flag_C = 1
-                  AND flag_A = 1
-                  AND flag_B = 1
-             THEN out_rub ELSE 0 END
-      ) AS [C ∩ A ∩ B]
-
+        CASE
+            WHEN is_promo = 0
+             AND flag_other_markup = 1
+             AND flag_newmoney = 0
+             AND dict_match = 0
+            THEN out_rub ELSE 0
+        END
+      ) AS [Не промо - прочие надбавки без новых денег и справочника]
 
 FROM #result_check;
 
 
 
 /* ============================================================
-   RESULT SET 3 — ПО TSEGMENTNAME
+   RESULT SET №3
+   ТО ЖЕ В РАЗБИВКЕ TSEGMENTNAME
    ============================================================ */
 
 SELECT
-      ISNULL(TSEGMENTNAME,N'NULL')
-        AS TSEGMENTNAME
+      ISNULL(TSEGMENTNAME,N'NULL') AS TSEGMENTNAME
 
     , SUM(out_rub)
         AS [Весь баланс]
 
-    , SUM(
-        CASE WHEN flag_A = 1
-             THEN out_rub ELSE 0 END
-      ) AS [A - НОВ НДП НДМ]
+    , SUM(CASE
+            WHEN is_promo = 1
+            THEN out_rub ELSE 0
+          END)
+        AS [Промо всего]
 
-    , SUM(
-        CASE WHEN flag_B = 1
-             THEN out_rub ELSE 0 END
-      ) AS [B - По справочнику ставок]
+    , SUM(CASE
+            WHEN is_auto_promo = 1
+            THEN out_rub ELSE 0
+          END)
+        AS [Промо AUTO]
 
-    , SUM(
-        CASE WHEN flag_A = 1
-                  AND flag_B = 1
-             THEN out_rub ELSE 0 END
-      ) AS [A ∩ B]
+    , SUM(CASE
+            WHEN is_auto_promo = 0
+             AND flag_newmoney = 1
+             AND dict_match = 1
+            THEN out_rub ELSE 0
+          END)
+        AS [Промо НДП НДМ НОВ + справочник]
 
-    , SUM(
-        CASE WHEN flag_A = 1
-                  OR flag_B = 1
-             THEN out_rub ELSE 0 END
-      ) AS [A ∪ B]
+    , SUM(CASE
+            WHEN is_promo = 0
+            THEN out_rub ELSE 0
+          END)
+        AS [Не промо]
 
-    , SUM(
-        CASE WHEN flag_A = 1
-                  AND flag_B = 0
-             THEN out_rub ELSE 0 END
-      ) AS [A без B]
+    , SUM(CASE
+            WHEN is_promo = 0
+             AND flag_newmoney = 1
+             AND dict_match = 0
+            THEN out_rub ELSE 0
+          END)
+        AS [Не промо - новые деньги без справочника]
 
-    , SUM(
-        CASE WHEN flag_B = 1
-                  AND flag_A = 0
-             THEN out_rub ELSE 0 END
-      ) AS [B без A]
+    , SUM(CASE
+            WHEN is_promo = 0
+             AND flag_newmoney = 0
+             AND dict_match = 1
+            THEN out_rub ELSE 0
+          END)
+        AS [Не промо - справочник без новых денег]
 
-    , SUM(
-        CASE WHEN flag_C = 1
-             THEN out_rub ELSE 0 END
-      ) AS [C - Прочие надбавки]
-
-    , SUM(
-        CASE WHEN flag_C = 1
-                  AND flag_A = 1
-             THEN out_rub ELSE 0 END
-      ) AS [C ∩ A]
-
-    , SUM(
-        CASE WHEN flag_C = 1
-                  AND flag_B = 1
-             THEN out_rub ELSE 0 END
-      ) AS [C ∩ B]
-
-    , SUM(
-        CASE WHEN flag_C = 1
-                  AND flag_A = 1
-                  AND flag_B = 1
-             THEN out_rub ELSE 0 END
-      ) AS [C ∩ A ∩ B]
-
+    , SUM(CASE
+            WHEN is_promo = 0
+             AND flag_other_markup = 1
+             AND flag_newmoney = 0
+             AND dict_match = 0
+            THEN out_rub ELSE 0
+          END)
+        AS [Не промо - только прочие надбавки]
 
 FROM #result_check
 
-
 GROUP BY
     TSEGMENTNAME
-
 
 ORDER BY
     TSEGMENTNAME;
@@ -837,47 +817,77 @@ ORDER BY
 
 
 /* ============================================================
-   RESULT SET 4 — ПОДОГОВОРНАЯ ПРОВЕРКА
+   RESULT SET №4
+   ПОДОГОВОРНОЕ ПОЛОТНО НА @control_dt
    ============================================================ */
 
 SELECT
       con_id
     , cli_id
+
     , TSEGMENTNAME
+    , PROD_NAME_res
 
     , dt_open
     , termdays
 
     , out_rub
     , rate_con
-
     , conv_norm
 
     , CASE
         WHEN conv_norm = 'AT_THE_END'
             THEN 'AT_THE_END'
         ELSE 'NOT_AT_THE_END'
-      END AS [conv_для_справочника]
+      END AS conv_для_справочника
 
-    , flag_A
-        AS [A_НОВ_НДП_НДМ]
+    , is_auto_promo
+    , flag_newmoney
+    , dict_match
+    , flag_other_markup
 
-    , flag_B
-        AS [B_СПРАВОЧНИК]
+    , is_promo
 
-    , flag_C
-        AS [C_ПРОЧИЕ_НАДБАВКИ]
+    , CASE
 
+        WHEN TSEGMENTNAME = N'ДЧБО'
+            THEN N'ПРОМО: ДЧБО'
+
+        WHEN PROD_NAME_res IN
+             (
+                 N'Классический',
+                 N'Привилегия',
+                 N'Достояние'
+             )
+            THEN N'ПРОМО: продукт AUTO'
+
+        WHEN flag_newmoney = 1
+         AND dict_match = 1
+            THEN N'ПРОМО: НДП/НДМ/НОВ + справочник'
+
+        WHEN flag_newmoney = 1
+         AND dict_match = 0
+            THEN N'НЕ ПРОМО: новые деньги без справочника'
+
+        WHEN flag_newmoney = 0
+         AND dict_match = 1
+            THEN N'НЕ ПРОМО: справочник без новых денег'
+
+        WHEN flag_other_markup = 1
+            THEN N'НЕ ПРОМО: прочие надбавки'
+
+        ELSE N'НЕ ПРОМО'
+
+      END AS promo_reason
+
+    , dict_id
+    , dict_term_bucket
+    , dict_promo_rate
+    , campaign_name
 
 FROM #result_check
 
-
-WHERE
-       flag_A = 1
-    OR flag_B = 1
-    OR flag_C = 1
-
-
 ORDER BY
-      TSEGMENTNAME
+      is_promo DESC
+    , TSEGMENTNAME
     , out_rub DESC;
