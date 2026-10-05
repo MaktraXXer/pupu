@@ -5,37 +5,35 @@ DECLARE @dt_rep date = '2026-09-30';
 DECLARE @eps decimal(9,6) = 0.0005;
 
 
-/* =========================================================
-   СТАВКИ РК С 01.09
-   ========================================================= */
+/* ============================================================
+   СПРАВОЧНИК СТАВОК С 01.09
+   ============================================================ */
 
-IF OBJECT_ID('tempdb..#rk_rates') IS NOT NULL DROP TABLE #rk_rates;
+IF OBJECT_ID('tempdb..#rates') IS NOT NULL DROP TABLE #rates;
 
-CREATE TABLE #rk_rates
+CREATE TABLE #rates
 (
-    d_from     date,
-    d_to       date,
-    amount_min decimal(38,6),
-    amount_max decimal(38,6),
-    conv_type  varchar(20),
-    r          decimal(9,6)
+    amount_from decimal(38,6),
+    amount_to   decimal(38,6),
+    conv_type   varchar(20),
+    rate        decimal(9,6)
 );
 
-INSERT INTO #rk_rates
+INSERT INTO #rates
 VALUES
 /* < 1.5 млн */
-('2026-09-01','2026-09-30',0,1500000,'AT_THE_END',     0.144),
-('2026-09-01','2026-09-30',0,1500000,'NOT_AT_THE_END', 0.141),
+(0,       1500000, 'AT_THE_END',     0.144),
+(0,       1500000, 'NOT_AT_THE_END', 0.141),
 
 /* >= 1.5 млн */
-('2026-09-01','2026-09-30',1500000,NULL,'AT_THE_END',     0.145),
-('2026-09-01','2026-09-30',1500000,NULL,'NOT_AT_THE_END', 0.142);
+(1500000, NULL,    'AT_THE_END',     0.145),
+(1500000, NULL,    'NOT_AT_THE_END', 0.142);
 
 
 
-/* =========================================================
-   БАЛАНС НА 30.09
-   ========================================================= */
+/* ============================================================
+   БАЛАНС НА 30.09 — ОДНА СТРОКА НА ДОГОВОР
+   ============================================================ */
 
 IF OBJECT_ID('tempdb..#bal') IS NOT NULL DROP TABLE #bal;
 
@@ -46,60 +44,41 @@ SELECT
     , MIN(t.TSEGMENTNAME) AS TSEGMENTNAME
     , SUM(t.out_rub) AS out_rub
     , MIN(t.rate_con) AS rate_con
+    , MIN(t.termdays) AS termdays
 
     , CASE
-        WHEN MIN(NULLIF(LTRIM(RTRIM(COALESCE(t.conv,''))),'')) IS NULL
+        WHEN MIN(
+            NULLIF(LTRIM(RTRIM(COALESCE(t.conv,''))), '')
+          ) IS NULL
             THEN 'AT_THE_END'
         ELSE UPPER(LTRIM(RTRIM(MIN(t.conv))))
       END AS conv_norm
-
-    , MIN(t.termdays) AS termdays
 
 INTO #bal
 
 FROM ALM.ALM.VW_Balance_Rest_All t WITH (NOLOCK)
 
 WHERE
-    t.dt_rep = @dt_rep
+    t.dt_rep       = @dt_rep
     AND t.section_name = N'Срочные'
     AND t.block_name   = N'Привлечение ФЛ'
     AND t.acc_role     = N'LIAB'
     AND t.od_flag      = 1
     AND t.cur          = '810'
-
     AND t.out_rub IS NOT NULL
     AND t.out_rub >= 0
-
-    AND t.dt_open >= '2026-09-01'
-    AND t.dt_open <= @dt_rep
-
-    AND t.PROD_NAME_res NOT IN
-    (
-          N'Надёжный прайм'
-        , N'Надёжный VIP'
-        , N'Надёжный премиум'
-        , N'Надёжный промо'
-        , N'Надёжный старт'
-        , N'Надёжный Т2'
-        , N'Надёжный Мегафон'
-        , N'Надёжный процент'
-        , N'Могучий'
-        , N'Надёжный'
-        , N'ДОМа надёжно'
-        , N'Всё в ДОМ'
-    )
 
 GROUP BY
     t.con_id;
 
-CREATE UNIQUE CLUSTERED INDEX IX_bal_con
+CREATE UNIQUE CLUSTERED INDEX IX_bal
     ON #bal(con_id);
 
 
 
-/* =========================================================
-   НАДБАВКИ
-   ========================================================= */
+/* ============================================================
+   ПОСЛЕДНИЕ НАДБАВКИ ПО ДОГОВОРУ
+   ============================================================ */
 
 IF OBJECT_ID('tempdb..#attr') IS NOT NULL DROP TABLE #attr;
 
@@ -108,18 +87,17 @@ IF OBJECT_ID('tempdb..#attr') IS NOT NULL DROP TABLE #attr;
     SELECT
           TRY_CAST(a.CON_ID AS bigint) AS con_id
 
-        /* НДП / НДМ / НОВ */
+        /* A = НОВ / НДП / НДМ */
         , CASE
             WHEN
-                   ISNULL(TRY_CAST(a.[НДП] AS int),0) = 1
+                   ISNULL(TRY_CAST(a.[Нов] AS int),0) = 1
+                OR ISNULL(TRY_CAST(a.[НДП] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[НДМ] AS int),0) = 1
-                OR ISNULL(TRY_CAST(a.[Нов] AS int),0) = 1
-                THEN 1
-            ELSE 0
-          END AS is_ndp_ndm_nov
+            THEN 1 ELSE 0
+          END AS flag_A
 
 
-        /* исключённые группы */
+        /* C = остальные надбавки */
         , CASE
             WHEN
                    ISNULL(TRY_CAST(a.[Пк3] AS int),0) = 1
@@ -131,9 +109,8 @@ IF OBJECT_ID('tempdb..#attr') IS NOT NULL DROP TABLE #attr;
                 OR ISNULL(TRY_CAST(a.[От1] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[Мпл] AS int),0) = 1
                 OR ISNULL(TRY_CAST(a.[Пнс] AS int),0) = 1
-                THEN 1
-            ELSE 0
-          END AS is_excluded
+            THEN 1 ELSE 0
+          END AS flag_C
 
         , ROW_NUMBER() OVER
           (
@@ -151,124 +128,248 @@ IF OBJECT_ID('tempdb..#attr') IS NOT NULL DROP TABLE #attr;
 
 SELECT
       con_id
-    , is_ndp_ndm_nov
-    , is_excluded
+    , flag_A
+    , flag_C
 INTO #attr
 FROM x
 WHERE rn = 1;
 
 
 
-/* =========================================================
-   ФЛАГИ
-   ========================================================= */
+/* ============================================================
+   СОБИРАЕМ МНОЖЕСТВА
 
-;WITH flags AS
-(
-    SELECT
-          b.*
+   A = НОВ / НДП / НДМ
+   B = подходит под справочник ставок
+   C = прочие надбавки
+   ============================================================ */
 
-        , ISNULL(a.is_ndp_ndm_nov,0) AS is_ndp_ndm_nov
-        , ISNULL(a.is_excluded,0)    AS is_excluded
+IF OBJECT_ID('tempdb..#result') IS NOT NULL DROP TABLE #result;
 
-        , CASE
-            WHEN b.termdays BETWEEN 80 AND 115
+SELECT
+      b.*
 
-             AND EXISTS
-             (
-                 SELECT 1
-                 FROM #rk_rates r
-                 WHERE
-                     b.dt_open BETWEEN r.d_from AND r.d_to
+    , ISNULL(a.flag_A,0) AS flag_A
+    , ISNULL(a.flag_C,0) AS flag_C
 
-                     /* бакет суммы */
-                     AND b.out_rub >= r.amount_min
-                     AND (
-                            r.amount_max IS NULL
-                            OR b.out_rub < r.amount_max
-                         )
+    , CASE
+        WHEN
+            /* 91-дневный РК */
+            b.termdays BETWEEN 80 AND 115
 
-                     /* тип выплаты */
-                     AND r.conv_type =
-                         CASE
-                             WHEN b.conv_norm = 'AT_THE_END'
-                                 THEN 'AT_THE_END'
-                             ELSE 'NOT_AT_THE_END'
-                         END
+            /* открыт не раньше начала справочника */
+            AND b.dt_open >= '2026-09-01'
 
-                     /* ставка */
-                     AND ABS(b.rate_con - r.r) <= @eps
-             )
+            AND EXISTS
+            (
+                SELECT 1
+                FROM #rates r
 
-                THEN 1
-            ELSE 0
-          END AS rate_ok
+                WHERE
+                    /* сумма */
+                    b.out_rub >= r.amount_from
 
-    FROM #bal b
+                    AND
+                    (
+                        r.amount_to IS NULL
+                        OR b.out_rub < r.amount_to
+                    )
 
-    LEFT JOIN #attr a
-        ON a.con_id = b.con_id
-)
+                    /* выплата процентов */
+                    AND r.conv_type =
+                        CASE
+                            WHEN b.conv_norm = 'AT_THE_END'
+                                THEN 'AT_THE_END'
+                            ELSE 'NOT_AT_THE_END'
+                        END
+
+                    /* ставка */
+                    AND ABS(b.rate_con - r.rate) <= @eps
+            )
+
+        THEN 1
+        ELSE 0
+      END AS flag_B
+
+INTO #result
+
+FROM #bal b
+
+LEFT JOIN #attr a
+    ON a.con_id = b.con_id;
 
 
-/* =========================================================
-   ИТОГ ПО TSEGMENTNAME
-   ========================================================= */
+
+/* ============================================================
+   1. ОБЩИЕ ОБЪЁМЫ МНОЖЕСТВ
+   ============================================================ */
+
+SELECT
+      SUM(out_rub) AS [Весь баланс]
+
+    /* A */
+    , SUM(CASE
+            WHEN flag_A = 1
+            THEN out_rub ELSE 0
+          END) AS [A - НОВ НДП НДМ]
+
+    /* B */
+    , SUM(CASE
+            WHEN flag_B = 1
+            THEN out_rub ELSE 0
+          END) AS [B - По справочнику ставки]
+
+    /* A ∩ B */
+    , SUM(CASE
+            WHEN flag_A = 1
+             AND flag_B = 1
+            THEN out_rub ELSE 0
+          END) AS [A ∩ B]
+
+    /* A ∪ B */
+    , SUM(CASE
+            WHEN flag_A = 1
+              OR flag_B = 1
+            THEN out_rub ELSE 0
+          END) AS [A ∪ B]
+
+    /* A \ B */
+    , SUM(CASE
+            WHEN flag_A = 1
+             AND flag_B = 0
+            THEN out_rub ELSE 0
+          END) AS [A без B]
+
+    /* B \ A */
+    , SUM(CASE
+            WHEN flag_B = 1
+             AND flag_A = 0
+            THEN out_rub ELSE 0
+          END) AS [B без A]
+
+
+    /* ==========================
+       СПРАВОЧНО: ПРОЧИЕ НАДБАВКИ
+       ========================== */
+
+    /* C */
+    , SUM(CASE
+            WHEN flag_C = 1
+            THEN out_rub ELSE 0
+          END) AS [C - Прочие надбавки]
+
+    /* C ∩ A */
+    , SUM(CASE
+            WHEN flag_C = 1
+             AND flag_A = 1
+            THEN out_rub ELSE 0
+          END) AS [C ∩ A]
+
+    /* C ∩ B */
+    , SUM(CASE
+            WHEN flag_C = 1
+             AND flag_B = 1
+            THEN out_rub ELSE 0
+          END) AS [C ∩ B]
+
+    /* C ∩ A ∩ B */
+    , SUM(CASE
+            WHEN flag_C = 1
+             AND flag_A = 1
+             AND flag_B = 1
+            THEN out_rub ELSE 0
+          END) AS [C ∩ A ∩ B]
+
+FROM #result;
+
+
+
+/* ============================================================
+   2. ТО ЖЕ САМОЕ В РАЗБИВКЕ TSEGMENTNAME
+   ============================================================ */
 
 SELECT
       ISNULL(TSEGMENTNAME,N'NULL') AS TSEGMENTNAME
 
-    /* 1. НДП + НДМ + НОВ */
-    , SUM(
-        CASE WHEN is_ndp_ndm_nov = 1
-             THEN out_rub ELSE 0 END
-      ) AS [1_НДП_НДМ_НОВ]
+    , SUM(out_rub) AS [Весь баланс]
+
+    , SUM(CASE WHEN flag_A = 1
+               THEN out_rub ELSE 0 END)
+        AS [A - НОВ НДП НДМ]
+
+    , SUM(CASE WHEN flag_B = 1
+               THEN out_rub ELSE 0 END)
+        AS [B - По справочнику ставки]
+
+    , SUM(CASE WHEN flag_A = 1 AND flag_B = 1
+               THEN out_rub ELSE 0 END)
+        AS [A ∩ B]
+
+    , SUM(CASE WHEN flag_A = 1 OR flag_B = 1
+               THEN out_rub ELSE 0 END)
+        AS [A ∪ B]
+
+    , SUM(CASE WHEN flag_A = 1 AND flag_B = 0
+               THEN out_rub ELSE 0 END)
+        AS [A без B]
+
+    , SUM(CASE WHEN flag_B = 1 AND flag_A = 0
+               THEN out_rub ELSE 0 END)
+        AS [B без A]
 
 
-    /* 2. Все подходящие по ставке */
-    , SUM(
-        CASE WHEN rate_ok = 1
-             THEN out_rub ELSE 0 END
-      ) AS [2_По_ставке]
+    /* прочие надбавки */
+    , SUM(CASE WHEN flag_C = 1
+               THEN out_rub ELSE 0 END)
+        AS [C - Прочие надбавки]
 
+    , SUM(CASE WHEN flag_C = 1 AND flag_A = 1
+               THEN out_rub ELSE 0 END)
+        AS [C ∩ A]
 
-    /* 3. По ставке БЕЗ исключённых */
-    , SUM(
-        CASE WHEN rate_ok = 1
-                  AND is_excluded = 0
-             THEN out_rub ELSE 0 END
-      ) AS [3_По_ставке_без_исключенных]
+    , SUM(CASE WHEN flag_C = 1 AND flag_B = 1
+               THEN out_rub ELSE 0 END)
+        AS [C ∩ B]
 
+    , SUM(CASE WHEN flag_C = 1 AND flag_A = 1 AND flag_B = 1
+               THEN out_rub ELSE 0 END)
+        AS [C ∩ A ∩ B]
 
-    /* 4. По ставке И исключённые */
-    , SUM(
-        CASE WHEN rate_ok = 1
-                  AND is_excluded = 1
-             THEN out_rub ELSE 0 END
-      ) AS [4_По_ставке_исключенные]
-
-
-    /* контроль */
-    , SUM(
-        CASE WHEN is_ndp_ndm_nov = 1
-             THEN out_rub ELSE 0 END
-      )
-      +
-      SUM(
-        CASE WHEN rate_ok = 1
-             THEN out_rub ELSE 0 END
-      )
-      -
-      SUM(
-        CASE WHEN rate_ok = 1
-                  AND is_excluded = 1
-             THEN out_rub ELSE 0 END
-      ) AS [1+2-4]
-
-FROM flags
+FROM #result
 
 GROUP BY
     TSEGMENTNAME
 
 ORDER BY
     TSEGMENTNAME;
+
+
+
+/* ============================================================
+   3. ПОДОГОВОРНАЯ ВЫГРУЗКА ДЛЯ ПРОВЕРКИ
+   ============================================================ */
+
+SELECT
+      con_id
+    , cli_id
+    , TSEGMENTNAME
+    , dt_open
+    , termdays
+    , out_rub
+    , rate_con
+    , conv_norm
+
+    , flag_A AS [A_НОВ_НДП_НДМ]
+    , flag_B AS [B_СПРАВОЧНИК_СТАВКИ]
+    , flag_C AS [C_ПРОЧИЕ_НАДБАВКИ]
+
+FROM #result
+
+WHERE
+       flag_A = 1
+    OR flag_B = 1
+    OR flag_C = 1
+
+ORDER BY
+      TSEGMENTNAME
+    , out_rub DESC;
