@@ -1,232 +1,381 @@
-Используем существующую схему `[morgach]` в базе `ALM_TEST`. Название таблицы — `[ALM_TEST].[morgach].[contract_transfer_rates]`.
-
-## 1. SQL — создание таблицы
-
-```
-USE [ALM_TEST];
-GO
-
-CREATE TABLE [morgach].[contract_transfer_rates]
-(
-    ID             BIGINT IDENTITY(1,1) PRIMARY KEY,
-    CON_ID         BIGINT,
-    DT_FROM        DATE,
-    DT_TO          DATE,
-    TRF_RATE_TYPE  NVARCHAR(50),
-    TRF_RATE       DECIMAL(18,8),
-    CON_NO         NVARCHAR(100),
-    DT_OPEN_FACT   DATE,
-    DT_CLOSE_PLAN  DATE,
-    DT_CLOSE_FACT  DATE,
-    MATUR          NVARCHAR(50),
-    CUR            NVARCHAR(10),
-    PROD_ID        BIGINT,
-    PROD_NAME      NVARCHAR(500),
-    LOAD_DT        DATETIME2 DEFAULT SYSDATETIME()
-);
-GO
-```
-
-## 2. VBA — импорт Excel в SQL Server
-
-Макрос рассчитан на исходные 13 столбцов `A:M`, заголовки в первой строке и данные со второй. Перед запуском поменяй `SHEET_NAME` на название листа.
-
-Особенности:
-
-- Загружает данные пакетами по 200 строк.
-- Сохраняет русские названия продуктов.
-- Даты `01.01.4444` обрабатывает как текст.
-- Ставку `0.1575` сохраняет как `0.1575`.
-- При повторной загрузке полностью заменяет содержимое таблицы.
-- Использует транзакцию с откатом при ошибке.
-
-```
 
 Option Explicit
 
+'====================================================
+' ИМПОРТ EXCEL -> ALM_TEST.morgach.contract_transfer_rates
+'
+' Источник: активный лист, A2:M25274
+' Подключение: trading-db.ahml1.ru
+'
+' При повторной загрузке таблица заменяется целиком.
+' При ошибке все изменения откатываются.
+'====================================================
+
 Sub ImportContractTransferRates()
 
-    Const SHEET_NAME As String = "Лист1"  ' Изменить
     Const FIRST_ROW As Long = 2
+    Const LAST_ROW As Long = 25274
     Const BATCH_SIZE As Long = 200
 
     Dim ws As Worksheet
     Dim conn As Object
     Dim data As Variant
-    Dim lastRow As Long
+
     Dim r As Long, c As Long
     Dim sql As String, vals As String
-    Dim batchCount As Long, rowsLoaded As Long
+    Dim batchCount As Long
+    Dim rowsLoaded As Long
     Dim inTrans As Boolean
+
     Dim errMsg As String
+    Dim errNum As Long
+    Dim stage As String
 
     On Error GoTo ErrHandler
+
     Application.ScreenUpdating = False
+    Application.EnableEvents = False
 
-    Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
-    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    stage = "Чтение листа"
 
-    If lastRow < FIRST_ROW Then
-        Err.Raise vbObjectError + 1, , "Нет данных для импорта"
-    End If
+    ' Берем активный лист, название не важно
+    Set ws = ActiveSheet
 
-    data = ws.Range("A" & FIRST_ROW & ":M" & lastRow).Value2
+    ' Загружаем диапазон в память
+    data = ws.Range("A" & FIRST_ROW & ":M" & LAST_ROW).Value2
+
+    '================================================
+    ' ПОДКЛЮЧЕНИЕ
+    '================================================
+
+    stage = "Подключение к SQL Server"
 
     Set conn = CreateObject("ADODB.Connection")
+
     conn.ConnectionTimeout = 30
     conn.CommandTimeout = 300
 
-    conn.Open "Provider=SQLOLEDB;" & _
-              "Data Source=trading-db.ahml1.ru;" & _
-              "Initial Catalog=ALM_TEST;" & _
-              "Integrated Security=SSPI;"
+    conn.Open _
+        "Provider=SQLOLEDB;" & _
+        "Data Source=trading-db.ahml1.ru;" & _
+        "Initial Catalog=ALM_TEST;" & _
+        "Integrated Security=SSPI;"
 
     conn.BeginTrans
     inTrans = True
 
-    conn.Execute "DELETE FROM [morgach].[contract_transfer_rates];"
+    stage = "Очистка таблицы"
 
-    sql = ""
+    conn.Execute _
+        "DELETE FROM [morgach].[contract_transfer_rates];"
+
+    '================================================
+    ' ЗАГРУЗКА ДАННЫХ
+    '================================================
+
     batchCount = 0
+    rowsLoaded = 0
+    sql = ""
 
     For r = 1 To UBound(data, 1)
 
-        If Len(Trim$(CStr(data(r, 1)))) > 0 Then
+        stage = "Обработка Excel, строка " & (r + FIRST_ROW - 1)
 
-            vals = "("
+        If IsError(data(r, 1)) Then
+            Err.Raise vbObjectError + 101, , _
+                "Ошибка в CON_ID"
+        End If
 
-            For c = 1 To 13
-                Select Case c
-                    Case 2, 3, 7, 8, 9
-                        vals = vals & SqlDateValue(data(r, c))
-                    Case 1, 12
-                        vals = vals & SqlNumber(data(r, c))
-                    Case 5
-                        vals = vals & SqlRate(data(r, c))
-                    Case Else
-                        vals = vals & SqlText(data(r, c))
-                End Select
+        If Len(Trim$(CStr(data(r, 1)))) = 0 Then
+            Err.Raise vbObjectError + 102, , _
+                "Пустой CON_ID"
+        End If
 
-                If c < 13 Then vals = vals & ","
-            Next c
+        vals = "("
 
-            vals = vals & ")"
+        For c = 1 To 13
 
-            If batchCount = 0 Then
-                sql = "INSERT INTO [morgach].[contract_transfer_rates] " & _
-                      "(CON_ID, DT_FROM, DT_TO, TRF_RATE_TYPE, " & _
-                      "TRF_RATE, CON_NO, DT_OPEN_FACT, DT_CLOSE_PLAN, " & _
-                      "DT_CLOSE_FACT, MATUR, CUR, PROD_ID, PROD_NAME) VALUES "
-            Else
-                sql = sql & ","
-            End If
+            Select Case c
 
-            sql = sql & vals
-            batchCount = batchCount + 1
+                ' Даты
+                Case 2, 3, 7, 8, 9
+                    vals = vals & SqlDateValue(data(r, c))
 
-            If batchCount >= BATCH_SIZE Then
-                conn.Execute sql
-                rowsLoaded = rowsLoaded + batchCount
-                batchCount = 0
-                sql = ""
-            End If
+                ' Числовые ID
+                Case 1, 12
+                    vals = vals & SqlIntegerValue(data(r, c))
+
+                ' Трансфертная ставка
+                Case 5
+                    vals = vals & SqlRateValue(data(r, c))
+
+                ' Остальные значения - текст
+                Case Else
+                    vals = vals & SqlTextValue(data(r, c))
+
+            End Select
+
+            If c < 13 Then vals = vals & ","
+
+        Next c
+
+        vals = vals & ")"
+
+        If batchCount = 0 Then
+
+            sql = _
+                "INSERT INTO [morgach].[contract_transfer_rates] (" & _
+                "CON_ID, DT_FROM, DT_TO, TRF_RATE_TYPE, " & _
+                "TRF_RATE, CON_NO, DT_OPEN_FACT, " & _
+                "DT_CLOSE_PLAN, DT_CLOSE_FACT, MATUR, " & _
+                "CUR, PROD_ID, PROD_NAME) VALUES "
+
+        Else
+            sql = sql & ","
+        End If
+
+        sql = sql & vals
+
+        batchCount = batchCount + 1
+
+        ' Отправляем пакет
+        If batchCount >= BATCH_SIZE Then
+
+            stage = "SQL INSERT, пакет до строки " & _
+                    (r + FIRST_ROW - 1)
+
+            conn.Execute sql
+
+            rowsLoaded = rowsLoaded + batchCount
+
+            batchCount = 0
+            sql = ""
+
+            Application.StatusBar = _
+                "Импортировано строк: " & rowsLoaded
 
         End If
+
     Next r
 
+    ' Последний неполный пакет
     If batchCount > 0 Then
+
+        stage = "Последний пакет INSERT"
+
         conn.Execute sql
+
         rowsLoaded = rowsLoaded + batchCount
+
     End If
+
+    '================================================
+    ' ЗАВЕРШЕНИЕ
+    '================================================
+
+    stage = "Подтверждение транзакции"
 
     conn.CommitTrans
     inTrans = False
 
-    MsgBox "Импорт завершён. Загружено строк: " & _
-           rowsLoaded, vbInformation
+    MsgBox _
+        "Импорт успешно завершен!" & vbCrLf & _
+        "Загружено строк: " & rowsLoaded & vbCrLf & _
+        "База: ALM_TEST" & vbCrLf & _
+        "Таблица: morgach.contract_transfer_rates", _
+        vbInformation
 
 CleanUp:
+
     On Error Resume Next
+
     If Not conn Is Nothing Then
         If conn.State = 1 Then conn.Close
     End If
+
+    Application.StatusBar = False
     Application.ScreenUpdating = True
+    Application.EnableEvents = True
+
+    Set conn = Nothing
+
     Exit Sub
 
 ErrHandler:
-    errMsg = "Ошибка в строке Excel " & _
-             (r + FIRST_ROW - 1) & ": " & Err.Description
+
+    errNum = Err.Number
+    errMsg = Err.Description
+
     On Error Resume Next
-    If inTrans Then conn.RollbackTrans
-    MsgBox errMsg, vbCritical
+
+    If Not conn Is Nothing Then
+        If inTrans And conn.State = 1 Then
+            conn.RollbackTrans
+        End If
+    End If
+
+    MsgBox _
+        "Ошибка VBA/SQL: " & errNum & vbCrLf & _
+        "Этап: " & stage & vbCrLf & _
+        "Описание: " & errMsg, _
+        vbCritical
+
     Resume CleanUp
 
 End Sub
 
 
-Private Function SqlText(ByVal v As Variant) As String
+'====================================================
+' ТЕКСТОВЫЕ ЗНАЧЕНИЯ
+'====================================================
 
-    If IsError(v) Or IsEmpty(v) Or IsNull(v) Then
-        SqlText = "NULL"
-    ElseIf Len(Trim$(CStr(v))) = 0 Then
-        SqlText = "NULL"
+Private Function SqlTextValue(ByVal v As Variant) As String
+
+    If IsError(v) Then
+        Err.Raise vbObjectError + 201, , _
+            "Ошибка Excel в текстовом поле"
+    End If
+
+    If IsEmpty(v) Or IsNull(v) Then
+        SqlTextValue = "NULL"
+        Exit Function
+    End If
+
+    If Len(Trim$(CStr(v))) = 0 Then
+        SqlTextValue = "NULL"
     Else
-        SqlText = "N'" & Replace(CStr(v), "'", "''") & "'"
+        SqlTextValue = "N'" & _
+            Replace(CStr(v), "'", "''") & "'"
     End If
 
 End Function
 
 
-Private Function SqlNumber(ByVal v As Variant) As String
+'====================================================
+' ЧИСЛОВЫЕ ИДЕНТИФИКАТОРЫ
+'====================================================
 
-    If IsError(v) Or IsEmpty(v) Or IsNull(v) Then
-        SqlNumber = "NULL"
-    ElseIf Len(Trim$(CStr(v))) = 0 Then
-        SqlNumber = "NULL"
-    ElseIf Not IsNumeric(v) Then
-        Err.Raise vbObjectError + 2, , _
-                  "Некорректное число: " & CStr(v)
-    Else
-        SqlNumber = Trim$(Str$(CDbl(v)))
-    End If
-
-End Function
-
-
-Private Function SqlRate(ByVal v As Variant) As String
+Private Function SqlIntegerValue(ByVal v As Variant) As String
 
     Dim s As String
 
-    If IsError(v) Or IsEmpty(v) Or IsNull(v) Then
-        SqlRate = "NULL"
+    If IsError(v) Then
+        Err.Raise vbObjectError + 202, , _
+            "Ошибка Excel в числовом поле"
+    End If
+
+    If IsEmpty(v) Or IsNull(v) Then
+        SqlIntegerValue = "NULL"
         Exit Function
     End If
 
     s = Trim$(CStr(v))
 
     If s = "" Then
-        SqlRate = "NULL"
-    ElseIf IsNumeric(v) Then
-        SqlRate = SqlNumber(v)
-    ElseIf InStr(s, "%") > 0 Then
-        s = Replace(s, "%", "")
-        If Not IsNumeric(s) Then
-            Err.Raise 13, , "Некорректная ставка: " & s
-        End If
-        SqlRate = Trim$(Str$(CDbl(s) / 100#))
-    Else
-        Err.Raise 13, , "Некорректная ставка: " & s
+        SqlIntegerValue = "NULL"
+        Exit Function
     End If
+
+    If Not IsNumeric(v) Then
+        Err.Raise vbObjectError + 203, , _
+            "Некорректное числовое поле: " & s
+    End If
+
+    If CDbl(v) <> Fix(CDbl(v)) Then
+        Err.Raise vbObjectError + 204, , _
+            "Ожидалось целое число: " & s
+    End If
+
+    SqlIntegerValue = Format$(CDbl(v), "0")
 
 End Function
 
+
+'====================================================
+' СТАВКА
+'
+' 0.1575  -> 0.15750000
+' 0,1575  -> 0.15750000
+' 15.75%  -> 0.15750000
+'====================================================
+
+Private Function SqlRateValue(ByVal v As Variant) As String
+
+    Dim s As String
+    Dim x As Double
+    Dim hasPercent As Boolean
+
+    If IsError(v) Then
+        Err.Raise vbObjectError + 301, , _
+            "Ошибка Excel в ставке"
+    End If
+
+    If IsEmpty(v) Or IsNull(v) Then
+        SqlRateValue = "NULL"
+        Exit Function
+    End If
+
+    s = Trim$(CStr(v))
+
+    If s = "" Then
+        SqlRateValue = "NULL"
+        Exit Function
+    End If
+
+    hasPercent = (InStr(s, "%") > 0)
+
+    s = Replace(s, "%", "")
+    s = Replace(s, ChrW(160), "")
+    s = Replace(s, " ", "")
+    s = Replace(s, ",", ".")
+
+    ' Проверяем числовой формат
+    If s Like "*[!0-9.+-]*" Or _
+       Len(s) = 0 Then
+
+        Err.Raise vbObjectError + 302, , _
+            "Некорректная ставка: " & CStr(v)
+
+    End If
+
+    If Not IsNumeric(Replace(s, ".", _
+        Application.International(xlDecimalSeparator))) Then
+
+        Err.Raise vbObjectError + 303, , _
+            "Некорректная ставка: " & CStr(v)
+
+    End If
+
+    x = Val(s)
+
+    If hasPercent Then x = x / 100#
+
+    SqlRateValue = Replace( _
+        Format$(x, "0.00000000"), ",", ".")
+
+End Function
+
+
+'====================================================
+' ДАТЫ
+'
+' 01.01.2026 -> '20260101'
+' 01.01.4444 -> '44440101'
+' Поддерживает даты Excel и текстовые даты
+'====================================================
 
 Private Function SqlDateValue(ByVal v As Variant) As String
 
     Dim s As String
     Dim d As Date
+    Dim yy As Long, mm As Long, dd As Long
 
-    If IsError(v) Or IsEmpty(v) Or IsNull(v) Then
+    If IsError(v) Then
+        Err.Raise vbObjectError + 401, , _
+            "Ошибка Excel в поле даты"
+    End If
+
+    If IsEmpty(v) Or IsNull(v) Then
         SqlDateValue = "NULL"
         Exit Function
     End If
@@ -238,23 +387,55 @@ Private Function SqlDateValue(ByVal v As Variant) As String
         Exit Function
     End If
 
-    If IsNumeric(v) Then
-        d = DateSerial(1899, 12, 30) + CDbl(v)
-        SqlDateValue = "'" & Format$(d, "yyyymmdd") & "'"
+    ' Числовые даты Excel (Value2)
+    If VarType(v) <> vbString And IsNumeric(v) Then
 
-    ElseIf Len(s) = 10 And Mid$(s, 3, 1) = "." Then
-        SqlDateValue = "'" & _
-                       Mid$(s, 7, 4) & _
-                       Mid$(s, 4, 2) & _
-                       Left$(s, 2) & "'"
+        d = DateAdd("d", Fix(CDbl(v)), _
+                    DateSerial(1899, 12, 30))
+
+    ' Текстовая дата ДД.ММ.ГГГГ
+    ElseIf Len(s) = 10 And _
+           Mid$(s, 3, 1) = "." And _
+           Mid$(s, 6, 1) = "." Then
+
+        dd = CLng(Left$(s, 2))
+        mm = CLng(Mid$(s, 4, 2))
+        yy = CLng(Right$(s, 4))
+
+        d = DateSerial(yy, mm, dd)
+
+        If Year(d) <> yy Or Month(d) <> mm Or Day(d) <> dd Then
+            Err.Raise vbObjectError + 402, , _
+                "Некорректная дата: " & s
+        End If
+
+    ' Текстовая дата ГГГГ-ММ-ДД
+    ElseIf Len(s) = 10 And _
+           Mid$(s, 5, 1) = "-" And _
+           Mid$(s, 8, 1) = "-" Then
+
+        yy = CLng(Left$(s, 4))
+        mm = CLng(Mid$(s, 6, 2))
+        dd = CLng(Right$(s, 2))
+
+        d = DateSerial(yy, mm, dd)
+
+        If Year(d) <> yy Or Month(d) <> mm Or Day(d) <> dd Then
+            Err.Raise vbObjectError + 403, , _
+                "Некорректная дата: " & s
+        End If
+
     Else
-        d = CDate(s)
-        SqlDateValue = "'" & Format$(d, "yyyymmdd") & "'"
+
+        Err.Raise vbObjectError + 404, , _
+            "Неизвестный формат даты: " & s
+
     End If
+
+    SqlDateValue = "'" & Format$(d, "yyyymmdd") & "'"
 
 End Function
 
-```
 
 ## 3. Проверка загрузки
 
