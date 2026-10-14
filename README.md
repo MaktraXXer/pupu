@@ -2,336 +2,137 @@ USE ALM;
 SET NOCOUNT ON;
 
 /* PARAMETERS */
-DECLARE @dt_rep     date = '2026-10-10';
-DECLARE @date_from  date = '2026-10-01';
-DECLARE @date_to    date = '2026-10-10';
-DECLARE @control_dt date = '2026-10-10';
-DECLARE @eps decimal(9,6) = 0.0005;
+DECLARE @dt_to_mar date = '2026-03-12';
+DECLARE @dt_to_sep date = '2026-09-12';
+DECLARE @dt_to_oct date = '2026-10-12';
 
-/* 1. NEW DEPOSITS */
-IF OBJECT_ID('tempdb..#new_bal') IS NOT NULL DROP TABLE #new_bal;
+DECLARE @threshold decimal(18,2) = 200000000;
 
-SELECT
-      CAST(t.dt_open AS date) AS dt_open
-    , t.con_id
-    , t.cli_id
-    , t.TSEGMENTNAME
-    , t.PROD_NAME_RES
-    , t.out_rub
-    , t.rate_con
-    , t.rate_trf
-    , t.termdays
-    , t.conv
-    , fk.AVG_KEY_RATE
-INTO #new_bal
-FROM ALM.ALM.VW_Balance_Rest_All t WITH (NOLOCK)
-LEFT JOIN ALM_TEST.WORK.ForecastKey_Cache fk
-    ON fk.DT_REP = CAST(t.dt_open AS date)
-   AND fk.TERM = t.termdays
-WHERE t.dt_rep = @dt_rep
-  AND t.dt_open >= @date_from
-  AND t.dt_open < DATEADD(day, 1, @date_to)
-  AND t.section_name = N'Срочные'
-  AND t.block_name = N'Привлечение ФЛ'
-  AND t.acc_role = N'LIAB'
-  AND t.od_flag = 1
-  AND t.cur = '810'
-  AND t.out_rub IS NOT NULL
-  AND t.out_rub >= 0;
+;WITH periods AS (
+    SELECT CAST('2026-03-01' AS date) AS dt_from,
+           @dt_to_mar AS dt_to,
+           '01.03-' + CONVERT(varchar(5), @dt_to_mar, 104) AS r_w
 
-/* 2. CONTROL BALANCE */
-IF OBJECT_ID('tempdb..#control_bal') IS NOT NULL DROP TABLE #control_bal;
+    UNION ALL
 
-SELECT
-      CAST(t.dt_open AS date) AS dt_open
-    , t.con_id
-    , t.cli_id
-    , t.TSEGMENTNAME
-    , t.PROD_NAME_RES
-    , t.out_rub
-    , t.rate_con
-    , t.termdays
-    , t.conv
-INTO #control_bal
-FROM ALM.ALM.VW_Balance_Rest_All t WITH (NOLOCK)
-WHERE t.dt_rep = @control_dt
-  AND t.section_name = N'Срочные'
-  AND t.block_name = N'Привлечение ФЛ'
-  AND t.acc_role = N'LIAB'
-  AND t.od_flag = 1
-  AND t.cur = '810'
-  AND t.out_rub IS NOT NULL
-  AND t.out_rub >= 0;
+    SELECT '2026-09-01',
+           @dt_to_sep,
+           '01.09-' + CONVERT(varchar(5), @dt_to_sep, 104)
 
-/* 3. REQUIRED CONTRACT IDS */
-IF OBJECT_ID('tempdb..#ids') IS NOT NULL DROP TABLE #ids;
+    UNION ALL
 
-SELECT con_id
-INTO #ids
-FROM (
-    SELECT con_id FROM #new_bal
-    UNION
-    SELECT con_id FROM #control_bal
-) x
-WHERE con_id IS NOT NULL;
-
-CREATE UNIQUE CLUSTERED INDEX IX_ids ON #ids(con_id);
-
-/* 4. MOST RECENT MARKUPS */
-IF OBJECT_ID('tempdb..#attr') IS NOT NULL DROP TABLE #attr;
-
-;WITH ranked AS
-(
-    SELECT
-          TRY_CAST(a.CON_ID AS bigint) AS con_id
-        , TRY_CAST(a.[Нов] AS int) AS nov
-        , TRY_CAST(a.[НДП] AS int) AS ndp
-        , TRY_CAST(a.[НДМ] AS int) AS ndm
-        , TRY_CAST(a.[Пр2] AS int) AS pr2
-        , TRY_CAST(a.[Пр3] AS int) AS pr3
-        , TRY_CAST(a.[Пк2] AS int) AS pk2
-        , TRY_CAST(a.[Пк3] AS int) AS pk3
-        , TRY_CAST(a.[Пк6] AS int) AS pk6
-        , TRY_CAST(a.[Пк7] AS int) AS pk7
-        , TRY_CAST(a.[От1] AS int) AS ot1
-        , TRY_CAST(a.[Мпл] AS int) AS mpl
-        , TRY_CAST(a.[Пнс] AS int) AS pns
-        , ROW_NUMBER() OVER (
-            PARTITION BY a.CON_ID
-            ORDER BY a.DT_UPDATE DESC, a.loaddate DESC
-          ) AS rn
-    FROM ALM.ehd.attr_DepoFLConditions a WITH (NOLOCK)
-    INNER JOIN #ids i ON i.con_id = TRY_CAST(a.CON_ID AS bigint)
-)
-SELECT
-      con_id
-    , nov, ndp, ndm
-    , pr2, pr3, pk2, pk3, pk6, pk7, ot1, mpl, pns
-    , CASE WHEN ISNULL(nov,0) = 1 OR ISNULL(ndp,0) = 1 OR ISNULL(ndm,0) = 1
-           THEN 1 ELSE 0 END AS new_money
-    , CASE WHEN ISNULL(pr2,0) = 1 OR ISNULL(pr3,0) = 1
-             OR ISNULL(pk2,0) = 1 OR ISNULL(pk3,0) = 1
-             OR ISNULL(pk6,0) = 1 OR ISNULL(pk7,0) = 1
-             OR ISNULL(ot1,0) = 1 OR ISNULL(mpl,0) = 1 OR ISNULL(pns,0) = 1
-           THEN 1 ELSE 0 END AS other_markup
-INTO #attr
-FROM ranked
-WHERE rn = 1;
-
-CREATE UNIQUE CLUSTERED INDEX IX_attr ON #attr(con_id);
-
-/* 5. CLASSIFY NEW DEPOSITS */
-IF OBJECT_ID('tempdb..#new') IS NOT NULL DROP TABLE #new;
-
-SELECT
-      b.*
-    , CASE
-        WHEN b.termdays BETWEEN 28 AND 44 THEN 31
-        WHEN b.termdays BETWEEN 45 AND 79 THEN 61
-        WHEN b.termdays BETWEEN 80 AND 115 THEN 91
-        WHEN b.termdays BETWEEN 116 AND 140 THEN 124
-        WHEN b.termdays BETWEEN 141 AND 174 THEN 151
-        WHEN b.termdays BETWEEN 175 AND 200 THEN 181
-        WHEN b.termdays BETWEEN 201 AND 230 THEN 212
-        WHEN b.termdays BETWEEN 231 AND 250 THEN 243
-        WHEN b.termdays BETWEEN 251 AND 290 THEN 274
-        WHEN b.termdays BETWEEN 340 AND 405 THEN 365
-        WHEN b.termdays BETWEEN 540 AND 621 THEN 550
-        WHEN b.termdays BETWEEN 720 AND 763 THEN 750
-        WHEN b.termdays BETWEEN 1090 AND 1140 THEN 1100
-        WHEN b.termdays BETWEEN 1450 AND 1475 THEN 1460
-        WHEN b.termdays BETWEEN 1795 AND 1830 THEN 1825
-        ELSE b.termdays
-      END AS normal_bucket
-    , d.term_bucket AS promo_bucket
-    , CASE
-        WHEN d.term_bucket IS NULL THEN 0
-        WHEN b.TSEGMENTNAME = N'ДЧБО'
-          OR b.PROD_NAME_RES IN (N'Классический', N'Привилегия', N'Достояние') THEN 1
-        WHEN ISNULL(a.new_money,0) = 1 AND ISNULL(a.other_markup,0) = 0 THEN 1
-        ELSE 0
-      END AS is_promo
-INTO #new
-FROM #new_bal b
-LEFT JOIN #attr a ON a.con_id = b.con_id
-OUTER APPLY
-(
-    SELECT TOP (1) r.term_bucket
-    FROM ALM_TEST.WORK.promo_new_money_rate_dict r WITH (NOLOCK)
-    WHERE b.dt_open BETWEEN r.date_from AND r.date_to
-      AND b.termdays BETWEEN r.term_min AND r.term_max
-      AND r.conv_type = CASE WHEN ISNULL(b.conv,'AT_THE_END') = 'AT_THE_END'
-                             THEN 'AT_THE_END' ELSE 'NOT_AT_THE_END' END
-      AND b.out_rub BETWEEN r.amount_from AND r.amount_to
-      AND ABS(b.rate_con - r.promo_rate) <= @eps
-    ORDER BY r.id DESC
-) d;
-
-/* ============================================================
-   RESULT 1: VOLUME-WEIGHTED AND VOLUME x TERM-WEIGHTED METRICS
-   _vt = weighted by out_rub * termdays.
-   For each measure exclude its NULLs from the corresponding denominator.
-   ============================================================ */
-
-;WITH calc AS
-(
-    SELECT
-          n.*
-        , CASE
-            WHEN rate_con IS NULL THEN NULL
-            WHEN conv = '1M' THEN CAST(rate_con AS float)
-            WHEN termdays > 0 THEN
-                (POWER(1.0 + CAST(rate_con AS float) * termdays / 365.0,
-                       365.0 / (12.0 * termdays)) - 1.0) * 12.0
-          END AS monthly_rate
-        , CASE
-            WHEN rate_trf IS NULL THEN NULL
-            WHEN conv = '1M' THEN CAST(rate_trf AS float)
-            WHEN termdays > 0 THEN
-                (POWER(1.0 + CAST(rate_trf AS float) * termdays / 365.0,
-                       365.0 / (12.0 * termdays)) - 1.0) * 12.0
-          END AS monthly_ts
-        , CASE WHEN is_promo = 1 THEN CONCAT(promo_bucket, ' RK')
-               ELSE CAST(normal_bucket AS varchar(20)) END AS bucket
-        , CASE WHEN is_promo = 1 THEN promo_bucket
-               ELSE normal_bucket END AS sort_bucket
-        , CAST(out_rub AS float) * termdays AS vt_weight
-    FROM #new n
+    SELECT '2026-10-01',
+           @dt_to_oct,
+           '01.10-' + CONVERT(varchar(5), @dt_to_oct, 104)
 ),
-agg AS
-(
+
+base AS (
     SELECT
-          bucket
-        , sort_bucket
-        , dt_open AS open_date
-        , SUM(out_rub) AS volume
+          p.r_w
+        , t.bank_name_main
+        , t.spec_cat
+        , t.transaction_type
+        , t.direction_txt
+        , t.[распознано_НС]
+          + t.[распознано_СР]
+          + t.[Распознано_ДВС] AS amt
 
-        /* Weighted by volume */
-        , SUM(out_rub * rate_con) /
-          NULLIF(SUM(CASE WHEN rate_con IS NOT NULL THEN out_rub END), 0) AS client_rate
-        , SUM(out_rub * rate_trf) /
-          NULLIF(SUM(CASE WHEN rate_trf IS NOT NULL THEN out_rub END), 0) AS trf_rate
-        , SUM(out_rub * AVG_KEY_RATE) /
-          NULLIF(SUM(CASE WHEN AVG_KEY_RATE IS NOT NULL THEN out_rub END), 0) AS forecast_key_rate
-        , SUM(out_rub * monthly_rate) /
-          NULLIF(SUM(CASE WHEN monthly_rate IS NOT NULL THEN out_rub END), 0) AS monthlyconv_rate
-        , SUM(out_rub * monthly_ts) /
-          NULLIF(SUM(CASE WHEN monthly_ts IS NOT NULL THEN out_rub END), 0) AS monthlyconv_TS
-        , SUM(out_rub * termdays) /
-          NULLIF(SUM(CASE WHEN termdays IS NOT NULL THEN out_rub END), 0) AS avg_termdays
+    FROM ALM.ehd.VW_transfers_FL_AGG_tab t WITH (NOLOCK)
 
-        /* Weighted by volume * termdays */
-        , SUM(vt_weight * rate_con) /
-          NULLIF(SUM(CASE WHEN rate_con IS NOT NULL THEN vt_weight END), 0) AS client_rate_vt
-        , SUM(vt_weight * rate_trf) /
-          NULLIF(SUM(CASE WHEN rate_trf IS NOT NULL THEN vt_weight END), 0) AS trf_rate_vt
-        , SUM(vt_weight * AVG_KEY_RATE) /
-          NULLIF(SUM(CASE WHEN AVG_KEY_RATE IS NOT NULL THEN vt_weight END), 0) AS forecast_key_rate_vt
-        , SUM(vt_weight * monthly_rate) /
-          NULLIF(SUM(CASE WHEN monthly_rate IS NOT NULL THEN vt_weight END), 0) AS monthlyconv_rate_vt
-        , SUM(vt_weight * monthly_ts) /
-          NULLIF(SUM(CASE WHEN monthly_ts IS NOT NULL THEN vt_weight END), 0) AS monthlyconv_TS_vt
-    FROM calc
-    GROUP BY bucket, sort_bucket, dt_open
+    INNER JOIN periods p
+        ON t.dt_rep BETWEEN p.dt_from AND p.dt_to
+
+    WHERE t.direction_type <> N'Ошибка'
+      AND t.[целевая категория] = 1
+      AND t.transaction_type <> N'Внутренние переводы'
+      AND t.transit_flag = N'Не транзит'
+      AND t.cli_biz IN (N'Розница', N'ДЧБО')
+),
+
+flows AS (
+    SELECT
+          r_w
+
+        , CASE
+            WHEN spec_cat IN ('BR','SR','FU')
+                THEN N'Market'
+            WHEN transaction_type = N'Наличные'
+                THEN N'Наличные'
+            ELSE bank_name_main
+          END AS bank
+
+        , CASE
+            WHEN spec_cat IN ('BR','SR','FU') THEN 'market'
+            WHEN transaction_type = N'Наличные' THEN 'cash'
+            ELSE 'bank'
+          END AS bank_type
+
+        , CASE
+            WHEN direction_txt = N'входящие'
+              OR (direction_txt = N'смешанные' AND amt > 0)
+                THEN amt
+            ELSE 0
+          END AS incoming
+
+        , CASE
+            WHEN direction_txt = N'исходящие'
+              OR (direction_txt = N'смешанные' AND amt < 0)
+                THEN amt
+            ELSE 0
+          END AS outgoing
+
+    FROM base
+
+    WHERE spec_cat NOT IN ('BR','SR','FU')
+       OR (
+            spec_cat IN ('BR','SR','FU')
+            AND transaction_type <> N'Наличные'
+          )
+),
+
+by_bank AS (
+    SELECT
+          r_w
+        , bank
+        , bank_type
+        , SUM(incoming) AS incoming
+        , SUM(outgoing) AS outgoing
+
+    FROM flows
+    GROUP BY r_w, bank, bank_type
+),
+
+classified AS (
+    SELECT
+          r_w
+
+        , CASE
+            WHEN bank_type = 'bank'
+             AND ABS(incoming) <= @threshold
+             AND ABS(outgoing) <= @threshold
+                THEN N'else'
+            ELSE bank
+          END AS bank_name_main
+
+        , incoming
+        , outgoing
+
+    FROM by_bank
 )
-SELECT
-      bucket
-    , open_date
-    , volume
-    , CAST(client_rate AS decimal(9,6)) AS client_rate
-    , CAST(trf_rate AS decimal(9,6)) AS trf_rate
-    , CAST(forecast_key_rate AS decimal(9,6)) AS forecast_key_rate
-    , CAST(monthlyconv_rate AS decimal(9,6)) AS monthlyconv_rate
-    , CAST(monthlyconv_TS AS decimal(9,6)) AS monthlyconv_TS
-    , CAST(monthlyconv_rate + 0.0048 - forecast_key_rate AS decimal(9,6)) AS spread_keyrate
-    , CAST(monthlyconv_TS + 0.0048 - forecast_key_rate AS decimal(9,6)) AS spread_TS
-    , CAST(monthlyconv_TS - monthlyconv_rate AS decimal(9,6)) AS margin
-    , CAST(trf_rate - client_rate AS decimal(9,6)) AS margin_check
-    , CAST(avg_termdays AS decimal(18,2)) AS avg_termdays
-
-    , CAST(client_rate_vt AS decimal(9,6)) AS client_rate_vt
-    , CAST(trf_rate_vt AS decimal(9,6)) AS trf_rate_vt
-    , CAST(forecast_key_rate_vt AS decimal(9,6)) AS forecast_key_rate_vt
-    , CAST(monthlyconv_rate_vt AS decimal(9,6)) AS monthlyconv_rate_vt
-    , CAST(monthlyconv_TS_vt AS decimal(9,6)) AS monthlyconv_TS_vt
-    , CAST(monthlyconv_rate_vt + 0.0048 - forecast_key_rate_vt AS decimal(9,6)) AS spread_keyrate_vt
-    , CAST(monthlyconv_TS_vt + 0.0048 - forecast_key_rate_vt AS decimal(9,6)) AS spread_TS_vt
-    , CAST(monthlyconv_TS_vt - monthlyconv_rate_vt AS decimal(9,6)) AS margin_vt
-    , CAST(trf_rate_vt - client_rate_vt AS decimal(9,6)) AS margin_check_vt
-FROM agg
-ORDER BY open_date, sort_bucket, bucket;
-
-/* 6. CLASSIFY CONTROL BALANCE */
-IF OBJECT_ID('tempdb..#control') IS NOT NULL DROP TABLE #control;
 
 SELECT
-      b.*
-    , ISNULL(a.new_money,0) AS new_money
-    , ISNULL(a.other_markup,0) AS other_markup
-    , CASE WHEN d.term_bucket IS NOT NULL THEN 1 ELSE 0 END AS dict_match
-    , d.term_bucket AS promo_bucket
-    , CASE
-        WHEN d.term_bucket IS NULL THEN 0
-        WHEN b.TSEGMENTNAME = N'ДЧБО'
-          OR b.PROD_NAME_RES IN (N'Классический', N'Привилегия', N'Достояние') THEN 1
-        WHEN ISNULL(a.new_money,0) = 1 AND ISNULL(a.other_markup,0) = 0 THEN 1
-        ELSE 0
-      END AS is_promo
-INTO #control
-FROM #control_bal b
-LEFT JOIN #attr a ON a.con_id = b.con_id
-OUTER APPLY
-(
-    SELECT TOP (1) r.term_bucket
-    FROM ALM_TEST.WORK.promo_new_money_rate_dict r WITH (NOLOCK)
-    WHERE b.dt_open BETWEEN r.date_from AND r.date_to
-      AND b.termdays BETWEEN r.term_min AND r.term_max
-      AND r.conv_type = CASE WHEN ISNULL(b.conv,'AT_THE_END') = 'AT_THE_END'
-                             THEN 'AT_THE_END' ELSE 'NOT_AT_THE_END' END
-      AND b.out_rub BETWEEN r.amount_from AND r.amount_to
-      AND ABS(b.rate_con - r.promo_rate) <= @eps
-    ORDER BY r.id DESC
-) d;
+      r_w
+    , bank_name_main
+    , SUM(incoming) / 1000000.0 AS incoming
+    , SUM(outgoing) / 1000000.0 AS outgoing
+    , SUM(incoming + outgoing) / 1000000.0 AS saldo
 
-/* RESULT 2: CONTROL VOLUMES */
-SELECT
-      SUM(out_rub) AS total_volume
-    , SUM(CASE WHEN is_promo = 1 THEN out_rub ELSE 0 END) AS promo_volume
-    , SUM(CASE WHEN is_promo = 0 AND new_money = 1 THEN out_rub ELSE 0 END) AS nonpromo_new_money
-    , SUM(CASE WHEN is_promo = 0 AND dict_match = 1 THEN out_rub ELSE 0 END) AS nonpromo_dict_match
-    , SUM(CASE WHEN is_promo = 0 AND dict_match = 1 AND other_markup = 1
-               THEN out_rub ELSE 0 END) AS nonpromo_dict_other_markup
-    , SUM(CASE WHEN other_markup = 1 THEN out_rub ELSE 0 END) AS other_markup_volume
-FROM #control;
+FROM classified
 
-/* RESULT 3: CONTRACT LEVEL */
-SELECT
-      c.con_id
-    , c.cli_id
-    , c.TSEGMENTNAME
-    , c.PROD_NAME_RES
-    , c.dt_open
-    , c.termdays
-    , c.out_rub
-    , c.rate_con
-    , c.conv
-    , c.promo_bucket
-    , c.dict_match
-    , c.is_promo
-    , a.new_money
-    , a.other_markup
-    , a.nov
-    , a.ndp
-    , a.ndm
-    , a.pr2
-    , a.pr3
-    , a.pk2
-    , a.pk3
-    , a.pk6
-    , a.pk7
-    , a.ot1
-    , a.mpl
-    , a.pns
-FROM #control c
-LEFT JOIN #attr a ON a.con_id = c.con_id
-ORDER BY c.is_promo DESC, c.TSEGMENTNAME, c.PROD_NAME_RES, c.out_rub DESC;
+GROUP BY
+      r_w
+    , bank_name_main
+
+ORDER BY
+      r_w
+    , bank_name_main;
