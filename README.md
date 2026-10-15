@@ -12,6 +12,10 @@ RETURNS TABLE
 AS
 RETURN
 (
+    /* ========================================================
+       1. MARKETPLACE PRODUCTS
+       ======================================================== */
+
     WITH mp_list AS
     (
         SELECT prod_name_res
@@ -35,7 +39,9 @@ RETURN
         ) m(prod_name_res)
     ),
 
-    /* 1. Source balances */
+    /* ========================================================
+       2. BALANCE
+       ======================================================== */
 
     src AS
     (
@@ -48,17 +54,23 @@ RETURN
             , v.rate_con
             , v.conv
             , CAST(v.dt_open AS date) AS dt_open
-            , CASE WHEN mp.prod_name_res IS NOT NULL
-                   THEN 1 ELSE 0 END AS is_mp
+
+            , CASE
+                WHEN mp.prod_name_res IS NOT NULL
+                    THEN 1
+                ELSE 0
+              END AS is_mp
+
             , CASE
                 WHEN v.TSegmentName = N'ДЧБО'
                   OR v.PROD_NAME_res IN
-                     (
-                         N'Классический',
-                         N'Привилегия',
-                         N'Достояние'
-                     )
-                THEN 1 ELSE 0
+                  (
+                      N'Классический',
+                      N'Привилегия',
+                      N'Достояние'
+                  )
+                    THEN 1
+                ELSE 0
               END AS is_private
 
         FROM ALM.ALM.vw_balance_rest_all v WITH (NOLOCK)
@@ -66,36 +78,46 @@ RETURN
         LEFT JOIN mp_list mp
             ON mp.prod_name_res = v.PROD_NAME_res
 
-        WHERE v.DT_REP = @ReportDate
-          AND v.dt_open >= @OpenFrom
-          AND v.dt_open < DATEADD(day, 1, @OpenTo)
+        WHERE
+            v.DT_REP = @ReportDate
 
-          AND v.section_name = N'Срочные'
-          AND v.block_name = N'Привлечение ФЛ'
-          AND v.ap = N'Пассив'
-          AND v.od_flag = 1
-          AND v.cur = '810'
-          AND v.OUT_RUB > 0
-          AND ISNULL(v.is_floatrate,0) = 0
+            AND v.dt_open >= @OpenFrom
+            AND v.dt_open < DATEADD(day, 1, @OpenTo)
 
-          AND v.termdays BETWEEN 28 AND 1830
+            AND v.section_name = N'Срочные'
+            AND v.block_name = N'Привлечение ФЛ'
+            AND v.ap = N'Пассив'
+            AND v.od_flag = 1
+            AND v.cur = '810'
+            AND v.OUT_RUB > 0
+            AND ISNULL(v.is_floatrate,0) = 0
 
-          AND NOT EXISTS
-          (
-              SELECT 1
-              FROM LIQUIDITY.liq.man_FloatContracts fc WITH (NOLOCK)
-              WHERE fc.CON_ID = v.CON_ID
-          )
+            AND v.termdays BETWEEN 28 AND 1830
 
-          AND (@ExcludeMP = 0 OR mp.prod_name_res IS NULL)
+            AND NOT EXISTS
+            (
+                SELECT 1
+                FROM LIQUIDITY.liq.man_FloatContracts fc
+                    WITH (NOLOCK)
+                WHERE fc.CON_ID = v.CON_ID
+            )
+
+            AND
+            (
+                @ExcludeMP = 0
+                OR mp.prod_name_res IS NULL
+            )
     ),
 
-    /* 2. Latest markups for relevant contracts */
+    /* ========================================================
+       3. LATEST ATTRIBUTES
+       ======================================================== */
 
     attr_ranked AS
     (
         SELECT
               a.CON_ID
+
             , a.[Нов]
             , a.[НДП]
             , a.[НДМ]
@@ -107,7 +129,9 @@ RETURN
             , ROW_NUMBER() OVER
               (
                   PARTITION BY a.CON_ID
-                  ORDER BY a.DT_UPDATE DESC, a.loaddate DESC
+                  ORDER BY
+                      a.DT_UPDATE DESC,
+                      a.loaddate DESC
               ) AS rn
 
         FROM ALM.ehd.attr_DepoFLConditions a WITH (NOLOCK)
@@ -120,7 +144,9 @@ RETURN
             ON s.CON_ID = a.CON_ID
     ),
 
-    /* 3. Dictionary and markup flags */
+    /* ========================================================
+       4. DICTIONARY AND MARKUPS
+       ======================================================== */
 
     matched AS
     (
@@ -128,18 +154,31 @@ RETURN
               s.*
             , d.id AS dict_id
 
+            /* NOV / NDP / NDM / MPL / PNS */
             , CASE
-                WHEN ISNULL(TRY_CAST(a.[Нов] AS int),0) = 1
-                  OR ISNULL(TRY_CAST(a.[НДП] AS int),0) = 1
-                  OR ISNULL(TRY_CAST(a.[НДМ] AS int),0) = 1
-                  OR ISNULL(TRY_CAST(a.[Мпл] AS int),0) = 1
-                  OR ISNULL(TRY_CAST(a.[Пнс] AS int),0) = 1
+                WHEN
+                       ISNULL(TRY_CAST(a.[Нов] AS int),0) = 1
+                    OR ISNULL(TRY_CAST(a.[НДП] AS int),0) = 1
+                    OR ISNULL(TRY_CAST(a.[НДМ] AS int),0) = 1
+                    OR ISNULL(TRY_CAST(a.[Мпл] AS int),0) = 1
+                    OR ISNULL(TRY_CAST(a.[Пнс] AS int),0) = 1
                 THEN 1 ELSE 0
               END AS new_money
 
+            /* ONLY NOV / NDP / NDM - STRICT CHECK */
             , CASE
-                WHEN ISNULL(TRY_CAST(a.[От1] AS int),0) = 1
-                  OR ISNULL(TRY_CAST(a.[Пк2] AS int),0) = 1
+                WHEN
+                       ISNULL(TRY_CAST(a.[Нов] AS int),0) = 1
+                    OR ISNULL(TRY_CAST(a.[НДП] AS int),0) = 1
+                    OR ISNULL(TRY_CAST(a.[НДМ] AS int),0) = 1
+                THEN 1 ELSE 0
+              END AS strict_new_money
+
+            /* OT1 / PK2 */
+            , CASE
+                WHEN
+                       ISNULL(TRY_CAST(a.[От1] AS int),0) = 1
+                    OR ISNULL(TRY_CAST(a.[Пк2] AS int),0) = 1
                 THEN 1 ELSE 0
               END AS retention
 
@@ -151,6 +190,7 @@ RETURN
 
         LEFT JOIN ALM_TEST.WORK.promo_new_money_rate_dict d
             ON s.dt_open BETWEEN d.date_from AND d.date_to
+
            AND s.termdays BETWEEN d.term_min AND d.term_max
 
            AND d.conv_type =
@@ -161,16 +201,20 @@ RETURN
                END
 
            AND s.OUT_RUB BETWEEN d.amount_from AND d.amount_to
+
            AND ABS(s.rate_con - d.promo_rate) <= 0.0005
     ),
 
-    /* 4. Categories and validation */
+    /* ========================================================
+       5. CLASSIFICATION AND VALIDATION
+       ======================================================== */
 
     classified AS
     (
         SELECT
               m.*
 
+            /* BUSINESS CATEGORY */
             , CASE
                 WHEN m.is_mp = 1
                     THEN N'вклады маркетплейса'
@@ -191,25 +235,61 @@ RETURN
                 ELSE N'нетипичные вклады масс-сегмента'
               END AS segment_name
 
-            /* Error codes contain the contract ID */
+
+            /* ====================================================
+               VALIDATION
+
+               ERR 1:
+               NOV/NDP/NDM without dictionary
+
+               MPL/PNS alone without dictionary -> ALLOWED
+
+               ERR 2:
+               Dictionary without any of 5 new-money markups
+
+               ERR 3:
+               Dictionary + new-money + retention
+               ==================================================== */
 
             , CASE
-                WHEN m.is_mp = 0 AND m.is_private = 0
-                 AND m.new_money = 1 AND m.dict_id IS NULL
-                    THEN CONCAT('ERR_NEW_MONEY_NO_DICT_CON_ID=',m.CON_ID)
 
-                WHEN m.is_mp = 0 AND m.is_private = 0
-                 AND m.dict_id IS NOT NULL AND m.new_money = 0
-                    THEN CONCAT('ERR_DICT_NO_NEW_MONEY_CON_ID=',m.CON_ID)
+                /* ERR 1 */
+                WHEN m.is_mp = 0
+                 AND m.is_private = 0
+                 AND m.strict_new_money = 1
+                 AND m.dict_id IS NULL
+                    THEN CONCAT(
+                        'ERR_NOV_NDP_NDM_NO_DICT_CON_ID=',
+                        m.CON_ID
+                    )
 
-                WHEN m.is_mp = 0 AND m.is_private = 0
+                /* ERR 2 */
+                WHEN m.is_mp = 0
+                 AND m.is_private = 0
                  AND m.dict_id IS NOT NULL
-                 AND m.new_money = 1 AND m.retention = 1
-                    THEN CONCAT('ERR_NEW_MONEY_AND_RETENTION_CON_ID=',m.CON_ID)
+                 AND m.new_money = 0
+                    THEN CONCAT(
+                        'ERR_DICT_NO_NEW_MONEY_CON_ID=',
+                        m.CON_ID
+                    )
+
+                /* ERR 3 */
+                WHEN m.is_mp = 0
+                 AND m.is_private = 0
+                 AND m.dict_id IS NOT NULL
+                 AND m.new_money = 1
+                 AND m.retention = 1
+                    THEN CONCAT(
+                        'ERR_NEW_MONEY_AND_RETENTION_CON_ID=',
+                        m.CON_ID
+                    )
 
                 ELSE '0'
+
               END AS validation_code
 
+
+            /* TERM BUCKET */
             , CASE
                 WHEN termdays BETWEEN 28 AND 44 THEN 31
                 WHEN termdays BETWEEN 45 AND 70 THEN 61
@@ -232,7 +312,9 @@ RETURN
         FROM matched m
     ),
 
-    /* 5. Aggregation by category and term bucket */
+    /* ========================================================
+       6. AGGREGATION
+       ======================================================== */
 
     seg_bucket AS
     (
@@ -240,11 +322,15 @@ RETURN
               bucket_code
             , segment_name
 
+            /* Force error when validation_code is not 0 */
             , SUM(OUT_RUB)
               + SUM(CONVERT(int, validation_code)) AS segment_vol
 
         FROM classified
-        GROUP BY bucket_code, segment_name
+
+        GROUP BY
+              bucket_code
+            , segment_name
     ),
 
     seg_total AS
@@ -252,7 +338,9 @@ RETURN
         SELECT
               segment_name
             , SUM(segment_vol) AS segment_total
+
         FROM seg_bucket
+
         GROUP BY segment_name
     ),
 
@@ -261,7 +349,9 @@ RETURN
         SELECT
               bucket_code
             , SUM(segment_vol) AS bucket_total
+
         FROM seg_bucket
+
         GROUP BY bucket_code
     ),
 
@@ -271,7 +361,9 @@ RETURN
         FROM bucket_total
     )
 
-    /* 6. Final output */
+    /* ========================================================
+       7. FINAL RESULT
+       ======================================================== */
 
     SELECT
           sb.bucket_code AS Bucket
@@ -279,15 +371,15 @@ RETURN
         , sb.segment_vol AS SegmentVolume
 
         , CAST(
-              sb.segment_vol / NULLIF(st.segment_total,0)
-              AS decimal(18,4)
+            sb.segment_vol / NULLIF(st.segment_total,0)
+            AS decimal(18,4)
           ) AS SegmentSharePct
 
         , bt.bucket_total AS BucketVolume
 
         , CAST(
-              bt.bucket_total / NULLIF(g.grand_total,0)
-              AS decimal(18,4)
+            bt.bucket_total / NULLIF(g.grand_total,0)
+            AS decimal(18,4)
           ) AS BucketSharePct
 
     FROM seg_bucket sb
@@ -308,18 +400,19 @@ RETURN
         , bt.bucket_total
 
         , CAST(
-              bt.bucket_total / NULLIF(g.grand_total,0)
-              AS decimal(18,4)
+            bt.bucket_total / NULLIF(g.grand_total,0)
+            AS decimal(18,4)
           )
 
         , bt.bucket_total
 
         , CAST(
-              bt.bucket_total / NULLIF(g.grand_total,0)
-              AS decimal(18,4)
+            bt.bucket_total / NULLIF(g.grand_total,0)
+            AS decimal(18,4)
           )
 
     FROM bucket_total bt
+
     CROSS JOIN grand g
 );
 GO
