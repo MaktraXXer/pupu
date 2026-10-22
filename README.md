@@ -1,143 +1,564 @@
-USE ALM;
+USE ALM_TEST;
 GO
 
-SET NOCOUNT ON;
+SET ANSI_NULLS ON;
+GO
 
-DECLARE @json NVARCHAR(MAX) = N'
-{
-  "M": {"gamma": 0.0360939164692716, "rho": 1.0377775602882766, "lambda": 0.024857536772070893, "delta": 6.925237520382742, "alpha": 0.22226022918575383},
-  "U": {"gamma": 0.061474955843779176, "rho": 1.1150420397596015, "lambda": 0.008899299449885328, "delta": 4.943916673321318, "alpha": 0.0528430517312853},
-  "k1": {"gamma": 0.014283610454898324, "rho": 2.2802397579127414, "lambda": 0.04335350678674854, "delta": 2.924946608611938, "alpha": 1e-08},
-  "k2": {"gamma": 0.17330087748525627, "rho": 6.0908259310548996, "lambda": 0.030179240111745678, "delta": 2.8058966829731418, "alpha": 0.5894963465876183},
-  "I1": {"gamma": 2.4144684876370874, "rho": 0.09918583228190554, "lambda": 0.8614593343035482, "delta": 2.8469056035661753, "alpha": -0.2652372622899474, "c": -9.91480922788922},
-  "I2": {"gamma": 0.6493917452883262, "rho": 1.3130029424958412, "lambda": 1e-08, "delta": 1.4723792072053574, "alpha": -1.0000000000076169e-08, "c": -0.022378865558275493},
-  "L": 0.0,
-  "r0": 8.9,
-  "t0": 35.0
-}';
+SET QUOTED_IDENTIFIER ON;
+GO
 
-DECLARE @now DATETIME2 = SYSDATETIME();
+ALTER FUNCTION [reports].[fn_NewAttractionVolumes_TEST]
+(
+      @ReportDate date
+    , @OpenFrom date
+    , @OpenTo date
+    , @ExcludeMP bit = 1
+)
+RETURNS TABLE
+AS
+RETURN
+(
+    /*
+       Список вкладов маркетплейсов
+    */
 
-BEGIN TRY
-    BEGIN TRAN;
+    WITH mp_list AS
+    (
+        SELECT prod_name_res
+        FROM (VALUES
+              (N'ДОМа надёжно')
+            , (N'Всё в ДОМ')
+            , (N'Надёжный')
+            , (N'Надёжный VIP')
+            , (N'Надёжный премиум')
+            , (N'Надёжныйпромо')
+            , (N'Надёжный промо')
+            , (N'Надёжный старт')
+            , (N'Надёжный T2')
+            , (N'Надёжный Т2')
+            , (N'Надёжный Мегафон')
+            , (N'Надёжныйпрайм')
+            , (N'Надёжный прайм')
+            , (N'Надёжный процент')
+            , (N'Надёжныйпроцент')
+            , (N'Могучий')
+        ) m(prod_name_res)
+    ),
 
-    UPDATE p
-    SET
-        -- Метаданные модели
-        p.model_code = 'model_params_20260901',
-        p.model_name = N'CPR — модель из файла model_params_20260901.json',
-        p.created_at = @now,
-        p.updated_at = @now,
+    /*
+       Баланс
+    */
 
-        -- Общие параметры
-        p.L = j.L,
-        p.r0 = j.r0,
-        p.t0 = j.t0,
+    src AS
+    (
+        SELECT
+              v.CON_ID
+            , v.OUT_RUB
+            , v.TSegmentName
+            , v.PROD_NAME_res
+            , v.termdays
+            , v.rate_con
+            , v.conv
+            , CAST(v.dt_open AS date) AS dt_open
 
-        -- M
-        p.M_gamma = j.M_gamma,
-        p.M_rho = j.M_rho,
-        p.M_lam = j.M_lam,
-        p.M_delta = j.M_delta,
-        p.M_alpha = j.M_alpha,
+            , CASE
+                WHEN mp.prod_name_res IS NOT NULL
+                    THEN 1
+                ELSE 0
+              END AS is_mp
 
-        -- U
-        p.U_gamma = j.U_gamma,
-        p.U_rho = j.U_rho,
-        p.U_lam = j.U_lam,
-        p.U_delta = j.U_delta,
-        p.U_alpha = j.U_alpha,
+            , CASE
+                WHEN v.TSegmentName = N'ДЧБО'
+                  OR v.PROD_NAME_res IN
+                  (
+                      N'Классический',
+                      N'Привилегия',
+                      N'Достояние'
+                  )
+                    THEN 1
+                ELSE 0
+              END AS is_private
 
-        -- k1
-        p.k1_gamma = j.k1_gamma,
-        p.k1_rho = j.k1_rho,
-        p.k1_lam = j.k1_lam,
-        p.k1_delta = j.k1_delta,
-        p.k1_alpha = j.k1_alpha,
 
-        -- k2
-        p.k2_gamma = j.k2_gamma,
-        p.k2_rho = j.k2_rho,
-        p.k2_lam = j.k2_lam,
-        p.k2_delta = j.k2_delta,
-        p.k2_alpha = j.k2_alpha,
+            /* Особая ставка 15% на 2 месяца */
+            , CASE
+                WHEN v.termdays BETWEEN 45 AND 70
+                 AND ISNULL(v.conv,'AT_THE_END') = 'AT_THE_END'
+                 AND ABS(v.rate_con - 0.1500) <= 0.0005
+                    THEN 1
+                ELSE 0
+              END AS special_2m
 
-        -- I1
-        p.I1_gamma = j.I1_gamma,
-        p.I1_rho = j.I1_rho,
-        p.I1_lam = j.I1_lam,
-        p.I1_delta = j.I1_delta,
-        p.I1_alpha = j.I1_alpha,
-        p.I1_c = j.I1_c,
 
-        -- I2
-        p.I2_gamma = j.I2_gamma,
-        p.I2_rho = j.I2_rho,
-        p.I2_lam = j.I2_lam,
-        p.I2_delta = j.I2_delta,
-        p.I2_alpha = j.I2_alpha,
-        p.I2_c = j.I2_c
+            /* Особая ставка 14.6% на 4 месяца */
+            , CASE
+                WHEN v.termdays BETWEEN 120 AND 140
+                 AND ISNULL(v.conv,'AT_THE_END') = 'AT_THE_END'
+                 AND ABS(v.rate_con - 0.1460) <= 0.0005
+                    THEN 1
+                ELSE 0
+              END AS special_4m
 
-    FROM dbo.cpr_model_params p
-    CROSS APPLY OPENJSON(@json)
-    WITH (
-        L FLOAT '$.L',
-        r0 FLOAT '$.r0',
-        t0 FLOAT '$.t0',
 
-        M_gamma FLOAT '$.M.gamma',
-        M_rho FLOAT '$.M.rho',
-        M_lam FLOAT '$.M.lambda',
-        M_delta FLOAT '$.M.delta',
-        M_alpha FLOAT '$.M.alpha',
+        FROM ALM.ALM.vw_balance_rest_all v WITH (NOLOCK)
 
-        U_gamma FLOAT '$.U.gamma',
-        U_rho FLOAT '$.U.rho',
-        U_lam FLOAT '$.U.lambda',
-        U_delta FLOAT '$.U.delta',
-        U_alpha FLOAT '$.U.alpha',
+        LEFT JOIN mp_list mp
+            ON mp.prod_name_res = v.PROD_NAME_res
 
-        k1_gamma FLOAT '$.k1.gamma',
-        k1_rho FLOAT '$.k1.rho',
-        k1_lam FLOAT '$.k1.lambda',
-        k1_delta FLOAT '$.k1.delta',
-        k1_alpha FLOAT '$.k1.alpha',
+        WHERE
+            v.DT_REP = @ReportDate
 
-        k2_gamma FLOAT '$.k2.gamma',
-        k2_rho FLOAT '$.k2.rho',
-        k2_lam FLOAT '$.k2.lambda',
-        k2_delta FLOAT '$.k2.delta',
-        k2_alpha FLOAT '$.k2.alpha',
+            AND v.dt_open >= @OpenFrom
+            AND v.dt_open < DATEADD(day, 1, @OpenTo)
 
-        I1_gamma FLOAT '$.I1.gamma',
-        I1_rho FLOAT '$.I1.rho',
-        I1_lam FLOAT '$.I1.lambda',
-        I1_delta FLOAT '$.I1.delta',
-        I1_alpha FLOAT '$.I1.alpha',
-        I1_c FLOAT '$.I1.c',
+            AND v.section_name = N'Срочные'
+            AND v.block_name = N'Привлечение ФЛ'
+            AND v.ap = N'Пассив'
+            AND v.od_flag = 1
+            AND v.cur = '810'
+            AND v.OUT_RUB > 0
+            AND ISNULL(v.is_floatrate,0) = 0
 
-        I2_gamma FLOAT '$.I2.gamma',
-        I2_rho FLOAT '$.I2.rho',
-        I2_lam FLOAT '$.I2.lambda',
-        I2_delta FLOAT '$.I2.delta',
-        I2_alpha FLOAT '$.I2.alpha',
-        I2_c FLOAT '$.I2.c'
-    ) j
-    WHERE p.model_id = 1;
+            AND v.termdays BETWEEN 28 AND 1830
 
-    IF @@ROWCOUNT <> 1
-        THROW 50001, 'Model update failed: expected exactly one row.', 1;
+            /* Исключаем договоры с плавающей ставкой */
+            AND NOT EXISTS
+            (
+                SELECT 1
+                FROM LIQUIDITY.liq.man_FloatContracts fc
+                    WITH (NOLOCK)
+                WHERE fc.CON_ID = v.CON_ID
+            )
 
-    COMMIT;
+            AND
+            (
+                @ExcludeMP = 0
+                OR mp.prod_name_res IS NULL
+            )
+    ),
 
-    SELECT *
-    FROM dbo.cpr_model_params
-    WHERE model_id = 1;
+    /*
+       Надбавки вкладов для масс-сегмента
 
-END TRY
-BEGIN CATCH
-    IF @@TRANCOUNT > 0
-        ROLLBACK;
+       Помню Всеволод говорил, что там бывают
+       несколько записей по CON_ID.
 
-    THROW;
-END CATCH;
+       Поэтому берём только последнюю запись.
+
+       Для маркетплейсов и private надбавки не нужны.
+    */
+
+    joined AS
+    (
+        SELECT
+              s.*
+
+            , d.dict_match
+
+            , a.[Нов]
+            , a.[НДП]
+            , a.[НДМ]
+            , a.[Мпл]
+            , a.[Пнс]
+            , a.[От1]
+            , a.[Пк2]
+
+        FROM src s
+
+        OUTER APPLY
+        (
+            SELECT TOP (1)
+                  a.[Нов]
+                , a.[НДП]
+                , a.[НДМ]
+                , a.[Мпл]
+                , a.[Пнс]
+                , a.[От1]
+                , a.[Пк2]
+
+            FROM ALM.ehd.attr_DepoFLConditions a
+                WITH (NOLOCK)
+
+            WHERE
+                a.CON_ID = s.CON_ID
+                AND s.is_mp = 0
+                AND s.is_private = 0
+
+            ORDER BY
+                  a.DT_UPDATE DESC
+                , a.loaddate DESC
+        ) a
+
+
+        /*
+           Джоиню справочник истории промо-ставки
+           на новые деньги.
+        */
+
+        OUTER APPLY
+        (
+            SELECT TOP (1)
+                1 AS dict_match
+
+            FROM ALM_TEST.WORK.promo_new_money_rate_dict d
+                WITH (NOLOCK)
+
+            WHERE
+                s.is_mp = 0
+                AND s.is_private = 0
+
+                AND s.dt_open
+                    BETWEEN d.date_from AND d.date_to
+
+                AND s.termdays
+                    BETWEEN d.term_min AND d.term_max
+
+                AND d.conv_type =
+                    CASE
+                        WHEN ISNULL(s.conv,'AT_THE_END') = 'AT_THE_END'
+                            THEN 'AT_THE_END'
+                        ELSE 'NOT_AT_THE_END'
+                    END
+
+                AND s.OUT_RUB
+                    BETWEEN d.amount_from AND d.amount_to
+
+                AND ABS(s.rate_con - d.promo_rate) <= 0.0005
+        ) d
+    ),
+
+    /*
+       Флаги надбавок
+
+       NOV / NDP / NDM / MPL / PNS - новые деньги
+       NOV / NDP / NDM - строгая проверка
+       OT1 / PK2 - удержание
+    */
+
+    matched AS
+    (
+        SELECT
+              j.*
+
+            , CASE
+                WHEN
+                       ISNULL(TRY_CAST(j.[Нов] AS int),0) = 1
+                    OR ISNULL(TRY_CAST(j.[НДП] AS int),0) = 1
+                    OR ISNULL(TRY_CAST(j.[НДМ] AS int),0) = 1
+                    OR ISNULL(TRY_CAST(j.[Мпл] AS int),0) = 1
+                    OR ISNULL(TRY_CAST(j.[Пнс] AS int),0) = 1
+                THEN 1
+                ELSE 0
+              END AS new_money
+
+            , CASE
+                WHEN
+                       ISNULL(TRY_CAST(j.[Нов] AS int),0) = 1
+                    OR ISNULL(TRY_CAST(j.[НДП] AS int),0) = 1
+                    OR ISNULL(TRY_CAST(j.[НДМ] AS int),0) = 1
+                THEN 1
+                ELSE 0
+              END AS strict_new_money
+
+            , CASE
+                WHEN
+                       ISNULL(TRY_CAST(j.[От1] AS int),0) = 1
+                    OR ISNULL(TRY_CAST(j.[Пк2] AS int),0) = 1
+                THEN 1
+                ELSE 0
+              END AS retention
+
+        FROM joined j
+    ),
+
+    /*
+       Разделённые на категории вклады
+
+       Приоритет:
+
+       маркетплейс
+       -> особые предложения private
+       -> остальные вклады private
+       -> особые предложения масс
+       -> Активный процент
+       -> масс как новые деньги
+       -> масс на удержание
+       -> масс "Мой дом без опций"
+       -> остальные масс
+    */
+
+    classified AS
+    (
+        SELECT
+              m.CON_ID
+            , m.OUT_RUB
+            , m.termdays
+
+            /* Бизнес-категория */
+            , CASE
+
+                WHEN m.is_mp = 1
+                    THEN N'Маркетплейсы'
+
+
+                /* Особые предложения private:
+                   15% на 2 месяца
+                   или 14.6% на 4 месяца */
+                WHEN m.is_private = 1
+                 AND
+                 (
+                     m.special_2m = 1
+                     OR m.special_4m = 1
+                 )
+                    THEN N'Особые предложения private'
+
+
+                /* Остальные private */
+                WHEN m.is_private = 1
+                    THEN N'private-сегмент'
+
+
+                /* Особые предложения масс:
+                   15% на 2 месяца */
+                WHEN m.special_2m = 1
+                    THEN N'Особые предложения масс'
+
+
+                WHEN m.PROD_NAME_res = N'Активный процент'
+                    THEN N'Активный процент'
+
+
+                WHEN m.dict_match = 1
+                 AND m.new_money = 1
+                    THEN N'Новые деньги'
+
+
+                WHEN m.retention = 1
+                    THEN N'Механизм удержания'
+
+
+                WHEN m.PROD_NAME_res IN
+                (
+                    N'Мой дом безопций',
+                    N'Мой дом без опций'
+                )
+                    THEN N'Базовая ставка'
+
+
+                ELSE N'Другие вклады'
+
+              END AS segment_name
+
+
+            /*
+               Вызовется ошибка, если есть логическое нарушение
+               - для теста.
+
+               ERR 1:
+               NOV/NDP/NDM, но нет справочника.
+
+               MPL/PNS без справочника разрешены.
+
+               ERR 2:
+               Пока отключили проверку наличия справочника
+               без надбавки новых денег.
+
+               ERR 3:
+               Есть справочник + новые деньги + удержание.
+
+               Особые предложения масс исключаем из ERR:
+               они определяются самостоятельно по ставке
+               и срочности, без требования промо-справочника.
+            */
+
+            , CASE
+
+                /* ERR 1 */
+                WHEN m.is_mp = 0
+                 AND m.is_private = 0
+                 AND m.special_2m = 0
+                 AND m.strict_new_money = 1
+                 AND m.dict_match IS NULL
+                    THEN CONCAT(
+                        'ERR_NOV_NDP_NDM_NO_DICT_CON_ID=',
+                        m.CON_ID
+                    )
+
+
+                /*
+                -- ERR 2 временно отключён
+
+                WHEN m.is_mp = 0
+                 AND m.is_private = 0
+                 AND m.dict_match = 1
+                 AND m.new_money = 0
+                    THEN CONCAT(
+                        'ERR_DICT_NO_NEW_MONEY_CON_ID=',
+                        m.CON_ID
+                    )
+                */
+
+
+                /* ERR 3 */
+                WHEN m.is_mp = 0
+                 AND m.is_private = 0
+                 AND m.special_2m = 0
+                 AND m.dict_match = 1
+                 AND m.new_money = 1
+                 AND m.retention = 1
+                    THEN CONCAT(
+                        'ERR_NEW_MONEY_AND_RETENTION_CON_ID=',
+                        m.CON_ID
+                    )
+
+                ELSE '0'
+              END AS validation_code
+
+
+            /* Бакеты срочности для селекта */
+            , CASE
+                WHEN m.termdays BETWEEN 26 AND 44 THEN 31
+                WHEN m.termdays BETWEEN 45 AND 70 THEN 61
+                WHEN m.termdays BETWEEN 85 AND 119 THEN 91
+                WHEN m.termdays BETWEEN 120 AND 140 THEN 124
+                WHEN m.termdays BETWEEN 141 AND 170 THEN 151
+                WHEN m.termdays BETWEEN 175 AND 200 THEN 181
+                WHEN m.termdays BETWEEN 201 AND 230 THEN 212
+                WHEN m.termdays BETWEEN 231 AND 250 THEN 243
+                WHEN m.termdays BETWEEN 251 AND 290 THEN 274
+                WHEN m.termdays BETWEEN 340 AND 405 THEN 365
+                WHEN m.termdays BETWEEN 540 AND 621 THEN 550
+                WHEN m.termdays BETWEEN 720 AND 763 THEN 750
+                WHEN m.termdays BETWEEN 1090 AND 1140 THEN 1100
+                WHEN m.termdays BETWEEN 1450 AND 1475 THEN 1460
+                WHEN m.termdays BETWEEN 1795 AND 1830 THEN 1825
+                ELSE m.termdays
+              END AS bucket_code
+
+        FROM matched m
+    ),
+
+    /*
+       Агрегация
+    */
+
+    agg AS
+    (
+        SELECT
+              bucket_code
+
+            , CASE
+                WHEN GROUPING(segment_name) = 1
+                    THEN N'Итого'
+                ELSE segment_name
+              END AS segment_name
+
+            , GROUPING(segment_name) AS is_total
+
+            , SUM(OUT_RUB)
+              + CONVERT(int, MAX(validation_code))
+              AS segment_vol
+
+        FROM classified
+
+        GROUP BY GROUPING SETS
+        (
+              (bucket_code, segment_name)
+            , (bucket_code)
+        )
+    ),
+
+    /*
+       Доли
+
+       Private:
+       Особые предложения private + private-сегмент
+       считаем от общего объёма private.
+
+       Остальные категории:
+       считаем от общего объёма остальных вкладов.
+
+       BucketSharePct:
+       от всего объёма привлечений.
+    */
+
+    totals AS
+    (
+        SELECT
+              bucket_code
+            , segment_name
+            , is_total
+            , segment_vol
+
+            /* Общий знаменатель:
+               отдельно весь private,
+               отдельно все остальные категории */
+            , SUM(
+                CASE
+                    WHEN is_total = 0
+                        THEN segment_vol
+                    ELSE 0
+                END
+              ) OVER
+              (
+                  PARTITION BY
+                      CASE
+                          WHEN segment_name IN
+                          (
+                              N'private-сегмент',
+                              N'Особые предложения private'
+                          )
+                              THEN 1
+                          ELSE 0
+                      END
+              ) AS segment_total
+
+            , MAX(
+                CASE
+                    WHEN is_total = 1
+                        THEN segment_vol
+                END
+              ) OVER
+              (
+                  PARTITION BY bucket_code
+              ) AS bucket_total
+
+            , SUM(
+                CASE
+                    WHEN is_total = 1
+                        THEN segment_vol
+                    ELSE 0
+                END
+              ) OVER () AS grand_total
+
+        FROM agg
+    )
+
+    /*
+       Резалт
+    */
+
+    SELECT
+          bucket_code AS Bucket
+        , segment_name AS Segment
+        , segment_vol AS SegmentVolume
+
+        , CAST(
+            CASE
+                WHEN is_total = 1
+                    THEN segment_vol / NULLIF(grand_total,0)
+                ELSE segment_vol / NULLIF(segment_total,0)
+            END
+            AS decimal(18,4)
+          ) AS SegmentSharePct
+
+        , bucket_total AS BucketVolume
+
+        , CAST(
+            bucket_total / NULLIF(grand_total,0)
+            AS decimal(18,4)
+          ) AS BucketSharePct
+
+    FROM totals
+);
+GO
