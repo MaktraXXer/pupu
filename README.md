@@ -1,559 +1,121 @@
-
 USE ALM;
 SET NOCOUNT ON;
 
-/* ============================================================
-   PARAMETERS
-   ============================================================ */
-
-DECLARE @dt_rep    date = '2026-10-17';
-DECLARE @date_from date = '2026-10-01';
-DECLARE @date_to   date = '2026-10-17';
-
+DECLARE @dt_rep date = '2026-09-30';
 DECLARE @eps decimal(9,6) = 0.0005;
 
-
-/* ============================================================
-   1. NEW DEPOSITS
-   ============================================================ */
-
-IF OBJECT_ID('tempdb..#new_bal') IS NOT NULL DROP TABLE #new_bal;
-
 SELECT
-      CAST(t.dt_open AS date) AS dt_open
-    , t.con_id
-    , t.cli_id
-    , t.TSEGMENTNAME
-    , t.PROD_NAME_RES
-    , t.out_rub
-    , t.rate_con
-    , t.rate_trf
-    , t.termdays
-    , t.conv
-    , fk.AVG_KEY_RATE
+      t.*
 
-INTO #new_bal
+    /* Flags */
+    , CASE
+        WHEN t.rate_con = 0.15 THEN 1
+        ELSE 0
+      END AS is_rate_15
+
+    , CASE
+        WHEN p.CLI_ID IS NOT NULL THEN 1
+        ELSE 0
+      END AS is_premium_package
+
+    /* Attributes */
+    , a.[PROMO_CODE]
+    , a.[PROMO_GROUP]
+    , a.[selected_options]
+
+    , a.[Нов]
+    , a.[НДП]
+    , a.[НДМ]
+    , a.[Пр2]
+    , a.[Пр3]
+    , a.[Пк2]
+    , a.[Пк3]
+    , a.[Пк6]
+    , a.[Пк7]
+    , a.[От1]
+    , a.[Мпл]
+    , a.[Пнс]
+
+    /* Promo dictionary */
+    , d.id AS dict_id
+    , d.term_bucket AS promo_term_bucket
+    , d.promo_rate
+
+    /* Bucket */
+    , CASE
+        WHEN d.id IS NOT NULL
+            THEN CONCAT(d.term_bucket, ' RK')
+        WHEN t.termdays BETWEEN 28 AND 44 THEN '31'
+        WHEN t.termdays BETWEEN 45 AND 79 THEN '61'
+        WHEN t.termdays BETWEEN 80 AND 115 THEN '91'
+        WHEN t.termdays BETWEEN 116 AND 140 THEN '124'
+        WHEN t.termdays BETWEEN 141 AND 174 THEN '151'
+        WHEN t.termdays BETWEEN 175 AND 200 THEN '181'
+        WHEN t.termdays BETWEEN 201 AND 230 THEN '212'
+        WHEN t.termdays BETWEEN 231 AND 250 THEN '243'
+        WHEN t.termdays BETWEEN 251 AND 290 THEN '274'
+        WHEN t.termdays BETWEEN 340 AND 405 THEN '365'
+        WHEN t.termdays BETWEEN 540 AND 621 THEN '550'
+        WHEN t.termdays BETWEEN 720 AND 763 THEN '750'
+        WHEN t.termdays BETWEEN 1090 AND 1140 THEN '1100'
+        WHEN t.termdays BETWEEN 1450 AND 1475 THEN '1460'
+        WHEN t.termdays BETWEEN 1795 AND 1830 THEN '1825'
+        ELSE CAST(t.termdays AS varchar(20))
+      END AS bucket
 
 FROM ALM.ALM.VW_Balance_Rest_All t WITH (NOLOCK)
 
-LEFT JOIN ALM_TEST.WORK.ForecastKey_Cache fk
-    ON fk.DT_REP = CAST(t.dt_open AS date)
-   AND fk.TERM = t.termdays
+/* Deposit attributes */
+LEFT JOIN ALM.ehd.attr_DepoFLConditions a WITH (NOLOCK)
+    ON a.CON_ID = t.con_id
+
+/* Premium package valid on report date */
+LEFT JOIN
+(
+    SELECT DISTINCT CLI_ID
+    FROM ALM.ehd.attr_cli_stat_sal WITH (NOLOCK)
+    WHERE CLI_ATTR_CODE = 'PREMIUM_PACKAGE'
+      AND @dt_rep BETWEEN DT_FROM AND DT_TO
+) p
+    ON p.CLI_ID = t.cli_id
+
+/* Promo dictionary */
+LEFT JOIN ALM_TEST.WORK.promo_new_money_rate_dict d WITH (NOLOCK)
+    ON CAST(t.dt_open AS date)
+       BETWEEN d.date_from AND d.date_to
+
+   AND t.termdays
+       BETWEEN d.term_min AND d.term_max
+
+   AND d.conv_type =
+       CASE
+           WHEN ISNULL(t.conv,'AT_THE_END') = 'AT_THE_END'
+               THEN 'AT_THE_END'
+           ELSE 'NOT_AT_THE_END'
+       END
+
+   AND t.out_rub
+       BETWEEN d.amount_from AND d.amount_to
+
+   AND ABS(t.rate_con - d.promo_rate) <= @eps
 
 WHERE
     t.dt_rep = @dt_rep
-
-    AND t.dt_open >= @date_from
-    AND t.dt_open < DATEADD(DAY, 1, @date_to)
-
     AND t.section_name = N'Срочные'
     AND t.block_name = N'Привлечение ФЛ'
     AND t.acc_role = N'LIAB'
     AND t.od_flag = 1
     AND t.cur = '810'
-
     AND t.out_rub IS NOT NULL
-    AND t.out_rub >= 0;
+    AND t.out_rub >= 0
 
-
-/* ============================================================
-   2. REQUIRED CONTRACTS
-   ============================================================ */
-
-IF OBJECT_ID('tempdb..#ids') IS NOT NULL DROP TABLE #ids;
-
-SELECT DISTINCT con_id
-INTO #ids
-FROM #new_bal
-WHERE con_id IS NOT NULL;
-
-CREATE UNIQUE CLUSTERED INDEX IX_ids
-    ON #ids(con_id);
-
-
-/* ============================================================
-   3. LAST ATTRIBUTES BY CONTRACT
-   ============================================================ */
-
-IF OBJECT_ID('tempdb..#attr') IS NOT NULL DROP TABLE #attr;
-
-;WITH x AS
-(
-    SELECT
-          TRY_CAST(a.CON_ID AS bigint) AS con_id
-
-        , TRY_CAST(a.[Нов] AS int) AS nov
-        , TRY_CAST(a.[НДП] AS int) AS ndp
-        , TRY_CAST(a.[НДМ] AS int) AS ndm
-
-        , TRY_CAST(a.[Пр2] AS int) AS pr2
-        , TRY_CAST(a.[Пр3] AS int) AS pr3
-
-        , TRY_CAST(a.[Пк2] AS int) AS pk2
-        , TRY_CAST(a.[Пк3] AS int) AS pk3
-        , TRY_CAST(a.[Пк6] AS int) AS pk6
-        , TRY_CAST(a.[Пк7] AS int) AS pk7
-
-        , TRY_CAST(a.[От1] AS int) AS ot1
-        , TRY_CAST(a.[Мпл] AS int) AS mpl
-        , TRY_CAST(a.[Пнс] AS int) AS pns
-
-        , ROW_NUMBER() OVER
-          (
-              PARTITION BY a.CON_ID
-              ORDER BY
-                    a.DT_UPDATE DESC
-                  , a.loaddate DESC
-          ) AS rn
-
-    FROM ALM.ehd.attr_DepoFLConditions a WITH (NOLOCK)
-
-    INNER JOIN #ids i
-        ON i.con_id = TRY_CAST(a.CON_ID AS bigint)
-)
-
-SELECT
-      con_id
-
-    , nov
-    , ndp
-    , ndm
-
-    , pr2
-    , pr3
-
-    , pk2
-    , pk3
-    , pk6
-    , pk7
-
-    , ot1
-    , mpl
-    , pns
-
-    /* NOV / NDP / NDM */
-    , CASE
-        WHEN ISNULL(nov,0) = 1
-          OR ISNULL(ndp,0) = 1
-          OR ISNULL(ndm,0) = 1
-        THEN 1
-        ELSE 0
-      END AS new_money
-
-    /* Other markups */
-    , CASE
-        WHEN ISNULL(pr2,0) = 1
-          OR ISNULL(pr3,0) = 1
-
-          OR ISNULL(pk2,0) = 1
-          OR ISNULL(pk3,0) = 1
-          OR ISNULL(pk6,0) = 1
-          OR ISNULL(pk7,0) = 1
-
-          OR ISNULL(ot1,0) = 1
-          OR ISNULL(mpl,0) = 1
-          OR ISNULL(pns,0) = 1
-        THEN 1
-        ELSE 0
-      END AS other_markup
-
-INTO #attr
-
-FROM x
-WHERE rn = 1;
-
-CREATE UNIQUE CLUSTERED INDEX IX_attr
-    ON #attr(con_id);
-
-
-/* ============================================================
-   4. CLASSIFY NEW DEPOSITS
-
-   SPECIAL 61 RK:
-       45-79 days
-       Rate = 15%
-       AT_THE_END
-       Any segment / product / markup
-
-   OTHER PROMO:
-
-   A:
-       TSEGMENTNAME = DCHBO
-       OR product Classic / Privilege / Dostoyanie
-       Dictionary match is enough
-
-   B:
-       All other deposits
-       Dictionary match
-       + NOV/NDP/NDM
-       + no other markup
-   ============================================================ */
-
-IF OBJECT_ID('tempdb..#new') IS NOT NULL DROP TABLE #new;
-
-SELECT
-      b.*
-
-    /* Normal buckets */
-    , CASE
-        WHEN b.termdays BETWEEN 26   AND 44   THEN 31
-        WHEN b.termdays BETWEEN 45   AND 79   THEN 61
-        WHEN b.termdays BETWEEN 80   AND 115  THEN 91
-        WHEN b.termdays BETWEEN 116  AND 140  THEN 124
-        WHEN b.termdays BETWEEN 141  AND 174  THEN 151
-        WHEN b.termdays BETWEEN 175  AND 200  THEN 181
-        WHEN b.termdays BETWEEN 201  AND 230  THEN 212
-        WHEN b.termdays BETWEEN 231  AND 250  THEN 243
-        WHEN b.termdays BETWEEN 251  AND 290  THEN 274
-        WHEN b.termdays BETWEEN 340  AND 405  THEN 365
-        WHEN b.termdays BETWEEN 540  AND 621  THEN 550
-        WHEN b.termdays BETWEEN 720  AND 763  THEN 750
-        WHEN b.termdays BETWEEN 1090 AND 1140 THEN 1100
-        WHEN b.termdays BETWEEN 1450 AND 1475 THEN 1460
-        WHEN b.termdays BETWEEN 1795 AND 1830 THEN 1825
-        ELSE b.termdays
-      END AS normal_bucket
-
-    /* Promo bucket */
-    , CASE
-        WHEN sp.is_special_61 = 1 THEN 61
-        ELSE d.term_bucket
-      END AS promo_bucket
-
-    /* Promo classification */
-    , CASE
-
-        /* Special 61 RK */
-        WHEN sp.is_special_61 = 1
-            THEN 1
-
-        WHEN d.term_bucket IS NULL
-            THEN 0
-
-        /* Group A */
-        WHEN b.TSEGMENTNAME = N'ДЧБО'
-          OR b.PROD_NAME_RES IN
-             (
-                 N'Классический',
-                 N'Привилегия',
-                 N'Достояние'
-             )
-            THEN 1
-
-        /* Group B */
-        WHEN ISNULL(a.new_money,0) = 1
-         AND ISNULL(a.other_markup,0) = 0
-            THEN 1
-
-        ELSE 0
-      END AS is_promo
-
-INTO #new
-
-FROM #new_bal b
-
-LEFT JOIN #attr a
-    ON a.con_id = b.con_id
-
-/* Special 61 RK */
-CROSS APPLY
-(
-    SELECT
-        CASE
-            WHEN b.termdays BETWEEN 45 AND 79
-             AND ABS(b.rate_con - 0.15) <= @eps
-             AND b.conv = 'AT_THE_END'
-                THEN 1
-            ELSE 0
-        END AS is_special_61
-) sp
-
-/* Existing promo dictionary */
-OUTER APPLY
-(
-    SELECT TOP (1)
-        r.term_bucket
-
-    FROM ALM_TEST.WORK.promo_new_money_rate_dict r WITH (NOLOCK)
-
-    WHERE
-        r.is_active = 1
-
-        AND b.dt_open
-            BETWEEN r.date_from AND r.date_to
-
-        AND b.termdays
-            BETWEEN r.term_min AND r.term_max
-
-        AND r.conv_type =
-            CASE
-                WHEN ISNULL(b.conv,'AT_THE_END') = 'AT_THE_END'
-                    THEN 'AT_THE_END'
-                ELSE 'NOT_AT_THE_END'
-            END
-
-        AND b.out_rub
-            BETWEEN r.amount_from AND r.amount_to
-
-        AND ABS(b.rate_con - r.promo_rate) <= @eps
-
-    ORDER BY r.id DESC
-) d;
-
-
-/* ============================================================
-   RESULT 1
-
-   GROUP BY:
-       OPEN DATE
-       BUCKET
-       TSEGMENTNAME
-
-   ADDITIONAL:
-       ИТОГО ФЛ for each OPEN DATE + BUCKET
-
-   VOLUME / RATES / SPREADS / MARGIN / AVG TERM
-   ============================================================ */
-
-;WITH calc AS
-(
-    SELECT
-          *
-
-        /* Client rate in monthly convention */
-        , CASE
-            WHEN rate_con IS NULL
-                THEN NULL
-
-            WHEN conv = '1M'
-                THEN rate_con
-
-            WHEN termdays > 0
-                THEN
-                    (
-                        POWER(
-                            1.0 + rate_con * termdays / 365.0,
-                            1.0 / (12.0 * termdays / 365.0)
-                        ) - 1.0
-                    ) * 12.0
-          END AS monthly_rate
-
-        /* TS in monthly convention */
-        , CASE
-            WHEN rate_trf IS NULL
-                THEN NULL
-
-            WHEN conv = '1M'
-                THEN rate_trf
-
-            WHEN termdays > 0
-                THEN
-                    (
-                        POWER(
-                            1.0 + rate_trf * termdays / 365.0,
-                            1.0 / (12.0 * termdays / 365.0)
-                        ) - 1.0
-                    ) * 12.0
-          END AS monthly_ts
-
-        /* Final bucket */
-        , CASE
-            WHEN is_promo = 1
-                THEN CONCAT(promo_bucket, ' RK')
-            ELSE CAST(normal_bucket AS varchar(20))
-          END AS bucket
-
-        , CASE
-            WHEN is_promo = 1
-                THEN promo_bucket
-            ELSE normal_bucket
-          END AS sort_bucket
-
-    FROM #new
-),
-
-agg AS
-(
-    SELECT
-          bucket
-        , sort_bucket
-        , dt_open AS open_date
-
-        /* Segment / Total FL */
-        , CASE
-            WHEN GROUPING(TSEGMENTNAME) = 1
-                THEN N'ИТОГО ФЛ'
-            ELSE ISNULL(TSEGMENTNAME, N'БЕЗ СЕГМЕНТА')
-          END AS TSEGMENTNAME
-
-        /* Sorting flag */
-        , GROUPING(TSEGMENTNAME) AS is_total_segment
-
-        /* Full bucket volume */
-        , SUM(out_rub) AS volume
-
-        /* Client rate */
-        , SUM(
-            CASE
-                WHEN rate_con IS NOT NULL
-                    THEN out_rub * rate_con
-            END
-          )
-          /
-          NULLIF(
-              SUM(
-                  CASE
-                      WHEN rate_con IS NOT NULL
-                          THEN out_rub
-                  END
-              ), 0
-          ) AS client_rate
-
-        /* TS */
-        , SUM(
-            CASE
-                WHEN rate_trf IS NOT NULL
-                    THEN out_rub * rate_trf
-            END
-          )
-          /
-          NULLIF(
-              SUM(
-                  CASE
-                      WHEN rate_trf IS NOT NULL
-                          THEN out_rub
-                  END
-              ), 0
-          ) AS trf_rate
-
-        /* Forecast key */
-        , SUM(
-            CASE
-                WHEN AVG_KEY_RATE IS NOT NULL
-                    THEN out_rub * AVG_KEY_RATE
-            END
-          )
-          /
-          NULLIF(
-              SUM(
-                  CASE
-                      WHEN AVG_KEY_RATE IS NOT NULL
-                          THEN out_rub
-                  END
-              ), 0
-          ) AS forecast_key_rate
-
-        /* Client rate monthly convention */
-        , SUM(
-            CASE
-                WHEN monthly_rate IS NOT NULL
-                    THEN out_rub * monthly_rate
-            END
-          )
-          /
-          NULLIF(
-              SUM(
-                  CASE
-                      WHEN monthly_rate IS NOT NULL
-                          THEN out_rub
-                  END
-              ), 0
-          ) AS monthlyconv_rate
-
-        /* TS monthly convention */
-        , SUM(
-            CASE
-                WHEN monthly_ts IS NOT NULL
-                    THEN out_rub * monthly_ts
-            END
-          )
-          /
-          NULLIF(
-              SUM(
-                  CASE
-                      WHEN monthly_ts IS NOT NULL
-                          THEN out_rub
-                  END
-              ), 0
-          ) AS monthlyconv_TS
-
-        /* Weighted contractual term */
-        , SUM(
-            out_rub * CAST(termdays AS decimal(38,6))
-          )
-          /
-          NULLIF(SUM(out_rub),0) AS avg_termdays
-
-    FROM calc
-
-    /* Segment breakdown + Total FL */
-    GROUP BY GROUPING SETS
-    (
-        (bucket, sort_bucket, dt_open, TSEGMENTNAME),
-        (bucket, sort_bucket, dt_open)
-    )
-)
-
-SELECT
-      bucket
-    , open_date
-    , TSEGMENTNAME
-    , volume
-
-    , CAST(client_rate AS decimal(9,6))
-        AS client_rate
-
-    , CAST(trf_rate AS decimal(9,6))
-        AS trf_rate
-
-    , CAST(forecast_key_rate AS decimal(9,6))
-        AS forecast_key_rate
-
-    , CAST(monthlyconv_rate AS decimal(9,6))
-        AS monthlyconv_rate
-
-    , CAST(monthlyconv_TS AS decimal(9,6))
-        AS monthlyconv_TS
-
-    /* Client spread */
-    , CAST(
-        monthlyconv_rate
-        + 0.0048
-        - forecast_key_rate
-        AS decimal(9,6)
-      ) AS spread_keyrate
-
-    /* TS spread */
-    , CAST(
-        monthlyconv_TS
-        + 0.0048
-        - forecast_key_rate
-        AS decimal(9,6)
-      ) AS spread_TS
-
-    /* Monthly TS - Monthly Client Rate */
-    , CAST(
-        monthlyconv_TS - monthlyconv_rate
-        AS decimal(9,6)
-      ) AS margin
-
-    /* Raw TS - Raw Client Rate */
-    , CAST(
-        trf_rate - client_rate
-        AS decimal(9,6)
-      ) AS margin_check
-
-    /* Weighted average contractual term */
-    , CAST(
-        avg_termdays
-        AS decimal(18,2)
-      ) AS avg_termdays
-
-FROM agg
+    /* Only deposits with 15% rate */
+    AND t.rate_con = 0.15
 
 ORDER BY
-      open_date
-    , sort_bucket
-    , bucket
-    , is_total_segment DESC
-    , TSEGMENTNAME;
+      is_premium_package DESC
+    , t.dt_open
+    , t.out_rub DESC;
+
+   AND t.termdays BETWEEN 45 AND 70
+AND ISNULL(t.conv, 'AT_THE_END') = 'AT_THE_END'
