@@ -1,481 +1,107 @@
-USE ALM;
-SET NOCOUNT ON;
+Для оценки экономической стоимости изменения условий ипотеки \\(\Delta NPV\\) лучше, потому что непосредственно измеряет потери банка, а эквивалентный спред дополнительно зависит от выбранного графика ОСЗ. Из-за этого спред может давать искажённое представление о масштабе эффекта при сравнении сценариев.
 
-/* ============================================================
-   PARAMETERS
-   ============================================================ */
+Я бы выделил пять аргументов.
 
-DECLARE @dt_to_mar date = '2026-03-24';
-DECLARE @dt_to_sep date = '2025-10-24';
-DECLARE @dt_to_oct date = '2026-10-24';
+### 1. Эквивалентный спред может неправильно ранжировать сценарии по величине убытка
 
-DECLARE @threshold decimal(18,2) = 200000000;
+Предположим, сравниваем две ипотечные программы:
 
+| Показатель                       | Программа А | Программа Б |
+| -------------------------------- | ----------- | ----------- |
+| Потеря NPV от первоначального ОД | 3%          | 2%          |
+| Дисконтированная база ОСЗ        | 6           | 2           |
+| Эквивалентный годовой спред      | 0,50 п.п.   | 1,00 п.п.   |
 
-/* ============================================================
-   1. PERIODS
-   ============================================================ */
+Программа А обходится банку дороже, однако эквивалентный спред у неё вдвое меньше.
 
-IF OBJECT_ID('tempdb..#periods') IS NOT NULL DROP TABLE #periods;
+Причина — более продолжительный график остатков в знаменателе.
 
-CREATE TABLE #periods
-(
-    period_id int PRIMARY KEY,
-    dt_from date,
-    dt_to date,
-    r_w varchar(30)
-);
+Если цель — определить размер компенсирующей апфронт-комиссии, такой показатель может вводить в заблуждение.
 
-INSERT INTO #periods
-VALUES
-(1, '2026-03-01', @dt_to_mar,
-    '2026 01.03-' + CONVERT(varchar(5), @dt_to_mar, 104)),
+### 2. Спред не сохраняет временную структуру убытка
 
-(2, '2025-10-01', @dt_to_sep,
-    '2025 01.10-' + CONVERT(varchar(5), @dt_to_sep, 104)),
+В вашем случае часть эффекта возникает только после 15 лет, когда прекращается субсидирование.
 
-(3, '2026-10-01', @dt_to_oct,
-    '2026 01.10-' + CONVERT(varchar(5), @dt_to_oct, 104));
+Два сценария с одинаковой \\(\Delta NPV\\) могут иметь совершенно разную структуру:
 
+- В первом основные потери приходятся на первые годы.
+- Во втором — на период после 15 лет.
 
-/* ============================================================
-   2. PREMIUM CLIENTS
+При одинаковом знаменателе эквивалентный спред будет одинаковым.
 
-   Определяем премиальных клиентов отдельно для каждого
-   периода на дату его окончания.
+Но чувствительность потерь к изменению кривой ЕТС существенно различается.
 
-   DISTINCT исключает размножение платежей из-за нескольких
-   записей атрибута.
-   ============================================================ */
+Важная оговорка: сама \\(\Delta NPV\\) тоже не показывает дюрацию. Для этого необходимо дополнительно рассчитывать \\(\Delta DV01\\) или KRD. Преимущество NPV в том, что он сохраняет непосредственный смысл стоимости, не подменяя реальные потоки искусственной постоянной надбавкой.
 
-IF OBJECT_ID('tempdb..#premium_clients') IS NOT NULL
-    DROP TABLE #premium_clients;
+### 3. Спред смешивает экономический эффект с продолжительностью жизни кредита
 
-SELECT DISTINCT
-      p.period_id
-    , a.CLI_ID AS cli_id
+В ипотеке это особенно критично из-за CPR.
 
-INTO #premium_clients
+У вас изменение ставки способно одновременно менять:
 
-FROM ALM.ehd.attr_cli_stat_sal a WITH (NOLOCK)
+- процентные поступления;
+- скорость досрочного погашения;
+- сроки возврата основного долга;
+- объём получаемой субсидии.
 
-INNER JOIN #periods p
-    ON p.dt_to BETWEEN a.DT_FROM AND a.DT_TO
+Все эти изменения влияют на числитель — \\(\Delta NPV\\).
 
-WHERE a.CLI_ATTR_CODE = 'PREMIUM_PACKAGE'
-  AND a.CLI_ID IS NOT NULL;
+Однако CPR меняет ещё и знаменатель — дисконтированную сумму ОСЗ.
 
-CREATE UNIQUE CLUSTERED INDEX IX_premium_clients
-    ON #premium_clients(period_id, cli_id);
+Следовательно, эквивалентный спред может снизиться даже тогда, когда абсолютный экономический убыток увеличился, если дисконтированная база остатков выросла ещё сильнее.
 
+Причём результат будет зависеть от того, остатки какого сценария коллеги поставили в знаменатель.
 
-/* ============================================================
-   3. AGGREGATED FLOWS
+### 4. Эквивалентный спред не обязательно можно реализовать в виде настоящей ставки
 
-   Из агрегатов забираем ДЧБО и всю Розницу.
-   Деления на премиум и масс здесь ещё нет.
+Это, на мой взгляд, особенно сильный аргумент.
 
-   Сохраняем исходные фильтры и классификацию банков.
-   ============================================================ */
+Коллеги утверждают: «Эта надбавка к ставке компенсирует потери NPV».
 
-IF OBJECT_ID('tempdb..#agg_bank') IS NOT NULL DROP TABLE #agg_bank;
+Но они рассчитывают её на уже заданном графике ОСЗ.
 
-;WITH flows AS
-(
-    SELECT
-          p.period_id
-        , t.cli_biz AS segment
+Если действительно увеличить ставку клиенту на найденную величину, может измениться CPR, график платежей и фактический ОСЗ.
 
-        , CASE
-            WHEN t.spec_cat IN ('BR','SR','FU')
-                THEN N'Market'
-            WHEN t.transaction_type = N'Наличные'
-                THEN N'Наличные'
-            ELSE t.bank_name_main
-          END AS bank
+Тогда:
 
-        , CASE
-            WHEN t.spec_cat IN ('BR','SR','FU') THEN 'market'
-            WHEN t.transaction_type = N'Наличные' THEN 'cash'
-            ELSE 'bank'
-          END AS bank_type
-
-        , t.direction_txt
-
-        , ISNULL(t.[Распознано_НС],0)
-        + ISNULL(t.[Распознано_СР],0)
-        + ISNULL(t.[Распознано_ДВС],0) AS amt
-
-    FROM ALM.ehd.VW_transfers_FL_AGG_tab t WITH (NOLOCK)
-
-    INNER JOIN #periods p
-        ON t.dt_rep >= p.dt_from
-       AND t.dt_rep < DATEADD(day,1,p.dt_to)
-
-    WHERE t.direction_type <> N'Ошибка'
-      AND t.[целевая категория] = 1
-      AND t.transaction_type <> N'Внутренние переводы'
-      AND t.transit_flag = N'Не транзит'
-      AND t.cli_biz IN (N'Розница',N'ДЧБО')
-
-      AND
-      (
-          t.spec_cat NOT IN ('BR','SR','FU')
-          OR
-          (
-              t.spec_cat IN ('BR','SR','FU')
-              AND t.transaction_type <> N'Наличные'
-          )
-      )
-)
-
-SELECT
-      period_id
-    , segment
-    , bank
-    , bank_type
-
-    , SUM(
-        CASE
-            WHEN direction_txt = N'входящие'
-              OR (direction_txt = N'смешанные' AND amt > 0)
-                THEN amt
-            ELSE 0
-        END
-      ) AS incoming
-
-    , SUM(
-        CASE
-            WHEN direction_txt = N'исходящие'
-              OR (direction_txt = N'смешанные' AND amt < 0)
-                THEN amt
-            ELSE 0
-        END
-      ) AS outgoing
-
-INTO #agg_bank
-
-FROM flows
-
-GROUP BY
-      period_id
-    , segment
-    , bank
-    , bank_type
-
-OPTION (RECOMPILE);
-
-
-/* ============================================================
-   4. PREMIUM FLOWS FROM DETAILS
-
-   Самое важное:
-
-   1. Только cli_biz = Розница.
-   2. Только клиенты из #premium_clients.
-   3. Только платежи соответствующего периода.
-
-   Массовых клиентов отдельно НЕ выгружаем.
-
-   Фильтры и расчёт потоков повторяют агрегаты.
-   ============================================================ */
-
-IF OBJECT_ID('tempdb..#premium_bank') IS NOT NULL
-    DROP TABLE #premium_bank;
-
-;WITH flows AS
-(
-    SELECT
-          p.period_id
-
-        , CASE
-            WHEN t.spec_cat IN ('BR','SR','FU')
-                THEN N'Market'
-            WHEN t.transaction_type = N'Наличные'
-                THEN N'Наличные'
-            ELSE t.bank_name_main
-          END AS bank
-
-        , CASE
-            WHEN t.spec_cat IN ('BR','SR','FU') THEN 'market'
-            WHEN t.transaction_type = N'Наличные' THEN 'cash'
-            ELSE 'bank'
-          END AS bank_type
-
-        , t.direction_txt
-
-        , ISNULL(t.[Распознано_НС],0)
-        + ISNULL(t.[Распознано_СР],0)
-        + ISNULL(t.[Распознано_ДВС],0) AS amt
-
-    FROM #premium_clients pc
-
-    INNER JOIN #periods p
-        ON p.period_id = pc.period_id
-
-    INNER JOIN ALM.ehd.VW_transfers_FL_det t WITH (NOLOCK)
-        ON t.cli_id = pc.cli_id
-       AND t.dt_rep >= p.dt_from
-       AND t.dt_rep < DATEADD(day,1,p.dt_to)
-
-    WHERE t.cli_biz = N'Розница'
-
-      AND t.direction_type <> N'Ошибка'
-      AND t.[целевая категория] = 1
-      AND t.transaction_type <> N'Внутренние переводы'
-      AND t.transit_max_id IS NULL
-
-      AND
-      (
-          t.spec_cat NOT IN ('BR','SR','FU')
-          OR
-          (
-              t.spec_cat IN ('BR','SR','FU')
-              AND t.transaction_type <> N'Наличные'
-          )
-      )
-)
-
-SELECT
-      period_id
-    , bank
-    , bank_type
-
-    , SUM(
-        CASE
-            WHEN direction_txt = N'входящие'
-              OR (direction_txt = N'смешанные' AND amt > 0)
-                THEN amt
-            ELSE 0
-        END
-      ) AS incoming
-
-    , SUM(
-        CASE
-            WHEN direction_txt = N'исходящие'
-              OR (direction_txt = N'смешанные' AND amt < 0)
-                THEN amt
-            ELSE 0
-        END
-      ) AS outgoing
-
-INTO #premium_bank
-
-FROM flows
-
-GROUP BY
-      period_id
-    , bank
-    , bank_type
-
-OPTION (RECOMPILE);
-
-
-/* ============================================================
-   5. BANK THRESHOLD
-
-   Определяем маленькие банки по исходному общему потоку:
-   ДЧБО + вся Розница.
-
-   Порог применяем ДО выделения премиума,
-   чтобы банк не менял категорию только из-за разделения
-   клиентских сегментов.
-   ============================================================ */
-
-IF OBJECT_ID('tempdb..#bank_threshold') IS NOT NULL
-    DROP TABLE #bank_threshold;
-
-SELECT
-      period_id
-    , bank
-    , bank_type
-    , SUM(incoming) AS incoming
-    , SUM(outgoing) AS outgoing
-
-INTO #bank_threshold
-
-FROM #agg_bank
-
-GROUP BY
-      period_id
-    , bank
-    , bank_type;
-
-
-/* ============================================================
-   6. FINAL RESULT
-
-   ДЧБО    = агрегаты ДЧБО
-   Премиум = детализация Розницы с атрибутом PREMIUM_PACKAGE
-   Масс    = агрегаты Розницы - детализация Премиума
-   ============================================================ */
-
-;WITH segmented AS
-(
-    /* ДЧБО */
-    SELECT
-          period_id
-        , N'ДЧБО' AS segment
-        , bank
-        , bank_type
-        , incoming
-        , outgoing
-
-    FROM #agg_bank
-    WHERE segment = N'ДЧБО'
-
-
-    UNION ALL
-
-
-    /* Премиум */
-    SELECT
-          period_id
-        , N'Премиум'
-        , bank
-        , bank_type
-        , incoming
-        , outgoing
-
-    FROM #premium_bank
-
-
-    UNION ALL
-
-
-    /* Масс = Розница - Премиум */
-    SELECT
-          COALESCE(r.period_id,pr.period_id)
-        , N'Масс'
-        , COALESCE(r.bank,pr.bank)
-        , COALESCE(r.bank_type,pr.bank_type)
-
-        , ISNULL(r.incoming,0) - ISNULL(pr.incoming,0)
-        , ISNULL(r.outgoing,0) - ISNULL(pr.outgoing,0)
-
-    FROM
-    (
-        SELECT *
-        FROM #agg_bank
-        WHERE segment = N'Розница'
-    ) r
-
-    FULL OUTER JOIN #premium_bank pr
-        ON pr.period_id = r.period_id
-       AND pr.bank_type = r.bank_type
-       AND
-       (
-           pr.bank = r.bank
-           OR (pr.bank IS NULL AND r.bank IS NULL)
-       )
-),
-
-classified AS
-(
-    SELECT
-          s.*
-
-        , CASE
-            WHEN s.bank_type = 'bank'
-             AND ABS(b.incoming) <= @threshold
-             AND ABS(b.outgoing) <= @threshold
-                THEN N'else'
-            ELSE s.bank
-          END AS final_bank
-
-    FROM segmented s
-
-    LEFT JOIN #bank_threshold b
-        ON b.period_id = s.period_id
-       AND b.bank_type = s.bank_type
-       AND
-       (
-           b.bank = s.bank
-           OR (b.bank IS NULL AND s.bank IS NULL)
-       )
-)
-
-SELECT
-      p.r_w
-    , c.segment
-    , c.final_bank AS bank_name_main
-
-    , SUM(c.incoming) / 1000000000.0 AS incoming
-    , SUM(c.outgoing) / 1000000000.0 AS outgoing
-    , SUM(c.incoming + c.outgoing) / 1000000000.0 AS saldo
-
-FROM classified c
-
-INNER JOIN #periods p
-    ON p.period_id = c.period_id
-
-GROUP BY
-      p.period_id
-    , p.r_w
-    , c.segment
-    , c.final_bank
-
-ORDER BY
-      p.period_id
-    , c.segment
-    , c.final_bank;
-
-
-/* ============================================================
-   7. CONTROL
-
-   Проверяем, нет ли банков, по которым детализация
-   премиума превышает весь агрегированный поток Розницы.
-
-   Если результат пустой - таких противоречий нет.
-
-   Это диагностическая проверка, не замена сверки
-   витрин детализации и агрегатов.
-   ============================================================ */
-
-SELECT
-      p.r_w
-    , pr.bank
-    , pr.bank_type
-
-    , ISNULL(r.incoming,0) AS retail_incoming
-    , pr.incoming AS premium_incoming
-
-    , ISNULL(r.outgoing,0) AS retail_outgoing
-    , pr.outgoing AS premium_outgoing
-
-FROM #premium_bank pr
-
-INNER JOIN #periods p
-    ON p.period_id = pr.period_id
-
-LEFT JOIN #agg_bank r
-    ON r.period_id = pr.period_id
-   AND r.segment = N'Розница'
-   AND r.bank_type = pr.bank_type
-   AND
-   (
-       r.bank = pr.bank
-       OR (r.bank IS NULL AND pr.bank IS NULL)
-   )
-
-WHERE
-       pr.incoming > ISNULL(r.incoming,0) + 1
-    OR pr.outgoing < ISNULL(r.outgoing,0) - 1
-
-ORDER BY
-      p.period_id
-    , pr.bank;
-
-
-/* ============================================================
-   8. CLEANUP
-
-   После выполнения очищаем промежуточные таблицы.
-   ============================================================ */
-
-DROP TABLE #bank_threshold;
-DROP TABLE #premium_bank;
-DROP TABLE #agg_bank;
-DROP TABLE #premium_clients;
-DROP TABLE #periods;
+\\[ PV(\text{надбавки на новый ОСЗ}) \neq \Delta NPV\_{\text{исходное}} \\]
+
+Поэтому показатель является эквивалентом на фиксированном прогнозном графике, а не гарантированно компенсирующей ставкой. Для последнего потребовался бы итерационный пересчёт модели.
+
+А апфронт-комиссия в размере \\(\Delta NPV/ОД_0\\) компенсирует расчётную потерю непосредственно в момент выдачи.
+
+### 5. NPV позволяет прозрачно разложить эффект по компонентам
+
+Например:
+
+\\[ \Delta NPV\_{\text{общий}}= \Delta PV\_{\text{проценты}}+ \Delta PV\_{\text{субсидии}}+ \Delta PV\_{\text{основной долг}} \\]
+
+Величины в рублях аддитивны и имеют понятный экономический смысл.
+
+При использовании единого знаменателя эквивалентные спреды тоже можно складывать, но если использовать разные знаменатели, аддитивность пропадает.
+
+Кроме того, перевод потери PV основного долга в условные процентные пункты может скрывать сам источник убытка.
+
+## Что я бы сказал коллегам
+
+Основное замечание
+
+> Эквивалентный годовой спред не является самостоятельной мерой экономического эффекта. Он представляет собой отношение изменения NPV к дисконтированной базе остатков, которая сама зависит от CPR и срочности портфеля.
+>
+> В результате при сравнении сценариев изменение показателя может быть обусловлено не изменением стоимости, а изменением знаменателя. Кроме того, показатель не сохраняет временную структуру разницы денежных потоков и её процентную чувствительность.
+>
+> Для оценки стоимости изменения условий кредитования корректнее использовать \\(\Delta NPV\\), нормированную на первоначальный ОД. Для оценки процентного риска — дополнительно \\(\Delta DV01\\).
+
+## Мой вывод
+
+Я бы оставил три показателя:
+
+| Показатель                                  | Для чего                                               |
+| ------------------------------------------- | ------------------------------------------------------ |
+| \\(\Delta NPV/ОД_0\\)                       | Основная мера экономической стоимости и необходимой КВ |
+| Средневзвешенная \\(\Delta\\) ставки по ОСЗ | Для объяснения среднего изменения процентных условий   |
+| \\(\Delta DV01\\), KRD                      | Для анализа изменения процентного риска                |
+
+Эквивалентный спред коллег можно оставить дополнительной справочной метрикой, но я бы не делал его основным критерием принятия решений.
+
+И ключевой нюанс: если при переходе между сценариями знаменатель остаётся неизменным, эквивалентный спред и \\(\Delta NPV\\) дадут абсолютно одинаковое ранжирование. Все основные проблемы начинаются при сравнении сценариев с разными CPR, сроками жизни и дисконтированными базами ОСЗ — то есть именно в вашей ипотечной модели.
