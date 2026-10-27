@@ -1,109 +1,141 @@
 Option Explicit
 
-Sub calc_matrix_fast_exact()
+Sub calc_gosy_15()
 
     Dim wb As Workbook
+    Dim wsHelp As Worksheet
     Dim wsCalc As Worksheet
-    Dim wsKV As Worksheet
-    Dim wsSubs As Worksheet
 
     Set wb = ActiveWorkbook
+    Set wsHelp = wb.Worksheets("help")
+    Set wsCalc = wb.Worksheets("Госы две ставки, субсидия 15")
 
-    Set wsCalc = wb.Worksheets("Расчёт")
-    Set wsKV = wb.Worksheets("Матрица КВ")
-    Set wsSubs = wb.Worksheets("Матрица субс")
+    Dim minRow As Long, maxRow As Long
+    Dim nRows As Long
+    Dim r As Long, i As Long, j As Long
 
-    Dim min_row As Long, max_row As Long
-    Dim min_col As Long, max_col As Long
+    minRow = CLng(wsCalc.Range("A4").Value2)
+    maxRow = CLng(wsCalc.Range("A5").Value2)
 
-    min_row = CLng(wsCalc.Range("F4").Value)
-    max_row = CLng(wsCalc.Range("F5").Value)
-    min_col = CLng(wsCalc.Range("F6").Value)
-    max_col = CLng(wsCalc.Range("F7").Value)
+    If minRow < 2 Or maxRow < minRow _
+       Or maxRow > wsHelp.Rows.Count Then
+        MsgBox "Некорректные границы строк A4:A5", vbExclamation
+        Exit Sub
+    End If
 
-    Dim nRows As Long, nCols As Long
-    nRows = max_row - min_row + 1
-    nCols = max_col - min_col + 1
+    nRows = maxRow - minRow + 1
 
-    Dim arrRowInput As Variant
-    Dim arrColInput As Variant
+    Dim arrInput As Variant
+    Dim arrOutput() As Variant
 
-    Dim arrOutKV() As Variant
-    Dim arrOutSubs() As Variant
+    ' B:G - шесть входных параметров
+    arrInput = wsHelp.Range("B" & minRow & ":G" & maxRow).Value2
 
-    ReDim arrOutKV(1 To nRows, 1 To nCols)
-    ReDim arrOutSubs(1 To nRows, 1 To nCols)
-
-    arrRowInput = wsKV.Range(wsKV.Cells(min_row, 2), wsKV.Cells(max_row, 2)).Value2
-    arrColInput = wsKV.Range(wsKV.Cells(2, min_col), wsKV.Cells(2, max_col)).Value2
+    ' H:L - пять выходных показателей
+    ReDim arrOutput(1 To nRows, 1 To 5)
 
     Dim calcMode As XlCalculation
     Dim eventsState As Boolean
     Dim screenState As Boolean
-    Dim statusBarState As Variant
+    Dim statusState As Variant
+    Dim errText As String
 
     calcMode = Application.Calculation
     eventsState = Application.EnableEvents
     screenState = Application.ScreenUpdating
-    statusBarState = Application.StatusBar
+    statusState = Application.StatusBar
 
-    On Error GoTo CLEANUP
+    On Error GoTo ERR_HANDLER
 
     With Application
         .ScreenUpdating = False
         .EnableEvents = False
         .Calculation = xlCalculationManual
-        .StatusBar = "Расчёт матрицы..."
+        .StatusBar = "Расчёт сценариев..."
     End With
-
-    Dim r As Long, c As Long
 
     For r = 1 To nRows
 
-        ' Скидка меняется один раз на строку
-        wsCalc.Range("B6").Value2 = arrRowInput(r, 1)
+        i = minRow + r - 1
 
-        For c = 1 To nCols
+        ' Проверяем заполненность всех шести параметров
+        For j = 1 To 6
+            If IsEmpty(arrInput(r, j)) Then
+                Err.Raise vbObjectError + 100, , _
+                    "Пустые входные данные в строке help " & i
+            End If
+        Next j
 
-            ' Второй параметр из заголовка матрицы
-            wsCalc.Range("B7").Value2 = arrColInput(1, c)
+        ' Передаём параметры из help в расчётную модель
+        With wsCalc
 
-            ' B3 не изменяем: пересчитывается по формуле
-            wsCalc.Calculate
+            .Range("A2").Value2 = arrInput(r, 1) ' B: срок
+            .Range("C2").Value2 = arrInput(r, 2) ' C: ставка первые 15 лет
+            .Range("D2").Value2 = arrInput(r, 3) ' D: CPR первые 15 лет
+            .Range("D3").Value2 = arrInput(r, 4) ' E: CPR после 15 лет
+            .Range("F3").Value2 = arrInput(r, 5) ' F: ставка после 15 лет
+            .Range("D4").Value2 = arrInput(r, 6) ' G: 1 фикс / 0 флоат
 
-            ' Сохраняем результаты
-            arrOutKV(r, c) = wsCalc.Range("B14").Value2
-            arrOutSubs(r, c) = wsCalc.Range("C18").Value2
+        End With
 
-        Next c
+        ' Полный пересчёт всех открытых книг Excel
+        Application.CalculateFull
 
-        If r Mod 10 = 0 Or r = nRows Then
-            Application.StatusBar = "Расчёт матрицы: строка " & r & " / " & nRows
-        End If
+        ' Ожидаем завершения пересчёта
+        Do While Application.CalculationState <> xlDone
+            DoEvents
+        Loop
+
+        ' Забираем результаты только после пересчёта
+        With wsCalc
+
+            arrOutput(r, 1) = .Range("B14").Value2 ' NPV1
+            arrOutput(r, 2) = .Range("B15").Value2 ' NPV2
+            arrOutput(r, 3) = .Range("B16").Value2 ' Эффект на NIM2
+            arrOutput(r, 4) = .Range("B17").Value2 ' NPV3
+            arrOutput(r, 5) = .Range("B18").Value2 ' Эффект на NIM3
+
+        End With
+
+        ' Проверяем результаты на ошибки Excel
+        For j = 1 To 5
+            If IsError(arrOutput(r, j)) Then
+                Err.Raise vbObjectError + 101, , _
+                    "Ошибка формулы в строке help " & i & _
+                    ", показатель " & j
+            End If
+        Next j
+
+        Application.StatusBar = _
+            "Рассчитано " & r & " из " & nRows & _
+            " сценариев. Строка help: " & i
 
     Next r
 
-    ' Выгрузка результатов одним блоком
-    wsKV.Range(wsKV.Cells(min_row, min_col), _
-               wsKV.Cells(max_row, max_col)).Value2 = arrOutKV
-
-    wsSubs.Range(wsSubs.Cells(min_row, min_col), _
-                 wsSubs.Cells(max_row, max_col)).Value2 = arrOutSubs
-
-CLEANUP:
+    ' Выгружаем результаты одним блоком
+    wsHelp.Range("H" & minRow).Resize(nRows, 5).Value2 = arrOutput
 
     With Application
         .Calculation = calcMode
         .EnableEvents = eventsState
         .ScreenUpdating = screenState
-        .StatusBar = statusBarState
-        .CutCopyMode = False
+        .StatusBar = statusState
     End With
 
-    If Err.Number <> 0 Then
-        MsgBox "Ошибка: " & Err.Description, vbExclamation
-    Else
-        MsgBox "Расчёт матрицы завершён", vbInformation
-    End If
+    MsgBox "Готово. Рассчитано сценариев: " & nRows, vbInformation
+    Exit Sub
+
+ERR_HANDLER:
+
+    errText = Err.Description
+
+    With Application
+        .Calculation = calcMode
+        .EnableEvents = eventsState
+        .ScreenUpdating = screenState
+        .StatusBar = statusState
+    End With
+
+    MsgBox "Ошибка: " & errText, vbExclamation
 
 End Sub
