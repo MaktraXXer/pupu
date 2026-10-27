@@ -1,49 +1,53 @@
+
 Option Explicit
 
-Sub calc_gosy_15()
+Sub calc_matrix_upfront()
 
     Dim wb As Workbook
-    Dim wsHelp As Worksheet
     Dim wsCalc As Worksheet
+    Dim wsOut As Worksheet
 
     Set wb = ActiveWorkbook
-    Set wsHelp = wb.Worksheets("help")
-    Set wsCalc = wb.Worksheets("Госы две ставки, субсидия 15")
+    Set wsCalc = wb.Worksheets("Расчёт")
+    Set wsOut = wb.Worksheets("матрица апфронт")
 
     Dim minRow As Long, maxRow As Long
     Dim nRows As Long
-    Dim r As Long, i As Long, j As Long
+    Dim i As Long, r As Long
 
-    minRow = CLng(wsCalc.Range("A4").Value2)
-    maxRow = CLng(wsCalc.Range("A5").Value2)
+    minRow = CLng(wsCalc.Range("I4").Value2)
+    maxRow = CLng(wsCalc.Range("I5").Value2)
 
-    If minRow < 2 Or maxRow < minRow _
-       Or maxRow > wsHelp.Rows.Count Then
-        MsgBox "Некорректные границы строк A4:A5", vbExclamation
+    If minRow < 1 Or maxRow < minRow Then
+        MsgBox "Некорректные границы I4:I5", vbExclamation
         Exit Sub
     End If
 
     nRows = maxRow - minRow + 1
 
-    Dim arrInput As Variant
+    If nRows > wsOut.Rows.Count Then
+        MsgBox "Слишком много сценариев", vbExclamation
+        Exit Sub
+    End If
+
     Dim arrOutput() As Variant
-
-    ' B:G - шесть входных параметров
-    arrInput = wsHelp.Range("B" & minRow & ":G" & maxRow).Value2
-
-    ' H:L - пять выходных показателей
-    ReDim arrOutput(1 To nRows, 1 To 5)
+    ReDim arrOutput(1 To nRows, 1 To 1)
 
     Dim calcMode As XlCalculation
     Dim eventsState As Boolean
     Dim screenState As Boolean
     Dim statusState As Variant
+    Dim originalI7 As Variant
     Dim errText As String
+    Dim result As Variant
 
     calcMode = Application.Calculation
     eventsState = Application.EnableEvents
     screenState = Application.ScreenUpdating
     statusState = Application.StatusBar
+
+    ' Сохраняем исходное значение или формулу I7
+    originalI7 = wsCalc.Range("I7").Formula
 
     On Error GoTo ERR_HANDLER
 
@@ -51,32 +55,15 @@ Sub calc_gosy_15()
         .ScreenUpdating = False
         .EnableEvents = False
         .Calculation = xlCalculationManual
-        .StatusBar = "Расчёт сценариев..."
+        .StatusBar = "Расчёт матрицы апфронт..."
     End With
 
     For r = 1 To nRows
 
         i = minRow + r - 1
 
-        ' Проверяем заполненность всех шести параметров
-        For j = 1 To 6
-            If IsEmpty(arrInput(r, j)) Then
-                Err.Raise vbObjectError + 100, , _
-                    "Пустые входные данные в строке help " & i
-            End If
-        Next j
-
-        ' Передаём параметры из help в расчётную модель
-        With wsCalc
-
-            .Range("A2").Value2 = arrInput(r, 1) ' B: срок
-            .Range("C2").Value2 = arrInput(r, 2) ' C: ставка первые 15 лет
-            .Range("D2").Value2 = arrInput(r, 3) ' D: CPR первые 15 лет
-            .Range("D3").Value2 = arrInput(r, 4) ' E: CPR после 15 лет
-            .Range("F3").Value2 = arrInput(r, 5) ' F: ставка после 15 лет
-            .Range("D4").Value2 = arrInput(r, 6) ' G: 1 фикс / 0 флоат
-
-        End With
+        ' Подставляем номер сценария КС
+        wsCalc.Range("I7").Value2 = i
 
         ' Полный пересчёт всех открытых книг Excel
         Application.CalculateFull
@@ -86,34 +73,37 @@ Sub calc_gosy_15()
             DoEvents
         Loop
 
-        ' Забираем результаты только после пересчёта
-        With wsCalc
+        ' Получаем результат
+        result = wsCalc.Range("A18").Value2
 
-            arrOutput(r, 1) = .Range("B14").Value2 ' NPV1
-            arrOutput(r, 2) = .Range("B15").Value2 ' NPV2
-            arrOutput(r, 3) = .Range("B16").Value2 ' Эффект на NIM2
-            arrOutput(r, 4) = .Range("B17").Value2 ' NPV3
-            arrOutput(r, 5) = .Range("B18").Value2 ' Эффект на NIM3
+        If IsError(result) Then
+            Err.Raise vbObjectError + 100, , _
+                "Ошибка формулы A18 для сценария " & i
+        End If
 
-        End With
+        If Not IsNumeric(result) Then
+            Err.Raise vbObjectError + 101, , _
+                "A18 не содержит число. Сценарий " & i
+        End If
 
-        ' Проверяем результаты на ошибки Excel
-        For j = 1 To 5
-            If IsError(arrOutput(r, j)) Then
-                Err.Raise vbObjectError + 101, , _
-                    "Ошибка формулы в строке help " & i & _
-                    ", показатель " & j
-            End If
-        Next j
+        arrOutput(r, 1) = result
 
-        Application.StatusBar = _
-            "Рассчитано " & r & " из " & nRows & _
-            " сценариев. Строка help: " & i
+        If r Mod 10 = 0 Or r = nRows Then
+            Application.StatusBar = _
+                "Рассчитано " & r & " из " & nRows & _
+                ". Сценарий КС: " & i
+        End If
 
     Next r
 
-    ' Выгружаем результаты одним блоком
-    wsHelp.Range("H" & minRow).Resize(nRows, 5).Value2 = arrOutput
+    ' Выгружаем результаты в B1 и далее вниз
+    wsOut.Range("B1").Resize(nRows, 1).Value2 = arrOutput
+
+    ' Возвращаем исходное значение I7
+    wsCalc.Range("I7").Formula = originalI7
+
+    ' Пересчитываем модель после восстановления
+    Application.CalculateFull
 
     With Application
         .Calculation = calcMode
@@ -122,12 +112,19 @@ Sub calc_gosy_15()
         .StatusBar = statusState
     End With
 
-    MsgBox "Готово. Рассчитано сценариев: " & nRows, vbInformation
+    MsgBox "Готово. Рассчитано сценариев: " & nRows, _
+           vbInformation
+
     Exit Sub
 
 ERR_HANDLER:
 
     errText = Err.Description
+
+    ' Восстанавливаем исходный сценарий
+    wsCalc.Range("I7").Formula = originalI7
+
+    Application.CalculateFull
 
     With Application
         .Calculation = calcMode
