@@ -1,628 +1,254 @@
-USE [ALM_TEST]
-GO
+Я бы начал с гипотезы, что 5 млрд рублей не обязательно являются реальным оттоком вкладов — возможно, часть портфеля выпадает из твоих расчётных выборок.
 
-SET ANSI_NULLS ON
-GO
+В присланных SQL вижу несколько конкретных причин, почему статистики могут не сходиться.
 
-SET QUOTED_IDENTIFIER ON
-GO
+### 1. Что уже не так в сопоставлении
 
-ALTER FUNCTION [reports].[fn_NewAttractionVolumes_TEST]
-(
-      @ReportDate date
-    , @OpenFrom date
-    , @OpenTo date
-    , @ExcludeMP bit = 1
-)
-RETURNS TABLE
-AS
-RETURN
-(
-    /*
-       Список вкладов маркетплейсов
-    */
+| Проблема                                         | Почему важно                                                                                                                                 |
+| ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Разные даты                                      | Общий остаток смотришь с 29.10 по 02.11, действующие вклады и новые привлечения — с 30.09 по 02.11, поклиентную динамику — с 01.11 по 02.11. |
+| Разные фильтры                                   | В общем остатке нет `acc_role = 'LIAB'`, а в расчётах действующих и новых вкладов он есть.                                                   |
+| Разные исключения продуктов                      | Во втором скрипте написано `НадёжныйVIP` вместо `Надёжный VIP`, а `Надёжныйпроцент` обрабатывается неодинаково.                              |
+| Неполный охват закрытий                          | Плановые погашения не включают досрочно закрытые вклады, а в расчёте действующих вкладов остаются только договоры с `dt_close_plan > 02.11`. |
+| Новые привлечения считаются по конечному остатку | Скрипт берёт открытые с 01.10 вклады, существующие на 02.11. Это не весь фактический объём открытий за период.                               |
+| Поклиентная выборка ограничена                   | `OFFSET 0 ROWS FETCH NEXT 2500 ROWS ONLY` показывает лишь 2500 клиентов, поэтому совокупный отток может быть распределён между остальными.   |
 
-    WITH mp_list AS
-    (
-        SELECT prod_name_res
-        FROM (VALUES
-              (N'ДОМа надёжно')
-            , (N'Всё в ДОМ')
-            , (N'Надёжный')
-            , (N'Надёжный VIP')
-            , (N'Надёжный премиум')
-            , (N'Надёжныйпромо')
-            , (N'Надёжный промо')
-            , (N'Надёжный старт')
-            , (N'Надёжный T2')
-            , (N'Надёжный Т2')
-            , (N'Надёжный Мегафон')
-            , (N'Надёжныйпрайм')
-            , (N'Надёжный прайм')
-            , (N'Надёжный процент')
-            , (N'Надёжныйпроцент')
-            , (N'Могучий')
-        ) m(prod_name_res)
-    ),
+Эти расхождения видны непосредственно в условиях твоих запросов.&#x20;
 
-    /*
-       Баланс
-    */
+Вставленный текст(5).txt
 
-    src AS
-    (
-        SELECT
-              v.CON_ID
-            , v.OUT_RUB
-            , v.TSegmentName
-            , v.PROD_NAME_res
-            , v.termdays
-            , v.rate_con
-            , v.conv
-            , CAST(v.dt_open AS date) AS dt_open
+Вставленный текст(5).txt
 
-            , CASE
-                WHEN mp.prod_name_res IS NOT NULL
-                    THEN 1
-                ELSE 0
-              END AS is_mp
+Вставленный текст(5).txt
 
-            , CASE
-                WHEN v.TSegmentName = N'ДЧБО'
-                  OR v.PROD_NAME_res IN
-                  (
-                      N'Классический',
-                      N'Привилегия',
-                      N'Достояние',
-                      N'Достояние без опций',
-                      N'Достояние с пополнением и снятием',
-                      N'Достояние (перем.ст.) без опций',
-                      N'Достояние (перем.ст.) с пополнением и снятием'
-                  )
-                    THEN 1
-                ELSE 0
-              END AS is_private
 
 
-            /* Особая ставка 15% на 2 месяца */
-            , CASE
-                WHEN v.termdays BETWEEN 45 AND 70
-                 AND ISNULL(v.conv,'AT_THE_END') = 'AT_THE_END'
-                 AND ABS(v.rate_con - 0.1500) <= 0.0005
-                    THEN 1
-                ELSE 0
-              END AS special_2m
+### 2. Как я предлагаю искать 5 млрд
 
+Вместо того чтобы пытаться объяснить разницу сразу тремя статистиками, сначала нужно построить точный мост остатков на уровне `con_id`:
 
-            /* Особая ставка 14.6% на 4 месяца */
-            , CASE
-                WHEN v.termdays BETWEEN 120 AND 140
-                 AND ISNULL(v.conv,'AT_THE_END') = 'AT_THE_END'
-                 AND ABS(v.rate_con - 0.1460) <= 0.0005
-                    THEN 1
-                ELSE 0
-              END AS special_4m
+\\[ \Delta ОСЗ = \underbrace{\text{Появившиеся вклады}}\_{\text{не было → есть}} - \underbrace{\text{Исчезнувшие вклады}}\_{\text{были → нет}} + \underbrace{\text{Изменение действующих}}\_{\text{были → остались}} \\]
 
+Для двух снимков с одинаковыми фильтрами это точное балансовое равенство, независимо от плановых дат закрытия.
 
-        FROM ALM.ALM.vw_balance_rest_all v WITH (NOLOCK)
+Далее можно определить, какие именно договоры обеспечили снижение на 5 млрд, отделить плановые закрытия от досрочных, а также проверить, не изменились ли продукт, сегмент или классификация договора.
 
-        LEFT JOIN mp_list mp
-            ON mp.prod_name_res = v.PROD_NAME_res
+### 3. SQL для поиска конкретных вкладов
 
-        WHERE
-            v.DT_REP = @ReportDate
+Скрипт использует точно те же фильтры, что твой первый запрос, но сравнивает два среза по `con_id`. Он покажет суммы исчезнувших, появившихся и продолжающих действовать вкладов.
 
-            AND v.dt_open >= @OpenFrom
-            AND v.dt_open < DATEADD(day, 1, @OpenTo)
+```
 
-            AND v.section_name = N'Срочные'
-            AND v.block_name = N'Привлечение ФЛ'
-            AND v.ap = N'Пассив'
-            AND v.od_flag = 1
-            AND v.cur = '810'
-            AND v.OUT_RUB > 0
-            AND ISNULL(v.is_floatrate,0) = 0
-            AND v.rate_con IS NOT NULL
+USE ALM;
+SET NOCOUNT ON;
 
-            AND v.termdays BETWEEN 28 AND 1830
+DECLARE @DateOne date = '2026-10-29';
+DECLARE @DateTwo date = '2026-11-02';
 
-            /* Исключаем договоры с плавающей ставкой */
-            AND NOT EXISTS
-            (
-                SELECT 1
-                FROM LIQUIDITY.liq.man_FloatContracts fc
-                    WITH (NOLOCK)
-                WHERE fc.CON_ID = v.CON_ID
-            )
+DROP TABLE IF EXISTS #snap;
+DROP TABLE IF EXISTS #bridge;
 
-            AND
-            (
-                @ExcludeMP = 0
-                OR mp.prod_name_res IS NULL
-            )
-    ),
+/* 1. Исходные остатки — фильтры первого скрипта */
 
-    /*
-       Надбавки вкладов для масс-сегмента
+SELECT
+    dt_rep,
+    con_id,
+    cli_id,
+    TSEGMENTNAME,
+    PROD_NAME_res,
+    acc_role,
+    CAST(dt_open AS date) AS dt_open,
+    CAST(dt_close_plan AS date) AS dt_close_plan,
+    CAST(out_rub AS decimal(28,2)) AS out_rub
+INTO #snap
+FROM ALM.ALM.balance_rest_all
+WHERE dt_rep IN (@DateOne, @DateTwo)
+  AND section_name = N'Срочные'
+  AND block_name = N'Привлечение ФЛ'
+  AND od_flag = 1
+  AND cur = '810'
+  AND out_rub >= 0
+  AND PROD_NAME_res NOT IN (
+      N'Надёжный прайм', N'Надёжный VIP',
+      N'Надёжный премиум', N'Надёжный промо',
+      N'Надёжный старт', N'Надёжный Т2',
+      N'Надёжный Мегафон', N'Надёжный процент',
+      N'Могучий', N'Надёжный',
+      N'ДОМа надёжно', N'Всё в ДОМ'
+  );
 
-       Помню Всеволод говорил, что там бывают
-       несколько записей по CON_ID.
+/* 2. Проверка двух исходных срезов */
 
-       Поэтому берём только последнюю запись.
+SELECT
+    dt_rep,
+    SUM(out_rub) / 1e9 AS balance_bn,
+    COUNT(DISTINCT con_id) AS contracts,
+    SUM(CASE WHEN con_id IS NULL
+             THEN out_rub ELSE 0 END) / 1e9
+        AS no_con_id_bn,
+    SUM(CASE WHEN acc_role <> N'LIAB'
+                  OR acc_role IS NULL
+             THEN out_rub ELSE 0 END) / 1e9
+        AS non_liab_bn
+FROM #snap
+GROUP BY dt_rep
+ORDER BY dt_rep;
 
-       Для маркетплейсов и private надбавки не нужны.
-    */
+/* 3. Сопоставление договоров */
 
-    joined AS
-    (
-        SELECT
-              s.*
-
-            , d.dict_match
-
-            , a.[Нов]
-            , a.[НДП]
-            , a.[НДМ]
-            , a.[Мпл]
-            , a.[Пнс]
-            , a.[От1]
-            , a.[Пк2]
-
-        FROM src s
-
-        OUTER APPLY
-        (
-            SELECT TOP (1)
-                  a.[Нов]
-                , a.[НДП]
-                , a.[НДМ]
-                , a.[Мпл]
-                , a.[Пнс]
-                , a.[От1]
-                , a.[Пк2]
-
-            FROM ALM.ehd.attr_DepoFLConditions a
-                WITH (NOLOCK)
-
-            WHERE
-                a.CON_ID = s.CON_ID
-                AND s.is_mp = 0
-                AND s.is_private = 0
-
-            ORDER BY
-                  a.DT_UPDATE DESC
-                , a.loaddate DESC
-        ) a
-
-
-        /*
-           Джоиню справочник истории промо-ставки
-           на новые деньги.
-        */
-
-        OUTER APPLY
-        (
-            SELECT TOP (1)
-                1 AS dict_match
-
-            FROM ALM_TEST.WORK.promo_new_money_rate_dict d
-                WITH (NOLOCK)
-
-            WHERE
-                s.is_mp = 0
-                AND s.is_private = 0
-
-                AND s.dt_open
-                    BETWEEN d.date_from AND d.date_to
-
-                AND s.termdays
-                    BETWEEN d.term_min AND d.term_max
-
-                AND d.conv_type =
-                    CASE
-                        WHEN ISNULL(s.conv,'AT_THE_END') = 'AT_THE_END'
-                            THEN 'AT_THE_END'
-                        ELSE 'NOT_AT_THE_END'
-                    END
-
-                AND s.OUT_RUB
-                    BETWEEN d.amount_from AND d.amount_to
-
-                AND ABS(s.rate_con - d.promo_rate) <= 0.0005
-        ) d
-    ),
-
-    /*
-       Флаги надбавок
-
-       NOV / NDP / NDM / MPL / PNS - новые деньги
-       NOV / NDP / NDM - строгая проверка
-       OT1 / PK2 - удержание
-
-       Если хотя бы одна надбавка равна 1,
-       соответствующий флаг принимает значение 1.
-    */
-
-    matched AS
-    (
-        SELECT
-              j.*
-
-            , CASE
-                WHEN
-                       ISNULL(TRY_CAST(j.[Нов] AS int),0) = 1
-                    OR ISNULL(TRY_CAST(j.[НДП] AS int),0) = 1
-                    OR ISNULL(TRY_CAST(j.[НДМ] AS int),0) = 1
-                    OR ISNULL(TRY_CAST(j.[Мпл] AS int),0) = 1
-                    OR ISNULL(TRY_CAST(j.[Пнс] AS int),0) = 1
-                THEN 1
-                ELSE 0
-              END AS new_money
-
-            , CASE
-                WHEN
-                       ISNULL(TRY_CAST(j.[Нов] AS int),0) = 1
-                    OR ISNULL(TRY_CAST(j.[НДП] AS int),0) = 1
-                    OR ISNULL(TRY_CAST(j.[НДМ] AS int),0) = 1
-                THEN 1
-                ELSE 0
-              END AS strict_new_money
-
-            , CASE
-                WHEN
-                       ISNULL(TRY_CAST(j.[От1] AS int),0) = 1
-                    OR ISNULL(TRY_CAST(j.[Пк2] AS int),0) = 1
-                THEN 1
-                ELSE 0
-              END AS retention
-
-        FROM joined j
-    ),
-
-    /*
-       Разделённые на категории вклады
-
-       Приоритет:
-
-       маркетплейс
-       -> особые предложения private
-       -> остальные вклады private
-       -> особые предложения масс
-       -> Активный процент
-       -> масс как новые деньги
-       -> масс на удержание (От1 / Пк2)
-       -> масс "Мой дом без опций"
-       -> остальные масс
-    */
-
-    classified AS
-    (
-        SELECT
-              m.CON_ID
-            , m.OUT_RUB
-            , m.termdays
-
-            /* Бизнес-категория */
-            , CASE
-
-                WHEN m.is_mp = 1
-                    THEN N'Маркетплейсы'
-
-
-                /* Особые предложения private:
-                   15% на 2 месяца
-                   или 14.6% на 4 месяца */
-                WHEN m.is_private = 1
-                 AND
-                 (
-                     m.special_2m = 1
-                     OR m.special_4m = 1
-                 )
-                    THEN N'Особые предложения private'
-
-
-                /* Остальные private */
-                WHEN m.is_private = 1
-                    THEN N'private-сегмент'
-
-
-                /* Особые предложения масс:
-                   15% на 2 месяца */
-                WHEN m.special_2m = 1
-                    THEN N'Особые предложения масс'
-
-
-                /* Активный процент */
-                WHEN m.PROD_NAME_res = N'Активный процент'
-                    THEN N'Активный процент'
-
-
-                /* Новые деньги:
-                   справочник + Нов / НДП / НДМ / Мпл / Пнс */
-                WHEN m.dict_match = 1
-                 AND m.new_money = 1
-                    THEN N'Новые деньги'
-
-
-                /* Механизм удержания:
-                   достаточно От1 = 1 или Пк2 = 1 */
-                WHEN m.retention = 1
-                    THEN N'Механизм удержания'
-
-
-                /* Базовая ставка */
-                WHEN m.PROD_NAME_res IN
-                (
-                    N'Мой дом безопций',
-                    N'Мой дом без опций'
-                )
-                    THEN N'Базовая ставка'
-
-
-                ELSE N'Другие вклады'
-
-              END AS segment_name
-
-
-            /*
-               Вызовется ошибка, если есть логическое нарушение
-               - для теста.
-
-               ERR 1:
-               NOV/NDP/NDM, но нет справочника.
-
-               MPL/PNS без справочника разрешены.
-
-               ERR 2:
-               Пока отключили проверку наличия справочника
-               без надбавки новых денег.
-
-               ERR 3:
-               Есть справочник + новые деньги + удержание.
-
-               ERR 4 (НОВОЕ):
-               Одновременно присутствуют От1 / Пк2
-               и Нов / НДП / НДМ.
-
-               Для ERR 4 совпадение со справочником
-               не требуется.
-
-               Особые предложения масс исключены из
-               прежних ERR 1 и ERR 3.
-
-               Новая ERR 4 проверяет конфликт надбавок
-               независимо от особой ставки.
-            */
-
-            , CASE
-
-                /* ERR 4
-                   Конфликт надбавок удержания
-                   и Нов / НДП / НДМ */
-
-                WHEN m.is_mp = 0
-                 AND m.is_private = 0
-                 AND m.retention = 1
-                 AND m.strict_new_money = 1
-                    THEN CONCAT(
-                        'ERR_RETENTION_AND_NEW_MONEY_CON_ID=',
-                        m.CON_ID
-                    )
-
-
-                /* ERR 1
-                   Нов / НДП / НДМ, но нет справочника */
-
-                WHEN m.is_mp = 0
-                 AND m.is_private = 0
-                 AND m.special_2m = 0
-                 AND m.strict_new_money = 1
-                 AND m.dict_match IS NULL
-                    THEN CONCAT(
-                        'ERR_NOV_NDP_NDM_NO_DICT_CON_ID=',
-                        m.CON_ID
-                    )
-
-
-                /*
-                -- ERR 2 временно отключён
-
-                WHEN m.is_mp = 0
-                 AND m.is_private = 0
-                 AND m.dict_match = 1
-                 AND m.new_money = 0
-                    THEN CONCAT(
-                        'ERR_DICT_NO_NEW_MONEY_CON_ID=',
-                        m.CON_ID
-                    )
-                */
-
-
-                /* ERR 3
-                   Справочник + новые деньги + удержание */
-
-                WHEN m.is_mp = 0
-                 AND m.is_private = 0
-                 AND m.special_2m = 0
-                 AND m.dict_match = 1
-                 AND m.new_money = 1
-                 AND m.retention = 1
-                    THEN CONCAT(
-                        'ERR_NEW_MONEY_AND_RETENTION_CON_ID=',
-                        m.CON_ID
-                    )
-
-                ELSE '0'
-              END AS validation_code
-
-
-            /* Бакеты срочности для селекта */
-            , CASE
-                WHEN m.termdays BETWEEN 26 AND 44 THEN 31
-                WHEN m.termdays BETWEEN 45 AND 70 THEN 61
-                WHEN m.termdays BETWEEN 85 AND 119 THEN 91
-                WHEN m.termdays BETWEEN 120 AND 140 THEN 124
-                WHEN m.termdays BETWEEN 141 AND 170 THEN 151
-                WHEN m.termdays BETWEEN 175 AND 200 THEN 181
-                WHEN m.termdays BETWEEN 201 AND 230 THEN 212
-                WHEN m.termdays BETWEEN 231 AND 250 THEN 243
-                WHEN m.termdays BETWEEN 251 AND 290 THEN 274
-                WHEN m.termdays BETWEEN 340 AND 405 THEN 365
-                WHEN m.termdays BETWEEN 540 AND 621 THEN 550
-                WHEN m.termdays BETWEEN 720 AND 763 THEN 750
-                WHEN m.termdays BETWEEN 1090 AND 1140 THEN 1100
-                WHEN m.termdays BETWEEN 1450 AND 1475 THEN 1460
-                WHEN m.termdays BETWEEN 1795 AND 1830 THEN 1825
-                ELSE m.termdays
-              END AS bucket_code
-
-        FROM matched m
-    ),
-
-    /*
-       Агрегация
-
-       Объём каждой категории по бакету.
-       Отдельно общий объём каждого бакета.
-
-       Если есть логическая ошибка, прерываем расчёт.
-    */
-
-    agg AS
-    (
-        SELECT
-              bucket_code
-
-            , CASE
-                WHEN GROUPING(segment_name) = 1
-                    THEN N'Итого'
-                ELSE segment_name
-              END AS segment_name
-
-            , GROUPING(segment_name) AS is_total
-
-            , SUM(OUT_RUB)
-              + CONVERT(int, MAX(validation_code))
-              AS segment_vol
-
-        FROM classified
-
-        GROUP BY GROUPING SETS
-        (
-              (bucket_code, segment_name)
-            , (bucket_code)
-        )
-    ),
-
-    /*
-       Доли
-
-       Private:
-       Особые предложения private + private-сегмент
-       считаем от общего объёма private.
-
-       Остальные категории:
-       считаем от общего объёма остальных вкладов.
-
-       Маркетплейсы входят в общий знаменатель
-       остальных категорий, если @ExcludeMP = 0.
-
-       BucketSharePct:
-       от всего объёма привлечений.
-    */
-
-    totals AS
-    (
-        SELECT
-              bucket_code
-            , segment_name
-            , is_total
-            , segment_vol
-
-            /* Общий знаменатель:
-               отдельно весь private,
-               отдельно все остальные категории */
-            , SUM(
-                CASE
-                    WHEN is_total = 0
-                        THEN segment_vol
-                    ELSE 0
-                END
-              ) OVER
-              (
-                  PARTITION BY
-                      CASE
-                          WHEN segment_name IN
-                          (
-                              N'private-сегмент',
-                              N'Особые предложения private'
-                          )
-                              THEN 1
-                          ELSE 0
-                      END
-              ) AS segment_total
-
-            , MAX(
-                CASE
-                    WHEN is_total = 1
-                        THEN segment_vol
-                END
-              ) OVER
-              (
-                  PARTITION BY bucket_code
-              ) AS bucket_total
-
-            , SUM(
-                CASE
-                    WHEN is_total = 1
-                        THEN segment_vol
-                    ELSE 0
-                END
-              ) OVER () AS grand_total
-
-        FROM agg
-    )
-
-    /*
-       Резалт
-    */
-
+;WITH agg AS (
     SELECT
-          bucket_code AS Bucket
-        , segment_name AS Segment
-        , segment_vol AS SegmentVolume
-
-        , CAST(
-            CASE
-                WHEN is_total = 1
-                    THEN segment_vol / NULLIF(grand_total,0)
-                ELSE segment_vol / NULLIF(segment_total,0)
-            END
-            AS decimal(18,4)
-          ) AS SegmentSharePct
-
-        , bucket_total AS BucketVolume
-
-        , CAST(
-            bucket_total / NULLIF(grand_total,0)
-            AS decimal(18,4)
-          ) AS BucketSharePct
-
-    FROM totals
-);
-GO
-
-
-
-DECLARE @dt_to date = DATEADD(day,-2,CAST(GETDATE() AS date));
-DECLARE @dt_from date = DATEADD(day,-8,CAST(GETDATE() AS date));
-
-SELECT *
-FROM ALM_TEST.reports.fn_NewAttractionVolumes_TEST
-(
-    @dt_to,
-    @dt_from,
-    @dt_to,
-    0
+        dt_rep,
+        con_id,
+        MAX(TSEGMENTNAME) AS segment,
+        MAX(PROD_NAME_res) AS product,
+        MAX(dt_open) AS dt_open,
+        MAX(dt_close_plan) AS dt_close_plan,
+        SUM(out_rub) AS balance
+    FROM #snap
+    WHERE con_id IS NOT NULL
+    GROUP BY dt_rep, con_id
 )
-OPTION (RECOMPILE);
+SELECT
+    COALESCE(a.con_id, b.con_id) AS con_id,
+    COALESCE(a.segment, b.segment) AS segment,
+    COALESCE(a.product, b.product) AS product,
+    a.dt_close_plan AS planned_close,
+    b.dt_open AS open_date,
+
+    ISNULL(a.balance, 0) AS balance_before,
+    ISNULL(b.balance, 0) AS balance_after,
+    ISNULL(b.balance, 0) -
+        ISNULL(a.balance, 0) AS delta,
+
+    CASE
+        WHEN a.con_id IS NULL
+             AND b.dt_open > @DateOne
+            THEN N'1. Новые вклады'
+
+        WHEN a.con_id IS NULL
+            THEN N'2. Появились, но открыты ранее'
+
+        WHEN b.con_id IS NULL
+             AND a.dt_close_plan > @DateOne
+             AND a.dt_close_plan <= @DateTwo
+            THEN N'3. Исчезли, плановый срок в периоде'
+
+        WHEN b.con_id IS NULL
+            THEN N'4. Исчезли вне планового срока'
+
+        ELSE N'5. Действующие вклады'
+    END AS category
+
+INTO #bridge
+FROM (SELECT * FROM agg WHERE dt_rep = @DateOne) a
+FULL OUTER JOIN
+     (SELECT * FROM agg WHERE dt_rep = @DateTwo) b
+    ON a.con_id = b.con_id;
+
+/* 4. Балансовый мост по причинам изменения */
+
+SELECT
+    category,
+    COUNT(*) AS contracts,
+    SUM(balance_before) / 1e9 AS before_bn,
+    SUM(balance_after) / 1e9 AS after_bn,
+    SUM(delta) / 1e9 AS delta_bn
+FROM #bridge
+GROUP BY category
+ORDER BY category;
+
+/* 5. Какие продукты и сегменты дали изменение */
+
+SELECT
+    product,
+    segment,
+    COUNT(*) AS contracts,
+    SUM(delta) / 1e9 AS delta_bn
+FROM #bridge
+GROUP BY product, segment
+ORDER BY ABS(SUM(delta)) DESC;
+
+/* 6. ТОП-100 договоров по абсолютному изменению */
+
+SELECT TOP (100)
+    con_id,
+    category,
+    segment,
+    product,
+    planned_close,
+    open_date,
+    balance_before,
+    balance_after,
+    delta
+FROM #bridge
+ORDER BY ABS(delta) DESC;
+
+/* 7. Где теперь находятся исчезнувшие договоры */
+
+;WITH lost AS (
+    SELECT TOP (100) *
+    FROM #bridge
+    WHERE category LIKE N'3.%'
+       OR category LIKE N'4.%'
+    ORDER BY balance_before DESC
+)
+SELECT
+    l.con_id,
+    l.balance_before,
+    l.planned_close,
+    t.section_name,
+    t.PROD_NAME_res,
+    t.block_name,
+    t.acc_role,
+    t.od_flag,
+    t.cur,
+    t.out_rub
+FROM lost l
+LEFT JOIN ALM.ALM.balance_rest_all t
+    ON t.con_id = l.con_id
+   AND t.dt_rep = @DateTwo
+ORDER BY l.balance_before DESC;
+
+```
+
+В последнем результате важно смотреть, присутствуют ли исчезнувшие договоры в таблице вообще:
+
+- Если договор исчез из выбранного портфеля, но существует с другим `section_name`, `PROD_NAME_res` или `acc_role`, причина может быть в переклассификации.
+- Если договор отсутствует полностью, нужно проверять его фактическое закрытие и историю остатков.
+- Если сумма по `no_con_id_bn` существенна, такие записи нужно разобрать отдельно: мост по `con_id` их не учитывает.
+
+### 4. Ещё одна потенциально серьёзная ошибка
+
+В скрипте новых привлечений у тебя есть соединение с `ALM_TEST.WORK.ForecastKey_Cache` по дате открытия и сроку вклада.&#x20;
+
+Вставленный текст(5).txt
+
+
+
+Если в этой таблице несколько строк на одну комбинацию даты и срока, `LEFT JOIN` размножает записи вкладов, завышая статистику новых привлечений.
+
+Проверить можно так:
+
+```
+SELECT
+    DT_REP,
+    TERM,
+    COUNT(*) AS cnt
+FROM ALM_TEST.WORK.ForecastKey_Cache
+WHERE DT_REP BETWEEN '2026-10-01' AND '2026-11-02'
+GROUP BY DT_REP, TERM
+HAVING COUNT(*) > 1;
+```
+
+Если запрос что-то вернёт, нужно проверить, не завышается ли сумма `#new_bal`.
+
+### 5. Что проверил бы в первую очередь
+
+Сначала — результат № 4 (балансовый мост). Он покажет, в какой категории находится отрицательная дельта, и позволит понять, насколько она совпадает с твоими расчётами.
+
+Затем — результат № 5: продукты и сегменты, сформировавшие отток. И только потом разбирал бы отдельные договоры из результата № 6.
+
+Наконец, я бы повторил контроль для 02.11–03.11: если 5 млрд исчезли 2 ноября и вернулись 3 ноября, стоит прежде всего проверять полноту загрузки и корректность витрины, а не депозитное поведение клиентов.
+
+Главная задача: сначала получить точную раскладку изменения ОСЗ на уровне договоров, затем сопоставить её с твоими тремя расчётами. Так мы сможем найти не просто разницу в 5 млрд, а конкретные договоры и условие SQL, из-за которого они не попали в статистику.
