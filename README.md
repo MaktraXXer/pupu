@@ -1,131 +1,143 @@
-
 USE ALM;
 SET NOCOUNT ON;
 
-DECLARE @dt_from date = '2026-03-01';
-DECLARE @dt_to   date = '2026-04-07';
-DECLARE @dt_to_next date = DATEADD(day, 1, @dt_to);
-
-DROP TABLE IF EXISTS #base;
-DROP TABLE IF EXISTS #new_clients;
+DROP TABLE IF EXISTS #periods;
 DROP TABLE IF EXISTS #contracts;
-DROP TABLE IF EXISTS #daily_delta;
-DROP TABLE IF EXISTS #daily;
+DROP TABLE IF EXISTS #attr;
+DROP TABLE IF EXISTS #selected;
+DROP TABLE IF EXISTS #events;
 
-/* ============================================================
-   1. ИСТОРИЯ ДОГОВОРОВ ФЛ
-   ============================================================ */
+CREATE TABLE #periods (
+    period_name nvarchar(50),
+    dt_from date,
+    dt_to date
+);
 
-SELECT DISTINCT
-      a.CLI_ID
-    , a.CON_ID
-    , a.PROD_NAME
-    , CAST(a.DT_OPEN AS date) AS dt_open
-INTO #base
-FROM LIQUIDITY.liq.DepositContract_all a WITH (NOLOCK)
-WHERE a.DT_OPEN IS NOT NULL
-  AND a.DT_OPEN < @dt_to_next
-  AND a.cli_short_name = N'ФЛ'
-  AND a.cur = 'RUR'
-  AND a.PROD_NAME NOT IN (
-        N'Агентские эскроу ФЛ по ставке КС+спред',
-        N'Спец. банк.счёт',
-        N'Залоговый',
-        N'Агентские эскроу ФЛ по ставке КС/2',
-        N'Эскроу',
-        N'Депозит ФЛ (суррогатный договор для счета Новой Афины)',
-        N'Надёжный прайм',
-        N'Надёжный VIP',
-        N'Надёжный премиум',
-        N'Надёжный промо',
-        N'Надёжный старт',
-        N'Надёжный Т2',
-        N'Надёжный Мегафон',
-        N'Надёжный процент',
-        N'Могучий',
-        N'Надёжный',
-        N'ДОМа надёжно'
-  );
-
-CREATE INDEX IX_base_client
-    ON #base (CLI_ID, dt_open);
-
-/* ============================================================
-   2. НОВЫЕ КЛИЕНТЫ РК
-
-   Первый договор в доступной истории открыт в период РК.
-   ============================================================ */
-
-SELECT CLI_ID
-INTO #new_clients
-FROM #base
-WHERE CLI_ID IS NOT NULL
-GROUP BY CLI_ID
-HAVING MIN(dt_open) >= @dt_from
-   AND MIN(dt_open) <= @dt_to;
-
-CREATE UNIQUE CLUSTERED INDEX IX_new_clients
-    ON #new_clients (CLI_ID);
-
-/* ============================================================
-   3. ДОГОВОРЫ НОВЫХ КЛИЕНТОВ
-
-   Только открытые в период РК.
-   Один CON_ID = одна строка.
-   ============================================================ */
+INSERT INTO #periods VALUES
+    (N'Октябрь 2026', '2026-10-01', '2026-11-02'),
+    (N'Март 2026',    '2026-03-01', '2026-04-07'),
+    (N'Октябрь 2025', '2025-10-01', '2025-11-05');
 
 ;WITH ranked AS (
     SELECT
-          b.CLI_ID
-        , b.CON_ID
-        , b.PROD_NAME
-        , b.dt_open
-        , ROW_NUMBER() OVER (
-              PARTITION BY b.CON_ID
-              ORDER BY b.dt_open, b.PROD_NAME
-          ) AS rn
-    FROM #base b
-    INNER JOIN #new_clients n
-        ON n.CLI_ID = b.CLI_ID
-    WHERE b.dt_open BETWEEN @dt_from AND @dt_to
-      AND b.CON_ID IS NOT NULL
+        p.period_name,
+        p.dt_from,
+        p.dt_to,
+        TRY_CAST(a.CON_ID AS bigint) AS con_id,
+        CAST(a.DT_OPEN AS date) AS dt_open,
+        a.PROD_NAME,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.period_name, a.CON_ID
+            ORDER BY a.DT_OPEN DESC
+        ) AS rn
+    FROM LIQUIDITY.liq.DepositContract_all a WITH (NOLOCK)
+    INNER JOIN #periods p
+        ON a.DT_OPEN >= p.dt_from
+       AND a.DT_OPEN < DATEADD(day, 1, p.dt_to)
+    WHERE a.cli_short_name = N'ФЛ'
+      AND a.cur = 'RUR'
+      AND a.seg_name = N'Розничный бизнес'
+      AND a.CON_ID IS NOT NULL
+      AND a.PROD_NAME NOT IN (
+          N'Агентские эскроу ФЛ по ставке КС+спред',
+          N'Спец. банк.счёт',
+          N'Залоговый',
+          N'Агентские эскроу ФЛ по ставке КС/2',
+          N'Эскроу',
+          N'Депозит ФЛ (суррогатный договор для счета Новой Афины)',
+          N'Накопительный счёт',
+          N'Накопительный счётУльтра',
+          N'Надёжный прайм',
+          N'Надёжный VIP',
+          N'Надёжный премиум',
+          N'Надёжный промо',
+          N'Надёжный старт',
+          N'Надёжный Т2',
+          N'Надёжный Мегафон',
+          N'Надёжный процент',
+          N'Надёжныйпроцент',
+          N'Могучий',
+          N'Надёжный',
+          N'ДОМа надёжно',
+          N'Всё в ДОМ'
+      )
 )
 SELECT
-      CLI_ID
-    , CON_ID
-    , PROD_NAME
-    , dt_open
-    , CASE
-          WHEN PROD_NAME LIKE N'Накопительный счёт%'
-              THEN N'НС'
-          ELSE N'Вклады'
-      END AS product_type
+    period_name,
+    dt_from,
+    dt_to,
+    con_id,
+    dt_open,
+    PROD_NAME
 INTO #contracts
+FROM ranked
+WHERE rn = 1
+  AND con_id IS NOT NULL;
+
+CREATE UNIQUE CLUSTERED INDEX IX_contracts
+ON #contracts (con_id);
+
+;WITH ranked AS (
+    SELECT
+        TRY_CAST(a.CON_ID AS bigint) AS con_id,
+        TRY_CAST(a.[Нов] AS int) AS nov,
+        TRY_CAST(a.[НДП] AS int) AS ndp,
+        TRY_CAST(a.[НДМ] AS int) AS ndm,
+        ROW_NUMBER() OVER (
+            PARTITION BY a.CON_ID
+            ORDER BY a.DT_UPDATE DESC, a.loaddate DESC
+        ) AS rn
+    FROM ALM.ehd.attr_DepoFLConditions a WITH (NOLOCK)
+    INNER JOIN #contracts c
+        ON TRY_CAST(a.CON_ID AS bigint) = c.con_id
+)
+SELECT
+    con_id,
+    nov,
+    ndp,
+    ndm
+INTO #attr
 FROM ranked
 WHERE rn = 1;
 
-CREATE UNIQUE CLUSTERED INDEX IX_contracts
-    ON #contracts (CON_ID);
+CREATE UNIQUE CLUSTERED INDEX IX_attr
+ON #attr (con_id);
 
-/* ============================================================
-   4. ИСТОРИЯ САЛЬДО
+SELECT
+    c.period_name,
+    c.dt_from,
+    c.dt_to,
+    c.con_id,
+    c.dt_open,
+    CASE
+        WHEN ISNULL(a.nov, 0) = 1
+            THEN N'НОВ'
+        WHEN ISNULL(a.ndp, 0) = 1
+          OR ISNULL(a.ndm, 0) = 1
+            THEN N'НДП / НДМ'
+    END AS category
+INTO #selected
+FROM #contracts c
+INNER JOIN #attr a
+    ON a.con_id = c.con_id
+WHERE ISNULL(a.nov, 0) = 1
+   OR ISNULL(a.ndp, 0) = 1
+   OR ISNULL(a.ndm, 0) = 1;
 
-   DT_FROM ... DT_TO — интервал действия OUT_RUB.
-   Создаём +OUT_RUB в начале и -OUT_RUB после окончания.
-   ============================================================ */
+CREATE UNIQUE CLUSTERED INDEX IX_selected
+ON #selected (con_id);
 
 ;WITH saldo_clipped AS (
     SELECT
-          c.product_type
-        , CAST(s.OUT_RUB AS decimal(38,6)) AS out_rub
-        , bounds.dt_from
-        , bounds.dt_to
-
+        c.period_name,
+        c.category,
+        c.dt_to,
+        CAST(s.OUT_RUB AS decimal(38,6)) AS out_rub,
+        bounds.effective_from,
+        bounds.effective_to
     FROM LIQUIDITY.liq.DepositContract_Saldo s WITH (NOLOCK)
-
-    INNER JOIN #contracts c
-        ON c.CON_ID = s.CON_ID
-
+    INNER JOIN #selected c
+        ON c.con_id = s.CON_ID
     CROSS APPLY (
         SELECT
             (
@@ -133,127 +145,111 @@ CREATE UNIQUE CLUSTERED INDEX IX_contracts
                 FROM (VALUES
                     (CAST(s.DT_FROM AS date)),
                     (c.dt_open),
-                    (@dt_from)
+                    (c.dt_from)
                 ) v(dt)
-            ) AS dt_from,
-
+            ) AS effective_from,
             (
                 SELECT MIN(v.dt)
                 FROM (VALUES
-                    (ISNULL(CAST(s.DT_TO AS date), @dt_to)),
-                    (@dt_to)
+                    (ISNULL(CAST(s.DT_TO AS date), c.dt_to)),
+                    (c.dt_to)
                 ) v(dt)
-            ) AS dt_to
+            ) AS effective_to
     ) bounds
-
-    WHERE s.DT_FROM < @dt_to_next
-      AND (s.DT_TO IS NULL OR s.DT_TO >= @dt_from)
+    WHERE s.DT_FROM < DATEADD(day, 1, c.dt_to)
+      AND (s.DT_TO IS NULL OR s.DT_TO >= c.dt_from)
       AND s.OUT_RUB IS NOT NULL
-      AND bounds.dt_from <= bounds.dt_to
+      AND bounds.effective_from <= bounds.effective_to
 ),
-
-events AS (
+saldo_events AS (
     SELECT
-          e.dt_rep
-        , s.product_type
-        , e.delta
+        s.period_name,
+        s.category,
+        e.dt_rep,
+        e.delta
     FROM saldo_clipped s
     CROSS APPLY (VALUES
-          (s.dt_from, s.out_rub)
-        , (
-              CASE
-                  WHEN s.dt_to < @dt_to
-                  THEN DATEADD(day, 1, s.dt_to)
-              END,
-              -s.out_rub
-          )
+        (s.effective_from, s.out_rub),
+        (
+            CASE
+                WHEN s.effective_to < s.dt_to
+                THEN DATEADD(day, 1, s.effective_to)
+            END,
+            -s.out_rub
+        )
     ) e(dt_rep, delta)
     WHERE e.dt_rep IS NOT NULL
 )
-
 SELECT
-      dt_rep
-    , SUM(CASE WHEN product_type = N'Вклады'
-               THEN delta ELSE 0 END) AS delta_deposits
-    , SUM(CASE WHEN product_type = N'НС'
-               THEN delta ELSE 0 END) AS delta_ns
-INTO #daily_delta
-FROM events
-GROUP BY dt_rep;
-
-/* ============================================================
-   5. КАЛЕНДАРЬ И ПОДНЕВНЫЕ ОСТАТКИ
-   ============================================================ */
+    period_name,
+    category,
+    dt_rep,
+    SUM(delta) AS delta
+INTO #events
+FROM saldo_events
+GROUP BY period_name, category, dt_rep;
 
 ;WITH calendar AS (
-    SELECT @dt_from AS dt_rep
+    SELECT
+        period_name,
+        dt_from AS dt_rep,
+        dt_to
+    FROM #periods
 
     UNION ALL
 
-    SELECT DATEADD(day, 1, dt_rep)
+    SELECT
+        period_name,
+        DATEADD(day, 1, dt_rep),
+        dt_to
     FROM calendar
-    WHERE dt_rep < @dt_to
+    WHERE dt_rep < dt_to
+),
+categories AS (
+    SELECT N'НОВ' AS category
+    UNION ALL
+    SELECT N'НДП / НДМ'
+),
+daily AS (
+    SELECT
+        c.period_name,
+        c.dt_rep,
+        k.category,
+        ISNULL(e.delta, 0) AS delta
+    FROM calendar c
+    CROSS JOIN categories k
+    LEFT JOIN #events e
+        ON e.period_name = c.period_name
+       AND e.dt_rep = c.dt_rep
+       AND e.category = k.category
+),
+balances AS (
+    SELECT
+        period_name,
+        dt_rep,
+        category,
+        delta,
+        SUM(delta) OVER (
+            PARTITION BY period_name, category
+            ORDER BY dt_rep
+            ROWS BETWEEN UNBOUNDED PRECEDING
+                     AND CURRENT ROW
+        ) AS balance
+    FROM daily
 )
 SELECT
-      c.dt_rep
-
-    , SUM(ISNULL(d.delta_deposits, 0)) OVER (
-          ORDER BY c.dt_rep
-          ROWS BETWEEN UNBOUNDED PRECEDING
-                   AND CURRENT ROW
-      ) AS balance_deposits
-
-    , SUM(ISNULL(d.delta_ns, 0)) OVER (
-          ORDER BY c.dt_rep
-          ROWS BETWEEN UNBOUNDED PRECEDING
-                   AND CURRENT ROW
-      ) AS balance_ns
-
-INTO #daily
-FROM calendar c
-LEFT JOIN #daily_delta d
-    ON d.dt_rep = c.dt_rep
+    period_name,
+    dt_rep,
+    category,
+    CAST(balance / 1000000000.0 AS decimal(18,6)) AS balance_bn,
+    CAST(delta / 1000000000.0 AS decimal(18,6)) AS daily_change_bn
+FROM balances
+ORDER BY
+    CASE period_name
+        WHEN N'Октябрь 2025' THEN 1
+        WHEN N'Март 2026' THEN 2
+        WHEN N'Октябрь 2026' THEN 3
+    END,
+    dt_rep,
+    category
 OPTION (MAXRECURSION 0);
-
-/* ============================================================
-   РЕЗУЛЬТАТ 1. КОЛИЧЕСТВО КЛИЕНТОВ И ДОГОВОРОВ
-   ============================================================ */
-
-SELECT
-      (SELECT COUNT(*) FROM #new_clients) AS new_clients
-    , COUNT(*) AS contracts
-    , SUM(CASE WHEN product_type = N'Вклады'
-               THEN 1 ELSE 0 END) AS deposit_contracts
-    , SUM(CASE WHEN product_type = N'НС'
-               THEN 1 ELSE 0 END) AS ns_contracts
-FROM #contracts;
-
-/* ============================================================
-   РЕЗУЛЬТАТ 2. ПОДНЕВНАЯ ДИНАМИКА, МЛРД РУБ.
-   ============================================================ */
-
-SELECT
-      dt_rep
-    , CAST(balance_deposits / 1000000000.0
-           AS decimal(18,6)) AS deposits_bn
-    , CAST(balance_ns / 1000000000.0
-           AS decimal(18,6)) AS ns_bn
-    , CAST((balance_deposits + balance_ns) / 1000000000.0
-           AS decimal(18,6)) AS total_bn
-FROM #daily
-ORDER BY dt_rep;
-
-/* ============================================================
-   РЕЗУЛЬТАТ 3. ОСТАТКИ НА 7 АПРЕЛЯ, МЛРД РУБ.
-   ============================================================ */
-
-SELECT
-      dt_rep
-    , CAST(balance_deposits / 1000000000.0
-           AS decimal(18,6)) AS deposits_bn
-    , CAST(balance_ns / 1000000000.0
-           AS decimal(18,6)) AS ns_bn
-    , CAST((balance_deposits + balance_ns) / 1000000000.0
-           AS decimal(18,6)) AS total_bn
-FROM #daily
-WHERE dt_rep = @dt_to;
