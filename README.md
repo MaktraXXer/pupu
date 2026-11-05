@@ -3,10 +3,11 @@ WITH params AS (
     SELECT
         DATE '2026-09-29' AS dt_from,
         DATE '2026-11-05' AS dt_to
+    FROM dual
 ),
 contracts AS (
     SELECT DISTINCT
-        c.dt_first_act AS dt,
+        TRUNC(c.dt_first_act) AS dt,
         r.con_id
     FROM dds.con_rel r
     JOIN dds.contract c
@@ -14,7 +15,8 @@ contracts AS (
     CROSS JOIN params p
     WHERE r.con_rel_type = 'SECURITIZATION'
       AND c.bal_holder = 'DOM'
-      AND c.dt_first_act BETWEEN p.dt_from AND p.dt_to
+      AND c.dt_first_act >= p.dt_from
+      AND c.dt_first_act < p.dt_to + 1
 )
 SELECT
     TO_CHAR(c.dt, 'DD') || ' ' ||
