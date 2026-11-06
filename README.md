@@ -329,7 +329,10 @@ RETURN
     SELECT
           a.bucket_code AS Bucket
         , a.segment_name AS Segment
-        , a.segment_vol AS SegmentVolume
+        , CAST(
+    a.segment_vol / 1000000000.0
+    AS decimal(18,6)
+  ) AS SegmentVolume
 
         , CAST(
             a.segment_vol * 1.0
@@ -347,12 +350,3 @@ RETURN
     CROSS JOIN totals t
 );
 GO
-
-SELECT *
-FROM ALM_TEST.reports.fn_NewAttractionVolumes_forDimaMASS(
-    '2026-11-04',
-    '2026-10-20',
-    '2026-11-04',
-    0
-)
-ORDER BY Bucket, Segment;
