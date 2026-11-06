@@ -4,11 +4,14 @@ SET NOCOUNT ON;
 
 DROP TABLE IF EXISTS #cmp_periods;
 DROP TABLE IF EXISTS #cmp_dates;
+DROP TABLE IF EXISTS #cmp_excluded;
 DROP TABLE IF EXISTS #cmp_contracts;
 DROP TABLE IF EXISTS #cmp_clients;
 DROP TABLE IF EXISTS #cmp_uchk;
 DROP TABLE IF EXISTS #cmp_vw;
 DROP TABLE IF EXISTS #cmp_saldo;
+DROP TABLE IF EXISTS #cmp_all;
+
 
 /* ============================================================
    1. ДВЕ РК И ЧЕТЫРЕ КОНТРОЛЬНЫЕ ДАТЫ
@@ -22,10 +25,13 @@ CREATE TABLE #cmp_periods (
 );
 
 INSERT INTO #cmp_periods VALUES
-    (1, N'Март 2026',    DATEFROMPARTS(2026,3,1),
-                         DATEFROMPARTS(2026,4,7)),
-    (2, N'Октябрь 2026', DATEFROMPARTS(2026,10,1),
-                         DATEFROMPARTS(2026,11,4));
+    (1, N'Март 2026',
+        DATEFROMPARTS(2026,3,1),
+        DATEFROMPARTS(2026,4,7)),
+
+    (2, N'Октябрь 2026',
+        DATEFROMPARTS(2026,10,1),
+        DATEFROMPARTS(2026,11,4));
 
 SELECT
     period_id,
@@ -47,12 +53,46 @@ ON #cmp_dates (period_id, dt_rep);
 
 
 /* ============================================================
-   2. СПОСОБ №1: БАЛАНСОВАЯ ВИТРИНА
+   2. ЕДИНЫЕ ИСКЛЮЧЕНИЯ ДЛЯ ДВУХ ИСТОЧНИКОВ
 
-   Сегментация по TSEGMENTNAME:
-   ДЧБО = УЧК, остальные = Розница.
+   Технические продукты, маркетплейсы, ФУ.
+   ============================================================ */
 
-   Исключаем маркетплейсы и ФУ.
+CREATE TABLE #cmp_excluded (
+    PROD_NAME nvarchar(200) PRIMARY KEY
+);
+
+INSERT INTO #cmp_excluded VALUES
+    (N'Агентские эскроу ФЛ по ставке КС+спред'),
+    (N'Спец. банк.счёт'),
+    (N'Залоговый'),
+    (N'Агентские эскроу ФЛ по ставке КС/2'),
+    (N'Эскроу'),
+    (N'Депозит ФЛ (суррогатный договор для счета Новой Афины)'),
+    (N'ДОМа надёжно'),
+    (N'Всё в ДОМ'),
+    (N'Надёжный'),
+    (N'Надёжный прайм'),
+    (N'Надёжныйпрайм'),
+    (N'Надёжный VIP'),
+    (N'НадёжныйVIP'),
+    (N'Надёжный премиум'),
+    (N'Надёжный промо'),
+    (N'Надёжныйпромо'),
+    (N'Надёжный старт'),
+    (N'Надёжный Т2'),
+    (N'Надёжный T2'),
+    (N'Надёжный Мегафон'),
+    (N'Надёжный процент'),
+    (N'Надёжныйпроцент'),
+    (N'Могучий');
+
+
+/* ============================================================
+   3. СПОСОБ №1. БАЛАНСОВАЯ ВИТРИНА
+
+   TSEGMENTNAME = ДЧБО -> УЧК
+   Остальные -> MASS
    ============================================================ */
 
 SELECT
@@ -75,19 +115,23 @@ SELECT
 
     SUM(CASE
         WHEN t.section_name = N'Накопительный счёт'
-         AND (t.TSEGMENTNAME <> N'ДЧБО'
-              OR t.TSEGMENTNAME IS NULL)
+         AND (
+             t.TSEGMENTNAME <> N'ДЧБО'
+             OR t.TSEGMENTNAME IS NULL
+         )
             THEN CAST(t.out_rub AS decimal(28,2))
         ELSE 0
-    END) AS ns_retail,
+    END) AS ns_mass,
 
     SUM(CASE
         WHEN t.section_name = N'Срочные'
-         AND (t.TSEGMENTNAME <> N'ДЧБО'
-              OR t.TSEGMENTNAME IS NULL)
+         AND (
+             t.TSEGMENTNAME <> N'ДЧБО'
+             OR t.TSEGMENTNAME IS NULL
+         )
             THEN CAST(t.out_rub AS decimal(28,2))
         ELSE 0
-    END) AS dep_retail
+    END) AS dep_mass
 
 INTO #cmp_vw
 
@@ -112,28 +156,10 @@ LEFT JOIN ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
        OR t.acc_role = N'LIAB'
    )
 
-   AND (
-       t.section_name <> N'Срочные'
-       OR t.PROD_NAME_res IS NULL
-       OR t.PROD_NAME_res NOT IN (
-           N'ДОМа надёжно',
-           N'Всё в ДОМ',
-           N'Надёжный',
-           N'Надёжный прайм',
-           N'Надёжныйпрайм',
-           N'Надёжный VIP',
-           N'НадёжныйVIP',
-           N'Надёжный премиум',
-           N'Надёжный промо',
-           N'Надёжныйпромо',
-           N'Надёжный старт',
-           N'Надёжный Т2',
-           N'Надёжный T2',
-           N'Надёжный Мегафон',
-           N'Надёжный процент',
-           N'Надёжныйпроцент',
-           N'Могучий'
-       )
+   AND NOT EXISTS (
+       SELECT 1
+       FROM #cmp_excluded x
+       WHERE x.PROD_NAME = t.PROD_NAME_res
    )
 
 GROUP BY
@@ -145,9 +171,7 @@ ON #cmp_vw (period_id, dt_rep);
 
 
 /* ============================================================
-   3. СПОСОБ №2: РЕЕСТР ДОГОВОРОВ ДЛЯ SALDO
-
-   Используем те же продуктовые исключения.
+   4. СПОСОБ №2. РЕЕСТР ДОГОВОРОВ ДЛЯ SALDO
    ============================================================ */
 
 SELECT
@@ -159,31 +183,7 @@ SELECT
         WHEN a.PROD_NAME LIKE N'Накопительный счёт%'
             THEN 1
         ELSE 0
-    END) AS is_ns,
-
-    MAX(CASE
-        WHEN a.PROD_NAME IN (
-            N'ДОМа надёжно',
-            N'Всё в ДОМ',
-            N'Надёжный',
-            N'Надёжный прайм',
-            N'Надёжныйпрайм',
-            N'Надёжный VIP',
-            N'НадёжныйVIP',
-            N'Надёжный премиум',
-            N'Надёжный промо',
-            N'Надёжныйпромо',
-            N'Надёжный старт',
-            N'Надёжный Т2',
-            N'Надёжный T2',
-            N'Надёжный Мегафон',
-            N'Надёжный процент',
-            N'Надёжныйпроцент',
-            N'Могучий'
-        )
-            THEN 1
-        ELSE 0
-    END) AS is_excluded
+    END) AS is_ns
 
 INTO #cmp_contracts
 
@@ -193,16 +193,14 @@ WHERE a.DT_OPEN IS NOT NULL
   AND a.DT_OPEN < DATEFROMPARTS(2026,11,5)
   AND a.CON_ID IS NOT NULL
   AND a.CLI_ID IS NOT NULL
+  AND a.PROD_NAME IS NOT NULL
   AND a.cli_short_name = N'ФЛ'
   AND a.cur = 'RUR'
 
-  AND a.PROD_NAME NOT IN (
-      N'Агентские эскроу ФЛ по ставке КС+спред',
-      N'Спец. банк.счёт',
-      N'Залоговый',
-      N'Агентские эскроу ФЛ по ставке КС/2',
-      N'Эскроу',
-      N'Депозит ФЛ (суррогатный договор для счета Новой Афины)'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM #cmp_excluded x
+      WHERE x.PROD_NAME = a.PROD_NAME
   )
 
 GROUP BY a.CON_ID;
@@ -215,17 +213,18 @@ ON #cmp_contracts (CLI_ID);
 
 
 /* ============================================================
-   4. УНИКАЛЬНЫЕ КЛИЕНТЫ И ИСТОРИЧЕСКИЙ ПРИЗНАК УЧК
+   5. ИСТОРИЧЕСКОЕ ОПРЕДЕЛЕНИЕ УЧК
 
-   Если был хотя бы один договор с seg_name = ДЧБО,
-   клиент УЧК с даты открытия первого такого договора.
+   Проверяем все договоры клиента, включая исключенные
+   продукты, по признаку ДЧБО в DepositInterestsRate.
+
+   Сегмент фиксируется на конец каждой РК.
    ============================================================ */
 
 SELECT DISTINCT
     CLI_ID
 INTO #cmp_clients
-FROM #cmp_contracts
-WHERE is_excluded = 0;
+FROM #cmp_contracts;
 
 CREATE UNIQUE CLUSTERED INDEX IX_cmp_clients
 ON #cmp_clients (CLI_ID);
@@ -260,13 +259,10 @@ ON #cmp_uchk (CLI_ID);
 
 
 /* ============================================================
-   5. ОСТАТКИ ИЗ DepositContract_Saldo НА ТЕ ЖЕ 4 ДАТЫ
+   6. SALDO НА ЧЕТЫРЕ КОНТРОЛЬНЫЕ ДАТЫ
 
-   Без календаря и накопительных событий:
-   берем срезы непосредственно на нужные даты.
-
-   При пересечении интервалов одного CON_ID
-   выбираем запись с наиболее поздним DT_FROM.
+   Берем остаток договора на дату среза.
+   Если интервалы пересеклись, берем последний DT_FROM.
    ============================================================ */
 
 ;WITH snapshots AS (
@@ -296,7 +292,6 @@ ON #cmp_uchk (CLI_ID);
 
     INNER JOIN #cmp_contracts c
         ON c.dt_open <= d.dt_rep
-       AND c.is_excluded = 0
 
     LEFT JOIN #cmp_uchk u
         ON u.CLI_ID = c.CLI_ID
@@ -318,32 +313,24 @@ SELECT
     d.dt_rep,
 
     SUM(CASE
-        WHEN s.is_ns = 1
-         AND s.is_uchk = 1
-            THEN s.out_rub
-        ELSE 0
+        WHEN s.is_ns = 1 AND s.is_uchk = 1
+            THEN s.out_rub ELSE 0
     END) AS ns_uchk,
 
     SUM(CASE
-        WHEN s.is_ns = 0
-         AND s.is_uchk = 1
-            THEN s.out_rub
-        ELSE 0
+        WHEN s.is_ns = 0 AND s.is_uchk = 1
+            THEN s.out_rub ELSE 0
     END) AS dep_uchk,
 
     SUM(CASE
-        WHEN s.is_ns = 1
-         AND s.is_uchk = 0
-            THEN s.out_rub
-        ELSE 0
-    END) AS ns_retail,
+        WHEN s.is_ns = 1 AND s.is_uchk = 0
+            THEN s.out_rub ELSE 0
+    END) AS ns_mass,
 
     SUM(CASE
-        WHEN s.is_ns = 0
-         AND s.is_uchk = 0
-            THEN s.out_rub
-        ELSE 0
-    END) AS dep_retail
+        WHEN s.is_ns = 0 AND s.is_uchk = 0
+            THEN s.out_rub ELSE 0
+    END) AS dep_mass
 
 INTO #cmp_saldo
 
@@ -363,117 +350,186 @@ ON #cmp_saldo (period_id, dt_rep);
 
 
 /* ============================================================
-   6. ИТОГОВОЕ СРАВНЕНИЕ
-
-   4 СТРОКИ:
-   28.02.2026, 07.04.2026,
-   30.09.2026, 04.11.2026.
-
-   Все объемы и приросты в млрд руб.
+   7. СОБИРАЕМ ДВА ИСТОЧНИКА В ОДНУ ТАБЛИЦУ
    ============================================================ */
 
-;WITH comparison AS (
-    SELECT
-        d.period_id,
-        p.period_name,
-        d.dt_rep,
-        d.point_name,
+SELECT
+    d.period_id,
+    p.period_name,
+    d.dt_rep,
+    d.point_name,
 
-        ISNULL(v.ns_uchk, 0) AS vw_ns_uchk,
-        ISNULL(v.dep_uchk, 0) AS vw_dep_uchk,
-        ISNULL(v.ns_retail, 0) AS vw_ns_retail,
-        ISNULL(v.dep_retail, 0) AS vw_dep_retail,
+    ISNULL(v.ns_uchk, 0)  AS bal_ns_uchk,
+    ISNULL(s.ns_uchk, 0)  AS sal_ns_uchk,
 
-        ISNULL(s.ns_uchk, 0) AS saldo_ns_uchk,
-        ISNULL(s.dep_uchk, 0) AS saldo_dep_uchk,
-        ISNULL(s.ns_retail, 0) AS saldo_ns_retail,
-        ISNULL(s.dep_retail, 0) AS saldo_dep_retail
+    ISNULL(v.dep_uchk, 0) AS bal_dep_uchk,
+    ISNULL(s.dep_uchk, 0) AS sal_dep_uchk,
 
-    FROM #cmp_dates d
+    ISNULL(v.ns_mass, 0)  AS bal_ns_mass,
+    ISNULL(s.ns_mass, 0)  AS sal_ns_mass,
 
-    INNER JOIN #cmp_periods p
-        ON p.period_id = d.period_id
+    ISNULL(v.dep_mass, 0) AS bal_dep_mass,
+    ISNULL(s.dep_mass, 0) AS sal_dep_mass
 
-    LEFT JOIN #cmp_vw v
-        ON v.period_id = d.period_id
-       AND v.dt_rep = d.dt_rep
+INTO #cmp_all
 
-    LEFT JOIN #cmp_saldo s
-        ON s.period_id = d.period_id
-       AND s.dt_rep = d.dt_rep
-),
+FROM #cmp_dates d
 
-totals AS (
-    SELECT
-        *,
+INNER JOIN #cmp_periods p
+    ON p.period_id = d.period_id
 
-        vw_ns_uchk + vw_dep_uchk AS vw_uchk,
-        saldo_ns_uchk + saldo_dep_uchk AS saldo_uchk,
+LEFT JOIN #cmp_vw v
+    ON v.period_id = d.period_id
+   AND v.dt_rep = d.dt_rep
 
-        vw_ns_retail + vw_dep_retail AS vw_retail,
-        saldo_ns_retail + saldo_dep_retail AS saldo_retail
+LEFT JOIN #cmp_saldo s
+    ON s.period_id = d.period_id
+   AND s.dt_rep = d.dt_rep;
 
-    FROM comparison
-)
+CREATE UNIQUE CLUSTERED INDEX IX_cmp_all
+ON #cmp_all (period_id, dt_rep);
+
+
+/* ============================================================
+   РЕЗУЛЬТАТ 1. СРАВНЕНИЕ ОСТАТКОВ
+
+   Ровно 4 даты, все объемы в млрд руб.
+   Разница = SALDO - БАЛАНС.
+   ============================================================ */
 
 SELECT
     period_name AS [РК],
     CONVERT(varchar(10), dt_rep, 104) AS [Дата],
-    point_name AS [Срез],
 
-    CAST(vw_ns_uchk / 1e9 AS decimal(18,4))
-        AS [Баланс НС УЧК],
+    CAST(bal_ns_uchk / 1e9 AS decimal(18,4))
+        AS [НС УЧК баланс],
 
-    CAST(vw_dep_uchk / 1e9 AS decimal(18,4))
-        AS [Баланс вклады УЧК],
+    CAST(sal_ns_uchk / 1e9 AS decimal(18,4))
+        AS [НС УЧК сальдо],
 
-    CAST(vw_uchk / 1e9 AS decimal(18,4))
-        AS [Баланс УЧК всего],
+    CAST(bal_dep_uchk / 1e9 AS decimal(18,4))
+        AS [Вклады УЧК баланс],
 
-    CAST(saldo_ns_uchk / 1e9 AS decimal(18,4))
-        AS [Saldo НС УЧК],
+    CAST(sal_dep_uchk / 1e9 AS decimal(18,4))
+        AS [Вклады УЧК сальдо],
 
-    CAST(saldo_dep_uchk / 1e9 AS decimal(18,4))
-        AS [Saldo вклады УЧК],
+    CAST((bal_ns_uchk + bal_dep_uchk) / 1e9
+        AS decimal(18,4)) AS [Итого УЧК баланс],
 
-    CAST(saldo_uchk / 1e9 AS decimal(18,4))
-        AS [Saldo УЧК всего],
+    CAST((sal_ns_uchk + sal_dep_uchk) / 1e9
+        AS decimal(18,4)) AS [Итого УЧК сальдо],
 
-    CAST((saldo_uchk - vw_uchk) / 1e9
-        AS decimal(18,4))
-        AS [Разница УЧК],
+    CAST((
+        sal_ns_uchk + sal_dep_uchk
+        - bal_ns_uchk - bal_dep_uchk
+    ) / 1e9 AS decimal(18,4)) AS [Разница УЧК],
 
-    CAST(vw_retail / 1e9 AS decimal(18,4))
-        AS [Баланс Розница всего],
 
-    CAST(saldo_retail / 1e9 AS decimal(18,4))
-        AS [Saldo Розница всего],
+    CAST(bal_ns_mass / 1e9 AS decimal(18,4))
+        AS [НС MASS баланс],
 
-    CAST(
-        (saldo_uchk + saldo_retail
-         - vw_uchk - vw_retail) / 1e9
-        AS decimal(18,4))
-        AS [Разница всего портфеля],
+    CAST(sal_ns_mass / 1e9 AS decimal(18,4))
+        AS [НС MASS сальдо],
 
-    CAST(
-        (
-            vw_uchk
-            - FIRST_VALUE(vw_uchk) OVER (
-                PARTITION BY period_id
-                ORDER BY dt_rep
-            )
-        ) / 1e9 AS decimal(18,4))
-        AS [Прирост УЧК баланс],
+    CAST(bal_dep_mass / 1e9 AS decimal(18,4))
+        AS [Вклады MASS баланс],
 
-    CAST(
-        (
-            saldo_uchk
-            - FIRST_VALUE(saldo_uchk) OVER (
-                PARTITION BY period_id
-                ORDER BY dt_rep
-            )
-        ) / 1e9 AS decimal(18,4))
-        AS [Прирост УЧК Saldo]
+    CAST(sal_dep_mass / 1e9 AS decimal(18,4))
+        AS [Вклады MASS сальдо],
 
-FROM totals
+    CAST((bal_ns_mass + bal_dep_mass) / 1e9
+        AS decimal(18,4)) AS [Итого MASS баланс],
+
+    CAST((sal_ns_mass + sal_dep_mass) / 1e9
+        AS decimal(18,4)) AS [Итого MASS сальдо],
+
+    CAST((
+        sal_ns_mass + sal_dep_mass
+        - bal_ns_mass - bal_dep_mass
+    ) / 1e9 AS decimal(18,4)) AS [Разница MASS]
+
+FROM #cmp_all
 ORDER BY period_id, dt_rep;
+
+
+/* ============================================================
+   РЕЗУЛЬТАТ 2. СРАВНЕНИЕ ПРИРОСТОВ ЗА РК
+
+   Прирост = остаток на конец РК
+           - остаток на день до РК.
+
+   Всего, MASS, УЧК — млрд руб.
+   ============================================================ */
+
+;WITH growth AS (
+    SELECT
+        p.period_id,
+        p.period_name,
+
+        (
+            e.bal_ns_uchk + e.bal_dep_uchk
+            - b.bal_ns_uchk - b.bal_dep_uchk
+        ) AS uchk_balance,
+
+        (
+            e.sal_ns_uchk + e.sal_dep_uchk
+            - b.sal_ns_uchk - b.sal_dep_uchk
+        ) AS uchk_saldo,
+
+        (
+            e.bal_ns_mass + e.bal_dep_mass
+            - b.bal_ns_mass - b.bal_dep_mass
+        ) AS mass_balance,
+
+        (
+            e.sal_ns_mass + e.sal_dep_mass
+            - b.sal_ns_mass - b.sal_dep_mass
+        ) AS mass_saldo
+
+    FROM #cmp_periods p
+
+    INNER JOIN #cmp_all b
+        ON b.period_id = p.period_id
+       AND b.dt_rep = DATEADD(day, -1, p.dt_from)
+
+    INNER JOIN #cmp_all e
+        ON e.period_id = p.period_id
+       AND e.dt_rep = p.dt_to
+)
+
+SELECT
+    period_name AS [РК],
+
+    CAST((uchk_balance + mass_balance) / 1e9
+        AS decimal(18,4)) AS [Весь портфель баланс],
+
+    CAST((uchk_saldo + mass_saldo) / 1e9
+        AS decimal(18,4)) AS [Весь портфель сальдо],
+
+    CAST((
+        uchk_saldo + mass_saldo
+        - uchk_balance - mass_balance
+    ) / 1e9 AS decimal(18,4)) AS [Разница всего],
+
+
+    CAST(mass_balance / 1e9
+        AS decimal(18,4)) AS [MASS баланс],
+
+    CAST(mass_saldo / 1e9
+        AS decimal(18,4)) AS [MASS сальдо],
+
+    CAST((mass_saldo - mass_balance) / 1e9
+        AS decimal(18,4)) AS [Разница MASS],
+
+
+    CAST(uchk_balance / 1e9
+        AS decimal(18,4)) AS [УЧК баланс],
+
+    CAST(uchk_saldo / 1e9
+        AS decimal(18,4)) AS [УЧК сальдо],
+
+    CAST((uchk_saldo - uchk_balance) / 1e9
+        AS decimal(18,4)) AS [Разница УЧК]
+
+FROM growth
+ORDER BY period_id;
