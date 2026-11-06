@@ -1,42 +1,71 @@
 
-;WITH days AS (
-    SELECT day_num
-    FROM (VALUES
-        (1), (4), (7), (10), (13),
-        (16), (19), (22), (25), (28),
-        (30), (32), (33), (34), (35),
-        (36), (38)
-    ) v(day_num)
-),
-balances AS (
+SELECT
+    p.period_name,
+
+    COUNT(DISTINCT CASE
+        WHEN n.CLI_ID IS NOT NULL
+        THEN s.CLI_ID END
+    ) AS new_clients_in_second,
+
+    COUNT(DISTINCT CASE
+        WHEN m.CLI_ID IS NOT NULL
+        THEN s.CLI_ID END
+    ) AS overlapping_clients
+
+FROM #nm_selected s
+
+JOIN #periods p
+    ON p.period_id = s.period_id
+
+LEFT JOIN #new_clients n
+    ON n.period_id = s.period_id
+   AND n.CLI_ID = s.CLI_ID
+
+LEFT JOIN #mass_clients m
+    ON m.period_id = s.period_id
+   AND m.CLI_ID = s.CLI_ID
+
+GROUP BY p.period_id, p.period_name
+ORDER BY p.period_id;
+
+
+
+;WITH selected AS (
     SELECT
+        N'Новые клиенты' AS portfolio,
         period_id,
-        day_num,
-        CAST(
-            (nov_balance_rub + ndp_ndm_balance_rub) / 1000000000.0
-            AS decimal(18,6)
-        ) AS total_bn
-    FROM #nm_daily
+        CON_ID
+    FROM #contracts
+
+    UNION ALL
+
+    SELECT
+        N'Остальные клиенты',
+        period_id,
+        CON_ID
+    FROM #nm_selected
 )
 SELECT
-    CONVERT(
-        varchar(10),
-        DATEADD(day, d.day_num - 1, DATEFROMPARTS(2025, 10, 1)),
-        104
-    ) AS [Column1],
-
-    MAX(CASE WHEN b.period_id = 1
-        THEN b.total_bn END) AS [РК октябрь 26],
-
-    MAX(CASE WHEN b.period_id = 2
-        THEN b.total_bn END) AS [РК март 26],
-
-    MAX(CASE WHEN b.period_id = 3
-        THEN b.total_bn END) AS [РК октябрь 25]
-
-FROM days d
-LEFT JOIN balances b
-    ON b.day_num = d.day_num
-
-GROUP BY d.day_num
-ORDER BY d.day_num;
+    p.period_name,
+    s.portfolio,
+    o.PROD_NAME,
+    COUNT(DISTINCT s.CON_ID) AS contracts
+FROM selected s
+JOIN #opened o
+    ON o.period_id = s.period_id
+   AND o.CON_ID = s.CON_ID
+JOIN #periods p
+    ON p.period_id = s.period_id
+WHERE o.PROD_NAME IN (
+    N'Всё в ДОМ',
+    N'НадёжныйVIP',
+    N'Надёжныйпроцент',
+    N'Надёжныйпромо',
+    N'Надёжныйпрайм'
+)
+GROUP BY
+    p.period_id,
+    p.period_name,
+    s.portfolio,
+    o.PROD_NAME
+ORDER BY p.period_id, s.portfolio;
