@@ -12,6 +12,9 @@ DROP TABLE IF EXISTS #nm_daily;
 
 /* ============================================================
    1. ДОГОВОРЫ, ОТКРЫТЫЕ В ТРЕХ РК
+
+   Используем #opened с исходным списком исключений.
+   Дополнительно исключаем только накопительные счета.
    ============================================================ */
 
 SELECT
@@ -21,21 +24,7 @@ SELECT
     o.dt_open
 INTO #nm_candidates
 FROM #opened o
-WHERE o.PROD_NAME NOT LIKE N'Накопительный счёт%'
-  AND o.PROD_NAME NOT IN (
-      N'Всё в ДОМ',
-      N'Надёжныйпроцент',
-      N'Надёжныйпромо',
-      N'Надёжныйпрайм',
-      N'Классический',
-      N'Привилегия',
-      N'Достояние',
-      N'Достояние без опций',
-      N'Достояние с пополнением и снятием',
-      N'Достояние с пополнением',
-      N'Достояние (перем.ст.) без опций',
-      N'Достояние (перем.ст.) с пополнением и снятием'
-  );
+WHERE o.PROD_NAME NOT LIKE N'Накопительный счёт%';
 
 CREATE UNIQUE CLUSTERED INDEX IX_nm_candidates
 ON #nm_candidates (period_id, CON_ID);
@@ -53,7 +42,7 @@ ON #nm_candidate_clients (period_id, CLI_ID);
 /* ============================================================
    2. MASS-КЛИЕНТЫ, НЕ ПОПАВШИЕ В ПЕРВУЮ ВЫГРУЗКУ
 
-   Исключаем #mass_clients.
+   Исключаем новых клиентов из #mass_clients.
    Исключаем ДЧБО по истории DepositInterestsRate.
    ============================================================ */
 
@@ -112,6 +101,7 @@ SELECT
     END AS category
 
 INTO #nm_selected
+
 FROM #nm_candidates c
 
 INNER JOIN #nm_mass_clients m
@@ -123,8 +113,11 @@ OUTER APPLY (
         a.[Нов],
         a.[НДП],
         a.[НДМ]
+
     FROM ALM.ehd.attr_DepoFLConditions a WITH (NOLOCK)
+
     WHERE TRY_CAST(a.CON_ID AS bigint) = c.CON_ID
+
     ORDER BY
         a.DT_UPDATE DESC,
         a.loaddate DESC
@@ -162,7 +155,9 @@ SELECT
     END) AS ndp_ndm_count
 
 INTO #nm_openings
+
 FROM #nm_selected
+
 GROUP BY
     period_id,
     dt_open;
@@ -261,7 +256,9 @@ SELECT
     END) AS ndp_ndm_delta
 
 INTO #nm_events
+
 FROM saldo_events
+
 GROUP BY
     period_id,
     dt_rep;
@@ -323,6 +320,7 @@ SELECT
     ) AS ndp_ndm_balance_rub
 
 INTO #nm_daily
+
 FROM calendar c
 
 INNER JOIN #periods p
@@ -348,8 +346,10 @@ ON #nm_daily (period_id, dt_rep);
 
 SELECT
     dt_rep,
+
     nov_opened_cum AS nov_contracts,
     ndp_ndm_opened_cum AS ndp_ndm_contracts,
+
     nov_opened_cum + ndp_ndm_opened_cum AS total_contracts,
 
     CAST(nov_balance_rub / 1000000000.0
@@ -372,8 +372,10 @@ ORDER BY dt_rep;
 
 SELECT
     dt_rep,
+
     nov_opened_cum AS nov_contracts,
     ndp_ndm_opened_cum AS ndp_ndm_contracts,
+
     nov_opened_cum + ndp_ndm_opened_cum AS total_contracts,
 
     CAST(nov_balance_rub / 1000000000.0
@@ -396,8 +398,10 @@ ORDER BY dt_rep;
 
 SELECT
     dt_rep,
+
     nov_opened_cum AS nov_contracts,
     ndp_ndm_opened_cum AS ndp_ndm_contracts,
+
     nov_opened_cum + ndp_ndm_opened_cum AS total_contracts,
 
     CAST(nov_balance_rub / 1000000000.0
@@ -436,10 +440,12 @@ SELECT
     ) AS [Column1],
 
     MAX(CASE WHEN x.period_id = 1
-        THEN x.nov_opened_cum END) AS [Окт26 НОВ шт],
+        THEN x.nov_opened_cum
+    END) AS [Окт26 НОВ шт],
 
     MAX(CASE WHEN x.period_id = 1
-        THEN x.ndp_ndm_opened_cum END) AS [Окт26 НДП НДМ шт],
+        THEN x.ndp_ndm_opened_cum
+    END) AS [Окт26 НДП НДМ шт],
 
     MAX(CASE WHEN x.period_id = 1
         THEN CAST(x.nov_balance_rub / 1e9 AS decimal(18,6))
@@ -450,15 +456,20 @@ SELECT
     END) AS [Окт26 НДП НДМ млрд],
 
     MAX(CASE WHEN x.period_id = 1
-        THEN CAST((x.nov_balance_rub + x.ndp_ndm_balance_rub)
-                  / 1e9 AS decimal(18,6))
+        THEN CAST(
+            (x.nov_balance_rub + x.ndp_ndm_balance_rub)
+            / 1e9 AS decimal(18,6)
+        )
     END) AS [РК октябрь 26],
 
-    MAX(CASE WHEN x.period_id = 2
-        THEN x.nov_opened_cum END) AS [Мар26 НОВ шт],
 
     MAX(CASE WHEN x.period_id = 2
-        THEN x.ndp_ndm_opened_cum END) AS [Мар26 НДП НДМ шт],
+        THEN x.nov_opened_cum
+    END) AS [Мар26 НОВ шт],
+
+    MAX(CASE WHEN x.period_id = 2
+        THEN x.ndp_ndm_opened_cum
+    END) AS [Мар26 НДП НДМ шт],
 
     MAX(CASE WHEN x.period_id = 2
         THEN CAST(x.nov_balance_rub / 1e9 AS decimal(18,6))
@@ -469,15 +480,20 @@ SELECT
     END) AS [Мар26 НДП НДМ млрд],
 
     MAX(CASE WHEN x.period_id = 2
-        THEN CAST((x.nov_balance_rub + x.ndp_ndm_balance_rub)
-                  / 1e9 AS decimal(18,6))
+        THEN CAST(
+            (x.nov_balance_rub + x.ndp_ndm_balance_rub)
+            / 1e9 AS decimal(18,6)
+        )
     END) AS [РК март 26],
 
-    MAX(CASE WHEN x.period_id = 3
-        THEN x.nov_opened_cum END) AS [Окт25 НОВ шт],
 
     MAX(CASE WHEN x.period_id = 3
-        THEN x.ndp_ndm_opened_cum END) AS [Окт25 НДП НДМ шт],
+        THEN x.nov_opened_cum
+    END) AS [Окт25 НОВ шт],
+
+    MAX(CASE WHEN x.period_id = 3
+        THEN x.ndp_ndm_opened_cum
+    END) AS [Окт25 НДП НДМ шт],
 
     MAX(CASE WHEN x.period_id = 3
         THEN CAST(x.nov_balance_rub / 1e9 AS decimal(18,6))
@@ -488,11 +504,14 @@ SELECT
     END) AS [Окт25 НДП НДМ млрд],
 
     MAX(CASE WHEN x.period_id = 3
-        THEN CAST((x.nov_balance_rub + x.ndp_ndm_balance_rub)
-                  / 1e9 AS decimal(18,6))
+        THEN CAST(
+            (x.nov_balance_rub + x.ndp_ndm_balance_rub)
+            / 1e9 AS decimal(18,6)
+        )
     END) AS [РК октябрь 25]
 
 FROM days d
+
 LEFT JOIN #nm_daily x
     ON x.day_num = d.day_num
 
