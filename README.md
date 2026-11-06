@@ -22,7 +22,7 @@ balances AS (
 SELECT
     CONVERT(
         varchar(10),
-        DATEADD(day, d.day_num - 1, '2025-10-01'),
+        DATEADD(day, d.day_num - 1, DATEFROMPARTS(2025, 10, 1)),
         104
     ) AS [Column1],
 
