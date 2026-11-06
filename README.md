@@ -7,7 +7,7 @@ GO
 SET QUOTED_IDENTIFIER ON;
 GO
 
-ALTER FUNCTION [reports].[fn_NewAttractionVolumes_forDimaMASS]
+CREATE OR ALTER FUNCTION [reports].[fn_NewAttractionVolumes_forDimaMASS_v1.5]
 (
       @ReportDate date
     , @OpenFrom date
@@ -41,10 +41,15 @@ RETURN
         ) m(prod_name_res)
     ),
 
+    /* ============================================================
+       1. ИСХОДНЫЕ ВКЛАДЫ
+       ============================================================ */
+
     src AS
     (
         SELECT
               v.CON_ID
+            , v.CLI_ID
             , v.OUT_RUB
             , v.TSegmentName
             , v.PROD_NAME_res
@@ -117,6 +122,58 @@ RETURN
           )
     ),
 
+    /* ============================================================
+       2. КЛИЕНТЫ СО СПЕЦИАЛЬНОЙ СТАВКОЙ 15%
+       ============================================================ */
+
+    special_clients AS
+    (
+        SELECT DISTINCT CLI_ID
+        FROM src
+        WHERE special_2m = 1
+          AND CLI_ID IS NOT NULL
+    ),
+
+    /* ============================================================
+       3. ИСТОРИЯ КЛИЕНТОВ ДО НАЧАЛА РК
+
+       Учитываем рублевые вклады и НС.
+       Ранее закрытые договоры также учитываются.
+       ============================================================ */
+
+    prior_clients AS
+    (
+        SELECT DISTINCT
+            h.CLI_ID
+
+        FROM LIQUIDITY.liq.DepositContract_all h WITH (NOLOCK)
+
+        INNER JOIN special_clients sc
+            ON sc.CLI_ID = h.CLI_ID
+
+        WHERE h.DT_OPEN IS NOT NULL
+          AND h.DT_OPEN < @OpenFrom
+          AND h.cli_short_name = N'ФЛ'
+          AND h.cur = 'RUR'
+
+          AND (
+              h.PROD_NAME IS NULL
+              OR h.PROD_NAME NOT IN
+              (
+                  N'Агентские эскроу ФЛ по ставке КС+спред',
+                  N'Спец. банк.счёт',
+                  N'Залоговый',
+                  N'Агентские эскроу ФЛ по ставке КС/2',
+                  N'Эскроу',
+                  N'Депозит ФЛ (суррогатный договор для счета Новой Афины)'
+              )
+          )
+    ),
+
+    /* ============================================================
+       4. НАДБАВКИ И СПРАВОЧНИК ПРОМОСТАВОК
+       ============================================================ */
+
     joined AS
     (
         SELECT
@@ -130,7 +187,18 @@ RETURN
             , a.[От1]
             , a.[Пк2]
 
+            , CASE
+                WHEN s.special_2m = 1
+                 AND s.CLI_ID IS NOT NULL
+                 AND p.CLI_ID IS NULL
+                    THEN 1
+                ELSE 0
+              END AS is_new_client
+
         FROM src s
+
+        LEFT JOIN prior_clients p
+            ON p.CLI_ID = s.CLI_ID
 
         OUTER APPLY
         (
@@ -183,6 +251,10 @@ RETURN
         ) d
     ),
 
+    /* ============================================================
+       5. ФЛАГИ НАДБАВОК
+       ============================================================ */
+
     matched AS
     (
         SELECT
@@ -218,6 +290,10 @@ RETURN
         FROM joined j
     ),
 
+    /* ============================================================
+       6. КЛАССИФИКАЦИЯ ВКЛАДОВ
+       ============================================================ */
+
     classified AS
     (
         SELECT
@@ -233,6 +309,10 @@ RETURN
 
                 WHEN m.PROD_NAME_res = N'Активный процент'
                     THEN N'Активный процент'
+
+                WHEN m.special_2m = 1
+                 AND m.is_new_client = 1
+                    THEN N'Новые клиенты'
 
                 WHEN m.special_2m = 1
                     THEN N'Ставка 15%'
@@ -288,6 +368,10 @@ RETURN
         FROM matched m
     ),
 
+    /* ============================================================
+       7. АГРЕГАЦИЯ
+       ============================================================ */
+
     agg AS
     (
         SELECT
@@ -329,10 +413,11 @@ RETURN
     SELECT
           a.bucket_code AS Bucket
         , a.segment_name AS Segment
+
         , CAST(
-    a.segment_vol / 1000000000.0
-    AS decimal(18,6)
-  ) AS SegmentVolume
+            a.segment_vol / 1000000000.0
+            AS decimal(18,6)
+          ) AS SegmentVolume
 
         , CAST(
             a.segment_vol * 1.0
@@ -350,3 +435,16 @@ RETURN
     CROSS JOIN totals t
 );
 GO
+
+
+
+
+
+SELECT *
+FROM ALM_TEST.reports.[fn_NewAttractionVolumes_forDimaMASS_v1.5](
+    '2026-11-04',
+    '2026-10-20',
+    '2026-11-04',
+    0
+)
+ORDER BY Bucket, Segment;
