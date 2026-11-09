@@ -13,23 +13,21 @@ FROM LIQUIDITY.liq.DepositInterestsRate WITH (NOLOCK);
 
 /* ============================================================
    НОВЫЕ ПРИВЛЕЧЕНИЯ ЮЛ ЗА ОКТЯБРЬ 2026
-
-   Только последняя DT_REP.
-   Только рабочие дни.
-   Фильтры процедуры ЮЛ.
-   Сальдо непосредственно на дату открытия.
+   Только последняя DT_REP, только рабочие дни.
    ============================================================ */
 
 ;WITH contracts AS (
     SELECT
         d.CON_ID,
         d.CLI_ID,
+        d.CLI_SHORT_NAME,
         d.CLI_SUBTYPE,
         d.SEG_NAME,
+        d.PROD_TYPE,
+        d.CONVENTION AS CONV,
 
         d.ISDOMRF,
         d.IS_PDR,
-
         d.DT_OPEN,
         d.DT_CLOSE,
         d.MATUR,
@@ -91,12 +89,14 @@ SELECT
 
     d.CON_ID,
     d.CLI_ID,
+    d.CLI_SHORT_NAME,
     d.CLI_SUBTYPE,
     d.SEG_NAME,
+    d.PROD_TYPE,
+    d.CONV,
 
     d.ISDOMRF,
     d.IS_PDR,
-
     d.DT_OPEN,
     d.DT_CLOSE,
     d.MATUR,
@@ -131,9 +131,7 @@ CROSS APPLY (
     SELECT
         SUM(CAST(s.OUT_RUB AS decimal(28,2)))
             AS BALANCE_RUB
-
     FROM LIQUIDITY.liq.DepositContract_Saldo s WITH (NOLOCK)
-
     WHERE s.CON_ID = d.CON_ID
       AND d.DT_OPEN BETWEEN s.DT_FROM AND s.DT_TO
       AND s.OUT_RUB <> 0
