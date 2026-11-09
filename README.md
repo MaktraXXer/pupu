@@ -11,25 +11,29 @@ SELECT @LastDtRep = MAX(DT_REP)
 FROM LIQUIDITY.liq.DepositInterestsRate WITH (NOLOCK);
 
 DROP TABLE IF EXISTS #new_deals;
-DROP TABLE IF EXISTS #new_balances;
 
 
 /* ============================================================
    1. НОВЫЕ ПРИВЛЕЧЕНИЯ ЮЛ ЗА ОКТЯБРЬ 2026
 
-   Только последняя DT_REP.
+   Только последний DT_REP.
    Только рабочие дни.
-   Фильтры исходной процедуры ЮЛ.
+   Сохраняем фильтры исходной процедуры.
    ============================================================ */
 
 SELECT
     d.CON_ID,
     d.CLI_ID,
+    d.CLI_SUBTYPE,
+    d.SEG_NAME,
+
     d.ISDOMRF,
     d.IS_PDR,
+
     d.DT_OPEN,
     CAST(d.DT_OPEN AS date) AS dt_open_d,
     d.DT_CLOSE,
+
     d.MATUR,
     d.RATE,
     d.ISFLOAT,
@@ -92,19 +96,55 @@ ON #new_deals (CON_ID);
 
 
 /* ============================================================
-   2. SALDO НА ДАТУ ОТКРЫТИЯ
+   2. ИТОГОВАЯ ПОСДЕЛОЧНАЯ ВЫГРУЗКА
 
-   Сначала обращаемся только к найденным договорам.
+   SALDO — на дату открытия договора.
+   Без дополнительных витрин и тяжелых JOIN.
 
-   Суммируем остатки непосредственно по CON_ID.
-   Без GROUP BY по остальным атрибутам.
+   ТС* = MAX(ТС, клиентская ставка + ССВ).
+   Спред к КС — как в агрегированной витрине.
    ============================================================ */
 
 SELECT
-    d.*,
-    s.BALANCE_RUB
+    d.dt_open_d AS [Дата отчета],
 
-INTO #new_balances
+    d.CON_ID,
+    d.CLI_ID,
+    d.CLI_SUBTYPE,
+    d.SEG_NAME,
+
+    d.ISDOMRF,
+    d.IS_PDR,
+
+    d.DT_OPEN,
+    d.DT_CLOSE,
+    d.MATUR,
+    d.RATE,
+
+    d.ISFLOAT AS IS_FLOAT,
+    d.CUR,
+
+    s.BALANCE_RUB,
+
+    d.MonthlyCONV_RATE,
+    d.LIQ_ССВ_Fcast AS SSVRate_Fcast,
+
+    d.MonthlyCONV_RATE + d.LIQ_ССВ_Fcast
+        AS [Внешняя ставка +ССВ (ежемес)],
+
+    CASE
+        WHEN d.MonthlyCONV_LIQ_TransfertRate
+             >= d.MonthlyCONV_RATE + d.LIQ_ССВ_Fcast
+            THEN d.MonthlyCONV_LIQ_TransfertRate
+
+        ELSE d.MonthlyCONV_RATE + d.LIQ_ССВ_Fcast
+    END AS [ТС (ежемес до вычета ССВ)],
+
+    d.MonthlyCONV_RATE
+        + d.LIQ_ССВ_Fcast
+        + d.ALM_OptionRate
+        - d.MonthlyCONV_ForecastKeyRate
+        AS [Спред внешней ставки к КС (ежемес)]
 
 FROM #new_deals d
 
@@ -123,81 +163,8 @@ CROSS APPLY (
 
 WHERE s.BALANCE_RUB IS NOT NULL
 
-OPTION (MAXDOP 2, RECOMPILE);
-
-CREATE CLUSTERED INDEX IX_new_balances
-ON #new_balances (CON_ID);
-
-
-/* ============================================================
-   3. ИТОГОВАЯ ПОСДЕЛОЧНАЯ ВЫГРУЗКА
-
-   Реквизиты из вспомогательной витрины.
-   Ставки — из DepositInterestsRate.
-   Остатки — из DepositContract_Saldo.
-   ============================================================ */
-
-SELECT
-    b.dt_open_d AS [Дата отчета],
-
-    b.CON_ID,
-    b.CLI_ID,
-
-    m.INN,
-    m.CLI_SHORT_NAME,
-
-    b.ISDOMRF,
-    m.PROD_TYPE,
-    b.IS_PDR,
-
-    b.DT_OPEN,
-    b.DT_CLOSE,
-    b.MATUR,
-    b.RATE,
-    m.CONV,
-
-    b.ISFLOAT AS IS_FLOAT,
-    b.CUR,
-
-    b.BALANCE_RUB,
-
-    b.MonthlyCONV_RATE,
-    b.LIQ_ССВ_Fcast AS SSVRate_Fcast,
-
-    b.MonthlyCONV_RATE + b.LIQ_ССВ_Fcast
-        AS [Внешняя ставка +ССВ (ежемес)],
-
-    CASE
-        WHEN b.MonthlyCONV_LIQ_TransfertRate
-             >= b.MonthlyCONV_RATE + b.LIQ_ССВ_Fcast
-            THEN b.MonthlyCONV_LIQ_TransfertRate
-
-        ELSE b.MonthlyCONV_RATE + b.LIQ_ССВ_Fcast
-    END AS [ТС (ежемес до вычета ССВ)],
-
-    b.MonthlyCONV_RATE
-        + b.LIQ_ССВ_Fcast
-        + b.ALM_OptionRate
-        - b.MonthlyCONV_ForecastKeyRate
-        AS [Спред внешней ставки к КС (ежемес)]
-
-FROM #new_balances b
-
-OUTER APPLY (
-    SELECT TOP (1)
-        m.INN,
-        m.CLI_SHORT_NAME,
-        m.PROD_TYPE,
-        m.CONVENTION AS CONV
-
-    FROM LIQUIDITY.rep.DepositContract_LEGAL_InterestsRate m
-         WITH (NOLOCK)
-
-    WHERE m.CON_ID = b.CON_ID
-
-    ORDER BY m.DT_OPEN DESC
-) m
-
-ORDER BY b.DT_OPEN, b.CON_ID
+ORDER BY
+    d.DT_OPEN,
+    d.CON_ID
 
 OPTION (MAXDOP 2, RECOMPILE);
