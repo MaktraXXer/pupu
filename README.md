@@ -6,18 +6,15 @@ DECLARE @Dt_start date = '2026-10-01';
 DECLARE @Dt_end   date = '2026-10-31';
 
 DECLARE @LastDtRep datetime2(7);
-DECLARE @LastMetaDtRep datetime2(7);
 
 SELECT @LastDtRep = MAX(DT_REP)
 FROM LIQUIDITY.liq.DepositInterestsRate WITH (NOLOCK);
-
-SELECT @LastMetaDtRep = MAX(DT_REP)
-FROM LIQUIDITY.rep.DepositContract_LEGAL_InterestsRate WITH (NOLOCK);
 
 
 /* ============================================================
    1. НОВЫЕ ПРИВЛЕЧЕНИЯ ЮЛ ЗА ОКТЯБРЬ 2026
 
+   DepositInterestsRate — только последняя DT_REP.
    Только рабочие дни.
    Фильтры исходной процедуры сохранены.
    ============================================================ */
@@ -130,6 +127,8 @@ balances AS (
 
 /* ============================================================
    2. ИТОГОВЫЙ ПОСДЕЛОЧНЫЙ SELECT
+
+   Дополнительные реквизиты — без фильтра DT_REP.
    ============================================================ */
 
 SELECT
@@ -188,7 +187,6 @@ OUTER APPLY (
          WITH (NOLOCK)
 
     WHERE m.CON_ID = b.CON_ID
-      AND m.DT_REP = @LastMetaDtRep
 
     ORDER BY m.DT_OPEN DESC
 ) m
