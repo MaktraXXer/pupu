@@ -5,14 +5,17 @@ SET NOCOUNT ON;
 DECLARE @Dt_start date = '2026-11-01';
 DECLARE @Dt_end   date = '2026-11-07';
 
-DECLARE @LastDtRep datetime2(7);
+DECLARE @LastDtRep datetime;
 
 SELECT @LastDtRep = MAX(DT_REP)
 FROM LIQUIDITY.liq.DepositInterestsRate WITH (NOLOCK);
 
 DROP TABLE IF EXISTS #ul_dates;
 DROP TABLE IF EXISTS #ul_dep;
-DROP TABLE IF EXISTS #ul_deals;
+DROP TABLE IF EXISTS #ul_saldo;
+DROP TABLE IF EXISTS #ul_report_dates;
+DROP TABLE IF EXISTS #ul_balances;
+DROP TABLE IF EXISTS #ul_ids;
 DROP TABLE IF EXISTS #ul_meta;
 DROP TABLE IF EXISTS #ul_export;
 
@@ -20,296 +23,293 @@ DROP TABLE IF EXISTS #ul_export;
 /* ============================================================
    1. КАЛЕНДАРЬ
 
-   Новые привлечения — только рабочие дни.
-   Срезы — все календарные дни.
+   Новые привлечения: только рабочие дни.
+   Срез: все календарные дни.
    ============================================================ */
 
 SELECT
-    CAST(c.[Date] AS date) AS dt_rep,
-    MAX(CAST(c.IsWorkDay AS int)) AS IsWorkDay
+    CAST([Date] AS date) AS dt_rep,
+    MAX(CAST(IsWorkDay AS int)) AS is_workday
 INTO #ul_dates
-FROM ALM.info.VW_Calendar c WITH (NOLOCK)
-WHERE c.[Date] >= @Dt_start
-  AND c.[Date] < DATEADD(day, 1, @Dt_end)
-GROUP BY CAST(c.[Date] AS date);
+FROM ALM.info.VW_Calendar WITH (NOLOCK)
+WHERE [Date] >= @Dt_start
+  AND [Date] < DATEADD(day, 1, @Dt_end)
+GROUP BY CAST([Date] AS date);
 
 CREATE UNIQUE CLUSTERED INDEX IX_ul_dates
 ON #ul_dates (dt_rep);
 
 
 /* ============================================================
-   2. ДОГОВОРЫ ИЗ ПОСЛЕДНЕГО СРЕЗА DepositInterestsRate
+   2. ДОГОВОРЫ ПО ФИЛЬТРАМ ПРОЦЕДУРЫ ЮЛ
 
-   Повторяем фильтры исходной процедуры ЮЛ.
+   Берем только последний DT_REP.
+   ЮЛ Крупн. + ЮЛ ССВ = ЮЛ.
 
-   Включаем:
-   ЮЛ Крупн. + ЮЛ ССВ
+   SEG_NAME = Розница исключаем.
+   Остальные бизнес-сегменты оставляем.
 
-   Исключаем:
-   SEG_NAME = Розница
-
-   Не ограничиваем:
-   TERM_GROUP, IS_PDR, IS_FINANCE_LCR, IS_OPTION.
+   all termgroup / all PDR / all FINANCE_LCR
+   не являются фильтрами отдельных сделок.
    ============================================================ */
 
 SELECT
-    dep.CON_ID,
-    dep.CLI_ID,
-    dep.CLI_SUBTYPE,
-    dep.SEG_NAME,
+    d.CON_ID,
+    d.CLI_ID,
 
-    dep.ISDOMRF,
-    dep.IS_PDR,
+    d.ISDOMRF,
+    d.IS_PDR,
 
-    dep.DT_OPEN,
-    dep.DT_CLOSE,
-    dep.MATUR,
-    dep.RATE,
-    dep.ISFLOAT,
-    dep.CUR,
+    CAST(d.DT_OPEN AS date) AS dt_open,
+    CAST(d.DT_CLOSE AS date) AS dt_close,
 
-    dep.MonthlyCONV_RATE,
-    dep.LIQ_ССВ_Fcast,
-    dep.MonthlyCONV_LIQ_TransfertRate,
-    dep.MonthlyCONV_ForecastKeyRate,
-    dep.ALM_OptionRate
+    d.MATUR,
+    d.RATE,
+    d.ISFLOAT,
+    d.CUR,
+
+    d.MonthlyCONV_RATE,
+    d.LIQ_ССВ_Fcast,
+    d.MonthlyCONV_LIQ_TransfertRate,
+    d.MonthlyCONV_ForecastKeyRate,
+    d.ALM_OptionRate
 
 INTO #ul_dep
 
-FROM LIQUIDITY.liq.DepositInterestsRate dep WITH (NOLOCK)
+FROM LIQUIDITY.liq.DepositInterestsRate d WITH (NOLOCK)
 
-WHERE dep.DT_REP = @LastDtRep
+WHERE d.DT_REP = @LastDtRep
 
-  AND dep.CLI_SUBTYPE IN (
+  AND d.CLI_SUBTYPE IN (
       N'ЮЛ Крупн.',
       N'ЮЛ ССВ'
   )
 
-  AND ISNULL(dep.SEG_NAME, N'Прочий_сегмент')
-      <> N'Розница'
+  AND ISNULL(d.SEG_NAME, N'Прочий_сегмент') <> N'Розница'
 
-  AND dep.CUR = 'RUR'
-  AND dep.LIQ_ФОР IS NOT NULL
-  AND dep.MonthlyCONV_RATE IS NOT NULL
-  AND dep.MonthlyCONV_LIQ_TransfertRate IS NOT NULL
+  AND d.CUR = 'RUR'
+  AND d.LIQ_ФОР IS NOT NULL
+  AND d.MonthlyCONV_RATE IS NOT NULL
+  AND d.MonthlyCONV_LIQ_TransfertRate IS NOT NULL
 
-  AND dep.ISDOMRF = 0
-  AND ISNULL(dep.ISFLOAT, 0) = 0
-  AND dep.RATE > 0.01
+  AND d.ISDOMRF = 0
+  AND ISNULL(d.ISFLOAT, 0) = 0
+  AND d.RATE > 0.01
 
-  AND dep.MonthlyCONV_RATE BETWEEN
-      dep.MonthlyCONV_ForecastKeyRate - 0.07
-      AND dep.MonthlyCONV_ForecastKeyRate + 0.07
+  AND d.MonthlyCONV_RATE BETWEEN
+      d.MonthlyCONV_ForecastKeyRate - 0.07
+      AND d.MonthlyCONV_ForecastKeyRate + 0.07
 
-  AND dep.CLI_ID NOT IN (
+  AND d.CLI_ID NOT IN (
       3731800,
       3939590185
   )
 
-  AND dep.DT_OPEN < DATEADD(day, 1, @Dt_end)
+  AND d.DT_OPEN < DATEADD(day, 1, @Dt_end)
+  AND d.DT_CLOSE > @Dt_start;
 
-  AND (
-      dep.DT_CLOSE > @Dt_start
-      OR dep.DT_OPEN >= @Dt_start
-  );
-
-CREATE INDEX IX_ul_dep
+CREATE CLUSTERED INDEX IX_ul_dep
 ON #ul_dep (CON_ID);
 
 
 /* ============================================================
-   3. ПОСДЕЛОЧНЫЕ ОСТАТКИ
+   3. SALDO
 
-   Начало день ко дню:
-   DT_OPEN = дата отчета, рабочий день.
+   Одно обращение к DepositContract_Saldo.
 
-   Срез:
-   DT_OPEN <= дата отчета < DT_CLOSE.
+   Берем только интервалы, пересекающие нужную неделю,
+   только по договорам из #ul_dep.
 
-   Сальдо берём на соответствующую дату,
-   как в исходной процедуре.
+   Не размножаем строки на календарь при чтении SALDO.
    ============================================================ */
 
-;WITH report_dates AS (
-    SELECT
-        dt_rep,
-        N'Срез' AS report_type
-    FROM #ul_dates
-
-    UNION ALL
-
-    SELECT
-        dt_rep,
-        N'Начало день ко дню'
-    FROM #ul_dates
-    WHERE IsWorkDay = 1
-)
-
 SELECT
-    r.dt_rep,
-    r.report_type,
+    s.CON_ID,
+    s.DT_FROM,
+    s.DT_TO,
+    CAST(s.OUT_RUB AS decimal(28,2)) AS OUT_RUB
 
-    d.CON_ID,
-    d.CLI_ID,
-    d.ISDOMRF,
-    d.IS_PDR,
+INTO #ul_saldo
 
-    d.DT_OPEN,
-    d.DT_CLOSE,
-    d.MATUR,
-    d.RATE,
-    d.ISFLOAT,
-    d.CUR,
-
-    SUM(CAST(s.OUT_RUB AS decimal(38,6)))
-        AS BALANCE_RUB,
-
-    d.MonthlyCONV_RATE,
-    d.LIQ_ССВ_Fcast,
-    d.MonthlyCONV_LIQ_TransfertRate,
-    d.MonthlyCONV_ForecastKeyRate,
-    d.ALM_OptionRate
-
-INTO #ul_deals
-
-FROM report_dates r
+FROM LIQUIDITY.liq.DepositContract_Saldo s WITH (NOLOCK)
 
 INNER JOIN #ul_dep d
-    ON (
-        r.report_type = N'Срез'
-        AND d.DT_OPEN <= r.dt_rep
-        AND d.DT_CLOSE > r.dt_rep
-    )
-    OR (
-        r.report_type = N'Начало день ко дню'
-        AND d.DT_OPEN = r.dt_rep
-    )
+    ON d.CON_ID = s.CON_ID
 
-INNER JOIN LIQUIDITY.liq.DepositContract_Saldo s WITH (NOLOCK)
-    ON s.CON_ID = d.CON_ID
-   AND r.dt_rep BETWEEN s.DT_FROM AND s.DT_TO
+WHERE s.DT_FROM <= @Dt_end
+  AND s.DT_TO >= @Dt_start
+  AND s.OUT_RUB <> 0
 
-WHERE s.OUT_RUB <> 0
+OPTION (MAXDOP 2, RECOMPILE);
 
-GROUP BY
-    r.dt_rep,
-    r.report_type,
-
-    d.CON_ID,
-    d.CLI_ID,
-    d.ISDOMRF,
-    d.IS_PDR,
-
-    d.DT_OPEN,
-    d.DT_CLOSE,
-    d.MATUR,
-    d.RATE,
-    d.ISFLOAT,
-    d.CUR,
-
-    d.MonthlyCONV_RATE,
-    d.LIQ_ССВ_Fcast,
-    d.MonthlyCONV_LIQ_TransfertRate,
-    d.MonthlyCONV_ForecastKeyRate,
-    d.ALM_OptionRate
-
-OPTION (RECOMPILE);
-
-CREATE INDEX IX_ul_deals
-ON #ul_deals (report_type, dt_rep, CON_ID);
+CREATE CLUSTERED INDEX IX_ul_saldo
+ON #ul_saldo (CON_ID, DT_FROM);
 
 
 /* ============================================================
-   4. ДОПОЛНИТЕЛЬНЫЕ АТРИБУТЫ
+   4. ФОРМИРУЕМ НУЖНЫЕ ДАТЫ ПО ДОГОВОРАМ
 
-   INN, CLI_SHORT_NAME, PROD_TYPE, CONV.
+   1) Начало день ко дню:
+      только дата открытия + рабочий день.
 
-   Подтягиваем из посделочной витрины.
-   На отбор и финансовые расчеты не влияют.
+   2) Срез:
+      договор действует на отчетную дату.
+
+   Здесь нет обращения к большим таблицам.
+   ============================================================ */
+
+SELECT
+    CAST(N'Начало день ко дню' AS nvarchar(50))
+        AS report_type,
+
+    c.dt_rep,
+    d.CON_ID
+
+INTO #ul_report_dates
+
+FROM #ul_dep d
+
+INNER JOIN #ul_dates c
+    ON c.dt_rep = d.dt_open
+   AND c.is_workday = 1
+
+UNION ALL
+
+SELECT
+    CAST(N'Срез' AS nvarchar(50)),
+    c.dt_rep,
+    d.CON_ID
+
+FROM #ul_dep d
+
+INNER JOIN #ul_dates c
+    ON d.dt_open <= c.dt_rep
+   AND d.dt_close > c.dt_rep;
+
+CREATE CLUSTERED INDEX IX_ul_report_dates
+ON #ul_report_dates (CON_ID, dt_rep, report_type);
+
+
+/* ============================================================
+   5. ПОСДЕЛОЧНЫЕ ОСТАТКИ
+
+   Для каждой сделки и даты суммируем все подходящие
+   записи SALDO, аналогично исходной процедуре.
+
+   Сальдо уже находится во временной таблице.
+   ============================================================ */
+
+SELECT
+    r.report_type,
+    r.dt_rep,
+    r.CON_ID,
+
+    SUM(s.OUT_RUB) AS BALANCE_RUB
+
+INTO #ul_balances
+
+FROM #ul_report_dates r
+
+INNER JOIN #ul_saldo s
+    ON s.CON_ID = r.CON_ID
+   AND r.dt_rep BETWEEN s.DT_FROM AND s.DT_TO
+
+GROUP BY
+    r.report_type,
+    r.dt_rep,
+    r.CON_ID
+
+OPTION (MAXDOP 2, RECOMPILE);
+
+CREATE CLUSTERED INDEX IX_ul_balances
+ON #ul_balances (CON_ID, dt_rep, report_type);
+
+
+/* ============================================================
+   6. ДОГОВОРЫ, КОТОРЫЕ РЕАЛЬНО ПОПАЛИ В РЕЗУЛЬТАТ
+
+   Дополнительные атрибуты читаем только для них.
    ============================================================ */
 
 SELECT DISTINCT
-    CON_ID,
+    CON_ID
+INTO #ul_ids
+FROM #ul_balances;
 
-    CAST(NULL AS nvarchar(100)) AS INN,
-    CAST(NULL AS nvarchar(255)) AS CLI_SHORT_NAME,
-    CAST(NULL AS nvarchar(255)) AS PROD_TYPE,
-    CAST(NULL AS nvarchar(100)) AS CONV
+CREATE UNIQUE CLUSTERED INDEX IX_ul_ids
+ON #ul_ids (CON_ID);
+
+
+/* ============================================================
+   7. ДОПОЛНИТЕЛЬНЫЕ РЕКВИЗИТЫ
+
+   INN, CLI_SHORT_NAME, PROD_TYPE, CONV.
+
+   Одно соединение с витриной реквизитов.
+   Если в витрине несколько строк по CON_ID,
+   выбираем одну с последним DT_OPEN.
+
+   Эти поля не участвуют в финансовом отборе.
+   ============================================================ */
+
+;WITH ranked AS (
+    SELECT
+        m.CON_ID,
+        m.INN,
+        m.CLI_SHORT_NAME,
+        m.PROD_TYPE,
+        m.CONV,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY m.CON_ID
+            ORDER BY m.DT_OPEN DESC
+        ) AS rn
+
+    FROM LIQUIDITY.rep.DepositContract_LEGAL_InterestsRate m
+         WITH (NOLOCK)
+
+    INNER JOIN #ul_ids i
+        ON i.CON_ID = m.CON_ID
+)
+
+SELECT
+    CON_ID,
+    INN,
+    CLI_SHORT_NAME,
+    PROD_TYPE,
+    CONV
 
 INTO #ul_meta
 
-FROM #ul_deals;
+FROM ranked
+WHERE rn = 1
+
+OPTION (MAXDOP 2, RECOMPILE);
 
 CREATE UNIQUE CLUSTERED INDEX IX_ul_meta
 ON #ul_meta (CON_ID);
 
 
-/* CONV может отсутствовать в старой версии витрины */
-
-DECLARE @ConvExpr nvarchar(300);
-
-IF COL_LENGTH(
-    'LIQUIDITY.rep.DepositContract_LEGAL_InterestsRate',
-    'CONV'
-) IS NOT NULL
-    SET @ConvExpr = N'CAST(m.CONV AS nvarchar(100))';
-ELSE
-    SET @ConvExpr = N'CAST(NULL AS nvarchar(100))';
-
-
-DECLARE @sql nvarchar(max) = N'
-UPDATE t
-
-SET
-    t.INN = x.INN,
-    t.CLI_SHORT_NAME = x.CLI_SHORT_NAME,
-    t.PROD_TYPE = x.PROD_TYPE,
-    t.CONV = x.CONV
-
-FROM #ul_meta t
-
-OUTER APPLY (
-    SELECT TOP (1)
-
-        CAST(m.INN AS nvarchar(100)) AS INN,
-
-        CAST(m.CLI_SHORT_NAME AS nvarchar(255))
-            AS CLI_SHORT_NAME,
-
-        CAST(m.PROD_TYPE AS nvarchar(255))
-            AS PROD_TYPE,
-
-        ' + @ConvExpr + N' AS CONV
-
-    FROM LIQUIDITY.rep.DepositContract_LEGAL_InterestsRate m
-         WITH (NOLOCK)
-
-    WHERE m.CON_ID = t.CON_ID
-
-    ORDER BY m.DT_OPEN DESC
-) x;
-';
-
-EXEC sys.sp_executesql @sql;
-
-
 /* ============================================================
-   5. ИТОГОВАЯ ПОСДЕЛОЧНАЯ ВЫГРУЗКА
+   8. ГОТОВАЯ ПОСДЕЛОЧНАЯ ВЫГРУЗКА
 
-   Только запрошенные атрибуты и ставки.
+   Финансовые показатели — из DepositInterestsRate.
+   Остатки — из DepositContract_Saldo.
 
-   ТС* = MAX(ТС, Внешняя ставка + ССВ)
+   ТС* для ЮЛ = MAX(
+       MonthlyCONV_LIQ_TransfertRate,
+       MonthlyCONV_RATE + LIQ_ССВ_Fcast
+   )
 
-   Спред к КС повторяет расчет итоговой вьюхи,
-   включая ALM_OptionRate.
+   Spread_KeyRate — как в агрегированной вьюхе.
    ============================================================ */
 
 SELECT
-    d.dt_rep AS [Дата отчета],
+    b.dt_rep AS [Дата отчета],
+    b.report_type,
 
     d.CON_ID,
     d.CLI_ID,
-
     m.INN,
     m.CLI_SHORT_NAME,
 
@@ -317,8 +317,8 @@ SELECT
     m.PROD_TYPE,
     d.IS_PDR,
 
-    d.DT_OPEN,
-    d.DT_CLOSE,
+    d.dt_open,
+    d.dt_close,
     d.MATUR,
     d.RATE,
     m.CONV,
@@ -326,8 +326,7 @@ SELECT
     d.ISFLOAT AS IS_FLOAT,
     d.CUR,
 
-    CAST(d.BALANCE_RUB AS decimal(28,2))
-        AS BALANCE_RUB,
+    b.BALANCE_RUB,
 
     d.MonthlyCONV_RATE,
     d.LIQ_ССВ_Fcast AS SSVRate_Fcast,
@@ -348,27 +347,27 @@ SELECT
         + d.LIQ_ССВ_Fcast
         + d.ALM_OptionRate
         - d.MonthlyCONV_ForecastKeyRate
-    ) AS [Спред внешней ставки к КС (ежемес)],
-
-    d.report_type
+    ) AS [Спред внешней ставки к КС (ежемес)]
 
 INTO #ul_export
 
-FROM #ul_deals d
+FROM #ul_balances b
+
+INNER JOIN #ul_dep d
+    ON d.CON_ID = b.CON_ID
 
 LEFT JOIN #ul_meta m
-    ON m.CON_ID = d.CON_ID;
+    ON m.CON_ID = b.CON_ID;
 
-CREATE INDEX IX_ul_export
+CREATE CLUSTERED INDEX IX_ul_export
 ON #ul_export (report_type, [Дата отчета], CON_ID);
 
 
 /* ============================================================
-   РЕЗУЛЬТАТ 1.
-   НОВЫЕ ПРИВЛЕЧЕНИЯ 01–07.11.2026
+   РЕЗУЛЬТАТ 1. НОВЫЕ ПРИВЛЕЧЕНИЯ
 
-   Только рабочие дни по календарю.
-   BALANCE_RUB — остаток на дату открытия.
+   01–07.11.2026, только рабочие дни.
+   Остаток на дату открытия.
    ============================================================ */
 
 SELECT
@@ -380,8 +379,8 @@ SELECT
     ISDOMRF,
     PROD_TYPE,
     IS_PDR,
-    DT_OPEN,
-    DT_CLOSE,
+    dt_open,
+    dt_close,
     MATUR,
     RATE,
     CONV,
@@ -402,8 +401,7 @@ ORDER BY [Дата отчета], CON_ID;
 
 
 /* ============================================================
-   РЕЗУЛЬТАТЫ 2–8.
-   СЕМЬ БАЛАНСОВЫХ СРЕЗОВ
+   РЕЗУЛЬТАТЫ 2–8. СЕМЬ ЕЖЕДНЕВНЫХ СРЕЗОВ
 
    01.11.2026
    02.11.2026
@@ -412,6 +410,8 @@ ORDER BY [Дата отчета], CON_ID;
    05.11.2026
    06.11.2026
    07.11.2026
+
+   Здесь только чтение маленькой #ul_export.
    ============================================================ */
 
 DECLARE @Day date = @Dt_start;
@@ -428,8 +428,8 @@ BEGIN
         ISDOMRF,
         PROD_TYPE,
         IS_PDR,
-        DT_OPEN,
-        DT_CLOSE,
+        dt_open,
+        dt_close,
         MATUR,
         RATE,
         CONV,
