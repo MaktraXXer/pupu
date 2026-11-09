@@ -13,11 +13,11 @@ DECLARE @DateTo   date = CAST(DATEADD(day, -2, GETDATE()) AS date);
         SegmentSharePct,
         ClientRate,
         PartialNewMoneyVolume
-    FROM ALM_TEST.reports.fn_NewAttractionVolumes_forDimaPRIVATE_v1(
+    FROM ALM_TEST.reports.[fn_NewAttractionVolumes_forDimaMASS_v1.6](
         @DateTo,
         @DateFrom,
         @DateTo,
-        1
+        0
     )
 ),
 
@@ -26,20 +26,24 @@ mapped AS (
         Bucket,
 
         CASE
-            WHEN Segment = N'Базовая ставка или ниже'
+            WHEN Segment = N'Остальные вклады'
                 THEN N'Базовая ставка'
 
-            WHEN Segment = N'Выше базовой ставки'
-                THEN N'Индивидуальные согласования'
-
-            WHEN Segment = N'Промоставка на действующие деньги'
+            WHEN Segment IN (
+                N'Автоматический механизм удержания',
+                N'Другие вклады со ставкой новых денег',
+                N'Новые деньги без справочника'
+            )
                 THEN N'Удержание'
 
             WHEN Segment IN (
-                N'Новые деньги',
-                N'Частично новые деньги'
+                N'Частично новые деньги',
+                N'Новые деньги'
             )
                 THEN N'Новые деньги'
+
+            WHEN Segment = N'Вклады ПНС и МПЛ'
+                THEN N'Пенсионеры и Маркетплейсы'
 
             ELSE Segment
         END AS Segment,
