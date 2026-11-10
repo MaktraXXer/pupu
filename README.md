@@ -1,5 +1,3 @@
-За основу берём фактический ОСЗ ипотечных кредитов на отчётную дату и моделируем его дальнейшую амортизацию по аннуитетному графику на оставшийся срок до плановой даты закрытия, без восстановления графика от даты первоначальной выдачи и при нулевых досрочных погашениях. Процентные платежи рассчитываем исключительно по текущей клиентской ставке (`rate_int`), без учёта субсидий; в дату закрытия предполагаем полное погашение оставшегося ОСЗ.
-
 
 USE ALM;
 SET NOCOUNT ON;
@@ -17,7 +15,7 @@ DROP TABLE IF EXISTS #calendar;
 
 
 /* 1. Исходный ипотечный портфель.
-   Берем фактический ОСЗ, клиентскую и трансфертную ставки.
+   Берем фактический ОСЗ и клиентскую ставку.
    Делим портфель только по IS_FLOATRATE из баланса. */
 
 SELECT
@@ -30,7 +28,6 @@ SELECT
     CAST(t.DT_CLOSE AS date) AS dt_close_d,
     ABS(CAST(t.OUT_RUB AS float)) AS out_rub,
     CAST(t.RATE_CON AS float) AS rate_int,
-    CAST(t.RATE_TRF AS float) AS rate_trf,
 
     DATEDIFF(
         month,
@@ -166,7 +163,6 @@ SELECT
     is_floatrate,
     out_rub,
     rate_int,
-    rate_trf,
     dt_close_d,
     n_payments,
     i_month,
@@ -213,8 +209,8 @@ ON #numbers (n);
 
    В DT_CLOSE погашаем весь оставшийся ОСЗ.
    Погашение тела не может превышать текущий ОСЗ.
-   Если RATE_CON отсутствует, досрочную плановую
-   амортизацию не моделируем — только выход в DT_CLOSE. */
+   Если RATE_CON отсутствует, плановую амортизацию
+   не моделируем — только погашение в DT_CLOSE. */
 
 ;WITH schedule AS (
     SELECT
@@ -322,7 +318,6 @@ SELECT
     is_floatrate,
     payment_date AS d,
     rate_int,
-    rate_trf,
 
     CAST(principal_payment AS decimal(28,6))
         AS principal_payment,
@@ -341,8 +336,8 @@ ON #payments (is_floatrate, d);
 
 
 /* 5. Суммируем погашения и проценты по датам и IS_FLOATRATE.
-   Для последующего средневзвешивания ставок сохраняем
-   сумму погашений, умноженных на ставки. */
+   Для пересчета средневзвешенной клиентской ставки
+   сохраняем погашения, умноженные на RATE_CON. */
 
 SELECT
     is_floatrate,
@@ -361,19 +356,7 @@ SELECT
         WHEN rate_int IS NOT NULL
             THEN principal_payment
         ELSE 0
-    END) AS principal_int_den,
-
-    SUM(CASE
-        WHEN rate_trf IS NOT NULL
-            THEN principal_payment * rate_trf
-        ELSE 0
-    END) AS principal_trf_num,
-
-    SUM(CASE
-        WHEN rate_trf IS NOT NULL
-            THEN principal_payment
-        ELSE 0
-    END) AS principal_trf_den
+    END) AS principal_int_den
 
 INTO #daily_payments
 
@@ -385,7 +368,7 @@ CREATE UNIQUE CLUSTERED INDEX IX_daily_payments
 ON #daily_payments (is_floatrate, d);
 
 
-/* 6. Исходные ОСЗ и средневзвешенные ставки портфеля. */
+/* 6. Исходный ОСЗ и средневзвешенная клиентская ставка. */
 
 SELECT
     is_floatrate,
@@ -402,19 +385,7 @@ SELECT
         WHEN rate_int IS NOT NULL
             THEN out_rub
         ELSE 0
-    END) AS init_int_den,
-
-    SUM(CASE
-        WHEN rate_trf IS NOT NULL
-            THEN out_rub * rate_trf
-        ELSE 0
-    END) AS init_trf_num,
-
-    SUM(CASE
-        WHEN rate_trf IS NOT NULL
-            THEN out_rub
-        ELSE 0
-    END) AS init_trf_den
+    END) AS init_int_den
 
 INTO #init
 
@@ -450,7 +421,7 @@ ON #calendar (d);
 /* 8. Считаем подневной ОСЗ.
    Вычитаем накопленные погашения тела.
    Проценты не уменьшают ОСЗ.
-   Ставки взвешиваем по оставшемуся ОСЗ.
+   Клиентскую ставку взвешиваем по оставшемуся ОСЗ.
    В даты без платежей выплата процентов равна нулю. */
 
 ;WITH grid AS (
@@ -461,19 +432,21 @@ ON #calendar (d);
         i.init_out,
         i.init_int_num,
         i.init_int_den,
-        i.init_trf_num,
-        i.init_trf_den,
 
-        ISNULL(p.principal_payment, 0) AS principal_payment,
-        ISNULL(p.interest_payment, 0) AS interest_payment,
+        ISNULL(p.principal_payment, 0)
+            AS principal_payment,
 
-        ISNULL(p.principal_int_num, 0) AS principal_int_num,
-        ISNULL(p.principal_int_den, 0) AS principal_int_den,
+        ISNULL(p.interest_payment, 0)
+            AS interest_payment,
 
-        ISNULL(p.principal_trf_num, 0) AS principal_trf_num,
-        ISNULL(p.principal_trf_den, 0) AS principal_trf_den
+        ISNULL(p.principal_int_num, 0)
+            AS principal_int_num,
+
+        ISNULL(p.principal_int_den, 0)
+            AS principal_int_den
 
     FROM #init i
+
     CROSS JOIN #calendar c
 
     LEFT JOIN #daily_payments p
@@ -501,24 +474,12 @@ cumulative AS (
             PARTITION BY is_floatrate
             ORDER BY d
             ROWS UNBOUNDED PRECEDING
-        ) AS cum_int_den,
-
-        SUM(principal_trf_num) OVER (
-            PARTITION BY is_floatrate
-            ORDER BY d
-            ROWS UNBOUNDED PRECEDING
-        ) AS cum_trf_num,
-
-        SUM(principal_trf_den) OVER (
-            PARTITION BY is_floatrate
-            ORDER BY d
-            ROWS UNBOUNDED PRECEDING
-        ) AS cum_trf_den
+        ) AS cum_int_den
 
     FROM grid g
 )
 
-/* Результат: один сценарий, только группировка IS_FLOATRATE. */
+/* Результат: один сценарий, группировка только IS_FLOATRATE. */
 
 SELECT
     d AS [date],
@@ -539,16 +500,14 @@ SELECT
     ) AS rate_int_srvz,
 
     CAST(
-        (init_trf_num - cum_trf_num)
-        / NULLIF(init_trf_den - cum_trf_den, 0)
-        AS decimal(12,6)
-    ) AS rate_trf_srvz,
+        interest_payment
+        AS decimal(28,2)
+    ) AS interest_payment,
 
-    CAST(interest_payment AS decimal(28,2))
-        AS interest_payment,
-
-    CAST(principal_payment AS decimal(28,2))
-        AS principal_payment,
+    CAST(
+        principal_payment
+        AS decimal(28,2)
+    ) AS principal_payment,
 
     CAST(
         interest_payment + principal_payment
