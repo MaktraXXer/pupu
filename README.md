@@ -14,9 +14,8 @@ DROP TABLE IF EXISTS #init;
 DROP TABLE IF EXISTS #calendar;
 
 
-/* 1. Исходный ипотечный портфель.
-   Берем фактический ОСЗ и клиентскую ставку.
-   Делим портфель только по IS_FLOATRATE из баланса. */
+/* 1. Берём фактический ОСЗ на дату среза.
+   Группировка только по IS_FLOATRATE. */
 
 SELECT
     ROW_NUMBER() OVER (
@@ -24,25 +23,18 @@ SELECT
     ) AS loan_id,
 
     ISNULL(TRY_CAST(t.IS_FLOATRATE AS int), 0) AS is_floatrate,
-
     CAST(t.DT_CLOSE AS date) AS dt_close_d,
     ABS(CAST(t.OUT_RUB AS float)) AS out_rub,
     CAST(t.RATE_CON AS float) AS rate_int,
 
-    DATEDIFF(
-        month,
-        @dt_rep,
-        CAST(t.DT_CLOSE AS date)
-    )
+    DATEDIFF(month, @dt_rep, CAST(t.DT_CLOSE AS date))
     + CASE
         WHEN @dt_rep < EOMONTH(@dt_rep) THEN 1
         ELSE 0
-    END AS n_payments
+      END AS n_payments
 
 INTO #base
-
 FROM ALM.ALM.balance_rest_all t WITH (NOLOCK)
-
 WHERE t.DT_REP = @dt_rep
   AND t.BLOCK_NAME = N'Кредиты ФЛ'
   AND t.SECTION_NAME = N'Ипотека'
@@ -62,14 +54,11 @@ IF EXISTS (
     THROW 50001, 'RATE_CON должна быть в долях единицы', 1;
 
 
-/* 2. Рассчитываем аннуитет для каждой ипотеки.
-   За основу берем фактический ОСЗ на @dt_rep.
-   Первый процентный период — от @dt_rep до первого платежа.
-   Обычные месяцы — RATE_CON / 12.
-   Последний неполный месяц — пропорционально дням.
+/* 2. Рассчитываем аннуитет от текущего ОСЗ
+   на оставшийся срок до DT_CLOSE.
 
-   Аннуитет рассчитывается на весь оставшийся срок,
-   даже если дата закрытия позже @d_end. */
+   Первый и последний неполные периоды учитываем
+   по дням, обычные месяцы — RATE_CON / 12. */
 
 DECLARE @FirstMonthOffset int =
     CASE
@@ -119,12 +108,10 @@ DECLARE @FirstMonthOffset int =
 factors AS (
     SELECT
         p.*,
-
         POWER(
             1.0 + p.i_month,
             -CAST(p.n_payments - 2 AS float)
         ) AS q
-
     FROM periods p
 ),
 
@@ -141,7 +128,6 @@ pv AS (
                 *
                 (
                     1.0
-
                     + CASE
                         WHEN f.n_payments <= 2 THEN 0.0
 
@@ -150,7 +136,6 @@ pv AS (
 
                         ELSE (1.0 - f.q) / f.i_month
                       END
-
                     + f.q / (1.0 + f.i_last)
                 )
         END AS pv_factor
@@ -175,15 +160,13 @@ SELECT
     END AS annuity_payment
 
 INTO #model
-
 FROM pv;
 
 CREATE UNIQUE CLUSTERED INDEX IX_model
 ON #model (loan_id);
 
 
-/* 3. Создаем номера будущих платежей.
-   Считаем только платежи до конца прогнозного горизонта. */
+/* 3. Создаём номера платежей до конца горизонта. */
 
 DECLARE @ProjectedMonths int =
     DATEDIFF(month, @dt_rep, @d_end) + 2;
@@ -195,7 +178,6 @@ SELECT TOP (@ProjectedMonths)
     ) AS n
 
 INTO #numbers
-
 FROM sys.all_objects a
 CROSS JOIN sys.all_objects b;
 
@@ -203,14 +185,10 @@ CREATE UNIQUE CLUSTERED INDEX IX_numbers
 ON #numbers (n);
 
 
-/* 4. Строим платежи.
-   Проценты = ОСЗ перед платежом * ставка за период.
+/* 4. Моделируем ежемесячные платежи.
+   Проценты = ОСЗ до платежа * ставка за период.
    Погашение тела = аннуитет - проценты.
-
-   В DT_CLOSE погашаем весь оставшийся ОСЗ.
-   Погашение тела не может превышать текущий ОСЗ.
-   Если RATE_CON отсутствует, плановую амортизацию
-   не моделируем — только погашение в DT_CLOSE. */
+   В DT_CLOSE погашаем весь оставшийся долг. */
 
 ;WITH schedule AS (
     SELECT
@@ -220,7 +198,6 @@ ON #numbers (n);
         CASE
             WHEN n.n = m.n_payments - 1
                 THEN m.dt_close_d
-
             ELSE EOMONTH(
                 @dt_rep,
                 @FirstMonthOffset + n.n
@@ -234,7 +211,6 @@ ON #numbers (n);
         END AS period_rate
 
     FROM #model m
-
     INNER JOIN #numbers n
         ON n.n < m.n_payments
 ),
@@ -257,7 +233,6 @@ previous_balance AS (
                 * CASE
                     WHEN ABS(p.i_month) < 0.000000000001
                         THEN CAST(p.n - 1 AS float)
-
                     ELSE
                         (
                             POWER(1.0 + p.i_month, p.n - 1)
@@ -273,22 +248,18 @@ previous_balance AS (
 balances AS (
     SELECT
         p.*,
-
         CASE
             WHEN p.balance_before_raw < 0 THEN 0.0
             ELSE p.balance_before_raw
         END AS balance_before
-
     FROM previous_balance p
 ),
 
 interest_calc AS (
     SELECT
         b.*,
-
         b.balance_before * b.period_rate
             AS interest_payment
-
     FROM balances b
 ),
 
@@ -326,18 +297,15 @@ SELECT
         AS interest_payment
 
 INTO #payments
-
 FROM payments
-
 OPTION (MAXDOP 2, RECOMPILE);
 
 CREATE CLUSTERED INDEX IX_payments
 ON #payments (is_floatrate, d);
 
 
-/* 5. Суммируем погашения и проценты по датам и IS_FLOATRATE.
-   Для пересчета средневзвешенной клиентской ставки
-   сохраняем погашения, умноженные на RATE_CON. */
+/* 5. Агрегируем платежи по датам и IS_FLOATRATE.
+   Сохраняем веса для пересчёта клиентской ставки. */
 
 SELECT
     is_floatrate,
@@ -359,20 +327,17 @@ SELECT
     END) AS principal_int_den
 
 INTO #daily_payments
-
 FROM #payments
-
 GROUP BY is_floatrate, d;
 
 CREATE UNIQUE CLUSTERED INDEX IX_daily_payments
 ON #daily_payments (is_floatrate, d);
 
 
-/* 6. Исходный ОСЗ и средневзвешенная клиентская ставка. */
+/* 6. Исходные ОСЗ и средневзвешенные ставки. */
 
 SELECT
     is_floatrate,
-
     SUM(out_rub) AS init_out,
 
     SUM(CASE
@@ -388,16 +353,15 @@ SELECT
     END) AS init_int_den
 
 INTO #init
-
 FROM #base
-
 GROUP BY is_floatrate;
 
 CREATE UNIQUE CLUSTERED INDEX IX_init
 ON #init (is_floatrate);
 
 
-/* 7. Подневной календарь прогноза. */
+/* 7. Подневной календарь строго с @dt_rep.
+   На первый день приходится исходный фактический ОСЗ. */
 
 SELECT TOP (DATEDIFF(day, @dt_rep, @d_end) + 1)
     DATEADD(
@@ -406,11 +370,10 @@ SELECT TOP (DATEDIFF(day, @dt_rep, @d_end) + 1)
             ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1
             AS int
         ),
-        DATEADD(day, -1, @dt_rep)
+        @dt_rep
     ) AS d
 
 INTO #calendar
-
 FROM sys.all_objects a
 CROSS JOIN sys.all_objects b;
 
@@ -418,11 +381,10 @@ CREATE UNIQUE CLUSTERED INDEX IX_calendar
 ON #calendar (d);
 
 
-/* 8. Считаем подневной ОСЗ.
+/* 8. Прогнозируем подневной ОСЗ.
    Вычитаем накопленные погашения тела.
    Проценты не уменьшают ОСЗ.
-   Клиентскую ставку взвешиваем по оставшемуся ОСЗ.
-   В даты без платежей выплата процентов равна нулю. */
+   Ставку взвешиваем по оставшемуся долгу. */
 
 ;WITH grid AS (
     SELECT
@@ -446,7 +408,6 @@ ON #calendar (d);
             AS principal_int_den
 
     FROM #init i
-
     CROSS JOIN #calendar c
 
     LEFT JOIN #daily_payments p
@@ -479,7 +440,7 @@ cumulative AS (
     FROM grid g
 )
 
-/* Результат: один сценарий, группировка только IS_FLOATRATE. */
+/* Итог: один сценарий, группировка по IS_FLOATRATE. */
 
 SELECT
     d AS [date],
@@ -499,15 +460,11 @@ SELECT
         AS decimal(12,6)
     ) AS rate_int_srvz,
 
-    CAST(
-        interest_payment
-        AS decimal(28,2)
-    ) AS interest_payment,
+    CAST(interest_payment AS decimal(28,2))
+        AS interest_payment,
 
-    CAST(
-        principal_payment
-        AS decimal(28,2)
-    ) AS principal_payment,
+    CAST(principal_payment AS decimal(28,2))
+        AS principal_payment,
 
     CAST(
         interest_payment + principal_payment
@@ -515,6 +472,5 @@ SELECT
     ) AS total_payment
 
 FROM cumulative
-
 ORDER BY d, is_floatrate
 OPTION (RECOMPILE);
