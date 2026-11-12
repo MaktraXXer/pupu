@@ -16,8 +16,8 @@ DROP TABLE IF EXISTS #attrs;
 DROP TABLE IF EXISTS #tagged;
 
 
-/* 1. Клиенты, имеющие на 10.11 вклад под 15%
-   сроком 45–70 дней, открытый с 20 октября. */
+/* 1. Клиенты, открывшие вклад под 15% на 45–70 дней.
+   Клиент должен иметь положительный остаток на 10 ноября. */
 
 SELECT DISTINCT
     t.CLI_ID
@@ -45,8 +45,8 @@ CREATE UNIQUE CLUSTERED INDEX IX_clients
 ON #clients (CLI_ID);
 
 
-/* 2. Посделочный баланс только за 19.10 и 10.11.
-   Нужен для анализа источников и новых размещений. */
+/* 2. Посделочный баланс целевых клиентов
+   только за 19 октября и 10 ноября. */
 
 SELECT
     CAST(t.dt_rep AS date) AS dt_rep,
@@ -94,12 +94,9 @@ CREATE CLUSTERED INDEX IX_snap
 ON #snap (dt_rep, CLI_ID);
 
 
-/* 3. Подневные остатки.
-   Историю сразу агрегируем, без хранения
-   всех посделочных строк за 71 день.
-
-   Даты 19.10 и 10.11 берем из #snap,
-   чтобы посделочные суммы совпадали с агрегатами. */
+/* 3. Подневные остатки с 1 сентября по 10 ноября.
+   Историю сразу агрегируем, не сохраняя все договоры.
+   Даты 19 октября и 10 ноября берем из #snap. */
 
 ;WITH calendar AS (
     SELECT @dt_from AS dt_rep
@@ -134,7 +131,6 @@ balances AS (
 
     WHERE t.dt_rep >= @dt_from
       AND t.dt_rep < DATEADD(day, 1, @dt_to)
-
       AND t.dt_rep NOT IN (@dt_before, @dt_to)
 
       AND t.block_name = N'Привлечение ФЛ'
@@ -193,11 +189,9 @@ CREATE UNIQUE CLUSTERED INDEX IX_daily
 ON #daily (dt_rep);
 
 
-/* 4. Выходящие вклады и новые открытия.
-   Все объемы берутся непосредственно из #snap.
-
-   EXIT: на 19.10, закрытие 20.10–10.11.
-   OPEN: на 10.11, открытие 20.10–10.11. */
+/* 4. Вклады к закрытию и новые открытия.
+   EXIT — остаток на 19.10, закрытие 20.10–10.11.
+   OPEN — остаток на 10.11, открытие 20.10–10.11. */
 
 SELECT
     CAST('EXIT' AS varchar(4)) AS deal_type,
@@ -228,6 +222,7 @@ HAVING SUM(out_rub) > 0;
 
 
 INSERT INTO #deals
+
 SELECT
     'OPEN',
     CLI_ID,
@@ -264,8 +259,7 @@ CREATE INDEX IX_deals
 ON #deals (CLI_ID, deal_type);
 
 
-/* 5. Накопительные счета на 19 октября.
-   Все НС, без ограничений по датам открытия. */
+/* 5. Все накопительные счета на 19 октября. */
 
 SELECT
     CLI_ID,
@@ -290,12 +284,12 @@ CREATE INDEX IX_ns19
 ON #ns19 (CLI_ID);
 
 
-/* 6. Надбавки для выбранных договоров.
-   Берем последнюю запись каждого CON_ID.
-   Отсутствие надбавок не исключает договор. */
+/* 6. Последние надбавки по нужным договорам.
+   ПК3 читается ровно один раз.
+   КП3 нигде не используется. */
 
 SELECT
-    x.CON_ID,
+    i.CON_ID,
 
     ISNULL(TRY_CAST(a.[Нов] AS int), 0) AS nov,
     ISNULL(TRY_CAST(a.[НДП] AS int), 0) AS ndp,
@@ -304,7 +298,6 @@ SELECT
     ISNULL(TRY_CAST(a.[ПК3] AS int), 0) AS pk3,
     ISNULL(TRY_CAST(a.[ОТ1] AS int), 0) AS ot1,
 
-    ISNULL(TRY_CAST(a.[КП3] AS int), 0) AS kp3,
     ISNULL(TRY_CAST(a.[ПК6] AS int), 0) AS pk6,
     ISNULL(TRY_CAST(a.[ПК7] AS int), 0) AS pk7
 
@@ -314,26 +307,25 @@ FROM (
     SELECT DISTINCT CON_ID
     FROM #deals
     WHERE CON_ID IS NOT NULL
-) x
+) i
 
 OUTER APPLY (
     SELECT TOP (1)
-        a.[Нов],
-        a.[НДП],
-        a.[НДМ],
-        a.[ПК3],
-        a.[ОТ1],
-        a.[КП3],
-        a.[ПК6],
-        a.[ПК7]
+        x.[Нов],
+        x.[НДП],
+        x.[НДМ],
+        x.[ПК3],
+        x.[ОТ1],
+        x.[ПК6],
+        x.[ПК7]
 
-    FROM ALM.ehd.attr_DepoFLConditions a WITH (NOLOCK)
+    FROM ALM.ehd.attr_DepoFLConditions x WITH (NOLOCK)
 
-    WHERE a.CON_ID = CONVERT(varchar(30), x.CON_ID)
+    WHERE x.CON_ID = CONVERT(varchar(30), i.CON_ID)
 
     ORDER BY
-        a.DT_UPDATE DESC,
-        a.loaddate DESC
+        x.DT_UPDATE DESC,
+        x.loaddate DESC
 ) a;
 
 CREATE UNIQUE CLUSTERED INDEX IX_attrs
@@ -341,8 +333,12 @@ ON #attrs (CON_ID);
 
 
 /* 7. Категории надбавок.
-   Приоритет: новые деньги, удержание, CRM.
-   Каждый договор учитывается ровно один раз. */
+   Новые деньги: Нов / НДП / НДМ.
+   Удержание: ПК3 / ОТ1.
+   CRM: ПК3 / ПК6 / ПК7.
+
+   Приоритет: новые деньги -> удержание -> CRM.
+   Каждый договор учитывается в одной категории. */
 
 SELECT
     d.*,
@@ -354,18 +350,22 @@ SELECT
     ISNULL(a.pk3, 0) AS pk3,
     ISNULL(a.ot1, 0) AS ot1,
 
-    ISNULL(a.kp3, 0) AS kp3,
     ISNULL(a.pk6, 0) AS pk6,
     ISNULL(a.pk7, 0) AS pk7,
 
     CASE
-        WHEN a.nov = 1 OR a.ndp = 1 OR a.ndm = 1
+        WHEN a.nov = 1
+          OR a.ndp = 1
+          OR a.ndm = 1
             THEN N'Новые деньги'
 
-        WHEN a.pk3 = 1 OR a.ot1 = 1
+        WHEN a.pk3 = 1
+          OR a.ot1 = 1
             THEN N'Удержание'
 
-        WHEN a.kp3 = 1 OR a.pk6 = 1 OR a.pk7 = 1
+        WHEN a.pk3 = 1
+          OR a.pk6 = 1
+          OR a.pk7 = 1
             THEN N'CRM'
 
         ELSE N'Остальные'
@@ -382,7 +382,7 @@ CREATE INDEX IX_tagged
 ON #tagged (deal_type, CLI_ID);
 
 
-/* РЕЗУЛЬТАТ 1. Остатки 01.09–19.10 */
+/* РЕЗУЛЬТАТ 1. Подневные остатки до 19 октября. */
 
 SELECT
     dt_rep,
@@ -395,7 +395,7 @@ WHERE dt_rep <= @dt_before
 ORDER BY dt_rep;
 
 
-/* РЕЗУЛЬТАТ 2. Остатки 01.09–10.11 */
+/* РЕЗУЛЬТАТ 2. Подневные остатки до 10 ноября. */
 
 SELECT
     dt_rep,
@@ -407,7 +407,7 @@ FROM #daily
 ORDER BY dt_rep;
 
 
-/* РЕЗУЛЬТАТ 3. Вклады к закрытию на 19.10 */
+/* РЕЗУЛЬТАТ 3. Посделочно: вклады к закрытию на 19.10. */
 
 SELECT
     CLI_ID,
@@ -426,7 +426,6 @@ SELECT
     ndm AS [НДМ],
     pk3 AS [ПК3],
     ot1 AS [ОТ1],
-    kp3 AS [КП3],
     pk6 AS [ПК6],
     pk7 AS [ПК7],
 
@@ -437,14 +436,14 @@ WHERE deal_type = 'EXIT'
 ORDER BY dt_close, CLI_ID, CON_ID;
 
 
-/* РЕЗУЛЬТАТ 4. Все НС на 19.10 */
+/* РЕЗУЛЬТАТ 4. Все НС на 19 октября. */
 
 SELECT *
 FROM #ns19
 ORDER BY CLI_ID, CON_ID;
 
 
-/* РЕЗУЛЬТАТ 5. Поклиентные источники на 19.10 */
+/* РЕЗУЛЬТАТ 5. Поклиентная витрина источников на 19.10. */
 
 ;WITH exits AS (
     SELECT
@@ -455,16 +454,19 @@ ORDER BY CLI_ID, CON_ID;
 
         SUM(CASE WHEN category = N'Новые деньги'
             THEN 1 ELSE 0 END) AS exit_new_money_count,
+
         SUM(CASE WHEN category = N'Новые деньги'
             THEN out_rub ELSE 0 END) AS exit_new_money_sum,
 
         SUM(CASE WHEN category = N'Удержание'
             THEN 1 ELSE 0 END) AS exit_retention_count,
+
         SUM(CASE WHEN category = N'Удержание'
             THEN out_rub ELSE 0 END) AS exit_retention_sum,
 
         SUM(CASE WHEN category = N'CRM'
             THEN 1 ELSE 0 END) AS exit_crm_count,
+
         SUM(CASE WHEN category = N'CRM'
             THEN out_rub ELSE 0 END) AS exit_crm_sum
 
@@ -492,16 +494,19 @@ SELECT
 
     ISNULL(e.exit_new_money_count, 0)
         AS exit_new_money_count,
+
     ISNULL(e.exit_new_money_sum, 0)
         AS exit_new_money_sum,
 
     ISNULL(e.exit_retention_count, 0)
         AS exit_retention_count,
+
     ISNULL(e.exit_retention_sum, 0)
         AS exit_retention_sum,
 
     ISNULL(e.exit_crm_count, 0)
         AS exit_crm_count,
+
     ISNULL(e.exit_crm_sum, 0)
         AS exit_crm_sum,
 
@@ -511,12 +516,17 @@ SELECT
     ISNULL(n.ns_sum, 0) AS ns_sum
 
 FROM #clients c
-LEFT JOIN exits e ON e.CLI_ID = c.CLI_ID
-LEFT JOIN ns n ON n.CLI_ID = c.CLI_ID
+
+LEFT JOIN exits e
+    ON e.CLI_ID = c.CLI_ID
+
+LEFT JOIN ns n
+    ON n.CLI_ID = c.CLI_ID
+
 ORDER BY c.CLI_ID;
 
 
-/* РЕЗУЛЬТАТ 6. Поклиентные размещения на 10.11 */
+/* РЕЗУЛЬТАТ 6. Поклиентные размещения на 10.11. */
 
 ;WITH opened AS (
     SELECT
@@ -527,26 +537,31 @@ ORDER BY c.CLI_ID;
 
         SUM(CASE WHEN is_15 = 1
             THEN 1 ELSE 0 END) AS opened_15_count,
+
         SUM(CASE WHEN is_15 = 1
             THEN out_rub ELSE 0 END) AS opened_15_sum,
 
         SUM(CASE WHEN is_15 = 0
             THEN 1 ELSE 0 END) AS opened_other_count,
+
         SUM(CASE WHEN is_15 = 0
             THEN out_rub ELSE 0 END) AS opened_other_sum,
 
         SUM(CASE WHEN category = N'Новые деньги'
             THEN 1 ELSE 0 END) AS opened_new_money_count,
+
         SUM(CASE WHEN category = N'Новые деньги'
             THEN out_rub ELSE 0 END) AS opened_new_money_sum,
 
         SUM(CASE WHEN category = N'Удержание'
             THEN 1 ELSE 0 END) AS opened_retention_count,
+
         SUM(CASE WHEN category = N'Удержание'
             THEN out_rub ELSE 0 END) AS opened_retention_sum,
 
         SUM(CASE WHEN category = N'CRM'
             THEN 1 ELSE 0 END) AS opened_crm_count,
+
         SUM(CASE WHEN category = N'CRM'
             THEN out_rub ELSE 0 END) AS opened_crm_sum
 
@@ -579,16 +594,19 @@ SELECT
 
     ISNULL(o.opened_new_money_count, 0)
         AS opened_new_money_count,
+
     ISNULL(o.opened_new_money_sum, 0)
         AS opened_new_money_sum,
 
     ISNULL(o.opened_retention_count, 0)
         AS opened_retention_count,
+
     ISNULL(o.opened_retention_sum, 0)
         AS opened_retention_sum,
 
     ISNULL(o.opened_crm_count, 0)
         AS opened_crm_count,
+
     ISNULL(o.opened_crm_sum, 0)
         AS opened_crm_sum,
 
@@ -598,12 +616,17 @@ SELECT
     ISNULL(n.ns_sum, 0) AS ns_sum
 
 FROM #clients c
-LEFT JOIN opened o ON o.CLI_ID = c.CLI_ID
-LEFT JOIN ns n ON n.CLI_ID = c.CLI_ID
+
+LEFT JOIN opened o
+    ON o.CLI_ID = c.CLI_ID
+
+LEFT JOIN ns n
+    ON n.CLI_ID = c.CLI_ID
+
 ORDER BY c.CLI_ID;
 
 
-/* РЕЗУЛЬТАТ 7. Контроль сумм */
+/* РЕЗУЛЬТАТ 7. Контроль сумм. */
 
 ;WITH checks AS (
     SELECT
@@ -613,13 +636,12 @@ ORDER BY c.CLI_ID;
          FROM #snap
          WHERE dt_rep = @dt_before
            AND section_name = N'Срочные'
-           AND dt_close BETWEEN @dt_promo AND @dt_to)
-        AS source_rub,
+           AND dt_close BETWEEN @dt_promo AND @dt_to
+           AND out_rub > 0) AS source_rub,
 
         (SELECT ISNULL(SUM(out_rub), 0)
          FROM #tagged
-         WHERE deal_type = 'EXIT')
-        AS detail_rub
+         WHERE deal_type = 'EXIT') AS detail_rub
 
     UNION ALL
 
@@ -643,7 +665,8 @@ ORDER BY c.CLI_ID;
          FROM #snap
          WHERE dt_rep = @dt_to
            AND section_name = N'Срочные'
-           AND dt_open BETWEEN @dt_promo AND @dt_to),
+           AND dt_open BETWEEN @dt_promo AND @dt_to
+           AND out_rub > 0),
 
         (SELECT ISNULL(SUM(out_rub), 0)
          FROM #tagged
@@ -681,4 +704,5 @@ SELECT
     source_rub,
     detail_rub,
     detail_rub - source_rub AS difference_rub
+
 FROM checks;
