@@ -9,6 +9,8 @@ params AS (
 enriched AS (
     SELECT
         cpr.payment_period,
+        cpr.agg_prod_name,
+        cpr.dt_open_fact,
         cpr.od_after_plan,
         cpr.od,
         cpr.premat_payment,
@@ -18,23 +20,15 @@ enriched AS (
         cpr.age_group_id,
 
         CASE
-            WHEN cpr.agg_prod_name IN (
-                'Семейная ипотека',
-                'ИТ ипотека',
-                'Дальневосточная ипотека',
-                'Льготная ипотека'
-            ) THEN 1
-
-            WHEN cpr.prod_name = 'Первичная ипотека' THEN 4
-            WHEN cpr.prod_name = 'Вторичка' THEN 5
+            WHEN cpr.agg_prod_name = 'Первичная ипотека' THEN 4
+            WHEN cpr.agg_prod_name = 'Вторичка' THEN 5
         END AS product_num,
 
         CASE
-            WHEN cpr.con_rate * 100 < 19.25 THEN
-                FLOOR((cpr.con_rate * 100 + 0.25) / 0.5) + 1
-
-            WHEN cpr.con_rate * 100 < 20 THEN 40
-
+            WHEN cpr.con_rate * 100 < 19.25
+                THEN FLOOR((cpr.con_rate * 100 + 0.25) / 0.5) + 1
+            WHEN cpr.con_rate * 100 < 20
+                THEN 40
             ELSE 41
         END AS bucket_num
 
@@ -44,17 +38,9 @@ enriched AS (
     WHERE cpr.payment_period >= DATE '2026-01-01'
       AND cpr.payment_period < DATE '2026-11-01'
 
-      AND (
-          cpr.agg_prod_name IN (
-              'Семейная ипотека',
-              'ИТ ипотека',
-              'Дальневосточная ипотека',
-              'Льготная ипотека'
-          )
-          OR cpr.prod_name IN (
-              'Первичная ипотека',
-              'Вторичка'
-          )
+      AND cpr.agg_prod_name IN (
+          'Первичная ипотека',
+          'Вторичка'
       )
 
       AND cpr.stimul IS NOT NULL
@@ -99,17 +85,16 @@ bucket_names AS (
     CONNECT BY LEVEL <= 39
 
     UNION ALL
-
     SELECT 40, 'AN. 19.25-20.0%' FROM dual
 
     UNION ALL
-
     SELECT 41, 'AO. 20.0%+' FROM dual
 ),
 
 base_with_model AS (
     SELECT
         e.payment_period,
+        e.agg_prod_name,
         e.product_num,
         e.bucket_num,
         e.od_after_plan,
@@ -140,27 +125,11 @@ base_with_model AS (
 aggregated AS (
     SELECT
         b.payment_period AS dt_rep,
+        b.product_num,
+        b.agg_prod_name,
 
         CASE
-            WHEN GROUPING(b.product_num) = 1
-                THEN 0
-            ELSE b.product_num
-        END AS product_num,
-
-        CASE
-            WHEN GROUPING(b.product_num) = 1
-                THEN 'ВСЕ ПРОДУКТЫ'
-            WHEN b.product_num = 1
-                THEN 'ГОСПРОГРАММЫ'
-            WHEN b.product_num = 4
-                THEN 'Первичная ипотека'
-            WHEN b.product_num = 5
-                THEN 'Вторичка'
-        END AS product_name,
-
-        CASE
-            WHEN GROUPING(b.bucket_num) = 1
-                THEN 0
+            WHEN GROUPING(b.bucket_num) = 1 THEN 0
             ELSE b.bucket_num
         END AS bucket_num,
 
@@ -173,12 +142,7 @@ aggregated AS (
         SUM(b.od_after_plan) AS od_after_plan,
         SUM(b.od) AS od,
         SUM(b.premat_payment) AS premat_fact,
-
-        CASE
-            WHEN COUNT(b.premat_model) < COUNT(*)
-                THEN NULL
-            ELSE SUM(b.premat_model)
-        END AS premat_model,
+        SUM(b.premat_model) AS premat_model,
 
         COUNT(*) - COUNT(b.premat_model)
             AS missing_model_count
@@ -189,17 +153,15 @@ aggregated AS (
         ON b.bucket_num = bn.bucket_num
 
     GROUP BY GROUPING SETS (
-        (b.payment_period, b.product_num, b.bucket_num),
-        (b.payment_period, b.product_num),
-        (b.payment_period, b.bucket_num),
-        (b.payment_period)
+        (b.payment_period, b.product_num, b.agg_prod_name, b.bucket_num),
+        (b.payment_period, b.product_num, b.agg_prod_name)
     )
 )
 
 SELECT
     dt_rep,
     product_num,
-    product_name,
+    agg_prod_name,
     bucket_num,
     bucket_name,
 
@@ -233,9 +195,7 @@ SELECT
             ),
             2
         )
-    END AS cpr_model,
-
-    missing_model_count
+    END AS cpr_model
 
 FROM aggregated
 
