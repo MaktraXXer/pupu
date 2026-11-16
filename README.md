@@ -1,34 +1,22 @@
 
 WITH
 params AS (
-    SELECT
-        0 AS only_opened_2026
-    FROM dual
+    SELECT 0 AS only_opened_2026 FROM dual
 ),
 
 enriched AS (
     SELECT
         cpr.payment_period,
-        cpr.agg_prod_name,
-        cpr.dt_open_fact,
         cpr.od_after_plan,
         cpr.od,
         cpr.premat_payment,
-        cpr.con_rate,
-        cpr.refin_rate,
         cpr.stimul,
         cpr.age_group_id,
 
         CASE
-            WHEN cpr.agg_prod_name = 'Первичная ипотека' THEN 4
-            WHEN cpr.agg_prod_name = 'Вторичка' THEN 5
-        END AS product_num,
-
-        CASE
             WHEN cpr.con_rate * 100 < 19.25
                 THEN FLOOR((cpr.con_rate * 100 + 0.25) / 0.5) + 1
-            WHEN cpr.con_rate * 100 < 20
-                THEN 40
+            WHEN cpr.con_rate * 100 < 20 THEN 40
             ELSE 41
         END AS bucket_num
 
@@ -94,8 +82,6 @@ bucket_names AS (
 base_with_model AS (
     SELECT
         e.payment_period,
-        e.agg_prod_name,
-        e.product_num,
         e.bucket_num,
         e.od_after_plan,
         e.od,
@@ -125,8 +111,6 @@ base_with_model AS (
 aggregated AS (
     SELECT
         b.payment_period AS dt_rep,
-        b.product_num,
-        b.agg_prod_name,
 
         CASE
             WHEN GROUPING(b.bucket_num) = 1 THEN 0
@@ -153,15 +137,13 @@ aggregated AS (
         ON b.bucket_num = bn.bucket_num
 
     GROUP BY GROUPING SETS (
-        (b.payment_period, b.product_num, b.agg_prod_name, b.bucket_num),
-        (b.payment_period, b.product_num, b.agg_prod_name)
+        (b.payment_period, b.bucket_num),
+        (b.payment_period)
     )
 )
 
 SELECT
     dt_rep,
-    product_num,
-    agg_prod_name,
     bucket_num,
     bucket_name,
 
@@ -201,5 +183,4 @@ FROM aggregated
 
 ORDER BY
     dt_rep,
-    product_num,
     bucket_num;
