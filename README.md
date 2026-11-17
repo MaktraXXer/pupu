@@ -1,203 +1,195 @@
+Для 15 000 строк быстрее всего загрузить данные через VBA + ADO пакетными `INSERT` по 500 строк. Получится около 30 обращений к SQL Server вместо 15 000.
 
-USE ALM;
-SET NOCOUNT ON;
+## А) SQL — создать таблицу в ALM_TEST
 
-DECLARE @DateFrom date = '2026-10-01';
-DECLARE @DateTo date = '2026-11-04';
-DECLARE @threshold decimal(18,2) = 200000000;
+Выполни один раз в SSMS:
 
-;WITH base AS (
-    SELECT
-        t.bank_name_main,
-        t.spec_cat,
-        t.transaction_type,
-        t.direction_txt,
-        ISNULL(t.gr_size, N'Без gr_size') AS gr_size,
+```
 
-        t.[распознано_НС] AS amt_ns,
-        t.[распознано_СР] AS amt_sr,
-        t.[Распознано_ДВС] AS amt_dvs,
+USE [ALM_TEST];
 
-        t.[распознано_НС]
-        + t.[распознано_СР]
-        + t.[Распознано_ДВС] AS amt
+IF OBJECT_ID(N'WORK.ClientBuckets', N'U') IS NULL
+BEGIN
+    CREATE TABLE [WORK].[ClientBuckets] (
+        CLI_ID DECIMAL(18,0) NOT NULL,
+        [Бакет] NVARCHAR(100) NOT NULL,
 
-    FROM ALM.ehd.VW_transfers_FL_AGG_tab t WITH (NOLOCK)
+        CONSTRAINT PK_ClientBuckets
+            PRIMARY KEY CLUSTERED (CLI_ID)
+    );
+END;
 
-    WHERE t.dt_rep >= @DateFrom
-      AND t.dt_rep < DATEADD(day, 1, @DateTo)
+```
 
-      AND t.direction_type <> N'Ошибка'
-      AND t.[целевая категория] = 1
-      AND t.transaction_type <> N'Внутренние переводы'
-      AND t.transit_flag = N'Не транзит'
-      AND t.bank_name_main <> N'Без перевода'
-      AND t.cli_biz IN (N'Розница', N'ДЧБО')
-),
+## Б) VBA — быстрая загрузка из Excel
 
-flows AS (
-    SELECT
-        gr_size,
+Исходные данные: столбцы `A:B`, заголовки в первой строке, данные со второй.
 
-        CASE
-            WHEN spec_cat IN ('BR','SR','FU')
-                THEN N'Market'
-            WHEN transaction_type = N'Наличные'
-                THEN N'Наличные'
-            ELSE bank_name_main
-        END AS bank,
+В Excel: `Alt + F11` → `Insert` → `Module` → вставь код.
 
-        CASE
-            WHEN spec_cat IN ('BR','SR','FU') THEN 'market'
-            WHEN transaction_type = N'Наличные' THEN 'cash'
-            ELSE 'bank'
-        END AS bank_type,
+```
 
-        amt_ns,
-        amt_sr,
-        amt_dvs,
+Option Explicit
 
-        CASE
-            WHEN amt IS NOT NULL
-             AND (
-                direction_txt = N'входящие'
-                OR (direction_txt = N'смешанные' AND amt > 0)
-             )
-                THEN 1
-            ELSE 0
-        END AS is_incoming,
+Sub UploadClientBuckets()
 
-        CASE
-            WHEN amt IS NOT NULL
-             AND (
-                direction_txt = N'исходящие'
-                OR (direction_txt = N'смешанные' AND amt < 0)
-             )
-                THEN 1
-            ELSE 0
-        END AS is_outgoing
+    Dim ws As Worksheet
+    Dim cn As Object
+    Dim seen As Object
+    Dim data As Variant
+    Dim lastRow As Long, i As Long
+    Dim cli As String, bucket As String
+    Dim vals As String, sql As String
+    Dim batchCount As Long, totalCount As Long
+    Dim x As Double
+    Dim inTrans As Boolean
+    Dim errText As String
 
-    FROM base
+    On Error GoTo ErrHandler
 
-    WHERE spec_cat NOT IN ('BR','SR','FU')
-       OR (
-            spec_cat IN ('BR','SR','FU')
-            AND transaction_type <> N'Наличные'
-       )
-),
+    Set ws = ActiveSheet
+    lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
 
-/* Сначала агрегируем платежи банка по gr_size.
-   Все три типа распознано пока находятся в одной строке. */
+    If lastRow < 2 Then
+        MsgBox "Нет данных для загрузки"
+        Exit Sub
+    End If
 
-by_bank_gr AS (
-    SELECT
-        bank,
-        bank_type,
-        gr_size,
+    data = ws.Range("A2:B" & lastRow).Value2
+    Set seen = CreateObject("Scripting.Dictionary")
 
-        SUM(CASE WHEN is_incoming = 1
-            THEN amt_ns ELSE 0 END) AS incoming_ns,
+    Set cn = CreateObject("ADODB.Connection")
 
-        SUM(CASE WHEN is_outgoing = 1
-            THEN amt_ns ELSE 0 END) AS outgoing_ns,
+    cn.ConnectionTimeout = 15
+    cn.CommandTimeout = 120
 
-        SUM(CASE WHEN is_incoming = 1
-            THEN amt_sr ELSE 0 END) AS incoming_sr,
+    cn.Open _
+        "Provider=SQLOLEDB;" & _
+        "Data Source=YOUR_SQL_SERVER;" & _
+        "Initial Catalog=ALM_TEST;" & _
+        "Integrated Security=SSPI;"
 
-        SUM(CASE WHEN is_outgoing = 1
-            THEN amt_sr ELSE 0 END) AS outgoing_sr,
+    cn.BeginTrans
+    inTrans = True
 
-        SUM(CASE WHEN is_incoming = 1
-            THEN amt_dvs ELSE 0 END) AS incoming_dvs,
+    ' При повторном запуске заменяем содержимое таблицы
+    cn.Execute "DELETE FROM [WORK].[ClientBuckets]"
 
-        SUM(CASE WHEN is_outgoing = 1
-            THEN amt_dvs ELSE 0 END) AS outgoing_dvs
+    sql = "INSERT INTO [WORK].[ClientBuckets] " & _
+          "(CLI_ID, [Бакет]) VALUES "
 
-    FROM flows
+    For i = 1 To UBound(data, 1)
 
-    GROUP BY
-        bank,
-        bank_type,
-        gr_size
-),
+        If Not IsEmpty(data(i, 1)) Then
 
-/* Считаем полные объемы банка.
-   НЕТ разделения ни по gr_size, ни по типу распознано. */
+            If VarType(data(i, 1)) = vbString Then
+                cli = Trim$(CStr(data(i, 1)))
+            Else
+                x = CDbl(data(i, 1))
 
-bank_totals AS (
-    SELECT
-        g.*,
+                If x <> Fix(x) Or Abs(x) >= 1E+15 Then
+                    Err.Raise 1001, , "Некорректный CLI_ID"
+                End If
 
-        SUM(
-            ISNULL(incoming_ns, 0)
-          + ISNULL(incoming_sr, 0)
-          + ISNULL(incoming_dvs, 0)
-        ) OVER (
-            PARTITION BY bank, bank_type
-        ) AS bank_incoming,
+                cli = Format$(x, "0")
+            End If
 
-        SUM(
-            ISNULL(outgoing_ns, 0)
-          + ISNULL(outgoing_sr, 0)
-          + ISNULL(outgoing_dvs, 0)
-        ) OVER (
-            PARTITION BY bank, bank_type
-        ) AS bank_outgoing
+            If Len(cli) = 0 Or Len(cli) > 18 _
+               Or cli Like "*[!0-9]*" Then
+                Err.Raise 1002, , "Некорректный CLI_ID"
+            End If
 
-    FROM by_bank_gr g
-),
+            bucket = Trim$(CStr(data(i, 2)))
 
-/* Классифицируем банк по общему объему.
-   Только после этого разворачиваем три типа распознано. */
+            If Len(bucket) = 0 Or Len(bucket) > 100 Then
+                Err.Raise 1003, , "Некорректный бакет"
+            End If
 
-classified AS (
-    SELECT
-        g.gr_size,
+            If seen.Exists(cli) Then
+                Err.Raise 1004, , "Повторяющийся CLI_ID: " & cli
+            End If
 
-        CASE
-            WHEN g.bank_type = 'bank'
-             AND ABS(g.bank_incoming) <= @threshold
-             AND ABS(g.bank_outgoing) <= @threshold
-                THEN N'else'
-            ELSE g.bank
-        END AS bank_name_main,
+            seen.Add cli, True
+            bucket = Replace(bucket, "'", "''")
 
-        v.raspoznano_type,
-        v.incoming,
-        v.outgoing
+            If batchCount > 0 Then vals = vals & ","
 
-    FROM bank_totals g
+            vals = vals & "(" & cli & ",N'" & bucket & "')"
 
-    CROSS APPLY (
-        VALUES
-            (N'НС',     g.incoming_ns,  g.outgoing_ns),
-            (N'Вклады', g.incoming_sr,  g.outgoing_sr),
-            (N'ДВС',    g.incoming_dvs, g.outgoing_dvs)
-    ) v(raspoznano_type, incoming, outgoing)
-)
+            batchCount = batchCount + 1
+            totalCount = totalCount + 1
+
+            If batchCount = 500 Then
+                cn.Execute sql & vals
+                vals = ""
+                batchCount = 0
+                Application.StatusBar = _
+                    "Загружено: " & totalCount
+            End If
+
+        End If
+
+    Next i
+
+    If batchCount > 0 Then
+        cn.Execute sql & vals
+    End If
+
+    cn.CommitTrans
+    inTrans = False
+
+    cn.Close
+    Application.StatusBar = False
+
+    MsgBox "Успешно загружено: " & totalCount & _
+           " клиентов в ALM_TEST.WORK.ClientBuckets"
+
+    Exit Sub
+
+ErrHandler:
+
+    errText = Err.Description
+
+    On Error Resume Next
+    If inTrans Then cn.RollbackTrans
+    If Not cn Is Nothing Then cn.Close
+
+    Application.StatusBar = False
+
+    MsgBox "Ошибка на строке Excel " & i + 1 & _
+           ": " & errText, vbCritical
+
+End Sub
+
+```
+
+Обязательно замени `YOUR_SQL_SERVER` на имя SQL-сервера из окна подключения SSMS. VBA использует Windows-аутентификацию.
+
+При каждом запуске макрос очищает таблицу и загружает её заново. Всё выполняется в одной транзакции: при ошибке предыдущие данные таблицы восстанавливаются.
+
+## В) Проверка после загрузки
+
+```
 
 SELECT
-    N'2026 01.10-04.11' AS r_w,
+    COUNT(*) AS clients_count,
+    COUNT(DISTINCT CLI_ID) AS unique_clients
+FROM [ALM_TEST].[WORK].[ClientBuckets];
 
-    bank_name_main,
-    gr_size,
-    raspoznano_type,
+SELECT TOP (20)
+    CLI_ID,
+    [Бакет]
+FROM [ALM_TEST].[WORK].[ClientBuckets];
 
-    SUM(incoming) / 1000000000.0 AS incoming,
-    SUM(outgoing) / 1000000000.0 AS outgoing,
+```
 
-    SUM(incoming + outgoing) / 1000000000.0 AS saldo
+В результате должно быть около 14 999 уникальных клиентов (если заполнены все строки со 2-й по 15 000-ю).
 
-FROM classified
+Теперь таблицу можно напрямую присоединять к балансу:
 
-GROUP BY
-    bank_name_main,
-    gr_size,
-    raspoznano_type
+```
+INNER JOIN [ALM_TEST].[WORK].[ClientBuckets] b
+    ON b.CLI_ID = t.CLI_ID
+```
 
-ORDER BY
-    bank_name_main,
-    gr_size,
-    raspoznano_type
-
-OPTION (MAXDOP 2);
+Этот способ рассчитан на Excel под Windows с доступом к SQL Server.
