@@ -1,171 +1,225 @@
-Для 15 000 строк быстрее всего загрузить данные через VBA + ADO пакетными `INSERT` по 500 строк. Получится около 30 обращений к SQL Server вместо 15 000.
-
-## А) SQL — создать таблицу в ALM_TEST
-
-Выполни один раз в SSMS:
-
-```
-
-USE [ALM_TEST];
-
-IF OBJECT_ID(N'WORK.ClientBuckets', N'U') IS NULL
-BEGIN
-    CREATE TABLE [WORK].[ClientBuckets] (
-        CLI_ID DECIMAL(18,0) NOT NULL,
-        [Бакет] NVARCHAR(100) NOT NULL,
-
-        CONSTRAINT PK_ClientBuckets
-            PRIMARY KEY CLUSTERED (CLI_ID)
-    );
-END;
-
-```
-
-## Б) VBA — быстрая загрузка из Excel
-
-Исходные данные: столбцы `A:B`, заголовки в первой строке, данные со второй.
-
-В Excel: `Alt + F11` → `Insert` → `Module` → вставь код.
-
-```
 
 Option Explicit
 
 Sub UploadClientBuckets()
 
     Dim ws As Worksheet
-    Dim cn As Object
-    Dim seen As Object
+    Dim conn As Object
     Dim data As Variant
-    Dim lastRow As Long, i As Long
+    Dim seen As Object
+
+    Dim lastRow As Long
+    Dim i As Long, j As Long
     Dim cli As String, bucket As String
     Dim vals As String, sql As String
     Dim batchCount As Long, totalCount As Long
-    Dim x As Double
+    Dim stage As String, errText As String
     Dim inTrans As Boolean
-    Dim errText As String
+    Dim v As Variant
 
-    On Error GoTo ErrHandler
+    On Error GoTo ErrorHandler
+
+    Application.ScreenUpdating = False
 
     Set ws = ActiveSheet
     lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
 
     If lastRow < 2 Then
-        MsgBox "Нет данных для загрузки"
-        Exit Sub
+        MsgBox "Нет данных для загрузки", vbExclamation
+        GoTo CleanExit
     End If
 
     data = ws.Range("A2:B" & lastRow).Value2
     Set seen = CreateObject("Scripting.Dictionary")
 
-    Set cn = CreateObject("ADODB.Connection")
+    '========================
+    ' Проверка данных
+    '========================
 
-    cn.ConnectionTimeout = 15
-    cn.CommandTimeout = 120
+    stage = "Проверка данных Excel"
 
-    cn.Open _
+    For i = 1 To UBound(data, 1)
+
+        v = data(i, 1)
+
+        If IsError(v) Then
+            Err.Raise 1001, , "Ошибка в CLI_ID"
+        End If
+
+        If Len(Trim$(CStr(v))) = 0 Then
+            Err.Raise 1002, , "Пустой CLI_ID"
+        End If
+
+        If VarType(v) = vbString Then
+            cli = Trim$(CStr(v))
+        Else
+            If Not IsNumeric(v) Then
+                Err.Raise 1003, , "Некорректный CLI_ID"
+            End If
+
+            If CDbl(v) < 0 Or CDbl(v) >= 1E+15 _
+               Or CDbl(v) <> Fix(CDbl(v)) Then
+                Err.Raise 1004, , "Некорректный числовой CLI_ID"
+            End If
+
+            cli = Format$(CDbl(v), "0")
+        End If
+
+        If Len(cli) > 18 Or cli Like "*[!0-9]*" Then
+            Err.Raise 1005, , "CLI_ID должен быть целым числом"
+        End If
+
+        If seen.Exists(cli) Then
+            Err.Raise 1006, , "Дубликат CLI_ID: " & cli
+        End If
+
+        seen.Add cli, True
+
+        If IsError(data(i, 2)) Then
+            Err.Raise 1007, , "Ошибка в поле Бакет"
+        End If
+
+        bucket = Trim$(CStr(data(i, 2)))
+
+        If Len(bucket) = 0 Or Len(bucket) > 100 Then
+            Err.Raise 1008, , "Некорректный бакет"
+        End If
+
+    Next i
+
+    '========================
+    ' Подключение к БД
+    '========================
+
+    stage = "Подключение к SQL Server"
+
+    Set conn = CreateObject("ADODB.Connection")
+
+    conn.ConnectionString = _
         "Provider=SQLOLEDB;" & _
-        "Data Source=YOUR_SQL_SERVER;" & _
+        "Data Source=trading-db.ahml1.ru;" & _
         "Initial Catalog=ALM_TEST;" & _
         "Integrated Security=SSPI;"
 
-    cn.BeginTrans
+    conn.ConnectionTimeout = 30
+    conn.CommandTimeout = 180
+
+    conn.Open
+
+    If conn.State <> 1 Then
+        Err.Raise 1009, , "Не удалось открыть соединение"
+    End If
+
+    '========================
+    ' Начало транзакции
+    '========================
+
+    stage = "Начало транзакции"
+
+    conn.BeginTrans
     inTrans = True
 
-    ' При повторном запуске заменяем содержимое таблицы
-    cn.Execute "DELETE FROM [WORK].[ClientBuckets]"
+    stage = "Очистка таблицы"
+
+    conn.Execute "DELETE FROM [WORK].[ClientBuckets]"
 
     sql = "INSERT INTO [WORK].[ClientBuckets] " & _
           "(CLI_ID, [Бакет]) VALUES "
 
+    '========================
+    ' Пакетная загрузка
+    '========================
+
     For i = 1 To UBound(data, 1)
 
-        If Not IsEmpty(data(i, 1)) Then
+        v = data(i, 1)
 
-            If VarType(data(i, 1)) = vbString Then
-                cli = Trim$(CStr(data(i, 1)))
-            Else
-                x = CDbl(data(i, 1))
+        If VarType(v) = vbString Then
+            cli = Trim$(CStr(v))
+        Else
+            cli = Format$(CDbl(v), "0")
+        End If
 
-                If x <> Fix(x) Or Abs(x) >= 1E+15 Then
-                    Err.Raise 1001, , "Некорректный CLI_ID"
-                End If
+        bucket = Replace(Trim$(CStr(data(i, 2))), "'", "''")
 
-                cli = Format$(x, "0")
-            End If
+        If batchCount > 0 Then vals = vals & ","
 
-            If Len(cli) = 0 Or Len(cli) > 18 _
-               Or cli Like "*[!0-9]*" Then
-                Err.Raise 1002, , "Некорректный CLI_ID"
-            End If
+        vals = vals & "(" & cli & ",N'" & bucket & "')"
 
-            bucket = Trim$(CStr(data(i, 2)))
+        batchCount = batchCount + 1
+        totalCount = totalCount + 1
 
-            If Len(bucket) = 0 Or Len(bucket) > 100 Then
-                Err.Raise 1003, , "Некорректный бакет"
-            End If
+        If batchCount = 500 Then
 
-            If seen.Exists(cli) Then
-                Err.Raise 1004, , "Повторяющийся CLI_ID: " & cli
-            End If
+            stage = "Загрузка пакета, строка " & (i + 1)
 
-            seen.Add cli, True
-            bucket = Replace(bucket, "'", "''")
+            conn.Execute sql & vals
 
-            If batchCount > 0 Then vals = vals & ","
+            vals = ""
+            batchCount = 0
 
-            vals = vals & "(" & cli & ",N'" & bucket & "')"
+            Application.StatusBar = _
+                "Загружено " & totalCount & _
+                " из " & UBound(data, 1)
 
-            batchCount = batchCount + 1
-            totalCount = totalCount + 1
-
-            If batchCount = 500 Then
-                cn.Execute sql & vals
-                vals = ""
-                batchCount = 0
-                Application.StatusBar = _
-                    "Загружено: " & totalCount
-            End If
+            DoEvents
 
         End If
 
     Next i
 
+    ' Последний неполный пакет
+
     If batchCount > 0 Then
-        cn.Execute sql & vals
+        stage = "Загрузка последнего пакета"
+        conn.Execute sql & vals
     End If
 
-    cn.CommitTrans
+    '========================
+    ' Завершение
+    '========================
+
+    stage = "Фиксация транзакции"
+
+    conn.CommitTrans
     inTrans = False
 
-    cn.Close
+    conn.Close
+    Set conn = Nothing
+
+    MsgBox "Успешно загружено " & totalCount & _
+           " клиентов в ALM_TEST.WORK.ClientBuckets", vbInformation
+
+CleanExit:
     Application.StatusBar = False
-
-    MsgBox "Успешно загружено: " & totalCount & _
-           " клиентов в ALM_TEST.WORK.ClientBuckets"
-
+    Application.ScreenUpdating = True
     Exit Sub
 
-ErrHandler:
+ErrorHandler:
 
-    errText = Err.Description
+    errText = "Ошибка №" & Err.Number & vbCrLf & _
+              "Этап: " & stage & vbCrLf & _
+              "Строка Excel: " & (i + 1) & vbCrLf & _
+              Err.Description
 
     On Error Resume Next
-    If inTrans Then cn.RollbackTrans
-    If Not cn Is Nothing Then cn.Close
+
+    If Not conn Is Nothing Then
+        If conn.State = 1 Then
+            If inTrans Then conn.RollbackTrans
+            conn.Close
+        End If
+    End If
+
+    Set conn = Nothing
 
     Application.StatusBar = False
+    Application.ScreenUpdating = True
 
-    MsgBox "Ошибка на строке Excel " & i + 1 & _
-           ": " & errText, vbCritical
+    MsgBox errText, vbCritical
 
 End Sub
 
-```
-
-Обязательно замени `YOUR_SQL_SERVER` на имя SQL-сервера из окна подключения SSMS. VBA использует Windows-аутентификацию.
-
-При каждом запуске макрос очищает таблицу и загружает её заново. Всё выполняется в одной транзакции: при ошибке предыдущие данные таблицы восстанавливаются.
 
 ## В) Проверка после загрузки
 
