@@ -4,7 +4,6 @@ SET NOCOUNT ON;
 
 DECLARE @DateFrom date = '2026-10-01';
 DECLARE @DateTo date = '2026-11-04';
-
 DECLARE @threshold decimal(18,2) = 200000000;
 
 ;WITH base AS (
@@ -13,8 +12,11 @@ DECLARE @threshold decimal(18,2) = 200000000;
         t.spec_cat,
         t.transaction_type,
         t.direction_txt,
-
         ISNULL(t.gr_size, N'Без gr_size') AS gr_size,
+
+        t.[распознано_НС] AS amt_ns,
+        t.[распознано_СР] AS amt_sr,
+        t.[Распознано_ДВС] AS amt_dvs,
 
         t.[распознано_НС]
         + t.[распознано_СР]
@@ -51,19 +53,29 @@ flows AS (
             ELSE 'bank'
         END AS bank_type,
 
-        CASE
-            WHEN direction_txt = N'входящие'
-              OR (direction_txt = N'смешанные' AND amt > 0)
-                THEN amt
-            ELSE 0
-        END AS incoming,
+        amt_ns,
+        amt_sr,
+        amt_dvs,
 
         CASE
-            WHEN direction_txt = N'исходящие'
-              OR (direction_txt = N'смешанные' AND amt < 0)
-                THEN amt
+            WHEN amt IS NOT NULL
+             AND (
+                direction_txt = N'входящие'
+                OR (direction_txt = N'смешанные' AND amt > 0)
+             )
+                THEN 1
             ELSE 0
-        END AS outgoing
+        END AS is_incoming,
+
+        CASE
+            WHEN amt IS NOT NULL
+             AND (
+                direction_txt = N'исходящие'
+                OR (direction_txt = N'смешанные' AND amt < 0)
+             )
+                THEN 1
+            ELSE 0
+        END AS is_outgoing
 
     FROM base
 
@@ -71,18 +83,35 @@ flows AS (
        OR (
             spec_cat IN ('BR','SR','FU')
             AND transaction_type <> N'Наличные'
-          )
+       )
 ),
 
-/* Сначала агрегируем по банку и gr_size */
+/* Сначала агрегируем платежи банка по gr_size.
+   Все три типа распознано пока находятся в одной строке. */
 
 by_bank_gr AS (
     SELECT
         bank,
         bank_type,
         gr_size,
-        SUM(incoming) AS incoming,
-        SUM(outgoing) AS outgoing
+
+        SUM(CASE WHEN is_incoming = 1
+            THEN amt_ns ELSE 0 END) AS incoming_ns,
+
+        SUM(CASE WHEN is_outgoing = 1
+            THEN amt_ns ELSE 0 END) AS outgoing_ns,
+
+        SUM(CASE WHEN is_incoming = 1
+            THEN amt_sr ELSE 0 END) AS incoming_sr,
+
+        SUM(CASE WHEN is_outgoing = 1
+            THEN amt_sr ELSE 0 END) AS outgoing_sr,
+
+        SUM(CASE WHEN is_incoming = 1
+            THEN amt_dvs ELSE 0 END) AS incoming_dvs,
+
+        SUM(CASE WHEN is_outgoing = 1
+            THEN amt_dvs ELSE 0 END) AS outgoing_dvs
 
     FROM flows
 
@@ -92,45 +121,59 @@ by_bank_gr AS (
         gr_size
 ),
 
-/* Затем считаем объемы банка ПО ВСЕМ gr_size */
+/* Считаем полные объемы банка.
+   НЕТ разделения ни по gr_size, ни по типу распознано. */
 
 bank_totals AS (
     SELECT
-        bank,
-        bank_type,
-        gr_size,
-        incoming,
-        outgoing,
+        g.*,
 
-        SUM(incoming) OVER (
+        SUM(
+            ISNULL(incoming_ns, 0)
+          + ISNULL(incoming_sr, 0)
+          + ISNULL(incoming_dvs, 0)
+        ) OVER (
             PARTITION BY bank, bank_type
         ) AS bank_incoming,
 
-        SUM(outgoing) OVER (
+        SUM(
+            ISNULL(outgoing_ns, 0)
+          + ISNULL(outgoing_sr, 0)
+          + ISNULL(outgoing_dvs, 0)
+        ) OVER (
             PARTITION BY bank, bank_type
         ) AS bank_outgoing
 
-    FROM by_bank_gr
+    FROM by_bank_gr g
 ),
 
-/* Классификация банка по полному объему */
+/* Классифицируем банк по общему объему.
+   Только после этого разворачиваем три типа распознано. */
 
 classified AS (
     SELECT
-        gr_size,
+        g.gr_size,
 
         CASE
-            WHEN bank_type = 'bank'
-             AND ABS(bank_incoming) <= @threshold
-             AND ABS(bank_outgoing) <= @threshold
+            WHEN g.bank_type = 'bank'
+             AND ABS(g.bank_incoming) <= @threshold
+             AND ABS(g.bank_outgoing) <= @threshold
                 THEN N'else'
-            ELSE bank
+            ELSE g.bank
         END AS bank_name_main,
 
-        incoming,
-        outgoing
+        v.raspoznano_type,
+        v.incoming,
+        v.outgoing
 
-    FROM bank_totals
+    FROM bank_totals g
+
+    CROSS APPLY (
+        VALUES
+            (N'НС',     g.incoming_ns,  g.outgoing_ns),
+            (N'Вклады', g.incoming_sr,  g.outgoing_sr),
+            (N'ДВС',    g.incoming_dvs, g.outgoing_dvs)
+    ) v(raspoznano_type, incoming, outgoing)
 )
 
 SELECT
@@ -138,6 +181,7 @@ SELECT
 
     bank_name_main,
     gr_size,
+    raspoznano_type,
 
     SUM(incoming) / 1000000000.0 AS incoming,
     SUM(outgoing) / 1000000000.0 AS outgoing,
@@ -148,8 +192,12 @@ FROM classified
 
 GROUP BY
     bank_name_main,
-    gr_size
+    gr_size,
+    raspoznano_type
 
 ORDER BY
     bank_name_main,
-    gr_size;
+    gr_size,
+    raspoznano_type
+
+OPTION (MAXDOP 2);
