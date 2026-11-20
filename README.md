@@ -5,32 +5,47 @@ SET XACT_ABORT ON;
 
 DECLARE @DateBase date = '2026-10-31';
 DECLARE @DateFrom date = '2026-11-01';
-DECLARE @DateTo   date = '2026-11-18';
+DECLARE @DateTo date = '2026-11-18';
 
 DECLARE @threshold decimal(18,2) = 200000000;
 
-DECLARE @DaysPerRun int = 2;
+DECLARE @DaysPerRun int = 4;
 DECLARE @MaxRunSeconds int = 420;
 
 DECLARE @RunStart datetime2 = SYSDATETIME();
 DECLARE @DayStart datetime2;
 DECLARE @dt date;
 DECLARE @DaysThisRun int = 0;
+
 DECLARE @PayDone int;
 DECLARE @BalDone int;
-DECLARE @TotalPayDays int = DATEDIFF(day, @DateFrom, @DateTo) + 1;
-DECLARE @TotalBalDays int = DATEDIFF(day, @DateBase, @DateTo) + 1;
+
+DECLARE @TotalPayDays int =
+    DATEDIFF(day, @DateFrom, @DateTo) + 1;
+
+DECLARE @TotalBalDays int =
+    DATEDIFF(day, @DateBase, @DateTo) + 1;
+
 DECLARE @Msg nvarchar(500);
 
 IF @@TRANCOUNT <> 0
     THROW 50001, 'Open transaction in session', 1;
 
+IF @DateBase >= @DateFrom OR @DateFrom > @DateTo
+    THROW 50006, 'Incorrect date parameters', 1;
+
 
 /* ==========================================================
-   1. ИНИЦИАЛИЗАЦИЯ — ТОЛЬКО ПРИ ПЕРВОМ ЗАПУСКЕ
+   1. ИНИЦИАЛИЗАЦИЯ
+
+   Версия ISNULL_V2.
+   Старые временные таблицы автоматически сбрасываются
+   только при первом запуске новой версии.
+
+   Последующие запуски продолжают готовый расчет.
    ========================================================== */
 
-IF OBJECT_ID('tempdb..#flow_job') IS NULL
+IF OBJECT_ID('tempdb..#flow_job_isnull_v2') IS NULL
 BEGIN
 
     DROP TABLE IF EXISTS #existing_clients;
@@ -41,10 +56,18 @@ BEGIN
     DROP TABLE IF EXISTS #bal_stage;
     DROP TABLE IF EXISTS #bal_totals;
     DROP TABLE IF EXISTS #bal_done;
+    DROP TABLE IF EXISTS #flow_job;
 
-    /* Положительные остатки на 31.10.
-       Сохраняем также остатки по видам продуктов,
-       чтобы повторно не читать баланс на 31.10. */
+
+    RAISERROR(
+        N'Первый запуск ISNULL_V2. Формирую клиентов на 31.10',
+        0, 1
+    ) WITH NOWAIT;
+
+
+    /* Клиенты с положительным остатком на 31.10.
+       Сохраняем их исходные остатки для последующего
+       расчета подневной динамики. */
 
     SELECT
         t.CLI_ID,
@@ -73,86 +96,105 @@ BEGIN
 
     WHERE t.dt_rep >= @DateBase
       AND t.dt_rep < DATEADD(day, 1, @DateBase)
+
       AND t.block_name = N'Привлечение ФЛ'
       AND t.section_name IN (
           N'Срочные',
           N'Накопительный счёт',
           N'До востребования'
       )
+
       AND t.od_flag = 1
       AND t.cur = '810'
       AND t.CLI_ID IS NOT NULL
+      AND t.out_rub IS NOT NULL
       AND t.out_rub >= 0
 
     GROUP BY t.CLI_ID
+
     HAVING SUM(t.out_rub) > 0
 
     OPTION (MAXDOP 1, RECOMPILE);
 
+
     CREATE UNIQUE CLUSTERED INDEX IX_existing_clients
     ON #existing_clients (CLI_ID);
 
+
     IF NOT EXISTS (SELECT 1 FROM #existing_clients)
-        THROW 50002, 'No existing clients on 31.10', 1;
+        THROW 50002,
+            'No existing clients on 31.10',
+            1;
 
 
-    /* Участники платежей за весь период.
-       Наполняется постепенно при чтении детализации. */
+    /* Уникальные участники платежей за весь период */
 
     SELECT TOP (0)
         t.cli_id AS CLI_ID
+
     INTO #pay_participants
+
     FROM ALM.ehd.VW_transfers_FL_det t;
+
 
     CREATE UNIQUE CLUSTERED INDEX IX_pay_participants
     ON #pay_participants (CLI_ID);
 
 
-    /* Временный результат текущего дня.
-       row_kind = 0: уникальный клиент.
-       row_kind = 1: агрегат платежей.
-
-       GROUPING SETS позволяет получить оба результата
-       за одно чтение платёжной витрины. */
+    /* Промежуточный результат одного дня.
+       row_kind = 0: уникальный CLI_ID.
+       row_kind = 1: агрегат платежей. */
 
     SELECT TOP (0)
         CAST(0 AS tinyint) AS row_kind,
         t.cli_id AS CLI_ID,
+
         CAST(NULL AS nvarchar(20)) AS client_type,
         CAST(NULL AS nvarchar(512)) AS bank,
         CAST(NULL AS varchar(10)) AS bank_type,
         CAST(NULL AS nvarchar(100)) AS gr_size,
+
         CAST(0 AS decimal(38,6)) AS incoming_ns,
         CAST(0 AS decimal(38,6)) AS outgoing_ns,
+
         CAST(0 AS decimal(38,6)) AS incoming_sr,
         CAST(0 AS decimal(38,6)) AS outgoing_sr,
+
         CAST(0 AS decimal(38,6)) AS incoming_dvs,
         CAST(0 AS decimal(38,6)) AS outgoing_dvs
+
     INTO #pay_stage
+
     FROM ALM.ehd.VW_transfers_FL_det t;
 
 
+    /* Готовые агрегаты платежей */
+
     CREATE TABLE #pay_sums (
-        dt_rep date,
+        dt_rep date NOT NULL,
+
         client_type nvarchar(20),
         bank nvarchar(512),
         bank_type varchar(10),
         gr_size nvarchar(100),
+
         incoming_ns decimal(38,6),
         outgoing_ns decimal(38,6),
+
         incoming_sr decimal(38,6),
         outgoing_sr decimal(38,6),
+
         incoming_dvs decimal(38,6),
         outgoing_dvs decimal(38,6)
     );
+
 
     CREATE TABLE #pay_done (
         dt_rep date NOT NULL PRIMARY KEY
     );
 
 
-    /* Промежуточные и итоговые балансы.
-       Здесь всего две строки на дату. */
+    /* Балансовые агрегаты */
 
     CREATE TABLE #bal_stage (
         client_type nvarchar(20),
@@ -162,35 +204,42 @@ BEGIN
         total_rub decimal(38,6)
     );
 
+
     CREATE TABLE #bal_totals (
         dt_rep date NOT NULL,
         client_type nvarchar(20) NOT NULL,
+
         deposits_rub decimal(38,6),
         ns_rub decimal(38,6),
         dvs_rub decimal(38,6),
         total_rub decimal(38,6),
+
         PRIMARY KEY (dt_rep, client_type)
     );
+
 
     CREATE TABLE #bal_done (
         dt_rep date NOT NULL PRIMARY KEY,
         matched_groups int NOT NULL
     );
 
-    CREATE TABLE #flow_job (
-        date_base date,
-        date_from date,
-        date_to date
+
+    /* Маркер версии и параметров расчета */
+
+    CREATE TABLE #flow_job_isnull_v2 (
+        date_base date NOT NULL,
+        date_from date NOT NULL,
+        date_to date NOT NULL
     );
 
-    INSERT INTO #flow_job
+    INSERT INTO #flow_job_isnull_v2
     VALUES (@DateBase, @DateFrom, @DateTo);
 
 END;
 
 
 /* ==========================================================
-   2. КОНТРОЛЬ СОХРАНЁННОГО СОСТОЯНИЯ
+   2. ПРОВЕРКА СОСТОЯНИЯ ПОВТОРНОГО ЗАПУСКА
    ========================================================== */
 
 IF OBJECT_ID('tempdb..#existing_clients') IS NULL
@@ -203,24 +252,33 @@ IF OBJECT_ID('tempdb..#existing_clients') IS NULL
    OR OBJECT_ID('tempdb..#bal_done') IS NULL
     THROW 50003, 'Incomplete temporary state', 1;
 
+
 IF EXISTS (
     SELECT 1
-    FROM #flow_job
+    FROM #flow_job_isnull_v2
     WHERE date_base <> @DateBase
        OR date_from <> @DateFrom
        OR date_to <> @DateTo
 )
     THROW 50004, 'Date parameters changed', 1;
 
-SELECT @PayDone = COUNT(*) FROM #pay_done;
-SELECT @BalDone = COUNT(*) FROM #bal_done;
+
+SELECT @PayDone = COUNT(*)
+FROM #pay_done;
+
+SELECT @BalDone = COUNT(*)
+FROM #bal_done;
 
 
 /* ==========================================================
    3. ПЕРВЫЙ ЭТАП — ПЛАТЕЖИ
 
-   Определяем тех же участников платежей
-   и сразу агрегируем их потоки по группам.
+   Каждый день читаем только один раз.
+   Сразу определяем участников платежей
+   и агрегируем потоки по банкам, gr_size, типу клиента.
+
+   ИСПРАВЛЕНИЕ:
+   все три поля распознано через ISNULL(...,0).
    ========================================================== */
 
 IF @PayDone < @TotalPayDays
@@ -229,7 +287,9 @@ BEGIN
     SELECT @dt = DATEADD(day, 1, MAX(dt_rep))
     FROM #pay_done;
 
-    IF @dt IS NULL SET @dt = @DateFrom;
+    IF @dt IS NULL
+        SET @dt = @DateFrom;
+
 
     WHILE @dt <= @DateTo
       AND @DaysThisRun < @DaysPerRun
@@ -250,6 +310,7 @@ BEGIN
 
         TRUNCATE TABLE #pay_stage;
 
+
         ;WITH base AS (
             SELECT
                 t.cli_id AS CLI_ID,
@@ -263,38 +324,56 @@ BEGIN
                 CASE
                     WHEN t.spec_cat IN ('BR','SR','FU')
                         THEN N'Market'
+
                     WHEN t.transaction_type = N'Наличные'
                         THEN N'Наличные'
+
                     ELSE t.bank_name_main
                 END AS bank,
 
                 CASE
                     WHEN t.spec_cat IN ('BR','SR','FU')
                         THEN 'market'
+
                     WHEN t.transaction_type = N'Наличные'
                         THEN 'cash'
+
                     ELSE 'bank'
                 END AS bank_type,
 
-                ISNULL(t.gr_size, N'Без gr_size') AS gr_size,
+                ISNULL(
+                    t.gr_size,
+                    N'Без gr_size'
+                ) AS gr_size,
 
                 t.direction_txt,
 
-                t.[распознано_НС] AS amt_ns,
-                t.[распознано_СР] AS amt_sr,
-                t.[Распознано_ДВС] AS amt_dvs,
+                /* ISNULL применяется ДО расчета направления */
 
-                t.[распознано_НС]
-              + t.[распознано_СР]
-              + t.[Распознано_ДВС] AS amt
+                a.amt_ns,
+                a.amt_sr,
+                a.amt_dvs,
+
+                a.amt_ns
+                + a.amt_sr
+                + a.amt_dvs AS amt
 
             FROM ALM.ehd.VW_transfers_FL_det t WITH (NOLOCK)
+
+            CROSS APPLY (
+                VALUES (
+                    ISNULL(t.[распознано_НС], 0),
+                    ISNULL(t.[распознано_СР], 0),
+                    ISNULL(t.[Распознано_ДВС], 0)
+                )
+            ) a(amt_ns, amt_sr, amt_dvs)
 
             LEFT JOIN #existing_clients e
                 ON e.CLI_ID = t.cli_id
 
             WHERE t.dt_rep >= @dt
               AND t.dt_rep < DATEADD(day, 1, @dt)
+
               AND t.cli_id IS NOT NULL
 
               AND t.direction_type <> N'Ошибка'
@@ -318,33 +397,28 @@ BEGIN
                 b.*,
 
                 CASE
-                    WHEN amt IS NOT NULL
-                     AND (
-                         direction_txt = N'входящие'
-                         OR (
-                             direction_txt = N'смешанные'
-                             AND amt > 0
-                         )
-                     )
+                    WHEN direction_txt = N'входящие'
+                      OR (
+                          direction_txt = N'смешанные'
+                          AND amt > 0
+                      )
                         THEN 1
                     ELSE 0
                 END AS is_incoming,
 
                 CASE
-                    WHEN amt IS NOT NULL
-                     AND (
-                         direction_txt = N'исходящие'
-                         OR (
-                             direction_txt = N'смешанные'
-                             AND amt < 0
-                         )
-                     )
+                    WHEN direction_txt = N'исходящие'
+                      OR (
+                          direction_txt = N'смешанные'
+                          AND amt < 0
+                      )
                         THEN 1
                     ELSE 0
                 END AS is_outgoing
 
             FROM base b
         )
+
 
         INSERT INTO #pay_stage (
             row_kind,
@@ -353,10 +427,13 @@ BEGIN
             bank,
             bank_type,
             gr_size,
+
             incoming_ns,
             outgoing_ns,
+
             incoming_sr,
             outgoing_sr,
+
             incoming_dvs,
             outgoing_dvs
         )
@@ -370,27 +447,46 @@ BEGIN
             bank_type,
             gr_size,
 
-            SUM(CASE WHEN is_incoming = 1
-                THEN ISNULL(amt_ns,0) ELSE 0 END),
+            SUM(CASE
+                WHEN is_incoming = 1
+                    THEN amt_ns
+                ELSE 0
+            END),
 
-            SUM(CASE WHEN is_outgoing = 1
-                THEN ISNULL(amt_ns,0) ELSE 0 END),
+            SUM(CASE
+                WHEN is_outgoing = 1
+                    THEN amt_ns
+                ELSE 0
+            END),
 
-            SUM(CASE WHEN is_incoming = 1
-                THEN ISNULL(amt_sr,0) ELSE 0 END),
+            SUM(CASE
+                WHEN is_incoming = 1
+                    THEN amt_sr
+                ELSE 0
+            END),
 
-            SUM(CASE WHEN is_outgoing = 1
-                THEN ISNULL(amt_sr,0) ELSE 0 END),
+            SUM(CASE
+                WHEN is_outgoing = 1
+                    THEN amt_sr
+                ELSE 0
+            END),
 
-            SUM(CASE WHEN is_incoming = 1
-                THEN ISNULL(amt_dvs,0) ELSE 0 END),
+            SUM(CASE
+                WHEN is_incoming = 1
+                    THEN amt_dvs
+                ELSE 0
+            END),
 
-            SUM(CASE WHEN is_outgoing = 1
-                THEN ISNULL(amt_dvs,0) ELSE 0 END)
+            SUM(CASE
+                WHEN is_outgoing = 1
+                    THEN amt_dvs
+                ELSE 0
+            END)
 
         FROM flows
 
-        WHERE is_incoming = 1 OR is_outgoing = 1
+        WHERE is_incoming = 1
+           OR is_outgoing = 1
 
         GROUP BY GROUPING SETS (
             (CLI_ID),
@@ -400,8 +496,7 @@ BEGIN
         OPTION (MAXDOP 1, RECOMPILE);
 
 
-        /* Не записываем пустой платёжный день
-           как успешно обработанный. */
+        /* Контроль пустой платежной даты */
 
         IF NOT EXISTS (
             SELECT 1
@@ -409,24 +504,35 @@ BEGIN
             WHERE row_kind = 1
         )
         BEGIN
+
             SET @Msg = CONCAT(
                 N'Нет платежей после фильтров за ',
                 CONVERT(varchar(10), @dt, 120)
             );
+
             THROW 50005, @Msg, 1;
+
         END;
 
 
+        /* Фиксируем результаты дня одной транзакцией */
+
         BEGIN TRY
+
             BEGIN TRANSACTION;
 
-            /* Участники — по одной записи на CLI_ID */
+
+            /* Участники платежей — уникальные CLI_ID */
 
             INSERT INTO #pay_participants (CLI_ID)
+
             SELECT s.CLI_ID
+
             FROM #pay_stage s
+
             WHERE s.row_kind = 0
               AND s.CLI_ID IS NOT NULL
+
               AND NOT EXISTS (
                   SELECT 1
                   FROM #pay_participants p
@@ -434,7 +540,7 @@ BEGIN
               );
 
 
-            /* Только агрегированные денежные потоки */
+            /* Денежные потоки */
 
             INSERT INTO #pay_sums (
                 dt_rep,
@@ -442,45 +548,79 @@ BEGIN
                 bank,
                 bank_type,
                 gr_size,
+
                 incoming_ns,
                 outgoing_ns,
+
                 incoming_sr,
                 outgoing_sr,
+
                 incoming_dvs,
                 outgoing_dvs
             )
+
             SELECT
                 @dt,
                 client_type,
                 bank,
                 bank_type,
                 gr_size,
+
                 incoming_ns,
                 outgoing_ns,
+
                 incoming_sr,
                 outgoing_sr,
+
                 incoming_dvs,
                 outgoing_dvs
+
             FROM #pay_stage
+
             WHERE row_kind = 1;
 
 
-            INSERT INTO #pay_done VALUES (@dt);
+            /* Дата считается готовой только после
+               успешного сохранения участников и потоков */
+
+            INSERT INTO #pay_done (dt_rep)
+            VALUES (@dt);
+
 
             COMMIT TRANSACTION;
+
         END TRY
+
         BEGIN CATCH
-            IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+
+            IF XACT_STATE() <> 0
+                ROLLBACK TRANSACTION;
+
             THROW;
+
         END CATCH;
+
 
         SET @DaysThisRun = @DaysThisRun + 1;
 
         SET @Msg = CONCAT(
-            N'Готово: ', CONVERT(varchar(10), @dt, 120),
+            N'Готово: ',
+            CONVERT(varchar(10), @dt, 120),
+
+            N' | ',
+            @DaysThisRun,
+            N'/',
+            @DaysPerRun,
+            N' дней за запуск',
+
             N' | секунд: ',
-            DATEDIFF(second, @DayStart, SYSDATETIME())
+            DATEDIFF(
+                second,
+                @DayStart,
+                SYSDATETIME()
+            )
         );
+
         RAISERROR(N'%s', 0, 1, @Msg) WITH NOWAIT;
 
         SET @dt = DATEADD(day, 1, @dt);
@@ -493,10 +633,12 @@ END;
 
 
 /* ==========================================================
-   4. ВТОРОЙ ЭТАП — БАЛАНСЫ
+   4. ВТОРОЙ ЭТАП — ПОДНЕВНЫЕ БАЛАНСЫ
 
-   Запускается после завершения платежей.
-   Баланс только клиентов из #pay_participants.
+   Только те CLI_ID, которые участвовали
+   в отобранных платежах 01.11–18.11.
+
+   Группы клиентов фиксируются по 31.10.
    ========================================================== */
 
 ELSE IF @BalDone < @TotalBalDays
@@ -505,7 +647,9 @@ BEGIN
     SELECT @dt = DATEADD(day, 1, MAX(dt_rep))
     FROM #bal_done;
 
-    IF @dt IS NULL SET @dt = @DateBase;
+    IF @dt IS NULL
+        SET @dt = @DateBase;
+
 
     WHILE @dt <= @DateTo
       AND @DaysThisRun < @DaysPerRun
@@ -521,13 +665,13 @@ BEGIN
             N'БАЛАНС: ',
             CONVERT(varchar(10), @dt, 120)
         );
+
         RAISERROR(N'%s', 0, 1, @Msg) WITH NOWAIT;
 
         TRUNCATE TABLE #bal_stage;
 
 
-        /* За 31 октября уже есть сохранённые данные.
-           Повторно не обращаемся к VW_balance_rest_all. */
+        /* На 31.10 используем уже загруженные остатки */
 
         IF @dt = @DateBase
         BEGIN
@@ -539,11 +683,14 @@ BEGIN
                 dvs_rub,
                 total_rub
             )
+
             SELECT
                 N'Действующий',
+
                 SUM(e.deposits_rub),
                 SUM(e.ns_rub),
                 SUM(e.dvs_rub),
+
                 SUM(
                     e.deposits_rub
                   + e.ns_rub
@@ -551,6 +698,7 @@ BEGIN
                 )
 
             FROM #existing_clients e
+
             INNER JOIN #pay_participants p
                 ON p.CLI_ID = e.CLI_ID
 
@@ -561,8 +709,7 @@ BEGIN
         ELSE
         BEGIN
 
-            /* Баланс очередного дня только для
-               участников платежей 01.11–18.11. */
+            /* Один дневной срез баланса */
 
             INSERT INTO #bal_stage (
                 client_type,
@@ -611,11 +758,13 @@ BEGIN
               AND t.dt_rep < DATEADD(day, 1, @dt)
 
               AND t.block_name = N'Привлечение ФЛ'
+
               AND t.section_name IN (
                   N'Срочные',
                   N'Накопительный счёт',
                   N'До востребования'
               )
+
               AND t.od_flag = 1
               AND t.cur = '810'
               AND t.out_rub IS NOT NULL
@@ -633,10 +782,10 @@ BEGIN
         END;
 
 
-        /* Записываем оба клиентских сегмента,
-           даже если у одного нет остатков. */
+        /* Сохраняем агрегаты обоих типов клиентов */
 
         BEGIN TRY
+
             BEGIN TRANSACTION;
 
             INSERT INTO #bal_totals (
@@ -647,9 +796,11 @@ BEGIN
                 dvs_rub,
                 total_rub
             )
+
             SELECT
                 @dt,
                 v.client_type,
+
                 ISNULL(s.deposits_rub, 0),
                 ISNULL(s.ns_rub, 0),
                 ISNULL(s.dvs_rub, 0),
@@ -669,24 +820,45 @@ BEGIN
                 dt_rep,
                 matched_groups
             )
+
             SELECT @dt, COUNT(*)
             FROM #bal_stage;
 
+
             COMMIT TRANSACTION;
+
         END TRY
+
         BEGIN CATCH
-            IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+
+            IF XACT_STATE() <> 0
+                ROLLBACK TRANSACTION;
+
             THROW;
+
         END CATCH;
 
 
         SET @DaysThisRun = @DaysThisRun + 1;
 
         SET @Msg = CONCAT(
-            N'Готово: ', CONVERT(varchar(10), @dt, 120),
+            N'Готово: ',
+            CONVERT(varchar(10), @dt, 120),
+
+            N' | ',
+            @DaysThisRun,
+            N'/',
+            @DaysPerRun,
+            N' дней за запуск',
+
             N' | секунд: ',
-            DATEDIFF(second, @DayStart, SYSDATETIME())
+            DATEDIFF(
+                second,
+                @DayStart,
+                SYSDATETIME()
+            )
         );
+
         RAISERROR(N'%s', 0, 1, @Msg) WITH NOWAIT;
 
         SET @dt = DATEADD(day, 1, @dt);
@@ -699,18 +871,26 @@ END;
 
 
 /* ==========================================================
-   5. СТАТУС ПОСЛЕ КАЖДОГО ЗАПУСКА
+   5. СТАТУС РАСЧЕТА
    ========================================================== */
 
-SELECT @PayDone = COUNT(*) FROM #pay_done;
-SELECT @BalDone = COUNT(*) FROM #bal_done;
+SELECT @PayDone = COUNT(*)
+FROM #pay_done;
+
+SELECT @BalDone = COUNT(*)
+FROM #bal_done;
+
 
 SELECT
     @@SPID AS session_id,
 
     CASE
-        WHEN @PayDone < @TotalPayDays THEN N'Платежи'
-        WHEN @BalDone < @TotalBalDays THEN N'Балансы'
+        WHEN @PayDone < @TotalPayDays
+            THEN N'Платежи'
+
+        WHEN @BalDone < @TotalBalDays
+            THEN N'Балансы'
+
         ELSE N'Готово'
     END AS stage,
 
@@ -729,15 +909,21 @@ SELECT
     (SELECT MAX(dt_rep) FROM #bal_done)
         AS last_balance_date,
 
-    DATEDIFF(second, @RunStart, SYSDATETIME())
-        AS run_seconds;
+    DATEDIFF(
+        second,
+        @RunStart,
+        SYSDATETIME()
+    ) AS run_seconds;
 
 
 /* ==========================================================
    6. РЕЗУЛЬТАТ №1 — ПЛАТЕЖИ ПО БАНКАМ
 
-   Классификация банка по всем потокам сразу,
-   без зависимости от client_type, gr_size и продукта.
+   Порог рассчитывается по банку целиком:
+   - все действующие и новые клиенты;
+   - все gr_size;
+   - все виды распознано;
+   - все даты расчетного периода.
    ========================================================== */
 
 IF @PayDone = @TotalPayDays
@@ -750,20 +936,22 @@ BEGIN
             bank_type,
 
             SUM(
-                ISNULL(incoming_ns,0)
-              + ISNULL(incoming_sr,0)
-              + ISNULL(incoming_dvs,0)
+                ISNULL(incoming_ns, 0)
+              + ISNULL(incoming_sr, 0)
+              + ISNULL(incoming_dvs, 0)
             ) AS bank_incoming,
 
             SUM(
-                ISNULL(outgoing_ns,0)
-              + ISNULL(outgoing_sr,0)
-              + ISNULL(outgoing_dvs,0)
+                ISNULL(outgoing_ns, 0)
+              + ISNULL(outgoing_sr, 0)
+              + ISNULL(outgoing_dvs, 0)
             ) AS bank_outgoing
 
         FROM #pay_sums
 
-        GROUP BY bank, bank_type
+        GROUP BY
+            bank,
+            bank_type
     ),
 
     classified AS (
@@ -776,6 +964,7 @@ BEGIN
                  AND ABS(b.bank_incoming) <= @threshold
                  AND ABS(b.bank_outgoing) <= @threshold
                     THEN N'else'
+
                 ELSE s.bank
             END AS bank_name_main,
 
@@ -791,21 +980,36 @@ BEGIN
 
         CROSS APPLY (
             VALUES
-                (N'НС', s.incoming_ns, s.outgoing_ns),
-                (N'Вклады', s.incoming_sr, s.outgoing_sr),
-                (N'ДВС', s.incoming_dvs, s.outgoing_dvs)
+                (
+                    N'НС',
+                    s.incoming_ns,
+                    s.outgoing_ns
+                ),
+                (
+                    N'Вклады',
+                    s.incoming_sr,
+                    s.outgoing_sr
+                ),
+                (
+                    N'ДВС',
+                    s.incoming_dvs,
+                    s.outgoing_dvs
+                )
         ) v(raspoznano_type, incoming, outgoing)
     )
 
     SELECT
         N'2026 01.11-18.11' AS r_w,
+
         client_type,
         bank_name_main,
         gr_size,
         raspoznano_type,
 
         SUM(incoming) / 1000000000.0 AS incoming,
+
         SUM(outgoing) / 1000000000.0 AS outgoing,
+
         SUM(incoming + outgoing) / 1000000000.0 AS saldo
 
     FROM classified
@@ -824,9 +1028,8 @@ BEGIN
 
 
     /* ======================================================
-       7. РЕЗУЛЬТАТ №2 — ПОДНЕВНАЯ ДИНАМИКА БАЛАНСОВ
+       7. РЕЗУЛЬТАТ №2 — ПОДНЕВНЫЕ БАЛАНСЫ И ПЛАТЕЖИ
 
-       И рядом ежедневные и накопленные платежные потоки.
        Все суммы в млрд рублей.
        ====================================================== */
 
@@ -836,26 +1039,29 @@ BEGIN
             client_type,
 
             SUM(
-                ISNULL(incoming_ns,0)
-              + ISNULL(incoming_sr,0)
-              + ISNULL(incoming_dvs,0)
+                ISNULL(incoming_ns, 0)
+              + ISNULL(incoming_sr, 0)
+              + ISNULL(incoming_dvs, 0)
             ) AS incoming_rub,
 
             SUM(
-                ISNULL(outgoing_ns,0)
-              + ISNULL(outgoing_sr,0)
-              + ISNULL(outgoing_dvs,0)
+                ISNULL(outgoing_ns, 0)
+              + ISNULL(outgoing_sr, 0)
+              + ISNULL(outgoing_dvs, 0)
             ) AS outgoing_rub
 
         FROM #pay_sums
 
-        GROUP BY dt_rep, client_type
+        GROUP BY
+            dt_rep,
+            client_type
     ),
 
     joined AS (
         SELECT
             b.dt_rep,
             b.client_type,
+
             b.deposits_rub,
             b.ns_rub,
             b.dvs_rub,
@@ -863,8 +1069,8 @@ BEGIN
 
             start_bal.total_rub AS initial_rub,
 
-            ISNULL(p.incoming_rub,0) AS incoming_rub,
-            ISNULL(p.outgoing_rub,0) AS outgoing_rub
+            ISNULL(p.incoming_rub, 0) AS incoming_rub,
+            ISNULL(p.outgoing_rub, 0) AS outgoing_rub
 
         FROM #bal_totals b
 
@@ -881,7 +1087,9 @@ BEGIN
         SELECT
             j.*,
 
-            SUM(incoming_rub + outgoing_rub) OVER (
+            SUM(
+                incoming_rub + outgoing_rub
+            ) OVER (
                 PARTITION BY client_type
                 ORDER BY dt_rep
                 ROWS UNBOUNDED PRECEDING
@@ -894,32 +1102,50 @@ BEGIN
         dt_rep,
         client_type,
 
-        CAST(deposits_rub / 1000000000.0
-            AS decimal(20,6)) AS deposits_bln,
+        CAST(
+            deposits_rub / 1000000000.0
+            AS decimal(20,6)
+        ) AS deposits_bln,
 
-        CAST(ns_rub / 1000000000.0
-            AS decimal(20,6)) AS ns_bln,
+        CAST(
+            ns_rub / 1000000000.0
+            AS decimal(20,6)
+        ) AS ns_bln,
 
-        CAST(dvs_rub / 1000000000.0
-            AS decimal(20,6)) AS dvs_bln,
+        CAST(
+            dvs_rub / 1000000000.0
+            AS decimal(20,6)
+        ) AS dvs_bln,
 
-        CAST(total_rub / 1000000000.0
-            AS decimal(20,6)) AS total_bln,
+        CAST(
+            total_rub / 1000000000.0
+            AS decimal(20,6)
+        ) AS total_bln,
 
-        CAST((total_rub - initial_rub) / 1000000000.0
-            AS decimal(20,6)) AS balance_change_bln,
+        CAST(
+            (total_rub - initial_rub) / 1000000000.0
+            AS decimal(20,6)
+        ) AS balance_change_bln,
 
-        CAST(incoming_rub / 1000000000.0
-            AS decimal(20,6)) AS incoming_bln,
+        CAST(
+            incoming_rub / 1000000000.0
+            AS decimal(20,6)
+        ) AS incoming_bln,
 
-        CAST(outgoing_rub / 1000000000.0
-            AS decimal(20,6)) AS outgoing_bln,
+        CAST(
+            outgoing_rub / 1000000000.0
+            AS decimal(20,6)
+        ) AS outgoing_bln,
 
-        CAST((incoming_rub + outgoing_rub) / 1000000000.0
-            AS decimal(20,6)) AS payment_saldo_bln,
+        CAST(
+            (incoming_rub + outgoing_rub) / 1000000000.0
+            AS decimal(20,6)
+        ) AS payment_saldo_bln,
 
-        CAST(cumulative_payment_rub / 1000000000.0
-            AS decimal(20,6)) AS cumulative_payment_bln,
+        CAST(
+            cumulative_payment_rub / 1000000000.0
+            AS decimal(20,6)
+        ) AS cumulative_payment_bln,
 
         CAST(
             (
@@ -934,7 +1160,10 @@ BEGIN
 
     ORDER BY
         dt_rep,
-        CASE WHEN client_type = N'Действующий'
-            THEN 0 ELSE 1 END;
+        CASE
+            WHEN client_type = N'Действующий'
+                THEN 0
+            ELSE 1
+        END;
 
 END;
