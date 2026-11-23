@@ -13,35 +13,59 @@ DECLARE @DaysPerRun int = 4;
 DECLARE @MaxRunSeconds int = 420;
 
 DECLARE @RunStart datetime2 = SYSDATETIME();
+DECLARE @DayStart datetime2;
 DECLARE @dt date;
 DECLARE @d date;
 DECLARE @Stage int;
 DECLARE @Done int;
 DECLARE @Msg nvarchar(500);
 DECLARE @CohortClients bigint = NULL;
+DECLARE @ReuseTriggers bit = 0;
 
 IF @@TRANCOUNT <> 0
     THROW 50001, 'Open transaction', 1;
 
+IF @DateBase >= @DateFrom OR @DateFrom > @DateTo
+    THROW 50006, 'Incorrect date parameters', 1;
+
 
 /* ИНИЦИАЛИЗАЦИЯ.
-   При повторных запусках таблицы сохраняются. */
+   При повторных запусках таблицы сохраняются.
+   Старые агрегаты только по когорте сбрасываются.
+   Готовые триггеры по тем же датам сохраняются. */
 
-IF OBJECT_ID('tempdb..#r2_job') IS NULL
+IF OBJECT_ID('tempdb..#r2_job_all_v1') IS NULL
 BEGIN
 
+    IF OBJECT_ID('tempdb..#r2_job') IS NOT NULL
+       AND OBJECT_ID('tempdb..#r2_triggers') IS NOT NULL
+       AND OBJECT_ID('tempdb..#r2_trigger_done') IS NOT NULL
+    BEGIN
+
+        IF NOT EXISTS (
+            SELECT 1
+            FROM #r2_job
+            WHERE date_base <> @DateBase
+               OR date_from <> @DateFrom
+               OR date_to <> @DateTo
+        )
+            SET @ReuseTriggers = 1;
+
+    END;
+
+
     DROP TABLE IF EXISTS #r2_existing;
-    DROP TABLE IF EXISTS #r2_triggers;
     DROP TABLE IF EXISTS #r2_scan_clients;
-    DROP TABLE IF EXISTS #r2_trigger_done;
     DROP TABLE IF EXISTS #r2_closed;
     DROP TABLE IF EXISTS #r2_messages;
     DROP TABLE IF EXISTS #r2_sms_windows;
     DROP TABLE IF EXISTS #r2_push_windows;
     DROP TABLE IF EXISTS #r2_clients;
+    DROP TABLE IF EXISTS #r2_flags_day;
     DROP TABLE IF EXISTS #r2_pay_day;
     DROP TABLE IF EXISTS #r2_pay_sums;
     DROP TABLE IF EXISTS #r2_pay_done;
+
 
     /* Действующие клиенты по состоянию на 31.10 */
 
@@ -62,6 +86,7 @@ BEGIN
       AND t.od_flag = 1
       AND t.cur = '810'
       AND t.CLI_ID IS NOT NULL
+      AND t.out_rub IS NOT NULL
       AND t.out_rub >= 0
 
     GROUP BY t.CLI_ID
@@ -78,16 +103,29 @@ BEGIN
 
     /* Сохраняем только даты и CLI_ID триггеров */
 
-    SELECT TOP (0)
-        t.cli_id,
-        CAST(t.dt_rep AS date) AS dt
+    IF @ReuseTriggers = 0
+    BEGIN
 
-    INTO #r2_triggers
+        DROP TABLE IF EXISTS #r2_triggers;
+        DROP TABLE IF EXISTS #r2_trigger_done;
 
-    FROM ALM.ehd.VW_transfers_FL_det t;
+        SELECT TOP (0)
+            t.cli_id,
+            CAST(t.dt_rep AS date) AS dt
 
-    CREATE UNIQUE CLUSTERED INDEX IX_r2_triggers
-    ON #r2_triggers (cli_id, dt);
+        INTO #r2_triggers
+
+        FROM ALM.ehd.VW_transfers_FL_det t;
+
+        CREATE UNIQUE CLUSTERED INDEX IX_r2_triggers
+        ON #r2_triggers (cli_id, dt);
+
+
+        CREATE TABLE #r2_trigger_done (
+            dt date NOT NULL PRIMARY KEY
+        );
+
+    END;
 
 
     SELECT TOP (0)
@@ -101,15 +139,117 @@ BEGIN
     ON #r2_scan_clients (cli_id);
 
 
-    CREATE TABLE #r2_trigger_done (
-        dt date NOT NULL PRIMARY KEY
-    );
+    /* Закрытия срочных вкладов */
+
+    SELECT TOP (0)
+        cli_id,
+        CAST(NULL AS date) AS dt_close
+
+    INTO #r2_closed
+
+    FROM #r2_triggers;
+
+    CREATE UNIQUE CLUSTERED INDEX IX_r2_closed
+    ON #r2_closed (cli_id, dt_close);
 
 
-    /* Агрегаты всех платежей выбранной когорты */
+    /* Реестр фактических уведомлений */
+
+    SELECT TOP (0)
+        cli_id,
+        CAST(NULL AS date) AS dt,
+        CAST(0 AS int) AS sms_sent,
+        CAST(0 AS int) AS push_created,
+        CAST(0 AS int) AS push_viewed,
+        CAST(0 AS int) AS push_accepted
+
+    INTO #r2_messages
+
+    FROM #r2_triggers;
+
+    CREATE UNIQUE CLUSTERED INDEX IX_r2_messages
+    ON #r2_messages (cli_id, dt);
+
+
+    /* Окна СМС и пушей */
+
+    SELECT TOP (0)
+        cli_id,
+        dt AS dt_from,
+        dt AS dt_to
+
+    INTO #r2_sms_windows
+
+    FROM #r2_triggers;
+
+    CREATE UNIQUE CLUSTERED INDEX IX_r2_sms_windows
+    ON #r2_sms_windows (cli_id, dt_from);
+
+
+    SELECT TOP (0)
+        cli_id,
+        dt AS dt_from,
+        dt AS dt_to
+
+    INTO #r2_push_windows
+
+    FROM #r2_triggers;
+
+    CREATE UNIQUE CLUSTERED INDEX IX_r2_push_windows
+    ON #r2_push_windows (cli_id, dt_from);
+
+
+    /* Уникальные клиенты, связанные с удержанием */
+
+    SELECT TOP (0)
+        cli_id,
+        CAST(NULL AS nvarchar(20)) AS client_type,
+        CAST(0 AS int) AS sms_eligible_ever,
+        CAST(0 AS int) AS push_eligible_ever,
+        CAST(0 AS int) AS sms_fact_ever,
+        CAST(0 AS int) AS push_fact_ever,
+        CAST(0 AS int) AS push_viewed_ever
+
+    INTO #r2_clients
+
+    FROM #r2_triggers;
+
+    CREATE UNIQUE CLUSTERED INDEX IX_r2_clients
+    ON #r2_clients (cli_id);
+
+
+    /* Подневные флаги клиентов.
+       Считаем один раз на клиента за дату,
+       а не на каждый платеж. */
+
+    SELECT TOP (0)
+        cli_id,
+        sms_eligible_ever,
+        push_eligible_ever,
+        sms_fact_ever,
+        push_fact_ever,
+        push_viewed_ever,
+
+        CAST(0 AS int) AS sms_window,
+        CAST(0 AS int) AS push_window,
+        CAST(0 AS int) AS sms_offer_window,
+        CAST(0 AS int) AS push_view_day
+
+    INTO #r2_flags_day
+
+    FROM #r2_clients;
+
+    CREATE UNIQUE CLUSTERED INDEX IX_r2_flags_day
+    ON #r2_flags_day (cli_id);
+
+
+    /* Агрегаты всех платежей.
+       Клиенты без удержания получают нулевые флаги.
+       Точность сумм сохранена decimal(38,6). */
 
     CREATE TABLE #r2_pay_sums (
         dt_rep date NOT NULL,
+
         client_type nvarchar(20),
         bank nvarchar(512),
         bank_type varchar(10),
@@ -127,13 +267,16 @@ BEGIN
         sms_offer_window int,
         push_view_day int,
 
-        incoming_ns decimal(38,2),
-        outgoing_ns decimal(38,2),
-        incoming_sr decimal(38,2),
-        outgoing_sr decimal(38,2),
-        incoming_dvs decimal(38,2),
-        outgoing_dvs decimal(38,2)
+        incoming_ns decimal(38,6),
+        outgoing_ns decimal(38,6),
+
+        incoming_sr decimal(38,6),
+        outgoing_sr decimal(38,6),
+
+        incoming_dvs decimal(38,6),
+        outgoing_dvs decimal(38,6)
     );
+
 
     SELECT TOP (0) *
     INTO #r2_pay_day
@@ -147,131 +290,59 @@ BEGIN
 
     /* 1 = триггеры, 2 = когорта, 3 = платежи, 4 = готово */
 
-    CREATE TABLE #r2_job (
+    CREATE TABLE #r2_job_all_v1 (
         date_base date NOT NULL,
         date_from date NOT NULL,
         date_to date NOT NULL,
+        threshold decimal(18,2) NOT NULL,
         stage int NOT NULL
     );
 
-    INSERT INTO #r2_job
-    VALUES (@DateBase, @DateFrom, @DateTo, 1);
+    INSERT INTO #r2_job_all_v1
+    VALUES (
+        @DateBase,
+        @DateFrom,
+        @DateTo,
+        @threshold,
+        1
+    );
+
+    DROP TABLE IF EXISTS #r2_job;
 
 END;
 
 
-/* Создаем таблицы второго этапа заранее.
-   Это исправляет ошибку #r2_clients на первом этапе.
-   Уже обработанные даты триггеров не сбрасываем. */
+/* ПРОВЕРКА СОСТОЯНИЯ ПОВТОРНОГО ЗАПУСКА */
 
-IF OBJECT_ID('tempdb..#r2_triggers') IS NULL
-   OR OBJECT_ID('tempdb..#r2_existing') IS NULL
-   OR OBJECT_ID('tempdb..#r2_trigger_done') IS NULL
+IF OBJECT_ID('tempdb..#r2_existing') IS NULL
+   OR OBJECT_ID('tempdb..#r2_triggers') IS NULL
    OR OBJECT_ID('tempdb..#r2_scan_clients') IS NULL
-   OR OBJECT_ID('tempdb..#r2_pay_sums') IS NULL
+   OR OBJECT_ID('tempdb..#r2_trigger_done') IS NULL
+   OR OBJECT_ID('tempdb..#r2_closed') IS NULL
+   OR OBJECT_ID('tempdb..#r2_messages') IS NULL
+   OR OBJECT_ID('tempdb..#r2_sms_windows') IS NULL
+   OR OBJECT_ID('tempdb..#r2_push_windows') IS NULL
+   OR OBJECT_ID('tempdb..#r2_clients') IS NULL
+   OR OBJECT_ID('tempdb..#r2_flags_day') IS NULL
    OR OBJECT_ID('tempdb..#r2_pay_day') IS NULL
+   OR OBJECT_ID('tempdb..#r2_pay_sums') IS NULL
    OR OBJECT_ID('tempdb..#r2_pay_done') IS NULL
     THROW 50003, 'Incomplete calculation state', 1;
 
 
-IF OBJECT_ID('tempdb..#r2_closed') IS NULL
-BEGIN
-
-    SELECT TOP (0)
-        cli_id,
-        CAST(NULL AS date) AS dt_close
-    INTO #r2_closed
-    FROM #r2_triggers;
-
-    CREATE UNIQUE CLUSTERED INDEX IX_r2_closed
-    ON #r2_closed (cli_id, dt_close);
-
-END;
-
-
-IF OBJECT_ID('tempdb..#r2_messages') IS NULL
-BEGIN
-
-    SELECT TOP (0)
-        cli_id,
-        CAST(NULL AS date) AS dt,
-        CAST(0 AS int) AS sms_sent,
-        CAST(0 AS int) AS push_created,
-        CAST(0 AS int) AS push_viewed,
-        CAST(0 AS int) AS push_accepted
-    INTO #r2_messages
-    FROM #r2_triggers;
-
-    CREATE UNIQUE CLUSTERED INDEX IX_r2_messages
-    ON #r2_messages (cli_id, dt);
-
-END;
-
-
-IF OBJECT_ID('tempdb..#r2_sms_windows') IS NULL
-BEGIN
-
-    SELECT TOP (0)
-        cli_id,
-        CAST(NULL AS date) AS dt_from,
-        CAST(NULL AS date) AS dt_to
-    INTO #r2_sms_windows
-    FROM #r2_triggers;
-
-    CREATE UNIQUE CLUSTERED INDEX IX_r2_sms_windows
-    ON #r2_sms_windows (cli_id, dt_from);
-
-END;
-
-
-IF OBJECT_ID('tempdb..#r2_push_windows') IS NULL
-BEGIN
-
-    SELECT TOP (0)
-        cli_id,
-        CAST(NULL AS date) AS dt_from,
-        CAST(NULL AS date) AS dt_to
-    INTO #r2_push_windows
-    FROM #r2_triggers;
-
-    CREATE UNIQUE CLUSTERED INDEX IX_r2_push_windows
-    ON #r2_push_windows (cli_id, dt_from);
-
-END;
-
-
-IF OBJECT_ID('tempdb..#r2_clients') IS NULL
-BEGIN
-
-    SELECT TOP (0)
-        cli_id,
-        CAST(NULL AS nvarchar(20)) AS client_type,
-        CAST(0 AS int) AS sms_eligible_ever,
-        CAST(0 AS int) AS push_eligible_ever,
-        CAST(0 AS int) AS sms_fact_ever,
-        CAST(0 AS int) AS push_fact_ever,
-        CAST(0 AS int) AS push_viewed_ever
-    INTO #r2_clients
-    FROM #r2_triggers;
-
-    CREATE UNIQUE CLUSTERED INDEX IX_r2_clients
-    ON #r2_clients (cli_id);
-
-END;
-
-
 IF EXISTS (
     SELECT 1
-    FROM #r2_job
+    FROM #r2_job_all_v1
     WHERE date_base <> @DateBase
        OR date_from <> @DateFrom
        OR date_to <> @DateTo
+       OR threshold <> @threshold
 )
-    THROW 50003, 'Date parameters changed', 1;
+    THROW 50004, 'Calculation parameters changed', 1;
 
 
 SELECT @Stage = stage
-FROM #r2_job;
+FROM #r2_job_all_v1;
 
 
 /* ИЩЕМ ТОЛЬКО СБП-ТРИГГЕРЫ ПО 4 ДНЯ.
@@ -288,6 +359,7 @@ BEGIN
 
     SET @Done = 0;
 
+
     WHILE @dt <= @DateTo
       AND @Done < @DaysPerRun
     BEGIN
@@ -295,6 +367,8 @@ BEGIN
         IF DATEDIFF(second, @RunStart, SYSDATETIME())
            >= @MaxRunSeconds
             BREAK;
+
+        SET @DayStart = SYSDATETIME();
 
         SET @Msg = CONCAT(
             N'Триггеры: ',
@@ -339,6 +413,8 @@ BEGIN
         OPTION (MAXDOP 1, RECOMPILE);
 
 
+        /* Сохраняем результат готового дня */
+
         BEGIN TRY
 
             BEGIN TRANSACTION;
@@ -380,7 +456,7 @@ BEGIN
             N' | ',
             @Done, N'/', @DaysPerRun,
             N' | секунд: ',
-            DATEDIFF(second, @RunStart, SYSDATETIME())
+            DATEDIFF(second, @DayStart, SYSDATETIME())
         );
 
         RAISERROR(N'%s', 0, 1, @Msg) WITH NOWAIT;
@@ -395,8 +471,10 @@ BEGIN
         FROM #r2_trigger_done
     ) = DATEDIFF(day, @HistoryFrom, @DateTo) + 1
     BEGIN
-        UPDATE #r2_job
+
+        UPDATE #r2_job_all_v1
         SET stage = 2;
+
     END;
 
 END
@@ -422,6 +500,7 @@ BEGIN
     TRUNCATE TABLE #r2_sms_windows;
     TRUNCATE TABLE #r2_push_windows;
     TRUNCATE TABLE #r2_clients;
+    TRUNCATE TABLE #r2_flags_day;
 
 
     /* Закрытия срочных вкладов */
@@ -496,11 +575,13 @@ BEGIN
                 CAST(m.msgbegindate AS date),
                 CASE
                     WHEN LOWER(m.message_type) = N'sms'
-                    THEN 1 ELSE 0
+                        THEN 1
+                    ELSE 0
                 END,
                 CASE
                     WHEN LOWER(m.message_type) = N'push'
-                    THEN 1 ELSE 0
+                        THEN 1
+                    ELSE 0
                 END,
                 0,
                 0
@@ -511,7 +592,8 @@ BEGIN
                 0,
                 CASE
                     WHEN LOWER(m.message_type) = N'push'
-                    THEN 1 ELSE 0
+                        THEN 1
+                    ELSE 0
                 END,
                 0
             ),
@@ -522,7 +604,8 @@ BEGIN
                 0,
                 CASE
                     WHEN LOWER(m.message_type) = N'push'
-                    THEN 1 ELSE 0
+                        THEN 1
+                    ELSE 0
                 END
             )
     ) v(
@@ -704,19 +787,17 @@ BEGIN
         ON e.cli_id = ids.cli_id;
 
 
-    IF NOT EXISTS (SELECT 1 FROM #r2_clients)
-        THROW 50004, 'No clients in retention cohort', 1;
-
-
-    UPDATE #r2_job
+    UPDATE #r2_job_all_v1
     SET stage = 3;
 
 END
 
 
-/* ВСЕ ПЛАТЕЖИ КОГОРТЫ, ПО 4 ДНЯ ЗА ЗАПУСК.
+/* ВСЕ ПЛАТЕЖИ ПО 4 ДНЯ ЗА ЗАПУСК.
    Читаем по одному дню.
-   Сохраняем только агрегаты. */
+   Сохраняем только агрегаты.
+   Все исходные платежи остаются в расчете.
+   Клиентские флаги присоединяются через LEFT JOIN. */
 
 ELSE IF @Stage = 3
 BEGIN
@@ -738,45 +819,135 @@ BEGIN
            >= @MaxRunSeconds
             BREAK;
 
+        SET @DayStart = SYSDATETIME();
 
         SET @Msg = CONCAT(
-            N'Платежи когорты: ',
+            N'Платежи: ',
             CONVERT(varchar(10), @dt, 120)
         );
 
         RAISERROR(N'%s', 0, 1, @Msg) WITH NOWAIT;
+
+
+        /* Флаги на конкретную дату.
+           Одна строка на каждого клиента когорты. */
+
+        TRUNCATE TABLE #r2_flags_day;
+
+        INSERT INTO #r2_flags_day (
+            cli_id,
+
+            sms_eligible_ever,
+            push_eligible_ever,
+            sms_fact_ever,
+            push_fact_ever,
+            push_viewed_ever,
+
+            sms_window,
+            push_window,
+            sms_offer_window,
+            push_view_day
+        )
+
+        SELECT
+            c.cli_id,
+
+            c.sms_eligible_ever,
+            c.push_eligible_ever,
+            c.sms_fact_ever,
+            c.push_fact_ever,
+            c.push_viewed_ever,
+
+            CASE WHEN EXISTS (
+                SELECT 1
+                FROM #r2_sms_windows w
+                WHERE w.cli_id = c.cli_id
+                  AND @dt BETWEEN w.dt_from AND w.dt_to
+            ) THEN 1 ELSE 0 END,
+
+            CASE WHEN EXISTS (
+                SELECT 1
+                FROM #r2_push_windows w
+                WHERE w.cli_id = c.cli_id
+                  AND @dt BETWEEN w.dt_from AND w.dt_to
+            ) THEN 1 ELSE 0 END,
+
+            CASE WHEN EXISTS (
+                SELECT 1
+                FROM #r2_messages m
+                WHERE m.cli_id = c.cli_id
+                  AND m.sms_sent = 1
+                  AND @dt BETWEEN m.dt
+                              AND DATEADD(day, 6, m.dt)
+            ) THEN 1 ELSE 0 END,
+
+            CASE WHEN EXISTS (
+                SELECT 1
+                FROM #r2_messages m
+                WHERE m.cli_id = c.cli_id
+                  AND m.push_viewed = 1
+                  AND m.dt = @dt
+            ) THEN 1 ELSE 0 END
+
+        FROM #r2_clients c
+
+        OPTION (MAXDOP 1, RECOMPILE);
+
+
+        /* Один дневной срез всех платежей */
 
         TRUNCATE TABLE #r2_pay_day;
 
 
         ;WITH base AS (
             SELECT
-                CAST(t.dt_rep AS date) AS dt_rep,
-                c.client_type,
+                @dt AS dt_rep,
+
+                CASE
+                    WHEN e.cli_id IS NOT NULL
+                        THEN N'Действующий'
+                    ELSE N'Новый'
+                END AS client_type,
 
                 CASE
                     WHEN t.spec_cat IN ('BR','SR','FU')
                         THEN N'Market'
+
                     WHEN t.transaction_type = N'Наличные'
                         THEN N'Наличные'
+
                     ELSE t.bank_name_main
                 END AS bank,
 
                 CASE
                     WHEN t.spec_cat IN ('BR','SR','FU')
                         THEN 'market'
+
                     WHEN t.transaction_type = N'Наличные'
                         THEN 'cash'
+
                     ELSE 'bank'
                 END AS bank_type,
 
-                ISNULL(t.gr_size, N'Без gr_size') AS gr_size,
+                ISNULL(
+                    t.gr_size,
+                    N'Без gr_size'
+                ) AS gr_size,
 
-                c.sms_eligible_ever,
-                c.push_eligible_ever,
-                c.sms_fact_ever,
-                c.push_fact_ever,
-                c.push_viewed_ever,
+                ISNULL(f.sms_eligible_ever, 0)
+                    AS sms_eligible_ever,
+
+                ISNULL(f.push_eligible_ever, 0)
+                    AS push_eligible_ever,
+
+                ISNULL(f.sms_fact_ever, 0)
+                    AS sms_fact_ever,
+
+                ISNULL(f.push_fact_ever, 0)
+                    AS push_fact_ever,
+
+                ISNULL(f.push_viewed_ever, 0)
+                    AS push_viewed_ever,
 
                 CASE
                     WHEN t.direction_type = N'Переводы себе'
@@ -784,40 +955,18 @@ BEGIN
                      AND t.direction = '-1'
                      AND t.amount_out <= -1000000
                      AND t.cli_biz = N'Розница'
-                    THEN 1
+                        THEN 1
                     ELSE 0
                 END AS trigger_payment,
 
-                CASE WHEN EXISTS (
-                    SELECT 1
-                    FROM #r2_sms_windows w
-                    WHERE w.cli_id = t.cli_id
-                      AND @dt BETWEEN w.dt_from AND w.dt_to
-                ) THEN 1 ELSE 0 END AS sms_window,
+                ISNULL(f.sms_window, 0) AS sms_window,
+                ISNULL(f.push_window, 0) AS push_window,
 
-                CASE WHEN EXISTS (
-                    SELECT 1
-                    FROM #r2_push_windows w
-                    WHERE w.cli_id = t.cli_id
-                      AND @dt BETWEEN w.dt_from AND w.dt_to
-                ) THEN 1 ELSE 0 END AS push_window,
+                ISNULL(f.sms_offer_window, 0)
+                    AS sms_offer_window,
 
-                CASE WHEN EXISTS (
-                    SELECT 1
-                    FROM #r2_messages m
-                    WHERE m.cli_id = t.cli_id
-                      AND m.sms_sent = 1
-                      AND @dt BETWEEN m.dt
-                                  AND DATEADD(day, 6, m.dt)
-                ) THEN 1 ELSE 0 END AS sms_offer_window,
-
-                CASE WHEN EXISTS (
-                    SELECT 1
-                    FROM #r2_messages m
-                    WHERE m.cli_id = t.cli_id
-                      AND m.push_viewed = 1
-                      AND m.dt = @dt
-                ) THEN 1 ELSE 0 END AS push_view_day,
+                ISNULL(f.push_view_day, 0)
+                    AS push_view_day,
 
                 a.amt_ns,
                 a.amt_sr,
@@ -829,7 +978,8 @@ BEGIN
                           t.direction_txt = N'смешанные'
                           AND a.amt > 0
                       )
-                    THEN 1 ELSE 0
+                        THEN 1
+                    ELSE 0
                 END AS is_incoming,
 
                 CASE
@@ -838,45 +988,51 @@ BEGIN
                           t.direction_txt = N'смешанные'
                           AND a.amt < 0
                       )
-                    THEN 1 ELSE 0
+                        THEN 1
+                    ELSE 0
                 END AS is_outgoing
 
             FROM ALM.ehd.VW_transfers_FL_det t WITH (NOLOCK)
 
-            INNER JOIN #r2_clients c
-                ON c.cli_id = t.cli_id
+            LEFT JOIN #r2_existing e
+                ON e.cli_id = t.cli_id
+
+            LEFT JOIN #r2_flags_day f
+                ON f.cli_id = t.cli_id
 
             CROSS APPLY (
-                SELECT
+                VALUES (
                     CAST(
                         ISNULL(t.[распознано_НС], 0)
-                        AS decimal(28,2)
-                    ) AS amt_ns,
-
+                        AS decimal(28,6)
+                    ),
                     CAST(
                         ISNULL(t.[распознано_СР], 0)
-                        AS decimal(28,2)
-                    ) AS amt_sr,
-
+                        AS decimal(28,6)
+                    ),
                     CAST(
                         ISNULL(t.[Распознано_ДВС], 0)
-                        AS decimal(28,2)
-                    ) AS amt_dvs
-            ) v
+                        AS decimal(28,6)
+                    )
+                )
+            ) v(amt_ns, amt_sr, amt_dvs)
 
             CROSS APPLY (
-                SELECT
+                VALUES (
                     v.amt_ns,
                     v.amt_sr,
                     v.amt_dvs,
 
                     v.amt_ns
                     + v.amt_sr
-                    + v.amt_dvs AS amt
-            ) a
+                    + v.amt_dvs
+                )
+            ) a(amt_ns, amt_sr, amt_dvs, amt)
 
             WHERE t.dt_rep >= @dt
               AND t.dt_rep < DATEADD(day, 1, @dt)
+
+              AND t.cli_id IS NOT NULL
 
               AND t.direction_type <> N'Ошибка'
               AND t.[целевая категория] = 1
@@ -915,8 +1071,10 @@ BEGIN
 
             incoming_ns,
             outgoing_ns,
+
             incoming_sr,
             outgoing_sr,
+
             incoming_dvs,
             outgoing_dvs
         )
@@ -942,32 +1100,38 @@ BEGIN
 
             SUM(CASE
                 WHEN is_incoming = 1
-                    THEN amt_ns ELSE 0
+                    THEN amt_ns
+                ELSE 0
             END),
 
             SUM(CASE
                 WHEN is_outgoing = 1
-                    THEN amt_ns ELSE 0
+                    THEN amt_ns
+                ELSE 0
             END),
 
             SUM(CASE
                 WHEN is_incoming = 1
-                    THEN amt_sr ELSE 0
+                    THEN amt_sr
+                ELSE 0
             END),
 
             SUM(CASE
                 WHEN is_outgoing = 1
-                    THEN amt_sr ELSE 0
+                    THEN amt_sr
+                ELSE 0
             END),
 
             SUM(CASE
                 WHEN is_incoming = 1
-                    THEN amt_dvs ELSE 0
+                    THEN amt_dvs
+                ELSE 0
             END),
 
             SUM(CASE
                 WHEN is_outgoing = 1
-                    THEN amt_dvs ELSE 0
+                    THEN amt_dvs
+                ELSE 0
             END)
 
         FROM base
@@ -1003,9 +1167,65 @@ BEGIN
 
             BEGIN TRANSACTION;
 
-            INSERT INTO #r2_pay_sums
-            SELECT *
+            INSERT INTO #r2_pay_sums (
+                dt_rep,
+                client_type,
+                bank,
+                bank_type,
+                gr_size,
+
+                sms_eligible_ever,
+                push_eligible_ever,
+                sms_fact_ever,
+                push_fact_ever,
+                push_viewed_ever,
+
+                trigger_payment,
+                sms_window,
+                push_window,
+                sms_offer_window,
+                push_view_day,
+
+                incoming_ns,
+                outgoing_ns,
+
+                incoming_sr,
+                outgoing_sr,
+
+                incoming_dvs,
+                outgoing_dvs
+            )
+
+            SELECT
+                dt_rep,
+                client_type,
+                bank,
+                bank_type,
+                gr_size,
+
+                sms_eligible_ever,
+                push_eligible_ever,
+                sms_fact_ever,
+                push_fact_ever,
+                push_viewed_ever,
+
+                trigger_payment,
+                sms_window,
+                push_window,
+                sms_offer_window,
+                push_view_day,
+
+                incoming_ns,
+                outgoing_ns,
+
+                incoming_sr,
+                outgoing_sr,
+
+                incoming_dvs,
+                outgoing_dvs
+
             FROM #r2_pay_day;
+
 
             INSERT INTO #r2_pay_done (dt)
             VALUES (@dt);
@@ -1030,7 +1250,9 @@ BEGIN
             N'Готово: ',
             CONVERT(varchar(10), @dt, 120),
             N' | ',
-            @Done, N'/', @DaysPerRun
+            @Done, N'/', @DaysPerRun,
+            N' | секунд: ',
+            DATEDIFF(second, @DayStart, SYSDATETIME())
         );
 
         RAISERROR(N'%s', 0, 1, @Msg) WITH NOWAIT;
@@ -1045,8 +1267,10 @@ BEGIN
         FROM #r2_pay_done
     ) = DATEDIFF(day, @DateFrom, @DateTo) + 1
     BEGIN
-        UPDATE #r2_job
+
+        UPDATE #r2_job_all_v1
         SET stage = 4;
+
     END;
 
 END;
@@ -1055,12 +1279,14 @@ END;
 /* СТАТУС ВЫПОЛНЕНИЯ ДЛЯ ВЫВОДА */
 
 SELECT @Stage = stage
-FROM #r2_job;
+FROM #r2_job_all_v1;
 
 IF @Stage >= 3
 BEGIN
+
     SELECT @CohortClients = COUNT_BIG(*)
     FROM #r2_clients;
+
 END;
 
 
@@ -1097,21 +1323,24 @@ SELECT
 IF @Stage = 4
 BEGIN
 
+    /* Порог банка считаем по всем платежам.
+       Все типы клиентов, все gr_size и все флаги. */
+
     ;WITH bank_totals AS (
         SELECT
             bank,
             bank_type,
 
             SUM(
-                incoming_ns
-                + incoming_sr
-                + incoming_dvs
+                ISNULL(incoming_ns, 0)
+              + ISNULL(incoming_sr, 0)
+              + ISNULL(incoming_dvs, 0)
             ) AS bank_incoming,
 
             SUM(
-                outgoing_ns
-                + outgoing_sr
-                + outgoing_dvs
+                ISNULL(outgoing_ns, 0)
+              + ISNULL(outgoing_sr, 0)
+              + ISNULL(outgoing_dvs, 0)
             ) AS bank_outgoing
 
         FROM #r2_pay_sums
@@ -1130,6 +1359,7 @@ BEGIN
                  AND ABS(b.bank_incoming) <= @threshold
                  AND ABS(b.bank_outgoing) <= @threshold
                     THEN N'else'
+
                 ELSE p.bank
             END AS bank_name_main
 
@@ -1151,10 +1381,13 @@ BEGIN
             WHEN p.sms_eligible_ever = 1
              AND p.push_eligible_ever = 1
                 THEN N'SMS + Push'
+
             WHEN p.sms_eligible_ever = 1
                 THEN N'SMS'
+
             WHEN p.push_eligible_ever = 1
                 THEN N'Push'
+
             ELSE N'Нет'
         END AS eligible_group,
 
@@ -1162,10 +1395,13 @@ BEGIN
             WHEN p.sms_fact_ever = 1
              AND p.push_fact_ever = 1
                 THEN N'SMS + Push'
+
             WHEN p.sms_fact_ever = 1
                 THEN N'SMS'
+
             WHEN p.push_fact_ever = 1
                 THEN N'Push'
+
             ELSE N'Нет'
         END AS fact_group,
 
@@ -1177,6 +1413,7 @@ BEGIN
         p.trigger_payment,
 
         SUM(v.incoming) / 1000000000.0 AS incoming,
+
         SUM(v.outgoing) / 1000000000.0 AS outgoing,
 
         SUM(
@@ -1239,11 +1476,15 @@ BEGIN
 
     SELECT
         client_type,
+
         COUNT(*) AS clients,
+
         SUM(sms_eligible_ever) AS sms_eligible_clients,
         SUM(push_eligible_ever) AS push_eligible_clients,
+
         SUM(sms_fact_ever) AS sms_fact_clients,
         SUM(push_fact_ever) AS push_fact_clients,
+
         SUM(push_viewed_ever) AS push_viewed_clients
 
     FROM #r2_clients
@@ -1261,6 +1502,8 @@ END;
    Смотрим остатки ровно выбранных клиентов,
    сохраняя их постоянные флаги.
 
+   Клиенты вне когорты в этот запрос не включаются.
+
 DECLARE @BalanceDate date = '2026-11-10';
 
 SELECT
@@ -1271,6 +1514,7 @@ SELECT
     c.push_eligible_ever,
     c.sms_fact_ever,
     c.push_fact_ever,
+    c.push_viewed_ever,
 
     SUM(CASE
         WHEN t.section_name = N'Срочные'
@@ -1296,11 +1540,13 @@ INNER JOIN #r2_clients c
 
 WHERE t.dt_rep = @BalanceDate
   AND t.block_name = N'Привлечение ФЛ'
+
   AND t.section_name IN (
       N'Срочные',
       N'Накопительный счёт',
       N'До востребования'
   )
+
   AND t.od_flag = 1
   AND t.cur = '810'
   AND t.out_rub >= 0
@@ -1308,10 +1554,12 @@ WHERE t.dt_rep = @BalanceDate
 GROUP BY
     t.dt_rep,
     c.client_type,
+
     c.sms_eligible_ever,
     c.push_eligible_ever,
     c.sms_fact_ever,
-    c.push_fact_ever
+    c.push_fact_ever,
+    c.push_viewed_ever
 
 OPTION (MAXDOP 1, RECOMPILE);
 
