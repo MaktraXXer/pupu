@@ -7,18 +7,29 @@ DECLARE @DateFrom date = '2026-11-01';
 DECLARE @DateTo date = '2026-11-04';
 DECLARE @threshold decimal(18,2) = 200000000;
 
+DROP TABLE IF EXISTS #dbo_contracts;
 DROP TABLE IF EXISTS #test_existing;
 DROP TABLE IF EXISTS #test_payments;
 
 
-/* 1. Действующие клиенты на 31 октября */
+/* 1. Договоры, открытые через DBO */
 
-SELECT
-    t.CLI_ID
+SELECT DISTINCT
+    CON_ID
+INTO #dbo_contracts
+FROM ALM.ehd.VW_FL_DEPO_channels WITH (NOLOCK)
+WHERE CON_CHANNEL = N'DBO'
+  AND CON_ID IS NOT NULL;
+
+CREATE UNIQUE CLUSTERED INDEX IX_dbo_contracts
+ON #dbo_contracts (CON_ID);
+
+
+/* 2. Действующие клиенты на 31 октября */
+
+SELECT t.CLI_ID
 INTO #test_existing
-
 FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
-
 WHERE t.dt_rep = @DateBase
   AND t.block_name = N'Привлечение ФЛ'
   AND t.section_name IN (
@@ -30,17 +41,15 @@ WHERE t.dt_rep = @DateBase
   AND t.cur = '810'
   AND t.CLI_ID IS NOT NULL
   AND t.out_rub >= 0
-
 GROUP BY t.CLI_ID
 HAVING SUM(t.out_rub) > 0
-
 OPTION (MAXDOP 1, RECOMPILE);
 
 CREATE UNIQUE CLUSTERED INDEX IX_test_existing
 ON #test_existing (CLI_ID);
 
 
-/* 2. Платежи сразу агрегируем по клиенту, банку и gr_size */
+/* 3. Только платежи по DBO-договорам */
 
 ;WITH flows AS (
     SELECT
@@ -80,6 +89,9 @@ ON #test_existing (CLI_ID);
         END AS is_outgoing
 
     FROM ALM.ehd.VW_transfers_FL_det t WITH (NOLOCK)
+
+    INNER JOIN #dbo_contracts d
+        ON d.CON_ID = t.CON_ID
 
     LEFT JOIN #test_existing e
         ON e.CLI_ID = t.cli_id
@@ -132,7 +144,6 @@ SELECT
 INTO #test_payments
 
 FROM flows
-
 WHERE is_incoming = 1 OR is_outgoing = 1
 
 GROUP BY
@@ -145,7 +156,7 @@ GROUP BY
 OPTION (MAXDOP 1, RECOMPILE);
 
 
-/* 3. Порог банка по ВСЕМ клиентам и ВСЕМ gr_size */
+/* 4. Порог по всему банку, независимо от gr_size */
 
 ;WITH bank_totals AS (
     SELECT
@@ -160,7 +171,6 @@ OPTION (MAXDOP 1, RECOMPILE);
 classified AS (
     SELECT
         p.*,
-
         CASE
             WHEN p.bank_type = 'bank'
              AND ABS(b.bank_incoming) <= @threshold
@@ -168,14 +178,11 @@ classified AS (
                 THEN N'else'
             ELSE p.bank
         END AS final_bank
-
     FROM #test_payments p
     INNER JOIN bank_totals b
         ON b.bank = p.bank
        AND b.bank_type = p.bank_type
 )
-
-/* 4. Итог: количество операций и средние чеки */
 
 SELECT
     client_type,
@@ -198,23 +205,14 @@ SELECT
 
     CAST(
         SUM(outgoing_abs_rub)
-        / NULLIF(
-            COUNT(DISTINCT CASE WHEN outgoing_count > 0
-                THEN cli_id END),0
-        )
+        / NULLIF(COUNT(DISTINCT CASE
+            WHEN outgoing_count > 0 THEN cli_id END),0)
         AS decimal(20,2)
     ) AS avg_client_rub
 
 FROM classified
 
-GROUP BY
-    client_type,
-    final_bank,
-    gr_size
-
+GROUP BY client_type, final_bank, gr_size
 HAVING SUM(outgoing_count) > 0
 
-ORDER BY
-    client_type,
-    final_bank,
-    gr_size;
+ORDER BY client_type, final_bank, gr_size;
