@@ -2,244 +2,218 @@
 USE ALM;
 SET NOCOUNT ON;
 
-DECLARE @DateBase date = '2026-10-31';
-DECLARE @DateFrom date = '2026-11-01';
-DECLARE @DateTo date = '2026-11-04';
-DECLARE @threshold decimal(18,2) = 200000000;
+DECLARE @DateFrom date = '2026-11-15';
+DECLARE @DateTo date = '2026-11-21';
 
-DROP TABLE IF EXISTS #dbo_clients;
-DROP TABLE IF EXISTS #test_existing;
-DROP TABLE IF EXISTS #test_payments;
+DROP TABLE IF EXISTS #bal;
+DROP TABLE IF EXISTS #rates;
+DROP TABLE IF EXISTS #result;
 
 
-/* 1. Клиенты с хотя бы одним DBO-договором */
-
-SELECT DISTINCT
-    v.CLI_ID
-INTO #dbo_clients
-FROM ALM.ehd.VW_FL_DEPO_channels v WITH (NOLOCK)
-WHERE v.CON_CHANNEL = N'DBO'
-  AND v.CLI_ID IS NOT NULL
-  AND v.DT_OPEN_FACT < DATEADD(day, 1, @DateTo)
-OPTION (MAXDOP 1, RECOMPILE);
-
-CREATE UNIQUE CLUSTERED INDEX IX_dbo_clients
-ON #dbo_clients (CLI_ID);
-
-
-/* 2. Действующие клиенты на 31 октября */
+/* 1. Баланс + ставка LIQUIDITY */
 
 SELECT
-    t.CLI_ID
-INTO #test_existing
+    t.dt_rep,
+    t.dt_open,
+    t.con_id,
+
+    CAST(t.out_rub AS decimal(20,2)) AS out_rub,
+    CAST(t.rate_con AS decimal(9,4)) AS rate_balance,
+    t.rate_con_src,
+
+    dcr.rate AS rate_liq
+
+INTO #bal
+
 FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
 
-INNER JOIN #dbo_clients d
-    ON d.CLI_ID = t.CLI_ID
+OUTER APPLY (
+    SELECT TOP (1)
+        r.rate
+    FROM LIQUIDITY.liq.DepositContract_Rate r WITH (NOLOCK)
+    WHERE r.con_id = t.con_id
+      AND (
+          CASE
+              WHEN t.dt_open = t.dt_rep
+                  THEN DATEADD(day, 1, t.dt_rep)
+              ELSE t.dt_rep
+          END
+      ) BETWEEN r.dt_from AND r.dt_to
+    ORDER BY r.dt_from DESC, r.dt_to DESC
+) dcr
 
-WHERE t.dt_rep = @DateBase
+WHERE t.dt_rep >= @DateFrom
+  AND t.dt_rep < DATEADD(day, 3, @DateTo)
+
+  AND t.section_name = N'Накопительный счёт'
   AND t.block_name = N'Привлечение ФЛ'
-  AND t.section_name IN (
-      N'Срочные',
-      N'Накопительный счёт',
-      N'До востребования'
-  )
   AND t.od_flag = 1
   AND t.cur = '810'
-  AND t.out_rub >= 0
+  AND t.out_rub IS NOT NULL
 
-GROUP BY t.CLI_ID
-HAVING SUM(t.out_rub) > 0
+OPTION (MAXDOP 2, RECOMPILE);
 
-OPTION (MAXDOP 1, RECOMPILE);
-
-CREATE UNIQUE CLUSTERED INDEX IX_test_existing
-ON #test_existing (CLI_ID);
+CREATE CLUSTERED INDEX IX_bal
+ON #bal (con_id, dt_rep);
 
 
-/* 3. Платежи клиентов с DBO-договорами */
+/* 2. Рассчитываем ставку по алгоритму */
 
-;WITH flows AS (
+;WITH bal_pos AS (
     SELECT
-        t.cli_id,
+        *,
 
-        CASE
-            WHEN e.CLI_ID IS NOT NULL THEN N'Действующий'
-            ELSE N'Новый'
-        END AS client_type,
+        MIN(CASE
+            WHEN rate_balance > 0
+             AND rate_con_src = N'счет ультра,вручную'
+                THEN rate_balance
+        END) OVER (
+            PARTITION BY con_id
+            ORDER BY dt_rep
+            ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING
+        ) AS rate_pos
 
-        CASE
-            WHEN t.spec_cat IN ('BR','SR','FU') THEN N'Market'
-            WHEN t.transaction_type = N'Наличные' THEN N'Наличные'
-            ELSE t.bank_name_main
-        END AS bank,
-
-        CASE
-            WHEN t.spec_cat IN ('BR','SR','FU') THEN 'market'
-            WHEN t.transaction_type = N'Наличные' THEN 'cash'
-            ELSE 'bank'
-        END AS bank_type,
-
-        ISNULL(t.gr_size, N'Без gr_size') AS gr_size,
-
-        a.amt,
-
-        CASE
-            WHEN t.direction_txt = N'входящие'
-              OR (t.direction_txt = N'смешанные' AND a.amt > 0)
-                THEN 1 ELSE 0
-        END AS is_incoming,
-
-        CASE
-            WHEN t.direction_txt = N'исходящие'
-              OR (t.direction_txt = N'смешанные' AND a.amt < 0)
-                THEN 1 ELSE 0
-        END AS is_outgoing
-
-    FROM ALM.ehd.VW_transfers_FL_det t WITH (NOLOCK)
-
-    INNER JOIN #dbo_clients d
-        ON d.CLI_ID = t.cli_id
-
-    LEFT JOIN #test_existing e
-        ON e.CLI_ID = t.cli_id
-
-    CROSS APPLY (
-        VALUES (
-            CAST(ISNULL(t.[распознано_НС], 0) AS decimal(28,2))
-          + CAST(ISNULL(t.[распознано_СР], 0) AS decimal(28,2))
-          + CAST(ISNULL(t.[Распознано_ДВС], 0) AS decimal(28,2))
-        )
-    ) a(amt)
-
-    WHERE t.dt_rep >= @DateFrom
-      AND t.dt_rep < DATEADD(day, 1, @DateTo)
-      AND t.cli_id IS NOT NULL
-      AND t.direction_type <> N'Ошибка'
-      AND t.[целевая категория] = 1
-      AND t.transaction_type <> N'Внутренние переводы'
-      AND t.transit_max_id IS NULL
-      AND t.bank_name_main <> N'Без перевода'
-      AND t.cli_biz IN (N'Розница', N'ДЧБО')
-
-      AND (
-          t.spec_cat NOT IN ('BR','SR','FU')
-          OR (
-              t.spec_cat IN ('BR','SR','FU')
-              AND t.transaction_type <> N'Наличные'
-          )
-      )
-)
-
-SELECT
-    cli_id,
-    client_type,
-    bank,
-    bank_type,
-    gr_size,
-
-    SUM(CASE WHEN is_incoming = 1
-        THEN amt ELSE 0 END) AS incoming_rub,
-
-    SUM(CASE WHEN is_outgoing = 1
-        THEN amt ELSE 0 END) AS outgoing_rub,
-
-    COUNT_BIG(CASE
-        WHEN is_outgoing = 1 AND amt <> 0
-        THEN 1 END) AS outgoing_count,
-
-    SUM(CASE WHEN is_outgoing = 1
-        THEN ABS(amt) ELSE 0 END) AS outgoing_abs_rub
-
-INTO #test_payments
-
-FROM flows
-
-WHERE is_incoming = 1 OR is_outgoing = 1
-
-GROUP BY
-    cli_id,
-    client_type,
-    bank,
-    bank_type,
-    gr_size
-
-OPTION (MAXDOP 1, RECOMPILE);
-
-
-/* 4. Классификация банков по всем gr_size и клиентам */
-
-;WITH bank_totals AS (
-    SELECT
-        bank,
-        bank_type,
-        SUM(incoming_rub) AS bank_incoming,
-        SUM(outgoing_rub) AS bank_outgoing
-
-    FROM #test_payments
-    GROUP BY bank, bank_type
+    FROM #bal
 ),
 
-classified AS (
+rate_calc AS (
     SELECT
-        p.*,
+        dt_rep,
+        dt_open,
+        out_rub,
 
-        CASE
-            WHEN p.bank_type = 'bank'
-             AND ABS(b.bank_incoming) <= @threshold
-             AND ABS(b.bank_outgoing) <= @threshold
-                THEN N'else'
-            ELSE p.bank
-        END AS final_bank
+        rate_balance,
+        rate_liq,
 
-    FROM #test_payments p
+        CAST(
+            CASE
+                WHEN rate_liq IS NULL
+                    THEN CASE
+                        WHEN rate_balance < 0
+                            THEN COALESCE(rate_pos, rate_balance)
+                        ELSE rate_balance
+                    END
 
-    INNER JOIN bank_totals b
-        ON b.bank = p.bank
-       AND b.bank_type = p.bank_type
+                WHEN rate_liq < 0 AND rate_balance > 0
+                    THEN rate_balance
+
+                WHEN rate_liq < 0 AND rate_balance < 0
+                    THEN COALESCE(rate_pos, rate_balance)
+
+                WHEN rate_liq >= 0 AND rate_balance >= 0
+                    THEN rate_liq
+
+                WHEN rate_liq > 0 AND rate_balance < 0
+                    THEN rate_liq
+
+                ELSE rate_liq
+            END AS decimal(9,4)
+        ) AS rate_use
+
+    FROM bal_pos
+
+    WHERE dt_rep BETWEEN @DateFrom AND @DateTo
 )
 
-/* 5. Итоговая статистика */
+SELECT *
+INTO #rates
+FROM rate_calc;
+
+
+/* 3. Общие объемы и три средневзвешенные ставки */
+
+;WITH aggr AS (
+    SELECT
+        r.dt_rep,
+        s.data_scope,
+
+        SUM(r.out_rub) AS out_rub_total,
+
+        SUM(r.rate_balance * r.out_rub)
+            / NULLIF(SUM(r.out_rub), 0) AS rate_source_a,
+
+        SUM(r.rate_liq * r.out_rub)
+            / NULLIF(SUM(r.out_rub), 0) AS rate_source_b,
+
+        SUM(r.rate_use * r.out_rub)
+            / NULLIF(SUM(r.out_rub), 0) AS rate_algorithm
+
+    FROM #rates r
+
+    CROSS APPLY (
+        VALUES
+            (N'портфель', 1),
+            (N'новые',
+                CASE WHEN r.dt_open = r.dt_rep
+                    THEN 1 ELSE 0 END)
+    ) s(data_scope, include_flag)
+
+    WHERE s.include_flag = 1
+
+    GROUP BY
+        r.dt_rep,
+        s.data_scope
+),
+
+calendar AS (
+    SELECT DATEADD(day, n.n, @DateFrom) AS dt_rep
+    FROM (
+        VALUES (0),(1),(2),(3),(4),(5),(6)
+    ) n(n)
+)
 
 SELECT
-    client_type,
-    final_bank AS bank_name_main,
-    gr_size,
+    c.dt_rep,
+    s.data_scope,
 
-    SUM(outgoing_count) AS outgoing_operations,
+    a.out_rub_total,
+    a.rate_source_a,
+    a.rate_source_b,
+    a.rate_algorithm
 
-    COUNT(DISTINCT CASE
-        WHEN outgoing_count > 0 THEN cli_id
-    END) AS outgoing_clients,
+INTO #result
 
-    CAST(
-        SUM(outgoing_abs_rub) / 1000000000.0
-        AS decimal(20,6)
-    ) AS outgoing_bln,
+FROM calendar c
+CROSS JOIN (
+    VALUES (N'портфель'), (N'новые')
+) s(data_scope)
 
-    CAST(
-        SUM(outgoing_abs_rub)
-        / NULLIF(SUM(outgoing_count), 0)
-        AS decimal(20,2)
-    ) AS avg_payment_rub,
+LEFT JOIN aggr a
+    ON a.dt_rep = c.dt_rep
+   AND a.data_scope = s.data_scope;
 
-    CAST(
-        SUM(outgoing_abs_rub)
-        / NULLIF(COUNT(DISTINCT CASE
-            WHEN outgoing_count > 0 THEN cli_id END), 0)
-        AS decimal(20,2)
-    ) AS avg_client_rub
 
-FROM classified
+/* SELECT 1 — СТАВКА ИЗ БАЛАНСА */
 
-GROUP BY
-    client_type,
-    final_bank,
-    gr_size
+SELECT
+    dt_rep,
+    data_scope,
+    out_rub_total,
+    rate_source_a AS rate_con
 
-HAVING SUM(outgoing_count) > 0
+FROM #result
+ORDER BY dt_rep, data_scope;
 
-ORDER BY
-    client_type,
-    final_bank,
-    gr_size;
+
+/* SELECT 2 — СТАВКА ИЗ LIQUIDITY */
+
+SELECT
+    dt_rep,
+    data_scope,
+    out_rub_total,
+    rate_source_b AS rate_con
+
+FROM #result
+ORDER BY dt_rep, data_scope;
+
+
+/* SELECT 3 — СТАВКА ПО НАШЕМУ АЛГОРИТМУ */
+
+SELECT
+    dt_rep,
+    data_scope,
+    out_rub_total,
+    rate_algorithm AS rate_con
+
+FROM #result
+ORDER BY dt_rep, data_scope;
