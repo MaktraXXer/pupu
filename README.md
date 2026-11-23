@@ -1,3 +1,4 @@
+
 ;WITH x AS (
     SELECT
         t.section_name,
@@ -9,14 +10,14 @@
 
         ROW_NUMBER() OVER (
             PARTITION BY t.section_name
-            ORDER BY
-                CASE WHEN t.dt_open >= '2026-11-01' THEN 0 ELSE 1 END,
-                t.dt_open DESC
+            ORDER BY t.dt_open DESC, t.CON_ID
         ) AS rn
 
     FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
 
     WHERE t.dt_rep = '2026-11-15'
+      AND t.dt_open >= '2026-11-01'
+      AND t.dt_open < '2026-11-16'
       AND t.block_name = N'Привлечение ФЛ'
       AND t.section_name IN (
           N'Срочные',
@@ -35,8 +36,21 @@
       )
 )
 
-SELECT *
+SELECT
+    x.*,
+    ch.*
+
 FROM x
-WHERE rn <= 2
-ORDER BY section_name, rn
+
+OUTER APPLY (
+    SELECT TOP (1) c.*
+    FROM ALM.ehd.VW_FL_DEPO_channels c WITH (NOLOCK)
+    WHERE c.CON_ID = x.CON_ID
+    ORDER BY c.DT_OPEN_FACT DESC
+) ch
+
+WHERE x.rn <= 2
+
+ORDER BY x.section_name, x.rn
+
 OPTION (MAXDOP 1);
