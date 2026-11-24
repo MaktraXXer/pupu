@@ -1,68 +1,217 @@
-/* ДИАГНОСТИКА ПОДКЛЮЧЕНИЯ */
+
+IF NOT EXISTS (
+    SELECT 1
+    FROM #rk26w_job
+    WHERE stage = 5
+)
+    THROW 50001, 'Расчет не завершен', 1;
+
 
 SELECT
-    SYSDATETIME() AS check_time,
-    @@SERVERNAME AS server_name,
-    DB_NAME() AS current_db,
-    @@SPID AS session_id,
-    @@TRANCOUNT AS open_transactions;
+    a.dt_rep,
+    a.client_group,
+
+    a.bank_name_main,
+    a.bank_type,
+    a.gr_size,
+
+    a.payment_type,
+    a.transaction_type,
+    a.operation_type,
+    a.payment_direction,
+    a.cli_biz,
+
+    a.target_flag,
+    a.sbp_self_1m,
 
 
-/* ЗАПОЛНЕННОСТЬ TEMPDB */
+    /* Фактическое окно на дату платежа */
 
-EXEC tempdb.sys.sp_executesql N'
-SELECT
-    CAST(SUM(CAST(size AS bigint))
-        / 128.0 AS decimal(18,2)) AS total_mb,
+    CASE
+        WHEN a.sms_offer_window = 1
+         AND a.push_offer_window = 1
+            THEN N'SMS + Push'
 
-    CAST(SUM(CAST(FILEPROPERTY(name, ''SpaceUsed'') AS bigint))
-        / 128.0 AS decimal(18,2)) AS used_mb,
+        WHEN a.sms_offer_window = 1
+            THEN N'SMS'
 
-    CAST(SUM(CAST(size AS bigint)
-        - FILEPROPERTY(name, ''SpaceUsed''))
-        / 128.0 AS decimal(18,2)) AS free_mb,
+        WHEN a.push_offer_window = 1
+            THEN N'Push'
+
+        ELSE N'Нет'
+
+    END AS fact_group_day,
+
+
+    /* Потенциальное окно на дату платежа */
+
+    CASE
+        WHEN a.sms_window = 1
+         AND a.push_window = 1
+            THEN N'SMS + Push'
+
+        WHEN a.sms_window = 1
+            THEN N'SMS'
+
+        WHEN a.push_window = 1
+            THEN N'Push'
+
+        WHEN a.sms_unknown_window = 1
+          OR a.push_unknown_window = 1
+            THEN N'Не определено'
+
+        ELSE N'Нет'
+
+    END AS eligible_group_day,
+
+
+    /* Триггеры и приложения */
+
+    a.trigger_day,
+
+    a.has_app_activity,
+    a.has_old_app,
+    a.has_new_app,
+    a.has_unknown_app,
+
+    a.has_closed_deposit,
+
+
+    /* Потенциальные права */
+
+    a.sms_candidate_day,
+    a.sms_repeat_blocked_day,
+
+    a.sms_eligible_day,
+    a.push_eligible_day,
+
+    a.sms_unknown_day,
+    a.push_unknown_day,
+
+
+    /* Фактические уведомления */
+
+    a.sms_fact_day,
+    a.push_fact_day,
+
+    a.push_fact_unmatched_day,
+
+
+    /* Потенциальные окна */
+
+    a.sms_window,
+    a.push_window,
+
+    a.sms_unknown_window,
+    a.push_unknown_window,
+
+
+    /* Фактические окна */
+
+    a.sms_offer_window,
+    a.push_offer_window,
+
+    a.sms_cooldown_day,
+
+
+    /* Денежные показатели */
+
+    v.amount_scope,
+    v.raspoznano_type,
+
+    CASE
+        WHEN v.amount_scope = N'Полные суммы'
+            THEN a.source_rows
+    END AS source_rows,
+
+    CASE
+        WHEN v.amount_scope = N'Полные суммы'
+            THEN a.count_in
+    END AS count_in,
+
+    CASE
+        WHEN v.amount_scope = N'Полные суммы'
+            THEN a.count_out
+    END AS count_out,
 
     CAST(
-        100.0 * SUM(CAST(FILEPROPERTY(name, ''SpaceUsed'') AS bigint))
-        / NULLIF(SUM(CAST(size AS bigint)), 0)
-        AS decimal(9,2)
-    ) AS used_pct
+        v.incoming / 1000000000.0
+        AS decimal(20,6)
+    ) AS incoming,
 
-FROM sys.database_files
-WHERE type = 0;
-';
+    CAST(
+        v.outgoing / 1000000000.0
+        AS decimal(20,6)
+    ) AS outgoing,
 
+    CAST(
+        (v.incoming + v.outgoing) / 1000000000.0
+        AS decimal(20,6)
+    ) AS saldo
 
-/* НАГРУЗКА СОБСТВЕННОЙ СЕССИИ */
+FROM #rk26w_agg a
 
-SELECT
-    session_id,
-    cpu_time / 1000.0 AS cpu_seconds,
-    memory_usage * 8.0 / 1024 AS session_memory_mb,
-    reads,
-    writes,
-    logical_reads,
-    open_transaction_count
-FROM sys.dm_exec_sessions
-WHERE session_id = @@SPID;
+CROSS APPLY (
 
+    VALUES
 
-/* РАЗМЕРЫ НАШИХ ВРЕМЕННЫХ ТАБЛИЦ */
+        (
+            N'Компоненты',
+            N'Вклады',
+            a.incoming_sr,
+            a.outgoing_sr
+        ),
 
-IF OBJECT_ID('tempdb..#rk26p_cli') IS NOT NULL
-    EXEC tempdb.sys.sp_spaceused N'#rk26p_cli';
+        (
+            N'Компоненты',
+            N'НС',
+            a.incoming_ns,
+            a.outgoing_ns
+        ),
 
-IF OBJECT_ID('tempdb..#rk26w_msg') IS NOT NULL
-    EXEC tempdb.sys.sp_spaceused N'#rk26w_msg';
+        (
+            N'Компоненты',
+            N'ДВС',
+            a.incoming_dvs,
+            a.outgoing_dvs
+        ),
 
-IF OBJECT_ID('tempdb..#rk26w_event') IS NOT NULL
-    EXEC tempdb.sys.sp_spaceused N'#rk26w_event';
+        (
+            N'Компоненты',
+            N'Другие распознанные',
+            a.incoming_other,
+            a.outgoing_other
+        ),
 
-IF OBJECT_ID('tempdb..#rk26w_windows') IS NOT NULL
-    EXEC tempdb.sys.sp_spaceused N'#rk26w_windows';
+        (
+            N'Компоненты',
+            N'Нераспознанные',
+            a.incoming_unknown,
+            a.outgoing_unknown
+        ),
 
-IF OBJECT_ID('tempdb..#rk26w_dayflags') IS NOT NULL
-    EXEC tempdb.sys.sp_spaceused N'#rk26w_dayflags';
+        (
+            N'Полные суммы',
+            N'Полные переводы',
+            a.amount_in,
+            a.amount_out
+        )
 
-IF OBJECT_ID('tempdb..#rk26w_agg') IS NOT NULL
-    EXEC tempdb.sys.sp_spaceused N'#rk26w_agg';
+) v(amount_scope, raspoznano_type, incoming, outgoing)
+
+WHERE v.incoming <> 0
+   OR v.outgoing <> 0
+   OR (
+       v.amount_scope = N'Полные суммы'
+       AND a.source_rows > 0
+   )
+
+ORDER BY
+    a.dt_rep,
+    a.client_group,
+    a.bank_name_main,
+    a.gr_size,
+    v.amount_scope,
+    v.raspoznano_type
+
+OPTION (MAXDOP 1, RECOMPILE);
