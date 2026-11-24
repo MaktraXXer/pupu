@@ -1,3 +1,73 @@
+USE ALM_TEST;
+SET NOCOUNT ON;
+
+;WITH agg AS (
+
+    SELECT
+        target_flag,
+
+        SUM(incoming_sr) AS in_sr,
+        SUM(outgoing_sr) AS out_sr,
+
+        SUM(incoming_ns) AS in_ns,
+        SUM(outgoing_ns) AS out_ns,
+
+        SUM(incoming_dvs) AS in_dvs,
+        SUM(outgoing_dvs) AS out_dvs,
+
+        SUM(incoming_other) AS in_other,
+        SUM(outgoing_other) AS out_other,
+
+        SUM(incoming_unknown) AS in_unknown,
+        SUM(outgoing_unknown) AS out_unknown
+
+    FROM WORK.RK_Oct2026_PaymentAgg
+
+    GROUP BY target_flag
+
+)
+
+SELECT
+    a.target_flag,
+    v.raspoznano_type,
+
+    CAST(v.incoming / 1e9 AS decimal(20,4)) AS incoming,
+    CAST(v.outgoing / 1e9 AS decimal(20,4)) AS outgoing,
+
+    CAST((v.incoming + v.outgoing) / 1e9
+        AS decimal(20,4)) AS saldo,
+
+    CAST((ABS(v.incoming) + ABS(v.outgoing)) / 1e9
+        AS decimal(20,4)) AS turnover,
+
+    CAST(
+        100.0 * (ABS(v.incoming) + ABS(v.outgoing))
+        / NULLIF(
+            SUM(ABS(v.incoming) + ABS(v.outgoing))
+            OVER (PARTITION BY v.raspoznano_type), 0
+        )
+        AS decimal(10,2)
+    ) AS share_pct
+
+FROM agg a
+
+CROSS APPLY (
+    VALUES
+        (N'Вклады', a.in_sr, a.out_sr),
+        (N'НС', a.in_ns, a.out_ns),
+        (N'ДВС', a.in_dvs, a.out_dvs),
+        (N'Другие распознанные', a.in_other, a.out_other),
+        (N'Нераспознанные', a.in_unknown, a.out_unknown)
+) v(raspoznano_type, incoming, outgoing)
+
+ORDER BY
+    v.raspoznano_type,
+    a.target_flag
+
+OPTION (MAXDOP 1, RECOMPILE);
+
+
+
 USE ALM;
 SET NOCOUNT ON;
 
