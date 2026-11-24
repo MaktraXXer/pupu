@@ -1,47 +1,51 @@
+USE ALM;
+
+DECLARE @dt date = '2026-10-15';
+DECLARE @LookbackDays int = 7;
+
+;WITH clients AS (
+
+    SELECT TOP (20)
+        cli_id,
+        push_unknown
+    FROM #rk26w_event
+    WHERE dt_rep = @dt
+      AND sms_unknown = 1
+      AND has_app_activity = 0
+    ORDER BY cli_id
+
+)
+
 SELECT
-    CASE
-        WHEN has_app_activity = 0
-            THEN N'Активность не найдена'
-        WHEN has_unknown_app = 1
-            THEN N'Версия или ОС не определена'
-        ELSE N'Прочее'
-    END AS reason,
+    c.cli_id,
+    c.push_unknown,
 
-    sms_unknown_day,
-    push_unknown_day,
+    MAX(CASE
+        WHEN d.CLI_ID = c.cli_id
+         AND d.LOG_TIMESTAMP >= @dt
+        THEN 1 ELSE 0
+    END) AS activity_same_day,
 
-    SUM(outgoing_sr) / 1e9 AS outgoing_depo,
-    SUM(outgoing_ns) / 1e9 AS outgoing_ns,
-    SUM(outgoing_dvs) / 1e9 AS outgoing_dvs,
+    MAX(CASE
+        WHEN d.CLI_ID = c.cli_id
+         AND d.LOG_TIMESTAMP < @dt
+        THEN 1 ELSE 0
+    END) AS activity_previous_days,
 
-    SUM(outgoing_sr + outgoing_ns + outgoing_dvs)
-        / 1e9 AS outgoing_total
+    MAX(CASE
+        WHEN d.CLI_ID = -c.cli_id
+        THEN 1 ELSE 0
+    END) AS opposite_id_found
 
-FROM ALM_TEST.WORK.RK_Oct2026_PaymentAgg
+FROM clients c
 
-WHERE client_group IN (
-    N'старый клиент масс кто принес новые деньги',
-    N'старый клиент масс кто не принес новые деньги'
-)
-
-AND sbp_self_1m = 1
-AND sms_offer_window = 0
-AND push_offer_window = 0
-
-AND (
-    sms_unknown_day = 1
-    OR push_unknown_day = 1
-)
+LEFT JOIN ALM.ehd.ods_cli_devices d
+    ON d.CLI_ID IN (c.cli_id, -c.cli_id)
+   AND d.LOG_TIMESTAMP >= DATEADD(day, -@LookbackDays, @dt)
+   AND d.LOG_TIMESTAMP < DATEADD(day, 1, @dt)
 
 GROUP BY
-    CASE
-        WHEN has_app_activity = 0
-            THEN N'Активность не найдена'
-        WHEN has_unknown_app = 1
-            THEN N'Версия или ОС не определена'
-        ELSE N'Прочее'
-    END,
-    sms_unknown_day,
-    push_unknown_day
+    c.cli_id,
+    c.push_unknown
 
-OPTION (MAXDOP 1);
+OPTION (MAXDOP 1, RECOMPILE);
