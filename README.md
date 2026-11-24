@@ -1,273 +1,148 @@
 
-USE ALM_TEST;
+USE ALM;
 SET NOCOUNT ON;
-SET XACT_ABORT ON;
 
-DECLARE @DateFrom date = '2026-10-01';
-DECLARE @DateTo date = '2026-11-04';
+DECLARE @dt date = '2026-10-15';
 
-DECLARE @DaysPerRun int = 4;
-DECLARE @MaxRunSeconds int = 420;
-DECLARE @IncludePrivate bit = 0;
+/* Все платежи трех групп MASS.
+   Пока не применяем прежние фильтры платежей. */
 
-DECLARE @RunStart datetime2 = SYSDATETIME();
-DECLARE @DayStart datetime2;
-DECLARE @dt date;
-DECLARE @Done int = 0;
-DECLARE @Msg nvarchar(500);
-
-IF OBJECT_ID('WORK.RK_Oct2026_ClientRegistry', 'U') IS NULL
-    THROW 50001, 'Не найден реестр клиентов', 1;
-
-
-/* ИНИЦИАЛИЗАЦИЯ.
-   При повторных запусках таблица сохраняется. */
-
-IF OBJECT_ID('tempdb..#rk_oct26_group_balances') IS NULL
-BEGIN
-
-    CREATE TABLE #rk_oct26_group_balances (
-        dt_rep date NOT NULL,
-        client_group nvarchar(150) NOT NULL,
-
-        deposits_rub decimal(38,2),
-        ns_rub decimal(38,2),
-        total_rub decimal(38,2),
-
-        PRIMARY KEY (dt_rep, client_group)
-    );
-
-END;
-
-
-/* Определяем следующую необработанную дату */
-
-SELECT @dt = DATEADD(day, 1, MAX(dt_rep))
-FROM #rk_oct26_group_balances;
-
-IF @dt IS NULL
-    SET @dt = @DateFrom;
-
-
-/* ПОДНЕВНЫЕ БАЛАНСЫ ПО КАТЕГОРИЯМ КЛИЕНТОВ.
-   Используем готовый реестр.
-   Маркеты и ФУ исключаем по продуктам.
-   Фильтры первоначального балансового скрипта сохраняются. */
-
-WHILE @dt <= @DateTo
-  AND @Done < @DaysPerRun
-BEGIN
-
-    IF DATEDIFF(second, @RunStart, SYSDATETIME())
-       >= @MaxRunSeconds
-        BREAK;
-
-    SET @DayStart = SYSDATETIME();
-
-    SET @Msg = CONCAT(
-        N'Баланс по категориям: ',
-        CONVERT(varchar(10), @dt, 120)
-    );
-
-    RAISERROR(N'%s', 0, 1, @Msg) WITH NOWAIT;
-
-
-    /* Один дневной срез баланса */
-
-    ;WITH balances AS (
-
-        SELECT
-            c.client_group,
-
-            SUM(CASE
-                WHEN t.section_name = N'Срочные'
-                    THEN CAST(t.out_rub AS decimal(20,2))
-                ELSE 0
-            END) AS deposits_rub,
-
-            SUM(CASE
-                WHEN t.section_name = N'Накопительный счёт'
-                    THEN CAST(t.out_rub AS decimal(20,2))
-                ELSE 0
-            END) AS ns_rub,
-
-            SUM(CAST(t.out_rub AS decimal(20,2)))
-                AS total_rub
-
-        FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
-
-        INNER JOIN ALM_TEST.WORK.RK_Oct2026_ClientRegistry c
-            ON c.cli_id = t.CLI_ID
-
-        WHERE t.dt_rep >= @dt
-          AND t.dt_rep < DATEADD(day, 1, @dt)
-
-          AND t.block_name = N'Привлечение ФЛ'
-          AND t.od_flag = 1
-          AND t.cur = '810'
-          AND t.out_rub IS NOT NULL
-          AND t.out_rub >= 0
-
-          AND (
-              t.TSEGMENTNAME <> N'ДЧБО'
-              OR t.TSEGMENTNAME IS NULL
-          )
-
-          AND (
-
-              /* НС Розница */
-
-              (
-                  t.section_name = N'Накопительный счёт'
-                  AND t.acc_role = N'LIAB'
-              )
-
-              OR
-
-              /* Стандартная линейка вкладов Розница */
-
-              (
-                  t.section_name = N'Срочные'
-
-                  AND (
-                      t.PROD_NAME_res IS NULL
-
-                      OR t.PROD_NAME_res NOT IN (
-                          N'ДОМа надёжно',
-                          N'Всё в ДОМ',
-                          N'Надёжный прайм',
-                          N'НадёжныйVIP',
-                          N'Надёжный премиум',
-                          N'Надёжный промо',
-                          N'Надёжный старт',
-                          N'Надёжный Т2',
-                          N'Надёжный Мегафон',
-                          N'Надёжный процент',
-                          N'Могучий',
-                          N'Надёжный'
-                      )
-                  )
-              )
-          )
-
-        GROUP BY
-            c.client_group
-    ),
-
-    /* Сохраняем все категории на каждую дату */
-
-    client_groups AS (
-
-        SELECT client_group
-
-        FROM (VALUES
-            (N'новый клиент масс'),
-            (N'старый клиент масс кто принес новые деньги'),
-            (N'старый клиент масс кто не принес новые деньги'),
-            (N'потенциальный клиент private кто попал в статистику масс по балансу')
-        ) v(client_group)
-
-    )
-
-    INSERT INTO #rk_oct26_group_balances (
-        dt_rep,
-        client_group,
-        deposits_rub,
-        ns_rub,
-        total_rub
-    )
+;WITH base AS (
 
     SELECT
-        @dt,
-        g.client_group,
+        c.client_group,
+        t.direction_txt,
 
-        ISNULL(b.deposits_rub, 0),
-        ISNULL(b.ns_rub, 0),
-        ISNULL(b.total_rub, 0)
+        a.amount_out,
+        a.amt_ns,
+        a.amt_sr,
+        a.amt_dvs,
 
-    FROM client_groups g
+        a.amt_ns + a.amt_sr + a.amt_dvs AS amt,
 
-    LEFT JOIN balances b
-        ON b.client_group = g.client_group
+        CASE
+            WHEN t.direction_type IS NULL
+                THEN N'01. Нет direction_type'
 
-    OPTION (MAXDOP 1, RECOMPILE);
+            WHEN t.direction_type = N'Ошибка'
+                THEN N'02. Ошибка'
 
+            WHEN t.[целевая категория] IS NULL
+              OR t.[целевая категория] <> 1
+                THEN N'03. Нецелевая категория'
 
-    SET @Done = @Done + 1;
+            WHEN t.transaction_type IS NULL
+                THEN N'04. Нет transaction_type'
 
-    SET @Msg = CONCAT(
-        N'Готово: ',
-        CONVERT(varchar(10), @dt, 120),
-        N' | ',
-        @Done, N'/', @DaysPerRun,
-        N' | секунд: ',
-        DATEDIFF(second, @DayStart, SYSDATETIME())
-    );
+            WHEN t.transaction_type = N'Внутренние переводы'
+                THEN N'05. Внутренние переводы'
 
-    RAISERROR(N'%s', 0, 1, @Msg) WITH NOWAIT;
+            WHEN t.transit_max_id IS NOT NULL
+                THEN N'06. Транзит'
 
-    SET @dt = DATEADD(day, 1, @dt);
+            WHEN t.bank_name_main IS NULL
+                THEN N'07. Нет банка'
 
-END;
+            WHEN t.bank_name_main = N'Без перевода'
+                THEN N'08. Без перевода'
 
+            WHEN t.cli_biz IS NULL
+              OR t.cli_biz NOT IN (N'Розница', N'ДЧБО')
+                THEN N'09. Другой сегмент'
 
-/* СТАТУС РАСЧЕТА */
+            WHEN t.spec_cat IS NULL
+                THEN N'10. Нет spec_cat'
+
+            WHEN t.spec_cat IN ('BR','SR','FU')
+             AND t.transaction_type = N'Наличные'
+                THEN N'11. Market наличные'
+
+            WHEN t.direction_txt = N'смешанные'
+             AND a.amt_ns + a.amt_sr + a.amt_dvs = 0
+                THEN N'12. Смешанные с нулевым сальдо'
+
+            WHEN t.direction_txt IS NULL
+              OR t.direction_txt NOT IN (
+                  N'входящие',
+                  N'исходящие',
+                  N'смешанные'
+              )
+                THEN N'13. Не определено направление'
+
+            ELSE N'00. Включено в расчет'
+
+        END AS payment_filter
+
+    FROM ALM.ehd.VW_transfers_FL_det t WITH (NOLOCK)
+
+    INNER JOIN ALM_TEST.WORK.RK_Oct2026_ClientRegistry c
+        ON c.cli_id = t.cli_id
+
+    CROSS APPLY (
+        VALUES (
+            CAST(ISNULL(t.amount_out, 0) AS decimal(28,6)),
+            CAST(ISNULL(t.[распознано_НС], 0) AS decimal(28,6)),
+            CAST(ISNULL(t.[распознано_СР], 0) AS decimal(28,6)),
+            CAST(ISNULL(t.[Распознано_ДВС], 0) AS decimal(28,6))
+        )
+    ) a(amount_out, amt_ns, amt_sr, amt_dvs)
+
+    WHERE t.dt_rep >= @dt
+      AND t.dt_rep < DATEADD(day, 1, @dt)
+
+      AND c.client_group IN (
+          N'новый клиент масс',
+          N'старый клиент масс кто принес новые деньги',
+          N'старый клиент масс кто не принес новые деньги'
+      )
+)
+
+/* Сравниваем суммы и причины исключения */
 
 SELECT
-    CASE
-        WHEN COUNT(DISTINCT dt_rep)
-             = DATEDIFF(day, @DateFrom, @DateTo) + 1
-            THEN N'Готово'
-        ELSE N'Балансы'
-    END AS stage,
-
-    COUNT(DISTINCT dt_rep) AS days_done,
-
-    DATEDIFF(day, @DateFrom, @DateTo) + 1 AS days_total,
-
-    MAX(dt_rep) AS last_date,
-
-    DATEDIFF(second, @RunStart, SYSDATETIME()) AS run_seconds
-
-FROM #rk_oct26_group_balances;
-
-
-/* ИТОГ. Подневные остатки по категориям в млрд рублей */
-
-SELECT
-    dt_rep,
     client_group,
+    payment_filter,
 
-    CAST(
-        deposits_rub / 1000000000.0
-        AS decimal(20,6)
-    ) AS deposits_bln,
+    COUNT_BIG(*) AS rows_count,
 
-    CAST(
-        ns_rub / 1000000000.0
-        AS decimal(20,6)
-    ) AS ns_bln,
+    COUNT_BIG(CASE
+        WHEN amount_out < 0 THEN 1
+    END) AS raw_outgoing_rows,
 
-    CAST(
-        total_rub / 1000000000.0
-        AS decimal(20,6)
-    ) AS total_bln
+    COUNT_BIG(CASE
+        WHEN amount_out < 0
+         AND amt_ns = 0
+         AND amt_sr = 0
+         AND amt_dvs = 0
+        THEN 1
+    END) AS outgoing_not_recognized_rows,
 
-FROM #rk_oct26_group_balances
+    SUM(CASE
+        WHEN amount_out < 0
+            THEN amount_out ELSE 0
+    END) / 1000000000.0 AS amount_out_bln,
 
-WHERE @IncludePrivate = 1
+    SUM(CASE
+        WHEN amount_out < 0
+            THEN amt ELSE 0
+    END) / 1000000000.0 AS recognized_on_outgoing_rows_bln,
 
-   OR client_group IN (
-       N'новый клиент масс',
-       N'старый клиент масс кто принес новые деньги',
-       N'старый клиент масс кто не принес новые деньги'
-   )
+    SUM(amt_sr) / 1000000000.0 AS recognized_deposits_bln,
+
+    SUM(amt_ns) / 1000000000.0 AS recognized_ns_bln,
+
+    SUM(amt_dvs) / 1000000000.0 AS recognized_dvs_bln,
+
+    SUM(amt) / 1000000000.0 AS recognized_saldo_bln
+
+FROM base
+
+GROUP BY
+    client_group,
+    payment_filter
 
 ORDER BY
-    dt_rep,
-    CASE client_group
-        WHEN N'новый клиент масс' THEN 1
-        WHEN N'старый клиент масс кто принес новые деньги' THEN 2
-        WHEN N'старый клиент масс кто не принес новые деньги' THEN 3
-        ELSE 4
-    END;
+    client_group,
+    payment_filter
+
+OPTION (MAXDOP 1, RECOMPILE);
