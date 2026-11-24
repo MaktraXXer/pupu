@@ -1,191 +1,111 @@
-;WITH base AS (
+USE ALM;
+SET NOCOUNT ON;
+
+DECLARE @DateFrom date = '2026-09-30';
+DECLARE @DateTo date = '2026-11-04';
+
+;WITH balances AS (
 
     SELECT
-        a.dt_rep,
-        a.client_group,
-        a.bank_name_main,
-        a.bank_type,
-        a.gr_size,
-        a.payment_type,
-        a.transaction_type,
-        a.operation_type,
-        a.payment_direction,
+        c.client_group,
 
-        /* Потенциальное удержание */
+        SUM(CASE WHEN t.dt_rep = @DateFrom
+                  AND t.section_name = N'Срочные'
+                 THEN t.out_rub ELSE 0 END) AS depo_before,
 
-        CASE
-            WHEN a.sms_window = 1
-             AND a.push_window = 1
-                THEN N'SMS + Push'
+        SUM(CASE WHEN t.dt_rep = @DateTo
+                  AND t.section_name = N'Срочные'
+                 THEN t.out_rub ELSE 0 END) AS depo_after,
 
-            WHEN a.sms_window = 1
-             AND a.push_unknown_window = 1
-                THEN N'SMS + Push не определен'
+        SUM(CASE WHEN t.dt_rep = @DateFrom
+                  AND t.section_name = N'Накопительный счёт'
+                 THEN t.out_rub ELSE 0 END) AS ns_before,
 
-            WHEN a.push_window = 1
-             AND a.sms_unknown_window = 1
-                THEN N'Push + SMS не определена'
+        SUM(CASE WHEN t.dt_rep = @DateTo
+                  AND t.section_name = N'Накопительный счёт'
+                 THEN t.out_rub ELSE 0 END) AS ns_after
 
-            WHEN a.sms_window = 1
-                THEN N'SMS'
+    FROM ALM.ALM.VW_balance_rest_all t WITH (NOLOCK)
 
-            WHEN a.push_window = 1
-                THEN N'Push'
+    INNER JOIN ALM_TEST.WORK.RK_Oct2026_ClientRegistry c
+        ON c.cli_id = t.cli_id
 
-            WHEN a.sms_unknown_window = 1
-             AND a.push_unknown_window = 1
-                THEN N'SMS и Push не определены'
+    WHERE t.dt_rep IN (@DateFrom, @DateTo)
 
-            WHEN a.sms_unknown_window = 1
-                THEN N'SMS не определена'
+      AND c.client_group IN (
+          N'новый клиент масс',
+          N'старый клиент масс кто принес новые деньги',
+          N'старый клиент масс кто не принес новые деньги'
+      )
 
-            WHEN a.push_unknown_window = 1
-                THEN N'Push не определен'
+      AND t.block_name = N'Привлечение ФЛ'
+      AND t.od_flag = 1
+      AND t.cur = '810'
+      AND t.out_rub IS NOT NULL
+      AND t.out_rub >= 0
 
-            ELSE N'Нет'
+      AND (
+          t.TSEGMENTNAME <> N'ДЧБО'
+          OR t.TSEGMENTNAME IS NULL
+      )
 
-        END AS eligible_group,
+      AND (
+          (
+              t.section_name = N'Накопительный счёт'
+              AND t.acc_role = 'LIAB'
+          )
+          OR
+          (
+              t.section_name = N'Срочные'
 
-        /* Фактическое удержание */
+              AND (
+                  t.PROD_NAME_res IS NULL
+                  OR t.PROD_NAME_res NOT IN (
+                      N'ДОМа надёжно',
+                      N'Всё в ДОМ',
+                      N'Надёжный прайм',
+                      N'НадёжныйVIP',
+                      N'Надёжный премиум',
+                      N'Надёжный промо',
+                      N'Надёжный старт',
+                      N'Надёжный Т2',
+                      N'Надёжный Мегафон',
+                      N'Надёжный процент',
+                      N'Могучий',
+                      N'Надёжный'
+                  )
+              )
+          )
+      )
 
-        CASE
-            WHEN a.sms_offer_window = 1
-             AND a.push_offer_window = 1
-                THEN N'SMS + Push'
-
-            WHEN a.sms_offer_window = 1
-                THEN N'SMS'
-
-            WHEN a.push_offer_window = 1
-                THEN N'Push'
-
-            ELSE N'Нет'
-
-        END AS fact_group,
-
-        a.incoming_sr,
-        a.outgoing_sr,
-
-        a.incoming_ns,
-        a.outgoing_ns,
-
-        a.incoming_dvs,
-        a.outgoing_dvs,
-
-        a.incoming_other,
-        a.outgoing_other,
-
-        a.incoming_unknown,
-        a.outgoing_unknown,
-
-        a.amount_in,
-        a.amount_out
-
-    FROM ALM_TEST.WORK.RK_Oct2026_PaymentAgg a
-
-),
-
-/* Агрегация */
-
-agg AS (
-
-    SELECT
-        dt_rep,
-        client_group,
-        bank_name_main,
-        bank_type,
-        gr_size,
-        payment_type,
-        transaction_type,
-        operation_type,
-        payment_direction,
-        eligible_group,
-        fact_group,
-
-        SUM(incoming_sr) AS incoming_sr,
-        SUM(outgoing_sr) AS outgoing_sr,
-
-        SUM(incoming_ns) AS incoming_ns,
-        SUM(outgoing_ns) AS outgoing_ns,
-
-        SUM(incoming_dvs) AS incoming_dvs,
-        SUM(outgoing_dvs) AS outgoing_dvs,
-
-        SUM(incoming_other) AS incoming_other,
-        SUM(outgoing_other) AS outgoing_other,
-
-        SUM(incoming_unknown) AS incoming_unknown,
-        SUM(outgoing_unknown) AS outgoing_unknown,
-
-        SUM(amount_in) AS amount_in,
-        SUM(amount_out) AS amount_out
-
-    FROM base
-
-    GROUP BY
-        dt_rep,
-        client_group,
-        bank_name_main,
-        bank_type,
-        gr_size,
-        payment_type,
-        transaction_type,
-        operation_type,
-        payment_direction,
-        eligible_group,
-        fact_group
+    GROUP BY c.client_group
 
 )
 
-/* Итоговая выгрузка */
-
 SELECT
-    a.dt_rep,
-    a.client_group,
-    a.bank_name_main,
-    a.bank_type,
-    a.gr_size,
-    a.payment_type,
-    a.transaction_type,
-    a.operation_type,
-    a.payment_direction,
+    ISNULL(client_group, N'ИТОГО MASS') AS client_group,
 
-    a.eligible_group,
-    a.fact_group,
+    SUM(depo_before) / 1e9 AS depo_3009,
+    SUM(depo_after) / 1e9 AS depo_0411,
+    SUM(depo_after - depo_before) / 1e9 AS depo_delta,
 
-    v.raspoznano_type,
+    SUM(ns_before) / 1e9 AS ns_3009,
+    SUM(ns_after) / 1e9 AS ns_0411,
+    SUM(ns_after - ns_before) / 1e9 AS ns_delta,
 
-    CAST(v.incoming / 1000000000.0
-        AS decimal(20,6)) AS incoming,
+    SUM(depo_before + ns_before) / 1e9 AS total_3009,
+    SUM(depo_after + ns_after) / 1e9 AS total_0411,
 
-    CAST(v.outgoing / 1000000000.0
-        AS decimal(20,6)) AS outgoing,
+    SUM(depo_after + ns_after
+      - depo_before - ns_before) / 1e9 AS total_delta
 
-    CAST((v.incoming + v.outgoing) / 1000000000.0
-        AS decimal(20,6)) AS saldo
+FROM balances
 
-FROM agg a
+GROUP BY GROUPING SETS (
+    (client_group),
+    ()
+)
 
-CROSS APPLY (
-
-    VALUES
-        (N'Вклады', a.incoming_sr, a.outgoing_sr),
-        (N'НС', a.incoming_ns, a.outgoing_ns),
-        (N'ДВС', a.incoming_dvs, a.outgoing_dvs),
-        (N'Другие распознанные', a.incoming_other, a.outgoing_other),
-        (N'Нераспознанные', a.incoming_unknown, a.outgoing_unknown),
-        (N'Полные переводы', a.amount_in, a.amount_out)
-
-) v(raspoznano_type, incoming, outgoing)
-
-WHERE v.incoming <> 0
-   OR v.outgoing <> 0
-
-ORDER BY
-    a.dt_rep,
-    a.client_group,
-    a.bank_name_main,
-    a.gr_size,
-    v.raspoznano_type
+ORDER BY GROUPING(client_group), client_group
 
 OPTION (MAXDOP 1, RECOMPILE);
