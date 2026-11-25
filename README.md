@@ -1,77 +1,30 @@
-DECLARE @dt date = '2026-10-15';
+SELECT TOP (30)
+    cli_id,
+    action_date,
+    should_be,
+    total_out / 1e6 AS original_out_mln,
 
-;WITH src AS (
+    COUNT_BIG(*) AS rows_count,
+    COUNT(DISTINCT ping_date) AS message_dates,
 
-    SELECT
-        CASE
-            WHEN p.spec_cat IN ('BR','SR','FU')
-                THEN N'02. BR / SR / FU'
-            WHEN p.spec_cat IS NULL
-                THEN N'03. spec_cat NULL'
-            WHEN p.transaction_type = N'Внутренние переводы'
-                THEN N'04. Внутренние переводы'
-            WHEN p.direction_type = N'Ошибка'
-                THEN N'05. Ошибка'
-            WHEN p.transit_max_id IS NOT NULL
-                THEN N'06. Транзит'
-            ELSE N'01. Включено в расчет'
-        END AS reason,
+    SUM(total_out) / 1e6 AS summed_out_mln,
 
-        p.[Распознано_СР] AS sr,
-        p.[Распознано_НС] AS ns,
-        p.[Распознано_ДВС] AS dvs
+    (SUM(total_out) - MAX(total_out)) / 1e6
+        AS duplicated_out_mln
 
-    FROM ALM.ehd.VW_transfers_FL_det p
+FROM ALM_TEST.alm_history.sms_push_clients
 
-    JOIN ALM_TEST.WORK.RK_Oct2026_ClientRegistry c
-        ON p.cli_id = c.cli_id
+GROUP BY
+    cli_id,
+    action_date,
+    should_be,
+    total_out
 
-    WHERE p.dt_rep = @dt
+HAVING COUNT_BIG(*) > 1
 
-      AND c.client_group IN (
-          N'новый клиент масс',
-          N'старый клиент масс кто принес новые деньги',
-          N'старый клиент масс кто не принес новые деньги'
-      )
+ORDER BY ABS(SUM(total_out) - MAX(total_out)) DESC
 
-)
+OPTION (MAXDOP 1);
 
-SELECT
-    reason,
-    COUNT_BIG(*) AS source_rows,
 
-    SUM(CASE WHEN sr > 0 THEN sr ELSE 0 END)/1e9 AS in_sr,
-    SUM(CASE WHEN sr < 0 THEN sr ELSE 0 END)/1e9 AS out_sr,
-
-    SUM(CASE WHEN ns > 0 THEN ns ELSE 0 END)/1e9 AS in_ns,
-    SUM(CASE WHEN ns < 0 THEN ns ELSE 0 END)/1e9 AS out_ns,
-
-    SUM(CASE WHEN dvs > 0 THEN dvs ELSE 0 END)/1e9 AS in_dvs,
-    SUM(CASE WHEN dvs < 0 THEN dvs ELSE 0 END)/1e9 AS out_dvs
-
-FROM src
-
-GROUP BY reason
-
-UNION ALL
-
-SELECT
-    N'00. Наш сохраненный агрегат',
-    SUM(source_rows),
-
-    SUM(incoming_sr)/1e9,
-    SUM(outgoing_sr)/1e9,
-
-    SUM(incoming_ns)/1e9,
-    SUM(outgoing_ns)/1e9,
-
-    SUM(incoming_dvs)/1e9,
-    SUM(outgoing_dvs)/1e9
-
-FROM ALM_TEST.WORK.RK_Oct2026_PaymentAgg
-
-WHERE dt_rep = @dt
-
-ORDER BY reason
-
-OPTION (MAXDOP 1, RECOMPILE);
+Посмотри, пожалуйста, нет ли задвоения total_out при присоединении уведомлений и all_info. В последнем случае, если у клиента были и SMS, и Push, при JOIN по CLI_ID строки могут размножаться. Написал небольшой проверочный скрипт, который покажет конкретные примеры таких клиентов.
