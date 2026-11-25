@@ -1,63 +1,77 @@
 DECLARE @dt date = '2026-10-15';
-DECLARE @channel varchar(4) = 'SMS'; -- SMS или Push
 
-SELECT TOP (20)
-    e.cli_id,
-    e.dt_rep AS trigger_date,
-    m.dt_rep AS message_date,
-    @channel AS message_type,
-    d.dt_open,
-    e.has_app_activity,
-    e.has_old_app,
-    e.has_new_app,
-    e.has_unknown_app,
+;WITH src AS (
 
-    CASE
-        WHEN e.has_app_activity = 0
-            THEN N'Нет записей об активности'
-        WHEN e.has_unknown_app = 1
-            THEN N'Версия не определена'
-        ELSE N'Версия не соответствует механизму'
-    END AS reason
+    SELECT
+        CASE
+            WHEN p.spec_cat IN ('BR','SR','FU')
+                THEN N'02. BR / SR / FU'
+            WHEN p.spec_cat IS NULL
+                THEN N'03. spec_cat NULL'
+            WHEN p.transaction_type = N'Внутренние переводы'
+                THEN N'04. Внутренние переводы'
+            WHEN p.direction_type = N'Ошибка'
+                THEN N'05. Ошибка'
+            WHEN p.transit_max_id IS NOT NULL
+                THEN N'06. Транзит'
+            ELSE N'01. Включено в расчет'
+        END AS reason,
 
-FROM #rk26w_event e
+        p.[Распознано_СР] AS sr,
+        p.[Распознано_НС] AS ns,
+        p.[Распознано_ДВС] AS dvs
 
-JOIN #rk26w_msg m
-    ON m.cli_id = e.cli_id
-   AND m.dt_rep >= e.dt_rep
-   AND (
-       (@channel = 'SMS'
-        AND m.sms_fact_day = 1
-        AND m.dt_rep <= DATEADD(day, 6, e.dt_rep))
-       OR
-       (@channel = 'Push'
-        AND m.push_fact_day = 1
-        AND m.dt_rep <= DATEADD(day, 2, e.close_dt))
-   )
+    FROM ALM.ehd.VW_transfers_FL_det p
 
-CROSS APPLY (
-    SELECT TOP (1)
-        h.dt_open
-    FROM LIQUIDITY.liq.DepositContract_all h
-    WHERE h.cli_id = e.cli_id
-      AND h.cur = 'RUR'
-      AND h.cli_short_name = N'ФЛ'
-      AND h.PROD_NAME NOT LIKE N'Накопительный счёт%'
-      AND h.dt_open >= m.dt_rep
-      AND h.dt_open < DATEADD(day, 1,
-          CASE WHEN @channel = 'SMS'
-               THEN DATEADD(day, 6, m.dt_rep)
-               ELSE DATEADD(day, 2, e.close_dt)
-          END)
-    ORDER BY h.dt_open
-) d
+    JOIN ALM_TEST.WORK.RK_Oct2026_ClientRegistry c
+        ON p.cli_id = c.cli_id
 
-WHERE e.dt_rep = @dt
-  AND e.trigger_rows > 0
-  AND (
-      (@channel = 'SMS' AND e.has_old_app = 0)
-      OR
-      (@channel = 'Push' AND e.has_new_app = 0)
-  )
+    WHERE p.dt_rep = @dt
+
+      AND c.client_group IN (
+          N'новый клиент масс',
+          N'старый клиент масс кто принес новые деньги',
+          N'старый клиент масс кто не принес новые деньги'
+      )
+
+)
+
+SELECT
+    reason,
+    COUNT_BIG(*) AS source_rows,
+
+    SUM(CASE WHEN sr > 0 THEN sr ELSE 0 END)/1e9 AS in_sr,
+    SUM(CASE WHEN sr < 0 THEN sr ELSE 0 END)/1e9 AS out_sr,
+
+    SUM(CASE WHEN ns > 0 THEN ns ELSE 0 END)/1e9 AS in_ns,
+    SUM(CASE WHEN ns < 0 THEN ns ELSE 0 END)/1e9 AS out_ns,
+
+    SUM(CASE WHEN dvs > 0 THEN dvs ELSE 0 END)/1e9 AS in_dvs,
+    SUM(CASE WHEN dvs < 0 THEN dvs ELSE 0 END)/1e9 AS out_dvs
+
+FROM src
+
+GROUP BY reason
+
+UNION ALL
+
+SELECT
+    N'00. Наш сохраненный агрегат',
+    SUM(source_rows),
+
+    SUM(incoming_sr)/1e9,
+    SUM(outgoing_sr)/1e9,
+
+    SUM(incoming_ns)/1e9,
+    SUM(outgoing_ns)/1e9,
+
+    SUM(incoming_dvs)/1e9,
+    SUM(outgoing_dvs)/1e9
+
+FROM ALM_TEST.WORK.RK_Oct2026_PaymentAgg
+
+WHERE dt_rep = @dt
+
+ORDER BY reason
 
 OPTION (MAXDOP 1, RECOMPILE);
