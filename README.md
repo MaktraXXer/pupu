@@ -5,76 +5,120 @@ SET NOCOUNT ON;
 -- 0. НАСТРОЙКИ
 ------------------------------------------------------------
 
-DECLARE @AsOfDate date = '20261125';
-DECLARE @Weeks int = 12;
-DECLARE @DataLag int = 2;
+DECLARE @LastWednesday date = '20261118';
 
--- Специальная классификация 15% только с 01.10.2026
+-- NULL = все доступные полные недели
+-- Можно указать конкретное число, например 4 или 8
+DECLARE @Weeks int = NULL;
+
+-- Специальная логика 15% с 1 октября
 DECLARE @Promo15From date = '20261001';
 
--- Размер клиентского батча
-DECLARE @ClientBatchSize int = 3000;
+-- Маркетплейсы исключаем, как в исходном скрипте
+DECLARE @ExcludeMP bit = 1;
 
--- Паузы для снижения непрерывной нагрузки
+DECLARE @ClientBatchSize int = 3000;
 DECLARE @BatchPause varchar(8) = '00:00:01';
 DECLARE @WeekPause  varchar(8) = '00:00:03';
 
--- 1 = проверить первую неделю по исходной v1.6
--- 0 = выполнять только оптимизированный расчёт
+-- Контрольная сверка первой недели с исходной функцией
 DECLARE @VerifyFirstWeek bit = 1;
 
-IF @Weeks IS NULL
-   OR @Weeks NOT BETWEEN 1 AND 12
-   OR @ClientBatchSize IS NULL
-   OR @ClientBatchSize <= 0
-    THROW 50001, N'Некорректные параметры', 1;
+------------------------------------------------------------
+-- ПРОВЕРКА ПАРАМЕТРОВ
+------------------------------------------------------------
 
-DECLARE @AvailableDate date =
-    DATEADD(day, -@DataLag, @AsOfDate);
+IF @LastWednesday IS NULL
+   OR DATEDIFF(day, '19000103', @LastWednesday) % 7 <> 0
+    THROW 50001, N'Последняя дата должна быть средой', 1;
 
--- Последняя доступная среда
-DECLARE @DateTo date =
-    DATEADD(
+IF @ClientBatchSize IS NULL OR @ClientBatchSize <= 0
+    THROW 50002, N'Некорректный размер батча', 1;
+
+IF @@TRANCOUNT > 0 OR (@@OPTIONS & 2) = 2
+    THROW 50003, N'Запускайте скрипт вне открытой или неявной транзакции', 1;
+
+------------------------------------------------------------
+-- ОПРЕДЕЛЯЕМ МАКСИМАЛЬНО ДОСТУПНОЕ ЧИСЛО НЕДЕЛЬ
+------------------------------------------------------------
+
+DECLARE @FirstBaseDate date;
+
+SELECT
+    @FirstBaseDate = MIN(CAST(start_date AS date))
+FROM ALM_TEST.alm_history.base_rates WITH (NOLOCK)
+WHERE [customer segment] = 'private'
+OPTION (MAXDOP 1);
+
+IF @FirstBaseDate IS NULL
+    THROW 50004, N'История базовых ставок Private отсутствует', 1;
+
+IF DATEADD(day, -6, @LastWednesday) < @FirstBaseDate
+    THROW 50005, N'Нет доступных полных недель', 1;
+
+DECLARE @MaxWeeks int =
+    1 + DATEDIFF(
         day,
-        -(DATEDIFF(day, '19000103', @AvailableDate) % 7),
-        @AvailableDate
-    );
+        @FirstBaseDate,
+        DATEADD(day, -6, @LastWednesday)
+    ) / 7;
 
+IF @Weeks IS NULL
+    SET @Weeks = @MaxWeeks;
+
+IF @Weeks NOT BETWEEN 1 AND @MaxWeeks
+    THROW 50006, N'Количество недель превышает доступную историю базовых ставок', 1;
+
+------------------------------------------------------------
+-- СЛУЖЕБНЫЕ ПЕРЕМЕННЫЕ
+------------------------------------------------------------
+
+DECLARE @DateTo date = @LastWednesday;
 DECLARE @DateFrom date;
+
 DECLARE @WeekNo int = 1;
 DECLARE @BatchNo int;
 DECLARE @BatchCount int;
 
 DECLARE @Rows int;
 DECLARE @Sec int;
+DECLARE @MissingBase int;
 
 DECLARE @FromText varchar(10);
 DECLARE @ToText varchar(10);
 
+DECLARE @BaseDateText varchar(10) =
+    CONVERT(varchar(10), @FirstBaseDate, 104);
+
 DECLARE @StartTime datetime2 = SYSDATETIME();
 DECLARE @WeekTime datetime2;
 DECLARE @StepTime datetime2;
+
+RAISERROR(
+    N'История базовых ставок начинается с %s. Доступно недель: %d. Выбрано: %d.',
+    0, 1, @BaseDateText, @MaxWeeks, @Weeks
+) WITH NOWAIT;
 
 ------------------------------------------------------------
 -- ОЧИСТКА ПОСЛЕ ПРЕДЫДУЩИХ ЗАПУСКОВ
 ------------------------------------------------------------
 
 DROP TABLE IF EXISTS
-    #W3_Result,
-    #W3_Src,
-    #W3_Special,
-    #W3_History,
-    #W3_Prior,
-    #W3_Open,
-    #W3_Days,
-    #W3_Windows,
-    #W3_Allocation,
-    #W3_Agg,
-    #W3_Raw,
-    #W3_Mapped,
-    #W3_Reference;
+    #PR_Result,
+    #PR_Joined,
+    #PR_Promo,
+    #PR_History,
+    #PR_Prior,
+    #PR_Open,
+    #PR_Days,
+    #PR_Windows,
+    #PR_Allocation,
+    #PR_Agg,
+    #PR_Raw,
+    #PR_Mapped,
+    #PR_Reference;
 
-CREATE TABLE #W3_Result
+CREATE TABLE #PR_Result
 (
     WeekStart       date,
     WeekEnd         date,
@@ -86,7 +130,7 @@ CREATE TABLE #W3_Result
 );
 
 ------------------------------------------------------------
--- ОСНОВНОЙ ЦИКЛ ПО НЕДЕЛЯМ
+-- ОСНОВНОЙ ЦИКЛ: ОДНА НЕДЕЛЯ = ОДИН БАТЧ
 ------------------------------------------------------------
 
 WHILE @WeekNo <= @Weeks
@@ -99,35 +143,22 @@ BEGIN
     SET @ToText = CONVERT(varchar(10), @DateTo, 104);
 
     RAISERROR(
-        N'===== НЕДЕЛЯ %d/%d: %s - %s =====',
-        0, 1,
-        @WeekNo, @Weeks, @FromText, @ToText
+        N'===== PRIVATE: НЕДЕЛЯ %d/%d: %s - %s =====',
+        0, 1, @WeekNo, @Weeks, @FromText, @ToText
     ) WITH NOWAIT;
 
-    IF @DateTo < @Promo15From
-    BEGIN
-        RAISERROR(
-            N'Специальная классификация 15%% отключена: период до 01.10.2026',
-            0, 1
-        ) WITH NOWAIT;
-    END
-    ELSE
-    BEGIN
-        RAISERROR(
-            N'Специальная классификация 15%% включена для вкладов с 01.10.2026',
-            0, 1
-        ) WITH NOWAIT;
-    END;
-
     --------------------------------------------------------
-    -- 1. БАЛАНСОВЫЙ СРЕЗ
-    -- Фильтры исходной v1.6
+    -- 1. БАЛАНСОВЫЙ СРЕЗ И ОПРЕДЕЛЕНИЕ ПРОМО
+    --
+    -- Материализуем joined исходной функции.
+    -- Витрину, справочник промо и базовые ставки
+    -- обрабатываем один раз за неделю.
     --------------------------------------------------------
 
     SET @StepTime = SYSDATETIME();
 
     RAISERROR(
-        N'1/6 Загрузка балансового среза',
+        N'1/6 Загрузка балансового среза, промоставок и базовых ставок',
         0, 1
     ) WITH NOWAIT;
 
@@ -152,87 +183,219 @@ BEGIN
             , (N'Надёжныйпроцент')
             , (N'Могучий')
         ) m(prod_name_res)
+    ),
+
+    src AS
+    (
+        SELECT
+              v.CON_ID
+            , v.CLI_ID
+            , v.OUT_RUB
+            , v.termdays
+            , v.rate_con
+            , v.conv
+            , CAST(v.dt_open AS date) AS dt_open
+
+            ------------------------------------------------
+            -- Плавающая ставка: строго из PRIVATE_v1
+            ------------------------------------------------
+
+            , CASE
+                WHEN ISNULL(v.is_floatrate, 0) = 1
+
+                  OR v.PROD_NAME_res LIKE
+                     N'Достояние (перем.ст.)%'
+
+                  OR EXISTS
+                  (
+                      SELECT 1
+                      FROM LIQUIDITY.liq.man_FloatContracts fc
+                          WITH (NOLOCK)
+                      WHERE fc.CON_ID = v.CON_ID
+                  )
+                    THEN 1
+                ELSE 0
+              END AS is_float
+
+            ------------------------------------------------
+            -- Специальное промо 15% только с 01.10.2026
+            ------------------------------------------------
+
+            , CASE
+                WHEN v.dt_open >= @Promo15From
+                 AND v.termdays BETWEEN 45 AND 70
+                 AND ISNULL(v.conv, 'AT_THE_END') = 'AT_THE_END'
+                 AND ABS(v.rate_con - 0.1500) <= 0.0005
+                    THEN 1
+                ELSE 0
+              END AS special_15
+
+            ------------------------------------------------
+            -- Бакеты для поиска БАЗОВОЙ СТАВКИ.
+            -- Важно: 122, 367 и 730 сохранены!
+            ------------------------------------------------
+
+            , CASE
+                WHEN v.termdays BETWEEN 26 AND 44 THEN 31
+                WHEN v.termdays BETWEEN 45 AND 70 THEN 61
+                WHEN v.termdays BETWEEN 85 AND 119 THEN 91
+                WHEN v.termdays BETWEEN 120 AND 140 THEN 122
+                WHEN v.termdays BETWEEN 141 AND 170 THEN 151
+                WHEN v.termdays BETWEEN 175 AND 200 THEN 181
+                WHEN v.termdays BETWEEN 201 AND 230 THEN 212
+                WHEN v.termdays BETWEEN 231 AND 250 THEN 243
+                WHEN v.termdays BETWEEN 251 AND 290 THEN 274
+                WHEN v.termdays BETWEEN 340 AND 405 THEN 367
+                WHEN v.termdays BETWEEN 540 AND 621 THEN 550
+                WHEN v.termdays BETWEEN 720 AND 763 THEN 730
+                WHEN v.termdays BETWEEN 1090 AND 1140 THEN 1100
+                WHEN v.termdays BETWEEN 1450 AND 1475 THEN 1460
+                WHEN v.termdays BETWEEN 1795 AND 1830 THEN 1825
+                ELSE v.termdays
+              END AS base_term
+
+        FROM ALM.ALM.vw_balance_rest_all v WITH (NOLOCK)
+
+        LEFT JOIN mp_list mp
+            ON mp.prod_name_res = v.PROD_NAME_res
+
+        WHERE v.DT_REP = @DateTo
+          AND v.dt_open >= @DateFrom
+          AND v.dt_open < DATEADD(day, 1, @DateTo)
+
+          AND v.section_name = N'Срочные'
+          AND v.block_name = N'Привлечение ФЛ'
+          AND v.ap = N'Пассив'
+          AND v.od_flag = 1
+          AND v.cur = '810'
+          AND v.OUT_RUB > 0
+          AND v.termdays BETWEEN 28 AND 1830
+
+          --------------------------------------------------
+          -- Фильтр Private строго из исходной функции
+          --------------------------------------------------
+
+          AND
+          (
+              v.TSegmentName = N'ДЧБО'
+
+              OR v.PROD_NAME_res IN
+              (
+                  N'Классический',
+                  N'Привилегия',
+                  N'Достояние',
+                  N'Достояние без опций',
+                  N'Достояние с пополнением и снятием',
+                  N'Достояние (перем.ст.) без опций',
+                  N'Достояние (перем.ст.) с пополнением и снятием'
+              )
+          )
+
+          AND
+          (
+              @ExcludeMP = 0
+              OR mp.prod_name_res IS NULL
+          )
     )
 
     SELECT
-          v.CON_ID
-        , v.CLI_ID
-        , v.OUT_RUB
-        , v.PROD_NAME_res
-        , v.termdays
-        , v.rate_con
-        , v.conv
-        , CAST(v.dt_open AS date) AS dt_open
-
-        , CASE
-            WHEN mp.prod_name_res IS NOT NULL THEN 1
-            ELSE 0
-          END AS is_mp
+          s.CON_ID
+        , s.CLI_ID
+        , s.OUT_RUB
+        , s.termdays
+        , s.rate_con
+        , s.dt_open
+        , s.is_float
 
         ----------------------------------------------------
-        -- НОВОЕ УСЛОВИЕ:
-        -- специальная логика 15% только с 01.10.2026
+        -- Любое промо из справочника
+        -- ИЛИ специальное промо 15%
         ----------------------------------------------------
 
         , CASE
-            WHEN v.dt_open >= @Promo15From
-             AND v.termdays BETWEEN 45 AND 70
-             AND ISNULL(v.conv, 'AT_THE_END') = 'AT_THE_END'
-             AND ABS(v.rate_con - 0.1500) <= 0.0005
+            WHEN s.special_15 = 1
+              OR d.term_bucket IS NOT NULL
                 THEN 1
             ELSE 0
-          END AS special_2m
+          END AS is_promo
 
-    INTO #W3_Src
+        ----------------------------------------------------
+        -- Нормализация базовой ставки как в PRIVATE_v1
+        ----------------------------------------------------
 
-    FROM ALM.ALM.vw_balance_rest_all v WITH (NOLOCK)
+        , CASE
+            WHEN b.base_rate_raw > 1
+                THEN b.base_rate_raw / 100.0
+            ELSE b.base_rate_raw
+          END AS base_rate
 
-    LEFT JOIN mp_list mp
-        ON mp.prod_name_res = v.PROD_NAME_res
+    INTO #PR_Joined
 
-    WHERE v.DT_REP = @DateTo
+    FROM src s
 
-      AND v.dt_open >= @DateFrom
-      AND v.dt_open < DATEADD(day, 1, @DateTo)
+    OUTER APPLY
+    (
+        SELECT TOP (1)
+            d.term_bucket
 
-      AND v.section_name = N'Срочные'
-      AND v.block_name = N'Привлечение ФЛ'
-      AND v.ap = N'Пассив'
-      AND v.od_flag = 1
-      AND v.cur = '810'
-      AND v.OUT_RUB > 0
-      AND ISNULL(v.is_floatrate, 0) = 0
-      AND v.rate_con IS NOT NULL
-      AND v.termdays BETWEEN 28 AND 1830
+        FROM ALM_TEST.WORK.promo_new_money_rate_dict d
+            WITH (NOLOCK)
 
-      AND NOT EXISTS
-      (
-          SELECT 1
-          FROM LIQUIDITY.liq.man_FloatContracts fc
-              WITH (NOLOCK)
-          WHERE fc.CON_ID = v.CON_ID
-      )
+        WHERE s.is_float = 0
 
-      AND
-      (
-          v.TSegmentName IS NULL
-          OR v.TSegmentName <> N'ДЧБО'
-      )
+          AND s.dt_open
+              BETWEEN d.date_from AND d.date_to
 
-      AND
-      (
-          v.PROD_NAME_res IS NULL
-          OR v.PROD_NAME_res NOT IN
+          AND s.termdays
+              BETWEEN d.term_min AND d.term_max
+
+          AND d.conv_type =
+              CASE
+                  WHEN ISNULL(s.conv, 'AT_THE_END') = 'AT_THE_END'
+                      THEN 'AT_THE_END'
+                  ELSE 'NOT_AT_THE_END'
+              END
+
+          AND s.OUT_RUB
+              BETWEEN d.amount_from AND d.amount_to
+
+          AND ABS(s.rate_con - d.promo_rate) <= 0.0005
+
+        ORDER BY d.id DESC
+    ) d
+
+    OUTER APPLY
+    (
+        SELECT TOP (1)
+            TRY_CONVERT(decimal(18,8), b.[rate])
+                AS base_rate_raw
+
+        FROM ALM_TEST.alm_history.base_rates b
+            WITH (NOLOCK)
+
+        WHERE s.is_float = 0
+
+          AND b.[customer segment] = 'private'
+
+          AND TRY_CONVERT(int, b.[term]) = s.base_term
+
+          AND b.[convention] =
+              CASE
+                  WHEN ISNULL(s.conv, 'AT_THE_END') = 'AT_THE_END'
+                      THEN 'at the end'
+                  ELSE 'every month'
+              END
+
+          AND b.start_date <= s.dt_open
+
+          AND
           (
-              N'Классический',
-              N'Привилегия',
-              N'Достояние',
-              N'Достояние без опций',
-              N'Достояние с пополнением и снятием',
-              N'Достояние (перем.ст.) без опций',
-              N'Достояние (перем.ст.) с пополнением и снятием'
+              b.end_date IS NULL
+              OR b.end_date >= s.dt_open
           )
-      )
+
+        ORDER BY b.start_date DESC
+    ) b
 
     OPTION (MAXDOP 1, RECOMPILE);
 
@@ -245,13 +408,34 @@ BEGIN
     ) WITH NOWAIT;
 
     --------------------------------------------------------
-    -- 2. СПЕЦИАЛЬНЫЕ ВКЛАДЫ 15% И ИСТОРИЯ КЛИЕНТОВ
+    -- Контроль полноты справочника базовых ставок.
+    -- Бизнес-логику не меняем, только выводим предупреждение.
+    --------------------------------------------------------
+
+    SELECT @MissingBase = COUNT(*)
+    FROM #PR_Joined
+    WHERE is_float = 0
+      AND is_promo = 0
+      AND base_rate IS NULL;
+
+    IF @MissingBase > 0
+    BEGIN
+
+        RAISERROR(
+            N'ВНИМАНИЕ: не найдена базовая ставка у %d непромо-строк. Классификация сохранена как в PRIVATE_v1.',
+            0, 1, @MissingBase
+        ) WITH NOWAIT;
+
+    END;
+
+    --------------------------------------------------------
+    -- 2. ПРОМОВКЛАДЫ И ИСТОРИЯ КЛИЕНТОВ
     --------------------------------------------------------
 
     SET @StepTime = SYSDATETIME();
 
     RAISERROR(
-        N'2/6 Определение клиентов специального промо 15%%',
+        N'2/6 Определение промовкладов и истории клиентов',
         0, 1
     ) WITH NOWAIT;
 
@@ -260,19 +444,12 @@ BEGIN
         , CLI_ID
         , dt_open
 
-    INTO #W3_Special
+    INTO #PR_Promo
 
-    FROM #W3_Src
+    FROM #PR_Joined
 
-    WHERE special_2m = 1
-      AND is_mp = 0
-
-      AND
-      (
-          PROD_NAME_res IS NULL
-          OR PROD_NAME_res <> N'Активный процент'
-      )
-
+    WHERE is_float = 0
+      AND is_promo = 1
       AND CLI_ID IS NOT NULL
       AND CON_ID IS NOT NULL
 
@@ -281,16 +458,16 @@ BEGIN
     SET @Rows = @@ROWCOUNT;
 
     RAISERROR(
-        N'2/6 Найдено специальных договоров: %d',
+        N'2/6 Найдено промодоговоров: %d',
         0, 1, @Rows
     ) WITH NOWAIT;
 
-    CREATE UNIQUE CLUSTERED INDEX IX_Special
-        ON #W3_Special(CLI_ID, dt_open, CON_ID)
+    CREATE UNIQUE CLUSTERED INDEX IX_PR_Promo
+        ON #PR_Promo(CLI_ID, dt_open, CON_ID)
         WITH (MAXDOP = 1);
 
     --------------------------------------------------------
-    -- Наследуем типы идентификаторов из источника
+    -- Наследуем исходные типы идентификаторов
     --------------------------------------------------------
 
     SELECT TOP (0)
@@ -298,25 +475,18 @@ BEGIN
         , h.CON_ID
         , CAST(h.DT_OPEN AS date) AS dt_open
 
-    INTO #W3_History
+    INTO #PR_History
 
     FROM LIQUIDITY.liq.DepositContract_all h WITH (NOLOCK);
 
     --------------------------------------------------------
-    -- Если специальных договоров нет,
-    -- историю договоров не загружаем
+    -- История только клиентов с промовкладами
     --------------------------------------------------------
 
-    IF EXISTS (SELECT 1 FROM #W3_Special)
+    IF EXISTS (SELECT 1 FROM #PR_Promo)
     BEGIN
 
-        RAISERROR(
-            N'2/6 Загрузка истории договоров клиентов промо',
-            0, 1
-        ) WITH NOWAIT;
-
-        INSERT INTO #W3_History
-
+        INSERT INTO #PR_History
         SELECT
               h.CLI_ID
             , h.CON_ID
@@ -328,9 +498,9 @@ BEGIN
         INNER JOIN
         (
             SELECT DISTINCT CLI_ID
-            FROM #W3_Special
-        ) sc
-            ON sc.CLI_ID = h.CLI_ID
+            FROM #PR_Promo
+        ) pc
+            ON pc.CLI_ID = h.CLI_ID
 
         WHERE h.DT_OPEN IS NOT NULL
           AND h.DT_OPEN < DATEADD(day, 1, @DateTo)
@@ -363,23 +533,14 @@ BEGIN
             0, 1, @Rows
         ) WITH NOWAIT;
 
-    END
-    ELSE
-    BEGIN
-
-        RAISERROR(
-            N'2/6 Специальных договоров нет. Загрузка истории пропущена.',
-            0, 1
-        ) WITH NOWAIT;
-
     END;
 
-    CREATE UNIQUE CLUSTERED INDEX IX_History
-        ON #W3_History(CLI_ID, CON_ID)
+    CREATE UNIQUE CLUSTERED INDEX IX_PR_History
+        ON #PR_History(CLI_ID, CON_ID)
         WITH (MAXDOP = 1);
 
     --------------------------------------------------------
-    -- Существующие клиенты и распределение по батчам
+    -- Существующие клиенты: договор до начала недели
     --------------------------------------------------------
 
     SELECT
@@ -391,9 +552,9 @@ BEGIN
             AS int
           ) AS BatchNo
 
-    INTO #W3_Prior
+    INTO #PR_Prior
 
-    FROM #W3_History
+    FROM #PR_History
 
     WHERE dt_open < @DateFrom
 
@@ -401,18 +562,18 @@ BEGIN
 
     OPTION (MAXDOP 1, RECOMPILE);
 
-    CREATE UNIQUE CLUSTERED INDEX IX_Prior
-        ON #W3_Prior(CLI_ID)
+    CREATE UNIQUE CLUSTERED INDEX IX_PR_Prior
+        ON #PR_Prior(CLI_ID)
         WITH (MAXDOP = 1);
 
-    CREATE NONCLUSTERED INDEX IX_PriorBatch
-        ON #W3_Prior(BatchNo, CLI_ID)
+    CREATE NONCLUSTERED INDEX IX_PR_PriorBatch
+        ON #PR_Prior(BatchNo, CLI_ID)
         WITH (MAXDOP = 1);
 
     SELECT
           @BatchCount = ISNULL(MAX(BatchNo), 0)
         , @Rows = COUNT(*)
-    FROM #W3_Prior;
+    FROM #PR_Prior;
 
     SET @Sec = DATEDIFF(second, @StepTime, SYSDATETIME());
 
@@ -422,19 +583,16 @@ BEGIN
     ) WITH NOWAIT;
 
     --------------------------------------------------------
-    -- 3. РАСЧЁТ НОВЫХ ДЕНЕГ ПО КЛИЕНТСКИМ БАТЧАМ
+    -- 3. НОВЫЕ ДЕНЬГИ: БАТЧИ ПО КЛИЕНТАМ
     --------------------------------------------------------
-
-    -- Сохраняем все статусы, включая 0.
-    -- Соединение по CON_ID строго как в v1.6.
 
     SELECT TOP (0)
           CON_ID
         , CAST(0 AS int) AS new_money_status
 
-    INTO #W3_Allocation
+    INTO #PR_Allocation
 
-    FROM #W3_Special;
+    FROM #PR_Promo;
 
     SET @BatchNo = 1;
 
@@ -442,7 +600,7 @@ BEGIN
     BEGIN
 
         RAISERROR(
-            N'3/6 Расчёт исторических остатков не требуется',
+            N'3/6 Исторические остатки рассчитывать не требуется',
             0, 1
         ) WITH NOWAIT;
 
@@ -459,58 +617,57 @@ BEGIN
         ) WITH NOWAIT;
 
         ----------------------------------------------------
-        -- Остаток специального вклада на дату открытия
+        -- Остаток промовклада на дату открытия
         ----------------------------------------------------
 
         SELECT
-              s.CON_ID
-            , s.CLI_ID
-            , s.dt_open
+              p.CON_ID
+            , p.CLI_ID
+            , p.dt_open
 
             , CAST(
-                ISNULL(b.open_balance, 0)
+                ISNULL(s.open_balance, 0)
                 AS decimal(28,6)
               ) AS open_amount
 
-        INTO #W3_Open
+        INTO #PR_Open
 
-        FROM #W3_Special s
+        FROM #PR_Promo p
 
-        INNER JOIN #W3_Prior p
-            ON p.CLI_ID = s.CLI_ID
-           AND p.BatchNo = @BatchNo
+        INNER JOIN #PR_Prior pc
+            ON pc.CLI_ID = p.CLI_ID
+           AND pc.BatchNo = @BatchNo
 
         OUTER APPLY
         (
             SELECT
-                SUM(CAST(b.OUT_RUB AS decimal(28,6)))
+                SUM(CAST(s.OUT_RUB AS decimal(28,6)))
                     AS open_balance
 
-            FROM LIQUIDITY.liq.DepositContract_Saldo b
+            FROM LIQUIDITY.liq.DepositContract_Saldo s
                 WITH (NOLOCK)
 
-            WHERE b.CON_ID = s.CON_ID
+            WHERE s.CON_ID = p.CON_ID
 
-              AND b.DT_FROM < DATEADD(day, 1, s.dt_open)
+              AND s.DT_FROM < DATEADD(day, 1, p.dt_open)
 
               AND
               (
-                  b.DT_TO IS NULL
-                  OR b.DT_TO >= s.dt_open
+                  s.DT_TO IS NULL
+                  OR s.DT_TO >= p.dt_open
               )
 
-              AND b.OUT_RUB IS NOT NULL
-
-        ) b
+              AND s.OUT_RUB IS NOT NULL
+        ) s
 
         OPTION (MAXDOP 1, RECOMPILE);
 
-        CREATE UNIQUE CLUSTERED INDEX IX_Open
-            ON #W3_Open(CLI_ID, dt_open, CON_ID)
+        CREATE UNIQUE CLUSTERED INDEX IX_PR_Open
+            ON #PR_Open(CLI_ID, dt_open, CON_ID)
             WITH (MAXDOP = 1);
 
         ----------------------------------------------------
-        -- Суммарный объём открытий за день
+        -- Общий объём промовкладов за день
         ----------------------------------------------------
 
         SELECT
@@ -518,21 +675,20 @@ BEGIN
             , dt_open
             , SUM(open_amount) AS total_open_amount
 
-        INTO #W3_Days
+        INTO #PR_Days
 
-        FROM #W3_Open
+        FROM #PR_Open
 
         GROUP BY CLI_ID, dt_open
 
         OPTION (MAXDOP 1, RECOMPILE);
 
-        CREATE UNIQUE CLUSTERED INDEX IX_Days
-            ON #W3_Days(CLI_ID, dt_open)
+        CREATE UNIQUE CLUSTERED INDEX IX_PR_Days
+            ON #PR_Days(CLI_ID, dt_open)
             WITH (MAXDOP = 1);
 
         ----------------------------------------------------
-        -- Окна анализа остатков
-        -- Историю до 01.10.2026 НЕ ограничиваем
+        -- Окна анализа исторических остатков
         ----------------------------------------------------
 
         SELECT
@@ -555,9 +711,9 @@ BEGIN
 
             , MAX(dt_open) AS max_open
 
-        INTO #W3_Windows
+        INTO #PR_Windows
 
-        FROM #W3_Days
+        FROM #PR_Days
 
         GROUP BY
               CLI_ID
@@ -567,7 +723,8 @@ BEGIN
         OPTION (MAXDOP 1, RECOMPILE);
 
         ----------------------------------------------------
-        -- Событийный расчёт остатков строго из v1.6
+        -- Событийный расчёт остатков
+        -- Строго по исходной функции PRIVATE_v1
         ----------------------------------------------------
 
         ;WITH saldo_clipped AS
@@ -584,9 +741,9 @@ BEGIN
                 , bounds.effective_from
                 , bounds.effective_to
 
-            FROM #W3_Windows w
+            FROM #PR_Windows w
 
-            INNER JOIN #W3_History h
+            INNER JOIN #PR_History h
                 ON h.CLI_ID = w.CLI_ID
                AND h.dt_open <= w.max_open
 
@@ -627,7 +784,6 @@ BEGIN
                             , (w.max_open)
                         ) v(dt)
                     ) AS effective_to
-
             ) bounds
 
             WHERE s.OUT_RUB IS NOT NULL
@@ -670,7 +826,7 @@ BEGIN
                 , month_start
                 , prev_start
                 , CAST(0 AS decimal(28,6))
-            FROM #W3_Windows
+            FROM #PR_Windows
 
             UNION ALL
 
@@ -679,7 +835,7 @@ BEGIN
                 , month_start
                 , month_start
                 , CAST(0 AS decimal(28,6))
-            FROM #W3_Windows
+            FROM #PR_Windows
 
             UNION ALL
 
@@ -692,7 +848,7 @@ BEGIN
                   )
                 , dt_open
                 , CAST(0 AS decimal(28,6))
-            FROM #W3_Days
+            FROM #PR_Days
         ),
 
         event_agg AS
@@ -781,7 +937,7 @@ BEGIN
                     ELSE ISNULL(t.current_month_peak_before, 0)
                   END AS comparison_peak
 
-            FROM #W3_Days d
+            FROM #PR_Days d
 
             LEFT JOIN timeline_stats t
                 ON t.CLI_ID = d.CLI_ID
@@ -819,19 +975,16 @@ BEGIN
         )
 
         ----------------------------------------------------
-        -- Исходные статусы v1.6:
-        -- 0 = не новые деньги
-        -- 1 = частично новые деньги
-        -- 2 = полностью новые деньги
+        -- Статусы новых денег строго из PRIVATE_v1
         ----------------------------------------------------
 
-        INSERT INTO #W3_Allocation
+        INSERT INTO #PR_Allocation
 
         SELECT
-              s.CON_ID
+              p.CON_ID
 
             , CASE
-                WHEN s.open_amount <= 0
+                WHEN p.open_amount <= 0
                   OR d.total_open_amount <= 0
                     THEN 0
 
@@ -845,20 +998,20 @@ BEGIN
                 ELSE 0
               END AS new_money_status
 
-        FROM #W3_Open s
+        FROM #PR_Open p
 
         INNER JOIN day_budget d
-            ON d.CLI_ID = s.CLI_ID
-           AND d.dt_open = s.dt_open
+            ON d.CLI_ID = p.CLI_ID
+           AND d.dt_open = p.dt_open
 
         OPTION (MAXDOP 1, RECOMPILE);
 
         SET @Rows = @@ROWCOUNT;
 
         DROP TABLE
-            #W3_Open,
-            #W3_Days,
-            #W3_Windows;
+            #PR_Open,
+            #PR_Days,
+            #PR_Windows;
 
         SET @Sec = DATEDIFF(second, @StepTime, SYSDATETIME());
 
@@ -874,238 +1027,96 @@ BEGIN
 
     END;
 
-    CREATE NONCLUSTERED INDEX IX_Allocation
-        ON #W3_Allocation(CON_ID)
+    CREATE NONCLUSTERED INDEX IX_PR_Allocation
+        ON #PR_Allocation(CON_ID)
         INCLUDE (new_money_status)
         WITH (MAXDOP = 1);
 
-    DROP TABLE #W3_History, #W3_Special;
+    DROP TABLE #PR_History, #PR_Promo;
 
     --------------------------------------------------------
-    -- 4. КЛАССИФИКАЦИЯ ВКЛАДОВ
+    -- 4. КЛАССИФИКАЦИЯ И АГРЕГАЦИЯ ПО БАКЕТАМ
     --------------------------------------------------------
 
     SET @StepTime = SYSDATETIME();
 
     RAISERROR(
-        N'4/6 Классификация вкладов и агрегация по бакетам',
+        N'4/6 Классификация Private и агрегация по бакетам',
         0, 1
     ) WITH NOWAIT;
 
-    ;WITH joined AS
+    ;WITH classified AS
     (
         SELECT
-              s.*
-            , d.dict_match
+              j.OUT_RUB
+            , j.rate_con
 
-            , a.[Нов]
-            , a.[НДП]
-            , a.[НДМ]
-            , a.[Мпл]
-            , a.[Пнс]
-            , a.[От1]
-            , a.[Пк2]
+            ------------------------------------------------
+            -- Порядок классификации строго из PRIVATE_v1
+            ------------------------------------------------
 
             , CASE
-                WHEN s.special_2m = 1
-                 AND s.CLI_ID IS NOT NULL
-                 AND p.CLI_ID IS NULL
-                    THEN 1
-                ELSE 0
-              END AS is_new_client
+                WHEN j.is_float = 1
+                    THEN N'Плавающая ставка'
 
-            , ISNULL(sa.new_money_status, 0)
-                AS special_new_money_status
-
-        FROM #W3_Src s
-
-        LEFT JOIN #W3_Prior p
-            ON p.CLI_ID = s.CLI_ID
-
-        -- Ключ соединения строго из v1.6
-        LEFT JOIN #W3_Allocation sa
-            ON sa.CON_ID = s.CON_ID
-
-        OUTER APPLY
-        (
-            SELECT TOP (1)
-                  a.[Нов]
-                , a.[НДП]
-                , a.[НДМ]
-                , a.[Мпл]
-                , a.[Пнс]
-                , a.[От1]
-                , a.[Пк2]
-
-            FROM ALM.ehd.attr_DepoFLConditions a
-                WITH (NOLOCK)
-
-            WHERE a.CON_ID = s.CON_ID
-              AND s.is_mp = 0
-
-            ORDER BY
-                  a.DT_UPDATE DESC
-                , a.loaddate DESC
-        ) a
-
-        OUTER APPLY
-        (
-            SELECT TOP (1)
-                1 AS dict_match
-
-            FROM ALM_TEST.WORK.promo_new_money_rate_dict d
-                WITH (NOLOCK)
-
-            WHERE s.is_mp = 0
-
-              AND s.dt_open
-                  BETWEEN d.date_from AND d.date_to
-
-              AND s.termdays
-                  BETWEEN d.term_min AND d.term_max
-
-              AND d.conv_type =
-                  CASE
-                      WHEN ISNULL(s.conv, 'AT_THE_END')
-                           = 'AT_THE_END'
-                          THEN 'AT_THE_END'
-                      ELSE 'NOT_AT_THE_END'
-                  END
-
-              AND s.OUT_RUB
-                  BETWEEN d.amount_from AND d.amount_to
-
-              AND ABS(s.rate_con - d.promo_rate) <= 0.0005
-
-        ) d
-    ),
-
-    matched AS
-    (
-        SELECT
-              j.*
-
-            , CASE
-                WHEN ISNULL(TRY_CAST(j.[Нов] AS int), 0) = 1
-                    THEN 1
-                ELSE 0
-              END AS is_nov
-
-            , CASE
-                WHEN ISNULL(TRY_CAST(j.[НДП] AS int), 0) = 1
-                  OR ISNULL(TRY_CAST(j.[НДМ] AS int), 0) = 1
-                    THEN 1
-                ELSE 0
-              END AS is_ndp_ndm
-
-            , CASE
-                WHEN ISNULL(TRY_CAST(j.[Пнс] AS int), 0) = 1
-                  OR ISNULL(TRY_CAST(j.[Мпл] AS int), 0) = 1
-                    THEN 1
-                ELSE 0
-              END AS is_pns_mpl
-
-            , CASE
-                WHEN ISNULL(TRY_CAST(j.[От1] AS int), 0) = 1
-                  OR ISNULL(TRY_CAST(j.[Пк2] AS int), 0) = 1
-                    THEN 1
-                ELSE 0
-              END AS retention
-
-        FROM joined j
-    ),
-
-    classified AS
-    (
-        SELECT
-              m.OUT_RUB
-            , m.rate_con
-
-            , CASE
-
-                WHEN m.is_mp = 1
-                    THEN N'Маркетплейсы'
-
-                WHEN m.PROD_NAME_res = N'Активный процент'
-                    THEN N'Активный процент'
-
-                ------------------------------------------------
-                -- Специальное промо 15% с 01.10.2026
-                ------------------------------------------------
-
-                WHEN m.special_2m = 1
-                 AND m.is_new_client = 1
+                WHEN j.is_promo = 1
+                 AND j.CLI_ID IS NOT NULL
+                 AND pc.CLI_ID IS NULL
                     THEN N'Новые клиенты'
 
-                WHEN m.special_2m = 1
-                 AND m.special_new_money_status = 2
+                WHEN j.is_promo = 1
+                 AND a.new_money_status = 2
                     THEN N'Новые деньги'
 
-                WHEN m.special_2m = 1
-                 AND m.special_new_money_status = 1
+                WHEN j.is_promo = 1
+                 AND a.new_money_status = 1
                     THEN N'Частично новые деньги'
 
-                WHEN m.special_2m = 1
-                    THEN N'Другие вклады со ставкой новых денег'
+                WHEN j.is_promo = 1
+                    THEN N'Промоставка на действующие деньги'
 
-                ------------------------------------------------
-                -- Обычная классификация
-                -- Включая вклады 15%, открытые до октября
-                ------------------------------------------------
+                WHEN j.rate_con > j.base_rate + 0.0000005
+                    THEN N'Выше базовой ставки'
 
-                WHEN m.retention = 1
-                    THEN N'Автоматический механизм удержания'
-
-                WHEN m.is_nov = 1
-                 AND m.dict_match = 1
-                 AND m.is_pns_mpl = 0
-                    THEN N'Новые клиенты'
-
-                WHEN m.is_ndp_ndm = 1
-                 AND m.dict_match = 1
-                 AND m.is_pns_mpl = 0
-                    THEN N'Новые деньги'
-
-                WHEN (m.is_nov = 1 OR m.is_ndp_ndm = 1)
-                 AND m.dict_match IS NULL
-                 AND m.is_pns_mpl = 0
-                    THEN N'Новые деньги без справочника'
-
-                WHEN m.dict_match = 1
-                 AND m.is_pns_mpl = 0
-                    THEN N'Другие вклады со ставкой новых денег'
-
-                WHEN m.is_pns_mpl = 1
-                    THEN N'Вклады ПНС и МПЛ'
-
-                ELSE N'Остальные вклады'
-
+                ELSE N'Базовая ставка или ниже'
               END AS segment_name
 
+            ------------------------------------------------
+            -- ОТЧЁТНЫЕ бакеты.
+            -- Именно по ним считаем средневзвешенный срок.
+            ------------------------------------------------
+
             , CASE
-                WHEN m.termdays BETWEEN 26 AND 44 THEN 31
-                WHEN m.termdays BETWEEN 45 AND 70 THEN 61
-                WHEN m.termdays BETWEEN 85 AND 119 THEN 91
-                WHEN m.termdays BETWEEN 120 AND 140 THEN 124
-                WHEN m.termdays BETWEEN 141 AND 170 THEN 151
-                WHEN m.termdays BETWEEN 175 AND 200 THEN 181
-                WHEN m.termdays BETWEEN 201 AND 230 THEN 212
-                WHEN m.termdays BETWEEN 231 AND 250 THEN 243
-                WHEN m.termdays BETWEEN 251 AND 290 THEN 274
-                WHEN m.termdays BETWEEN 340 AND 405 THEN 365
-                WHEN m.termdays BETWEEN 540 AND 621 THEN 550
-                WHEN m.termdays BETWEEN 720 AND 763 THEN 750
-                WHEN m.termdays BETWEEN 1090 AND 1140 THEN 1100
-                WHEN m.termdays BETWEEN 1450 AND 1475 THEN 1460
-                WHEN m.termdays BETWEEN 1795 AND 1830 THEN 1825
-                ELSE m.termdays
+                WHEN j.termdays BETWEEN 26 AND 44 THEN 31
+                WHEN j.termdays BETWEEN 45 AND 70 THEN 61
+                WHEN j.termdays BETWEEN 85 AND 119 THEN 91
+                WHEN j.termdays BETWEEN 120 AND 140 THEN 124
+                WHEN j.termdays BETWEEN 141 AND 170 THEN 151
+                WHEN j.termdays BETWEEN 175 AND 200 THEN 181
+                WHEN j.termdays BETWEEN 201 AND 230 THEN 212
+                WHEN j.termdays BETWEEN 231 AND 250 THEN 243
+                WHEN j.termdays BETWEEN 251 AND 290 THEN 274
+                WHEN j.termdays BETWEEN 340 AND 405 THEN 365
+                WHEN j.termdays BETWEEN 540 AND 621 THEN 550
+                WHEN j.termdays BETWEEN 720 AND 763 THEN 750
+                WHEN j.termdays BETWEEN 1090 AND 1140 THEN 1100
+                WHEN j.termdays BETWEEN 1450 AND 1475 THEN 1460
+                WHEN j.termdays BETWEEN 1795 AND 1830 THEN 1825
+                ELSE j.termdays
               END AS bucket_code
 
-        FROM matched m
+        FROM #PR_Joined j
+
+        LEFT JOIN #PR_Prior pc
+            ON pc.CLI_ID = j.CLI_ID
+
+        -- Сохраняем ключ соединения исходной функции
+        LEFT JOIN #PR_Allocation a
+            ON a.CON_ID = j.CON_ID
     )
 
     --------------------------------------------------------
-    -- Материализация агрегации по исходным сегментам
+    -- Материализуем агрегацию, чтобы не считать её повторно
     --------------------------------------------------------
 
     SELECT
@@ -1122,12 +1133,28 @@ BEGIN
         , SUM(CAST(OUT_RUB AS decimal(24,2)))
             AS segment_vol
 
+        ----------------------------------------------------
+        -- ВАЖНО: в Private допускаются NULL-ставки.
+        -- Расчёт взвешенной ставки строго из PRIVATE_v1.
+        ----------------------------------------------------
+
         , SUM(
-            CAST(OUT_RUB AS decimal(24,2))
-            * CAST(rate_con AS decimal(12,8))
+            CASE
+                WHEN rate_con IS NOT NULL
+                    THEN CAST(OUT_RUB AS decimal(24,2))
+                       * CAST(rate_con AS decimal(12,8))
+            END
           ) AS weighted_rate_sum
 
-    INTO #W3_Agg
+        , SUM(
+            CASE
+                WHEN rate_con IS NOT NULL
+                    THEN CAST(OUT_RUB AS decimal(24,2))
+                ELSE 0
+            END
+          ) AS rate_volume
+
+    INTO #PR_Agg
 
     FROM classified
 
@@ -1140,13 +1167,13 @@ BEGIN
     OPTION (MAXDOP 1, RECOMPILE);
 
     DROP TABLE
-        #W3_Src,
-        #W3_Prior,
-        #W3_Allocation;
+        #PR_Joined,
+        #PR_Prior,
+        #PR_Allocation;
 
     --------------------------------------------------------
-    -- Воспроизводим выходные поля v1.6
-    -- С исходными округлениями
+    -- ВОСПРОИЗВОДИМ ВЫХОД ИСХОДНОЙ PRIVATE_v1
+    -- С исходной точностью округлений
     --------------------------------------------------------
 
     SELECT
@@ -1166,27 +1193,29 @@ BEGIN
 
         , CAST(
             a.weighted_rate_sum
-            / NULLIF(a.segment_vol, 0)
+            / NULLIF(a.rate_volume, 0)
             AS decimal(9,6)
           ) AS ClientRate
 
-    INTO #W3_Raw
+    INTO #PR_Raw
 
-    FROM #W3_Agg a
+    FROM #PR_Agg a
 
     CROSS JOIN
     (
         SELECT SUM(segment_vol) AS grand_total
-        FROM #W3_Agg
+        FROM #PR_Agg
         WHERE is_total = 0
-    ) t;
+    ) t
 
-    DROP TABLE #W3_Agg;
+    OPTION (MAXDOP 1, RECOMPILE);
+
+    DROP TABLE #PR_Agg;
 
     SET @Sec = DATEDIFF(second, @StepTime, SYSDATETIME());
 
     RAISERROR(
-        N'4/6 Классификация завершена: %d сек.',
+        N'4/6 Классификация и расчёт бакетов завершены: %d сек.',
         0, 1, @Sec
     ) WITH NOWAIT;
 
@@ -1198,12 +1227,10 @@ BEGIN
     ) WITH NOWAIT;
 
     --------------------------------------------------------
-    -- 5. КОНТРОЛЬНАЯ СВЕРКА С ИСХОДНОЙ v1.6
+    -- 5. КОНТРОЛЬНАЯ СВЕРКА С PRIVATE_v1
     --
-    -- Сверяем только первую неделю и только если она
-    -- полностью находится после начала специального промо.
-    --
-    -- До 01.10.2026 логика намеренно изменена.
+    -- Только первая неделя и только после 01.10.2026,
+    -- поскольку ранее специальная логика 15% изменена.
     --------------------------------------------------------
 
     IF @VerifyFirstWeek = 1
@@ -1214,7 +1241,7 @@ BEGIN
         SET @StepTime = SYSDATETIME();
 
         RAISERROR(
-            N'5/6 Контрольный запуск исходной v1.6',
+            N'5/6 Контрольный запуск исходной PRIVATE_v1',
             0, 1
         ) WITH NOWAIT;
 
@@ -1225,34 +1252,34 @@ BEGIN
             , SegmentSharePct
             , ClientRate
 
-        INTO #W3_Reference
+        INTO #PR_Reference
 
         FROM ALM_TEST.reports.
-            [fn_NewAttractionVolumes_forDimaMASS_v1.6]
+            [fn_NewAttractionVolumes_forDimaPRIVATE_v1]
         (
               @DateTo
             , @DateFrom
             , @DateTo
-            , 0
+            , @ExcludeMP
         )
 
         OPTION (MAXDOP 1, RECOMPILE);
 
         IF EXISTS
         (
-            SELECT * FROM #W3_Raw
+            SELECT * FROM #PR_Raw
 
             EXCEPT
 
-            SELECT * FROM #W3_Reference
+            SELECT * FROM #PR_Reference
         )
         OR EXISTS
         (
-            SELECT * FROM #W3_Reference
+            SELECT * FROM #PR_Reference
 
             EXCEPT
 
-            SELECT * FROM #W3_Raw
+            SELECT * FROM #PR_Raw
         )
         BEGIN
 
@@ -1262,42 +1289,38 @@ BEGIN
 
             FROM
             (
-                SELECT * FROM #W3_Raw
-
+                SELECT * FROM #PR_Raw
                 EXCEPT
-
-                SELECT * FROM #W3_Reference
+                SELECT * FROM #PR_Reference
             ) d
 
             UNION ALL
 
             SELECT
-                  N'Исходная v1.6'
+                  N'Исходная PRIVATE_v1'
                 , d.*
 
             FROM
             (
-                SELECT * FROM #W3_Reference
-
+                SELECT * FROM #PR_Reference
                 EXCEPT
-
-                SELECT * FROM #W3_Raw
+                SELECT * FROM #PR_Raw
             ) d
 
             ORDER BY Bucket, Segment, SourceVersion;
 
-            THROW 50002,
-                N'Обнаружено расхождение с v1.6. Расчёт остановлен.',
+            THROW 50007,
+                N'Обнаружено расхождение с PRIVATE_v1. Расчёт остановлен.',
                 1;
 
         END;
 
-        DROP TABLE #W3_Reference;
+        DROP TABLE #PR_Reference;
 
         SET @Sec = DATEDIFF(second, @StepTime, SYSDATETIME());
 
         RAISERROR(
-            N'5/6 ПРОВЕРКА ПРОЙДЕНА. Полное совпадение. v1.6: %d сек.',
+            N'5/6 ПРОВЕРКА ПРОЙДЕНА. Совпадение с PRIVATE_v1. Время исходной функции: %d сек.',
             0, 1, @Sec
         ) WITH NOWAIT;
 
@@ -1313,7 +1336,7 @@ BEGIN
     END;
 
     --------------------------------------------------------
-    -- 6. ВОСПРОИЗВОДИМ ИСХОДНЫЙ СКРИПТ КОЛЛЕГ
+    -- 6. ВОСПРОИЗВОДИМ СКРИПТ КОЛЛЕГ ДЛЯ PRIVATE
     --------------------------------------------------------
 
     SET @StepTime = SYSDATETIME();
@@ -1321,44 +1344,38 @@ BEGIN
     ;WITH mapped AS
     (
         SELECT
-            Bucket,
+              Bucket
 
-            CASE
-                WHEN Segment = N'Остальные вклады'
+            , CASE
+                WHEN Segment = N'Базовая ставка или ниже'
                     THEN N'Базовая ставка'
 
-                WHEN Segment IN
-                (
-                    N'Автоматический механизм удержания',
-                    N'Другие вклады со ставкой новых денег',
-                    N'Новые деньги без справочника'
-                )
+                WHEN Segment = N'Выше базовой ставки'
+                    THEN N'Индивидуальные согласования'
+
+                WHEN Segment = N'Промоставка на действующие деньги'
                     THEN N'Удержание'
 
                 WHEN Segment IN
                 (
-                    N'Частично новые деньги',
-                    N'Новые деньги'
+                    N'Новые деньги',
+                    N'Частично новые деньги'
                 )
                     THEN N'Новые деньги'
 
-                WHEN Segment = N'Вклады ПНС и МПЛ'
-                    THEN N'Пенсионеры и Маркетплейсы'
-
                 ELSE Segment
+              END AS Segment
 
-            END AS Segment,
+            , SegmentVolume
+            , SegmentSharePct
+            , ClientRate
 
-            SegmentVolume,
-            SegmentSharePct,
-            ClientRate
-
-        FROM #W3_Raw
+        FROM #PR_Raw
     )
 
     --------------------------------------------------------
     -- Исходная выгрузка коллег:
-    -- бакет + укрупнённая группа вкладов
+    -- бакеты + укрупнённые группы
     --------------------------------------------------------
 
     SELECT
@@ -1387,7 +1404,7 @@ BEGIN
             AS decimal(9,6)
           ) AS ClientRate
 
-    INTO #W3_Mapped
+    INTO #PR_Mapped
 
     FROM mapped
 
@@ -1396,18 +1413,18 @@ BEGIN
     OPTION (MAXDOP 1, RECOMPILE);
 
     --------------------------------------------------------
-    -- ФИНАЛЬНАЯ АГРЕГАЦИЯ
-    -- Аналог расчёта коллег в Excel
+    -- ФИНАЛЬНЫЕ ЧЕТЫРЕ ПОКАЗАТЕЛЯ
+    -- Аналог расчётов коллег в Excel
     --------------------------------------------------------
 
-    INSERT INTO #W3_Result
+    INSERT INTO #PR_Result
     SELECT
           @DateFrom
         , @DateTo
         , Segment
 
         ----------------------------------------------------
-        -- А. Общий объём, млрд руб.
+        -- А. Объём, млрд руб.
         ----------------------------------------------------
 
         , CAST(
@@ -1416,7 +1433,7 @@ BEGIN
           )
 
         ----------------------------------------------------
-        -- Б. Сумма долей от общего объёма
+        -- Б. Доля от общего объёма
         ----------------------------------------------------
 
         , CAST(
@@ -1425,12 +1442,15 @@ BEGIN
           )
 
         ----------------------------------------------------
-        -- В. Средневзвешенная клиентская ставка
+        -- В. Средневзвешенная ставка
+        -- СУММПРОИЗВ / СУММ
         ----------------------------------------------------
 
         , CAST(
             CAST(
-                SUM(SegmentVolume * ClientRate)
+                COALESCE(
+                    SUM(SegmentVolume * ClientRate), 0
+                )
                 AS decimal(30,12)
             )
             / NULLIF(
@@ -1456,7 +1476,7 @@ BEGIN
             AS decimal(12,2)
           )
 
-    FROM #W3_Mapped
+    FROM #PR_Mapped
 
     GROUP BY Segment
 
@@ -1475,8 +1495,8 @@ BEGIN
     END;
 
     DROP TABLE
-        #W3_Raw,
-        #W3_Mapped;
+        #PR_Raw,
+        #PR_Mapped;
 
     SET @Sec = DATEDIFF(second, @StepTime, SYSDATETIME());
 
@@ -1488,7 +1508,7 @@ BEGIN
     SET @Sec = DATEDIFF(second, @WeekTime, SYSDATETIME());
 
     RAISERROR(
-        N'===== НЕДЕЛЯ %d/%d ЗАВЕРШЕНА: %d сек. =====',
+        N'===== PRIVATE: НЕДЕЛЯ %d/%d ЗАВЕРШЕНА: %d сек. =====',
         0, 1, @WeekNo, @Weeks, @Sec
     ) WITH NOWAIT;
 
@@ -1511,7 +1531,7 @@ END;
 SET @Sec = DATEDIFF(second, @StartTime, SYSDATETIME());
 
 RAISERROR(
-    N'РАСЧЁТ ЗАВЕРШЁН. Общее время: %d сек.',
+    N'PRIVATE: РАСЧЁТ ЗАВЕРШЁН. Общее время: %d сек.',
     0, 1, @Sec
 ) WITH NOWAIT;
 
@@ -1524,19 +1544,21 @@ SELECT
     , ClientRate
     , WeightedTerm
 
-FROM #W3_Result
+FROM #PR_Result
 
 ORDER BY
     WeekEnd DESC,
 
     CASE Segment
         WHEN N'Базовая ставка' THEN 1
-        WHEN N'Удержание' THEN 2
-        WHEN N'Новые деньги' THEN 3
-        WHEN N'Новые клиенты' THEN 4
-        WHEN N'Активный процент' THEN 5
-        WHEN N'Маркетплейсы' THEN 6
-        WHEN N'Пенсионеры и Маркетплейсы' THEN 7
+        WHEN N'Плавающая ставка' THEN 2
+        WHEN N'Удержание' THEN 3
+        WHEN N'Новые деньги' THEN 4
+        WHEN N'Новые клиенты' THEN 5
+        WHEN N'Индивидуальные согласования' THEN 6
         WHEN N'Итого' THEN 99
         ELSE 98
     END;
+
+
+    
