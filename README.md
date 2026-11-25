@@ -1,30 +1,62 @@
-SELECT TOP (30)
-    cli_id,
-    action_date,
-    should_be,
-    total_out / 1e6 AS original_out_mln,
+;WITH t AS (
+    SELECT
+        SUM(amount_in) AS full_in,
+        SUM(amount_out) AS full_out,
 
-    COUNT_BIG(*) AS rows_count,
-    COUNT(DISTINCT ping_date) AS message_dates,
+        SUM(incoming_sr + incoming_ns + incoming_dvs
+            + incoming_other + incoming_unknown) AS parts_in,
 
-    SUM(total_out) / 1e6 AS summed_out_mln,
+        SUM(outgoing_sr + outgoing_ns + outgoing_dvs
+            + outgoing_other + outgoing_unknown) AS parts_out
 
-    (SUM(total_out) - MAX(total_out)) / 1e6
-        AS duplicated_out_mln
+    FROM ALM_TEST.WORK.RK_Oct2026_PaymentAgg
+)
+SELECT
+    full_in / 1e9 AS full_in,
+    parts_in / 1e9 AS parts_in,
 
-FROM ALM_TEST.alm_history.sms_push_clients
+    full_out / 1e9 AS full_out,
+    parts_out / 1e9 AS parts_out,
 
-GROUP BY
-    cli_id,
-    action_date,
-    should_be,
-    total_out
+    (full_in - parts_in) / 1e9 AS diff_in,
+    (parts_out - full_out) / 1e9 AS diff_out,
 
-HAVING COUNT_BIG(*) > 1
+    (full_in + full_out) / 1e9 AS full_saldo,
+    (parts_in + parts_out) / 1e9 AS parts_saldo,
 
-ORDER BY ABS(SUM(total_out) - MAX(total_out)) DESC
-
+    (full_in + full_out - parts_in - parts_out)
+        / 1e9 AS diff_saldo
+FROM t
 OPTION (MAXDOP 1);
 
 
-Посмотри, пожалуйста, нет ли задвоения total_out при присоединении уведомлений и all_info. В последнем случае, если у клиента были и SMS, и Push, при JOIN по CLI_ID строки могут размножаться. Написал небольшой проверочный скрипт, который покажет конкретные примеры таких клиентов.
+;WITH t AS (
+    SELECT
+        SUM(amount_in) AS full_in,
+        SUM(amount_out) AS full_out,
+
+        SUM(incoming_sr + incoming_ns + incoming_dvs
+            + incoming_other + incoming_unknown) AS parts_in,
+
+        SUM(outgoing_sr + outgoing_ns + outgoing_dvs
+            + outgoing_other + outgoing_unknown) AS parts_out
+
+    FROM ALM_TEST.WORK.RK_Oct2026_PaymentAgg
+)
+SELECT
+    full_in / 1e9 AS full_in,
+    parts_in / 1e9 AS parts_in,
+
+    full_out / 1e9 AS full_out,
+    parts_out / 1e9 AS parts_out,
+
+    (full_in - parts_in) / 1e9 AS diff_in,
+    (parts_out - full_out) / 1e9 AS diff_out,
+
+    (full_in + full_out) / 1e9 AS full_saldo,
+    (parts_in + parts_out) / 1e9 AS parts_saldo,
+
+    (full_in + full_out - parts_in - parts_out)
+        / 1e9 AS diff_saldo
+FROM t
+OPTION (MAXDOP 1);
