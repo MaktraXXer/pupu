@@ -1540,11 +1540,3 @@ ORDER BY
         WHEN N'Итого' THEN 99
         ELSE 98
     END;
-
-
-
-
-    DECLARE @AsOfDate date = '20261125';
-DECLARE @Weeks int = 12;
-DECLARE @Promo15From date = '20261001';
-DECLARE @VerifyFirstWeek bit = 1;
