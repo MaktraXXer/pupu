@@ -1,7 +1,15 @@
 SELECT
     a.*,
-    ISNULL(f.has_old_app_ever, 0) AS has_old_app_ever,
-    ISNULL(f.has_old_app_october, 0) AS has_old_app_october
+
+    CASE
+        WHEN ISNULL(f.has_version_ever, 0) = 0 THEN 1
+        ELSE f.has_old_app_ever
+    END AS has_old_app_ever,
+
+    CASE
+        WHEN ISNULL(f.has_version_october, 0) = 0 THEN 1
+        ELSE f.has_old_app_october
+    END AS has_old_app_october
 
 FROM ALM_TEST.alm_report.depo_fl_client_monthly_stats a
 
@@ -10,13 +18,21 @@ LEFT JOIN (
     SELECT
         b.CLI_ID AS device_cli_id,
 
-        1 AS has_old_app_ever,
+        MAX(CASE WHEN x.app_class >= 0
+                 THEN 1 ELSE 0 END) AS has_version_ever,
 
-        MAX(CASE
-            WHEN b.LOG_TIMESTAMP >= '20261001'
-             AND b.LOG_TIMESTAMP < '20261101'
-                THEN 1 ELSE 0
-        END) AS has_old_app_october
+        MAX(CASE WHEN x.app_class = 1
+                 THEN 1 ELSE 0 END) AS has_old_app_ever,
+
+        MAX(CASE WHEN x.app_class >= 0
+                  AND b.LOG_TIMESTAMP >= '20261001'
+                  AND b.LOG_TIMESTAMP < '20261101'
+                 THEN 1 ELSE 0 END) AS has_version_october,
+
+        MAX(CASE WHEN x.app_class = 1
+                  AND b.LOG_TIMESTAMP >= '20261001'
+                  AND b.LOG_TIMESTAMP < '20261101'
+                 THEN 1 ELSE 0 END) AS has_old_app_october
 
     FROM ALM.ehd.ods_cli_devices b WITH (NOLOCK)
 
@@ -48,16 +64,26 @@ LEFT JOIN (
             TRY_CAST(PARSENAME(v.ver,1) AS int) AS build
     ) p
 
-    WHERE p.major >= 0
-      AND p.minor >= 0
-      AND p.patch >= 0
-      AND p.build >= 0
+    CROSS APPLY (
+        SELECT CASE
+            WHEN p.major IS NULL
+              OR p.minor IS NULL
+              OR p.patch IS NULL
+              OR p.build IS NULL
+              OR p.major < 0
+              OR p.minor < 0
+              OR p.patch < 0
+              OR p.build < 0
+                THEN -1
 
-      AND (
-          p.major < 5
-          OR (p.major = 5 AND p.minor < 7)
-          OR (p.major = 5 AND p.minor = 7 AND p.patch < 1)
-      )
+            WHEN p.major < 5
+              OR (p.major = 5 AND p.minor < 7)
+              OR (p.major = 5 AND p.minor = 7 AND p.patch < 1)
+                THEN 1
+
+            ELSE 0
+        END AS app_class
+    ) x
 
     GROUP BY b.CLI_ID
 
