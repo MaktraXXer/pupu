@@ -1,42 +1,86 @@
-DECLARE @DateTo date = CAST(GETDATE() AS date);
-DECLARE @DateFrom date = DATEADD(month, -6, @DateTo);
+USE ALM_TEST;
+GO
 
-SELECT
-    p.cli_id,
+CREATE FUNCTION [alm_report].[fn_DepositFL_MonthlyGAP]
+(
+    @ReportDate date
+)
+RETURNS TABLE
+AS
+RETURN
+(
+    WITH months AS
+    (
+        SELECT
+            n AS BucketNo,
+            DATEADD(month, n,
+                DATEFROMPARTS(
+                    YEAR(@ReportDate),
+                    MONTH(@ReportDate), 1
+                )
+            ) AS MonthStart
+        FROM (VALUES
+            (0),(1),(2),(3),(4),(5),
+            (6),(7),(8),(9),(10),(11),
+            (12),(13),(14),(15),(16),(17)
+        ) t(n)
+    ),
 
-    MAX(CASE WHEN v.amt >= 1000000
-             THEN 1 ELSE 0 END) AS cash_in_flag,
+    agg AS
+    (
+        SELECT
+            b.BucketNo,
+            SUM(CAST(v.OUT_RUB AS decimal(24,2))) AS VolumeRub
 
-    MAX(CASE WHEN v.amt <= -1000000
-             THEN 1 ELSE 0 END) AS cash_out_flag
+        FROM ALM.ALM.vw_balance_rest_all v WITH (NOLOCK)
 
-FROM ALM.ehd.VW_transfers_FL_det p
+        CROSS APPLY
+        (
+            VALUES
+            (
+                CASE
+                    WHEN DATEDIFF(month, @ReportDate, v.DT_CLOSE) >= 17
+                        THEN 17
+                    ELSE DATEDIFF(month, @ReportDate, v.DT_CLOSE)
+                END
+            )
+        ) b(BucketNo)
 
-CROSS APPLY (
-    VALUES (
-        ISNULL(p.[Распознано_СР], 0)
-      + ISNULL(p.[Распознано_НС], 0)
-      + ISNULL(p.[Распознано_ДВС], 0)
+        WHERE v.DT_REP = @ReportDate
+          AND v.section_name = N'Срочные'
+          AND v.block_name = N'Привлечение ФЛ'
+          AND v.ap = N'Пассив'
+          AND v.od_flag = 1
+          AND v.cur = '810'
+          AND v.OUT_RUB > 0
+          AND v.DT_CLOSE >= @ReportDate
+
+        GROUP BY b.BucketNo
     )
-) v(amt)
 
-WHERE p.dt_rep >= @DateFrom
-  AND p.dt_rep < @DateTo
-  AND p.transaction_type = N'Наличные'
-  AND p.cli_id IS NOT NULL
+    SELECT
+        m.MonthStart,
 
-  AND (
-      (v.amt >= 1000000
-       AND p.count_in = 1
-       AND ISNULL(p.count_out, 0) = 0)
+        CONCAT(
+            CHOOSE(
+                MONTH(m.MonthStart),
+                N'Январь', N'Февраль', N'Март',
+                N'Апрель', N'Май', N'Июнь',
+                N'Июль', N'Август', N'Сентябрь',
+                N'Октябрь', N'Ноябрь', N'Декабрь'
+            ),
+            N' ',
+            YEAR(m.MonthStart),
+            CASE WHEN m.BucketNo = 17 THEN N'+' ELSE N'' END
+        ) AS MonthName,
 
-      OR
+        CAST(
+            ISNULL(a.VolumeRub, 0) / 1000000000.0
+            AS decimal(18,6)
+        ) AS VolumeBln
 
-      (v.amt <= -1000000
-       AND p.count_out = 1
-       AND ISNULL(p.count_in, 0) = 0)
-  )
-
-GROUP BY p.cli_id
-
-OPTION (MAXDOP 1, RECOMPILE);
+    FROM months m
+    LEFT JOIN agg a
+        ON a.BucketNo = m.BucketNo
+);
+GO
